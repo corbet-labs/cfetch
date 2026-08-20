@@ -140,7 +140,8 @@ fn selfcheck() -> anyhow::Result<()> {
 fn scan() -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     let mut conn = index::open(&paths::state_dir())?;
-    let report = index::scan(&mut conn, &cfg.brain_root)?;
+    let native = paths::native_projects_root();
+    let report = index::scan(&mut conn, &cfg.brain_root, Some(&native))?;
     println!(
         "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
         report.docs, report.blocks, report.skipped_high_ring
@@ -150,7 +151,8 @@ fn scan() -> anyhow::Result<()> {
 
 fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
-    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root)?;
+    let native = paths::native_projects_root();
+    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
 
     if let Some(cite) = id {
         let blocks = index::expand(&conn, cite)?;

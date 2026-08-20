@@ -35,6 +35,12 @@ pub fn config_path() -> PathBuf {
     }
 }
 
+/// Claude Code's per-project native auto-memory stores live under here.
+/// cfetch indexes them read-only; it never writes to the native store.
+pub fn native_projects_root() -> PathBuf {
+    home().join(".claude/projects")
+}
+
 /// The shared brain tree (source of truth, git-tracked markdown).
 pub fn default_brain_root() -> PathBuf {
     match std::env::var_os("CFETCH_BRAIN") {

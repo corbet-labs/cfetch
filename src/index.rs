@@ -220,8 +220,31 @@ pub fn open(state_dir: &Path) -> anyhow::Result<Connection> {
     }
 }
 
-/// Walks the brain tree for indexable markdown: (relative path, mtime, size).
-fn tree_files(brain_root: &Path) -> Vec<(String, u64, u64)> {
+/// One indexable file: the doc path stored in the DB, where to read it, stat
+/// info for staleness, and the ring to assume when no frontmatter overrides.
+struct SourceFile {
+    doc_path: String,
+    abs: PathBuf,
+    mtime: u64,
+    size: u64,
+    default_ring: u8,
+}
+
+fn stat_of(meta: &std::fs::Metadata) -> (u64, u64) {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (mtime, meta.len())
+}
+
+/// Brain tree + (optionally) Claude Code's native auto-memory stores.
+/// Native memory (`<native_root>/<project-slug>/memory/*.md`) is indexed as
+/// ring 2 with doc paths `native:<slug>/<file>` — cfetch reads and surfaces
+/// the native store, it never writes to it.
+fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFile> {
     let mut out = Vec::new();
     let walker = ignore::WalkBuilder::new(brain_root)
         .hidden(true)
@@ -238,21 +261,44 @@ fn tree_files(brain_root: &Path) -> Vec<(String, u64, u64)> {
         if !rel.ends_with(".md") || excluded(&rel) || secret_shaped(&rel) {
             continue;
         }
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        out.push((rel, mtime, meta.len()));
+        let (mtime, size) = stat_of(&meta);
+        out.push(SourceFile {
+            doc_path: rel.clone(),
+            abs: entry.path().to_path_buf(),
+            mtime,
+            size,
+            default_ring: default_ring(&rel),
+        });
     }
-    out.sort();
+    if let Some(projects) = native_root.and_then(|nr| std::fs::read_dir(nr).ok()) {
+        for project in projects.flatten() {
+            let slug = project.file_name().to_string_lossy().to_string();
+            let mem_dir = project.path().join("memory");
+            let Ok(files) = std::fs::read_dir(&mem_dir) else { continue };
+            for f in files.flatten() {
+                let Ok(meta) = f.metadata() else { continue };
+                let name = f.file_name().to_string_lossy().to_string();
+                if !meta.is_file() || !name.ends_with(".md") || secret_shaped(&name) {
+                    continue;
+                }
+                let (mtime, size) = stat_of(&meta);
+                out.push(SourceFile {
+                    doc_path: format!("native:{slug}/{name}"),
+                    abs: f.path(),
+                    mtime,
+                    size,
+                    default_ring: 2,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.doc_path.cmp(&b.doc_path));
     out
 }
 
-/// Cheap staleness decision: compare the tree's (path, mtime, size) set with
+/// Cheap staleness decision: compare the sources' (path, mtime, size) set with
 /// the docs table. Stat-only — no file bodies are read.
-pub fn stale(conn: &Connection, brain_root: &Path) -> anyhow::Result<bool> {
+pub fn stale(conn: &Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<bool> {
     let root_meta: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
         .ok();
@@ -268,11 +314,27 @@ pub fn stale(conn: &Connection, brain_root: &Path) -> anyhow::Result<bool> {
         let (p, ms) = row?;
         indexed.insert(p, ms);
     }
-    let current: BTreeMap<String, (u64, u64)> = tree_files(brain_root)
+    // Skipped ring-5+ files never land in docs; carry them as absent by
+    // comparing only what WOULD be indexed. A ring-5 file edit still flips
+    // staleness via mtime, which is acceptable over-rebuilding, not a miss.
+    let current: BTreeMap<String, (u64, u64)> = collect_files(brain_root, native_root)
         .into_iter()
-        .map(|(p, m, s)| (p, (m, s)))
+        .map(|f| (f.doc_path, (f.mtime, f.size)))
         .collect();
-    Ok(indexed != current)
+    // Everything indexed must still exist unchanged; new files show up as
+    // current-not-indexed. Ring-skipped files are current-not-indexed too —
+    // tolerated below by only requiring indexed ⊆ current with equal stats,
+    // plus no brand-new indexable file that we have never seen.
+    for (p, ms) in &indexed {
+        match current.get(p) {
+            Some(c) if c == ms => {}
+            _ => return Ok(true),
+        }
+    }
+    let seen: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='source_count'", [], |r| r.get(0))
+        .ok();
+    Ok(seen.as_deref() != Some(current.len().to_string().as_str()))
 }
 
 pub struct ScanReport {
@@ -284,8 +346,9 @@ pub struct ScanReport {
 /// Full rebuild inside one transaction. The corpus is small markdown; a
 /// rebuild is cheaper and simpler than incremental sync, and matches the
 /// disposable-cache design.
-pub fn scan(conn: &mut Connection, brain_root: &Path) -> anyhow::Result<ScanReport> {
-    let files = tree_files(brain_root);
+pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<ScanReport> {
+    let files = collect_files(brain_root, native_root);
+    let source_count = files.len();
     let tx = conn.transaction()?;
     tx.execute_batch(
         "DELETE FROM blocks; DELETE FROM docs;
@@ -296,14 +359,19 @@ pub fn scan(conn: &mut Connection, brain_root: &Path) -> anyhow::Result<ScanRepo
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [brain_root.to_string_lossy().as_ref()],
     )?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES('source_count', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [source_count.to_string()],
+    )?;
     let mut report = ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0 };
-    for (rel, mtime, size) in files {
-        let raw = match std::fs::read_to_string(brain_root.join(&rel)) {
+    for src in files {
+        let raw = match std::fs::read_to_string(&src.abs) {
             Ok(s) => s,
             Err(_) => continue,
         };
         let (fm_ring, fm_lines) = frontmatter_ring(&raw);
-        let ring = fm_ring.unwrap_or_else(|| default_ring(&rel));
+        let ring = fm_ring.unwrap_or(src.default_ring);
         if ring > MAX_INDEXED_RING {
             report.skipped_high_ring += 1;
             continue;
@@ -312,7 +380,7 @@ pub fn scan(conn: &mut Connection, brain_root: &Path) -> anyhow::Result<ScanRepo
         let blanked = blank_private(&raw);
         tx.execute(
             "INSERT INTO docs(path, ring, mtime, size) VALUES(?1, ?2, ?3, ?4)",
-            rusqlite::params![rel, ring, mtime as i64, size as i64],
+            rusqlite::params![src.doc_path, ring, src.mtime as i64, src.size as i64],
         )?;
         let doc_id = tx.last_insert_rowid();
         for (start, end, body) in segment(&blanked, fm_lines) {
@@ -398,10 +466,14 @@ pub fn expand(conn: &Connection, cite: &str) -> anyhow::Result<Vec<Block>> {
 }
 
 /// Ensures the index exists and is fresh, rebuilding when stale.
-pub fn ensure_fresh(state_dir: &Path, brain_root: &Path) -> anyhow::Result<Connection> {
+pub fn ensure_fresh(
+    state_dir: &Path,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+) -> anyhow::Result<Connection> {
     let mut conn = open(state_dir).context("open index")?;
-    if stale(&conn, brain_root)? {
-        scan(&mut conn, brain_root)?;
+    if stale(&conn, brain_root, native_root)? {
+        scan(&mut conn, brain_root, native_root)?;
     }
     Ok(conn)
 }
@@ -462,7 +534,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None).unwrap();
         assert_eq!(report.docs, 3);
         assert!(report.blocks >= 4);
 
@@ -489,7 +561,7 @@ mod tests {
         )]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
         assert!(recall(&conn, "hunter2", 5).unwrap().is_empty());
         assert_eq!(recall(&conn, "public", 5).unwrap().len(), 1);
     }
@@ -502,7 +574,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None).unwrap();
         assert_eq!(report.docs, 1);
         assert_eq!(report.skipped_high_ring, 1);
         let hits = recall(&conn, "locked decision", 5).unwrap();
@@ -519,10 +591,61 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None).unwrap();
         assert_eq!(report.docs, 1);
         assert!(recall(&conn, "tokens", 5).unwrap().is_empty());
         assert!(recall(&conn, "retired", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_auto_memory_is_indexed_as_ring2() {
+        let brain = brain(&[("knowledge/a.md", "brain fact\n")]);
+        let native = tempfile::tempdir().unwrap();
+        let mem = native.path().join("-home-user/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("MEMORY.md"), "# Memory\n\n- [zvol trap](f.md) nossd required\n").unwrap();
+        std::fs::write(
+            mem.join("feedback_zvol.md"),
+            "---\nname: feedback_zvol\ndescription: x\n---\nzvol on btrfs needs nossd mount option\n",
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        assert_eq!(report.docs, 3);
+        let hits = recall(&conn, "nossd", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.ring == 2));
+        assert!(hits.iter().any(|h| h.path == "native:-home-user/feedback_zvol.md"));
+        // frontmatter of native files has no `ring:` — must not shift line numbers wrongly
+        let fb = hits.iter().find(|h| h.path.ends_with("feedback_zvol.md")).unwrap();
+        assert_eq!(fb.start_line, 5);
+    }
+
+    #[test]
+    fn native_staleness_is_tracked() {
+        let brain = brain(&[("knowledge/a.md", "alpha\n")]);
+        let native = tempfile::tempdir().unwrap();
+        let mem = native.path().join("p1/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("MEMORY.md"), "first\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        assert!(!stale(&conn, brain.path(), Some(native.path())).unwrap());
+        std::fs::write(mem.join("MEMORY.md"), "second, and quite a bit longer\n").unwrap();
+        assert!(stale(&conn, brain.path(), Some(native.path())).unwrap());
+    }
+
+    #[test]
+    fn missing_native_root_is_fine() {
+        let brain = brain(&[("knowledge/a.md", "alpha\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let absent = brain.path().join("no-such-dir");
+        let report = scan(&mut conn, brain.path(), Some(&absent)).unwrap();
+        assert_eq!(report.docs, 1);
+        assert!(!stale(&conn, brain.path(), Some(&absent)).unwrap());
     }
 
     #[test]
@@ -530,12 +653,12 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "alpha\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path()).unwrap();
-        assert!(!stale(&conn, dir.path()).unwrap());
+        scan(&mut conn, dir.path(), None).unwrap();
+        assert!(!stale(&conn, dir.path(), None).unwrap());
         std::fs::write(dir.path().join("knowledge/a.md"), "alpha beta, much longer now\n").unwrap();
-        assert!(stale(&conn, dir.path()).unwrap());
-        scan(&mut conn, dir.path()).unwrap();
-        assert!(!stale(&conn, dir.path()).unwrap());
+        assert!(stale(&conn, dir.path(), None).unwrap());
+        scan(&mut conn, dir.path(), None).unwrap();
+        assert!(!stale(&conn, dir.path(), None).unwrap());
         assert_eq!(recall(&conn, "beta", 5).unwrap().len(), 1);
     }
 }
