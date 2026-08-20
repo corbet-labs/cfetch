@@ -1,9 +1,20 @@
 [package]
 name = "cfetch"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 description = "A second brain for coding agents: privilege-ring memory, hook injection, retrieval, and a code index in one binary"
 repository = "https://github.com/julian-corbet/cfetch"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
