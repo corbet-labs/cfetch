@@ -25,11 +25,21 @@ pub fn default_settings_path() -> PathBuf {
     paths::home().join(".claude/settings.json")
 }
 
+/// The command embeds the absolute binary path: hooks run outside a login
+/// shell, so PATH is not a contract. POSIX-single-quoted against spaces.
+fn hook_command(subcommand: &str) -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "cfetch".to_string());
+    format!("'{}' hook {subcommand}", exe.replace('\'', r"'\''"))
+}
+
 fn managed_entry(subcommand: &str) -> Value {
     json!({
         "hooks": [{
             "type": "command",
-            "command": format!("cfetch hook {subcommand}"),
+            "command": hook_command(subcommand),
             "timeout": 10,
             "_managedBy": MANAGED_BY,
         }]

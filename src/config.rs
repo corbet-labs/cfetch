@@ -54,19 +54,23 @@ impl Config {
     /// Loads the config file; a missing file yields defaults, a corrupt file is
     /// an error the caller surfaces (a half-applied config is worse than none).
     pub fn load() -> anyhow::Result<Config> {
-        let path = paths::config_path();
-        let raw = match std::fs::read_to_string(&path) {
+        Config::load_from(&paths::config_path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
+        let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Config::default());
             }
             Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
         };
-        let mut cfg: Config = serde_json::from_str(&raw)
+        // An explicitly empty `resident` list means "inject nothing" — the
+        // default (AGENT.md) applies only when no config file exists at all.
+        // On hosts where the harness already auto-loads the ring files,
+        // injecting them again would double-pay the context budget.
+        let cfg: Config = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
-        if cfg.resident.is_empty() {
-            cfg.resident = Config::default().resident;
-        }
         for r in &cfg.resident {
             if r.ring > 1 {
                 anyhow::bail!(
@@ -81,5 +85,43 @@ impl Config {
 
     pub fn resolve(&self, p: &std::path::Path) -> PathBuf {
         if p.is_absolute() { p.to_path_buf() } else { self.brain_root.join(p) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_yields_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.resident.len(), 1);
+        assert_eq!(cfg.resident[0].path, PathBuf::from("AGENT.md"));
+    }
+
+    #[test]
+    fn explicit_empty_resident_stays_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"resident": []}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.resident.is_empty(), "explicit [] must mean inject nothing");
+    }
+
+    #[test]
+    fn resident_ring_above_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"resident": [{"path": "x.md", "ring": 3}]}"#).unwrap();
+        assert!(Config::load_from(&p).is_err());
+    }
+
+    #[test]
+    fn corrupt_config_is_an_error_not_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, "{ nope").unwrap();
+        assert!(Config::load_from(&p).is_err());
     }
 }
