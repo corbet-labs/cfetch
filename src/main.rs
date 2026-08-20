@@ -3,6 +3,7 @@ mod daemon;
 mod heartbeat;
 mod hook_io;
 mod hooks;
+mod index;
 mod install;
 mod ledger;
 mod paths;
@@ -37,6 +38,20 @@ enum Command {
         /// Remove cfetch's managed entries instead of adding them
         #[arg(long)]
         remove: bool,
+    },
+    /// Rebuild the recall index from the brain tree
+    Scan,
+    /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
+    Recall {
+        /// Search terms (word-prefix matched, OR-combined)
+        query: Vec<String>,
+        /// Expand a citation id instead of searching
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Verify the installation end to end; nonzero exit on hard failures
     Selfcheck,
@@ -122,6 +137,70 @@ fn selfcheck() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn scan() -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let mut conn = index::open(&paths::state_dir())?;
+    let report = index::scan(&mut conn, &cfg.brain_root)?;
+    println!(
+        "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
+        report.docs, report.blocks, report.skipped_high_ring
+    );
+    Ok(())
+}
+
+fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root)?;
+
+    if let Some(cite) = id {
+        let blocks = index::expand(&conn, cite)?;
+        if blocks.is_empty() {
+            println!("no block with citation {cite} (index may have moved on — content-addressed ids change when the entry changes)");
+            return Ok(());
+        }
+        for b in blocks {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "cite": b.cite, "path": b.path, "ring": b.ring,
+                        "lines": [b.start_line, b.end_line], "text": b.text,
+                    })
+                );
+            } else {
+                println!("{} {}:{}-{} (ring {})\n{}\n", b.cite, b.path, b.start_line, b.end_line, b.ring, b.text);
+            }
+        }
+        return Ok(());
+    }
+
+    if query.trim().is_empty() {
+        anyhow::bail!("empty query (pass search terms or --id <citation>)");
+    }
+    let hits = index::recall(&conn, query, limit)?;
+    if json {
+        let arr: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "cite": h.cite, "path": h.path, "ring": h.ring,
+                    "lines": [h.start_line, h.end_line], "snippet": h.snippet,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(arr));
+    } else if hits.is_empty() {
+        println!("no hits for \"{query}\"");
+    } else {
+        for h in &hits {
+            println!("{} {}:{}-{} (ring {})", h.cite, h.path, h.start_line, h.end_line, h.ring);
+            println!("    {}", h.snippet);
+        }
+        println!("\nexpand a hit: cfetch recall --id <citation>");
+    }
+    Ok(())
+}
+
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
     let ledger = ledger::load();
@@ -170,6 +249,18 @@ fn main() {
             let path = settings.unwrap_or_else(install::default_settings_path);
             if let Err(e) = install::apply(&path, remove) {
                 eprintln!("cfetch install: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Scan => {
+            if let Err(e) = scan() {
+                eprintln!("cfetch scan: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Recall { query, id, limit, json } => {
+            if let Err(e) = recall(&query.join(" "), id.as_deref(), limit, json) {
+                eprintln!("cfetch recall: {e}");
                 std::process::exit(1);
             }
         }

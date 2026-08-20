@@ -7,6 +7,42 @@ use std::fmt::Write as _;
 
 use crate::config::Config;
 
+/// Like `strip_private`, but replaces private content with spaces instead of
+/// removing it, preserving newlines — so line numbers in citations computed
+/// from the blanked text still match the file on disk.
+pub fn blank_private(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        match rest.find("<private>") {
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                let after = &rest[start + "<private>".len()..];
+                let (private_part, next) = match after.find("</private>") {
+                    None => (after, ""), // fail closed: blank to end of input
+                    Some(end) => (&after[..end], &after[end + "</private>".len()..]),
+                };
+                // Tags themselves also blank to spaces.
+                out.extend("<private>".chars().map(|_| ' '));
+                for c in private_part.chars() {
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                }
+                if !next.is_empty() {
+                    out.extend("</private>".chars().map(|_| ' '));
+                }
+                rest = next;
+                if rest.is_empty() {
+                    return out;
+                }
+            }
+        }
+    }
+}
+
 /// Removes `<private>...</private>` regions. Fail-closed: an opening tag with
 /// no closing tag removes everything from the tag to the end.
 pub fn strip_private(s: &str) -> String {
@@ -110,6 +146,28 @@ mod tests {
     #[test]
     fn multiple_private_blocks() {
         assert_eq!(strip_private("a<private>x</private>b<private>y</private>c"), "abc");
+    }
+
+    #[test]
+    fn blanking_preserves_length_and_newlines() {
+        let s = "keep\n<private>zqx\nwvy</private>\ntail";
+        let b = blank_private(s);
+        assert_eq!(b.len(), s.len());
+        assert_eq!(b.matches('\n').count(), s.matches('\n').count());
+        assert!(b.starts_with("keep\n"));
+        assert!(b.ends_with("\ntail"));
+        assert!(!b.contains("zqx") && !b.contains("wvy"));
+    }
+
+    #[test]
+    fn blanking_unclosed_blanks_to_end_keeping_newlines() {
+        let s = "keep\n<private>x\ny";
+        let b = blank_private(s);
+        assert_eq!(b.len(), s.len());
+        assert!(b.starts_with("keep\n"));
+        assert!(!b.contains('x'));
+        assert!(!b.contains('y'));
+        assert_eq!(b.matches('\n').count(), 2);
     }
 
     #[test]
