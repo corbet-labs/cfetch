@@ -17,6 +17,7 @@ use anyhow::Context as _;
 use rusqlite::Connection;
 use sha2::Digest as _;
 
+use crate::config::RingRules;
 use crate::resident::blank_private;
 
 /// Rings 5-6 are never indexed: staging and exhaust must not surface in
@@ -51,47 +52,29 @@ pub struct Hit {
     pub(crate) chain: String,
 }
 
-/// Location defaults for a brain-root-relative path; frontmatter `ring: N`
-/// overrides. Mirrors DESIGN.md "existing brain -> ring mapping".
-pub fn default_ring(rel: &str) -> u8 {
-    if rel == "AGENT.md" || rel == "README.md" {
-        1
-    } else if rel.starts_with("mind/memories/") {
-        // Exactly the index file — a topic file named e.g. OLD-MEMORY.md must
-        // not inherit ring 1 by suffix accident.
-        if rel == "mind/memories/MEMORY.md" { 1 } else { 2 }
-    } else if rel.starts_with("todo/") {
-        4
-    } else {
-        3
-    }
+/// THE taxonomy entry point: the configured location default for a
+/// brain-root-relative path. Frontmatter `ring: N` still overrides it at
+/// scan time. Everything that needs a path's ring — the scan, the watcher,
+/// ring-6 capture — comes through here, so the mapping lives in the config
+/// and nowhere else.
+pub fn default_ring(rel: &str, rules: &RingRules) -> u8 {
+    rules.ring_for(rel)
 }
 
-/// Paths that must never enter the index. `knowledge/archive/` is excluded by
-/// convention (do not load unless investigating history); secrets and logs are
-/// excluded as a hard boundary; `projects/` holds repo clones (Milestone 3's
-/// code index owns those).
-fn excluded(rel: &str) -> bool {
-    rel.starts_with("mind/secrets/")
-        || rel.starts_with("logs/")
-        || rel.starts_with("projects/")
-        || rel.starts_with("knowledge/archive/")
-        || rel.starts_with(".git/")
-        || rel.contains("/.git/")
+/// Paths that must never enter the index: the compiled-in boundary (secrets,
+/// logs, git internals) plus the operator's `exclude_prefixes` — by default
+/// `projects/` (repo clones, owned by the code index) and
+/// `knowledge/archive/` (retired knowledge, not recallable by accident).
+fn excluded(rel: &str, rules: &RingRules) -> bool {
+    rules.excluded(rel)
 }
 
 /// Directory form of [`excluded`]: true when nothing under `rel` can ever be
-/// indexed, so the serving watcher can skip the whole subtree. Kept beside
-/// `excluded` deliberately — a prefix added there must be reflected here or
-/// the watcher would register watches the indexer ignores.
-pub(crate) fn excluded_dir(rel: &str) -> bool {
-    let rel = rel.trim_end_matches('/');
-    rel == "mind/secrets"
-        || rel == "logs"
-        || rel == "projects"
-        || rel == "knowledge/archive"
-        || rel == ".git"
-        || excluded(&format!("{rel}/"))
+/// indexed, so the serving watcher can skip the whole subtree. One predicate
+/// serves both forms — the watch set is the index set by construction, never
+/// by two hand-maintained lists agreeing.
+pub(crate) fn excluded_dir(rel: &str, rules: &RingRules) -> bool {
+    rules.excluded_dir(rel)
 }
 
 /// Secret-shaped file names are refused even outside mind/secrets/ — capture
@@ -460,7 +443,11 @@ fn stat_of(meta: &std::fs::Metadata) -> (u64, u64) {
 /// Native memory (`<native_root>/<project-slug>/memory/*.md`) is indexed as
 /// ring 2 with doc paths `native:<slug>/<file>` — cfetch reads and surfaces
 /// the native store, it never writes to it.
-fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFile> {
+fn collect_files(
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> Vec<SourceFile> {
     let mut out = Vec::new();
     let walker = ignore::WalkBuilder::new(brain_root)
         .hidden(true)
@@ -474,7 +461,7 @@ fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFil
         }
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
         let rel = rel.to_string_lossy().to_string();
-        if !rel.ends_with(".md") || excluded(&rel) || secret_shaped(&rel) {
+        if !rel.ends_with(".md") || excluded(&rel, rules) || secret_shaped(&rel) {
             continue;
         }
         let (mtime, size) = stat_of(&meta);
@@ -483,7 +470,7 @@ fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFil
             abs: entry.path().to_path_buf(),
             mtime,
             size,
-            default_ring: default_ring(&rel),
+            default_ring: default_ring(&rel, rules),
         });
     }
     if let Some(projects) = native_root.and_then(|nr| std::fs::read_dir(nr).ok()) {
@@ -530,7 +517,12 @@ fn source_fingerprint(files: &[SourceFile]) -> String {
 
 /// Cheap staleness decision: stat-only fingerprint comparison — no file
 /// bodies are read.
-pub fn stale(conn: &Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<bool> {
+pub fn stale(
+    conn: &Connection,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> anyhow::Result<bool> {
     let root_meta: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
         .ok();
@@ -540,7 +532,7 @@ pub fn stale(conn: &Connection, brain_root: &Path, native_root: Option<&Path>) -
     let stored: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0))
         .ok();
-    let current = source_fingerprint(&collect_files(brain_root, native_root));
+    let current = source_fingerprint(&collect_files(brain_root, native_root, rules));
     Ok(stored.as_deref() != Some(current.as_str()))
 }
 
@@ -740,8 +732,13 @@ fn set_fingerprint(tx: &rusqlite::Transaction<'_>, fingerprint: &str) -> anyhow:
 /// Full rebuild inside one transaction. The corpus is small markdown; a
 /// rebuild is cheap, and the incremental path ([`rescan_changed`]) exists for
 /// the serving daemon's event batches.
-pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<ScanReport> {
-    let files = collect_files(brain_root, native_root);
+pub fn scan(
+    conn: &mut Connection,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> anyhow::Result<ScanReport> {
+    let files = collect_files(brain_root, native_root, rules);
     let fingerprint = source_fingerprint(&files);
     // Read every body BEFORE the write transaction: the tree may be NFS, and
     // holding SQLite's writer lock across slow I/O starves concurrent readers
@@ -819,6 +816,7 @@ pub fn rescan_changed(
     conn: &mut Connection,
     brain_root: &Path,
     native_root: Option<&Path>,
+    rules: &RingRules,
 ) -> anyhow::Result<Option<ScanReport>> {
     let root_meta: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
@@ -828,7 +826,7 @@ pub fn rescan_changed(
     {
         return Ok(None);
     }
-    let files = collect_files(brain_root, native_root);
+    let files = collect_files(brain_root, native_root, rules);
     let fingerprint = source_fingerprint(&files);
     let stored: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0))
@@ -1343,15 +1341,16 @@ pub fn ensure_fresh(
     state_dir: &Path,
     brain_root: &Path,
     native_root: Option<&Path>,
+    rules: &RingRules,
 ) -> anyhow::Result<Connection> {
     let mut conn = open(state_dir).context("open index")?;
-    if stale(&conn, brain_root, native_root)? {
+    if stale(&conn, brain_root, native_root, rules)? {
         // `None` = another rebuilder is active; serve the committed snapshot.
         let lock = crate::lockfile::acquire(&state_dir.join("scan.lock"), 500, 120);
         // Re-check under the lock: the previous holder may have rebuilt
         // exactly what we were about to.
-        if lock.is_some() && stale(&conn, brain_root, native_root)? {
-            scan(&mut conn, brain_root, native_root)?;
+        if lock.is_some() && stale(&conn, brain_root, native_root, rules)? {
+            scan(&mut conn, brain_root, native_root, rules)?;
         }
     }
     Ok(conn)
@@ -1360,6 +1359,7 @@ pub fn ensure_fresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RingRule;
 
     fn brain(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1373,11 +1373,61 @@ mod tests {
 
     #[test]
     fn ring_defaults_follow_design_mapping() {
-        assert_eq!(default_ring("AGENT.md"), 1);
-        assert_eq!(default_ring("mind/memories/MEMORY.md"), 1);
-        assert_eq!(default_ring("mind/memories/feedback_x.md"), 2);
-        assert_eq!(default_ring("knowledge/hosts/server/zfs.md"), 3);
-        assert_eq!(default_ring("todo/active/cfetch/STATUS.md"), 4);
+        // Regression lock: with the shipped rules the taxonomy entry point
+        // answers exactly what the hardcoded version answered.
+        let r = RingRules::default();
+        assert_eq!(default_ring("AGENT.md", &r), 1);
+        assert_eq!(default_ring("README.md", &r), 1);
+        assert_eq!(default_ring("mind/memories/MEMORY.md", &r), 1);
+        assert_eq!(default_ring("mind/memories/feedback_x.md", &r), 2);
+        assert_eq!(default_ring("knowledge/hosts/example/storage.md", &r), 3);
+        assert_eq!(default_ring("todo/active/task/STATUS.md", &r), 4);
+    }
+
+    #[test]
+    fn custom_ring_rules_drive_the_indexed_rings() {
+        // A tree with none of the shipped names: rings come from config only.
+        let dir = brain(&[
+            ("laws.md", "kwenty is the hard law\n"),
+            ("handbook/style.md", "trakkel is the house style\n"),
+            ("misc/loose.md", "vurpel is a loose fact\n"),
+            ("scratch/dump.md", "pargast is scratch\n"),
+        ]);
+        let rules = RingRules {
+            rules: vec![
+                RingRule { prefix: "laws.md".into(), ring: 0 },
+                RingRule { prefix: "handbook/".into(), ring: 1 },
+                RingRule { prefix: "scratch/".into(), ring: 5 },
+                RingRule { prefix: String::new(), ring: 4 },
+            ],
+            exclude_prefixes: Vec::new(),
+        };
+        let mut conn = open(dir.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &rules).unwrap();
+        assert_eq!(report.skipped, vec!["scratch/dump.md".to_string()], "ring 5 is never indexed");
+        let ring_of = |q: &str| recall(&conn, q, 5).unwrap().first().map(|h| h.ring);
+        assert_eq!(ring_of("kwenty"), Some(0));
+        assert_eq!(ring_of("trakkel"), Some(1));
+        assert_eq!(ring_of("vurpel"), Some(4), "the catch-all rule applies");
+        assert_eq!(ring_of("pargast"), None);
+    }
+
+    #[test]
+    fn configured_exclusions_apply_while_hard_ones_cannot_be_lifted() {
+        let dir = brain(&[
+            ("mind/secrets/tokens.md", "hyllvar token\n"),
+            ("drafts/wip.md", "nogrant draft\n"),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let rules = RingRules {
+            rules: RingRules::default().rules,
+            exclude_prefixes: vec!["drafts/".into()],
+        };
+        let mut conn = open(dir.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &rules).unwrap();
+        assert!(recall(&conn, "hyllvar", 5).unwrap().is_empty(), "secrets stay out, always");
+        assert!(recall(&conn, "nogrant", 5).unwrap().is_empty(), "configured exclusion applies");
+        assert_eq!(recall(&conn, "kavender", 5).unwrap().len(), 1);
     }
 
     #[test]
@@ -1413,7 +1463,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.docs, 3);
         assert!(report.blocks >= 4);
 
@@ -1440,7 +1490,7 @@ mod tests {
         )]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert!(recall(&conn, "hunter2", 5).unwrap().is_empty());
         assert_eq!(recall(&conn, "public", 5).unwrap().len(), 1);
     }
@@ -1453,7 +1503,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.docs, 1);
         assert_eq!(report.skipped_high_ring, 1);
         let hits = recall(&conn, "locked decision", 5).unwrap();
@@ -1470,7 +1520,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.docs, 1);
         assert!(recall(&conn, "tokens", 5).unwrap().is_empty());
         assert!(recall(&conn, "retired", 5).unwrap().is_empty());
@@ -1490,7 +1540,7 @@ mod tests {
         .unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        let report = scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
         assert_eq!(report.docs, 3);
         let hits = recall(&conn, "nossd", 5).unwrap();
         assert_eq!(hits.len(), 2);
@@ -1510,10 +1560,10 @@ mod tests {
         std::fs::write(mem.join("MEMORY.md"), "first\n").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
-        assert!(!stale(&conn, brain.path(), Some(native.path())).unwrap());
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
+        assert!(!stale(&conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap());
         std::fs::write(mem.join("MEMORY.md"), "second, and quite a bit longer\n").unwrap();
-        assert!(stale(&conn, brain.path(), Some(native.path())).unwrap());
+        assert!(stale(&conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -1522,9 +1572,9 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         let absent = brain.path().join("no-such-dir");
-        let report = scan(&mut conn, brain.path(), Some(&absent)).unwrap();
+        let report = scan(&mut conn, brain.path(), Some(&absent), &RingRules::default()).unwrap();
         assert_eq!(report.docs, 1);
-        assert!(!stale(&conn, brain.path(), Some(&absent)).unwrap());
+        assert!(!stale(&conn, brain.path(), Some(&absent), &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -1535,7 +1585,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.skipped_high_ring, 1);
         assert!(recall(&conn, "zweptahl", 5).unwrap().is_empty());
         let hits = recall(&conn, "quorvex", 5).unwrap();
@@ -1552,7 +1602,7 @@ mod tests {
         std::fs::write(mem.join("quarantined.md"), "---\nring: 5\n---\nhidden\n").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, brain_dir.path(), Some(native.path())).unwrap();
+        let report = scan(&mut conn, brain_dir.path(), Some(native.path()), &RingRules::default()).unwrap();
         let hits = recall(&conn, "invariant", 5).unwrap();
         assert_eq!(hits[0].ring, 2, "promotion clamped to the store's contract ring");
         assert_eq!(report.skipped_high_ring, 1, "demotion to 5+ is honored");
@@ -1566,12 +1616,12 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
         // Editing the SKIPPED file (e.g. removing its ring-5 marker = promotion)
         // must be noticed — the old subset comparison was blind to this.
         std::fs::write(dir.path().join("knowledge/staged.md"), "now public\n").unwrap();
-        assert!(stale(&conn, dir.path(), None).unwrap());
+        assert!(stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -1589,10 +1639,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         assert_eq!(generation(&conn), 0, "unscanned index has generation 0");
-        let r1 = scan(&mut conn, dir.path(), None).unwrap();
+        let r1 = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(r1.generation, 1);
         assert_eq!(generation(&conn), 1);
-        let r2 = scan(&mut conn, dir.path(), None).unwrap();
+        let r2 = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(r2.generation, 2, "generation is monotonic per committed scan");
         drop(conn);
         let conn = open(state.path()).unwrap();
@@ -1610,17 +1660,17 @@ mod tests {
         let s2 = tempfile::tempdir().unwrap();
         let mut c1 = open(s1.path()).unwrap();
         let mut c2 = open(s2.path()).unwrap();
-        scan(&mut c1, dir.path(), None).unwrap();
-        scan(&mut c2, dir.path(), None).unwrap();
+        scan(&mut c1, dir.path(), None, &RingRules::default()).unwrap();
+        scan(&mut c2, dir.path(), None, &RingRules::default()).unwrap();
         // Different generations must not leak into the digest.
-        scan(&mut c2, dir.path(), None).unwrap();
+        scan(&mut c2, dir.path(), None, &RingRules::default()).unwrap();
         let k1 = catalog_checksum(&c1).unwrap();
         let k2 = catalog_checksum(&c2).unwrap();
         assert!(!k1.is_empty());
         assert_eq!(k1, k2, "same tree must yield the same catalog checksum");
         // A content change must change the digest.
         std::fs::write(dir.path().join("knowledge/b.md"), "- gamma\n- delta prime\n").unwrap();
-        scan(&mut c1, dir.path(), None).unwrap();
+        scan(&mut c1, dir.path(), None, &RingRules::default()).unwrap();
         assert_ne!(catalog_checksum(&c1).unwrap(), k2);
     }
 
@@ -1629,7 +1679,7 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "royw fact\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let ro = open_ro(state.path()).unwrap();
         assert_eq!(recall(&ro, "royw", 5).unwrap().len(), 1);
         assert!(
@@ -1671,7 +1721,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let linked = linked_docs(&conn, &["knowledge/zfs.md".to_string()], 8).unwrap();
         let paths: Vec<&str> = linked.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"knowledge/hosts/shares.md"), "outgoing link followed");
@@ -1688,7 +1738,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let linked = linked_docs(&conn, &["knowledge/linker.md".to_string()], 8).unwrap();
         assert!(linked.is_empty(), "ambiguous stem must create no edge");
     }
@@ -1746,7 +1796,7 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "- one\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let missing = blocks_without_vectors(&conn, 10).unwrap();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].1, "- one");
@@ -1766,7 +1816,7 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert!(!ensure_embed_model(&conn, "nomic-v1").unwrap(), "first model: nothing to drop");
         assert!(!ensure_embed_dim(&conn, 2).unwrap());
         for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
@@ -1792,12 +1842,12 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
             insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
         }
         assert_eq!(vector_counts(&conn).unwrap().0, 2);
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(vector_counts(&conn).unwrap().0, 0, "full rebuild must clear derived vectors");
     }
 
@@ -1810,7 +1860,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let assign = |text_frag: &str, v: &[f32]| {
             let id: i64 = conn
                 .query_row(
@@ -1845,7 +1895,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let mut stmt = conn.prepare("SELECT id FROM blocks ORDER BY id").unwrap();
         let ids: Vec<i64> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
         drop(stmt);
@@ -1877,7 +1927,7 @@ mod tests {
             .unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
         let hits = recall(&conn, "nossd", 5).unwrap();
         assert_eq!(hits.len(), 1, "one logical block, one hit");
         assert_eq!(hits[0].ring, 1, "the lowest-ring copy survives");
@@ -1946,7 +1996,7 @@ mod tests {
         std::fs::write(mem.join("MEMORY.md"), "- flumox\n").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
         let hits = recall(&conn, "flumox", 2).unwrap();
         assert_eq!(hits.len(), 2, "suppression must not shrink the result count");
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
@@ -1964,7 +2014,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "shared statement", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].ring, 1);
@@ -1986,7 +2036,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.skipped_high_ring, 2);
         assert_eq!(
             report.skipped,
@@ -2070,7 +2120,7 @@ mod tests {
         )]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "flurbium", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].snippet, "[ProjectX > Setup] Install the flurbium package.");
@@ -2088,7 +2138,7 @@ mod tests {
         )]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "serverx", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].snippet, "[Hosts > | Name | IP |] | serverx | 192.0.2.1 |");
@@ -2109,7 +2159,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "glorpnik", 10).unwrap();
         let ctx_only = hits
             .iter()
@@ -2135,7 +2185,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "restart", 5).unwrap();
         assert_eq!(hits.len(), 2, "different sections = different statements");
         assert!(hits.iter().all(|h| h.mirrors.is_empty()));
@@ -2156,7 +2206,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let linked = linked_docs(&conn, &["knowledge/linker.md".to_string()], 8).unwrap();
         let paths: Vec<&str> = linked.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"knowledge/a/readme2.md"), "parent/stem suffix resolves: {paths:?}");
@@ -2176,7 +2226,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "fenwick", 5).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].ring, 1, "top slot reserved for the ring 0-1 band");
@@ -2192,7 +2242,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "zelkova", 5).unwrap();
         assert_eq!(hits[0].ring, 3, "prior breaks the tie toward the lower ring");
         assert_eq!(hits[1].ring, 4);
@@ -2205,7 +2255,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "korvat", 5).unwrap();
         assert_eq!(hits[0].ring, 4, "a strong lexical win is never overridden by the prior");
     }
@@ -2219,7 +2269,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let r1 = scan(&mut conn, dir.path(), None).unwrap();
+        let r1 = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(r1.generation, 1);
         // Vectors on every block: unchanged docs must keep theirs.
         for (id, _) in blocks_without_vectors(&conn, 100).unwrap() {
@@ -2232,14 +2282,14 @@ mod tests {
         std::fs::write(dir.path().join("knowledge/d.md"), "arrived later, see [[a]]\n").unwrap();
         std::fs::remove_file(dir.path().join("knowledge/c.md")).unwrap();
 
-        let r2 = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("small diff → incremental");
+        let r2 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("small diff → incremental");
         assert_eq!(r2.generation, 2, "incremental commit advances the generation");
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
 
         // Byte-identical catalog vs an independent fresh derivation.
         let state2 = tempfile::tempdir().unwrap();
         let mut fresh = open(state2.path()).unwrap();
-        scan(&mut fresh, dir.path(), None).unwrap();
+        scan(&mut fresh, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(
             catalog_checksum(&conn).unwrap(),
             catalog_checksum(&fresh).unwrap(),
@@ -2264,7 +2314,7 @@ mod tests {
         assert!(vectors_before > vectors_after);
 
         // A no-op rescan commits nothing and keeps the generation.
-        let r3 = rescan_changed(&mut conn, dir.path(), None).unwrap().unwrap();
+        let r3 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();
         assert_eq!(r3.generation, 2, "fingerprint already current → no new commit");
         assert_eq!(generation(&conn), 2);
     }
@@ -2275,17 +2325,17 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         // Never scanned: no basis.
-        assert!(rescan_changed(&mut conn, dir.path(), None).unwrap().is_none());
-        scan(&mut conn, dir.path(), None).unwrap();
+        assert!(rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().is_none());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         // Different brain root: no basis.
         let other = brain(&[("knowledge/a.md", "alpha\n")]);
-        assert!(rescan_changed(&mut conn, other.path(), None).unwrap().is_none());
+        assert!(rescan_changed(&mut conn, other.path(), None, &RingRules::default()).unwrap().is_none());
         // A diff beyond the incremental cap falls back to the full scan.
         for i in 0..40 {
             std::fs::write(dir.path().join(format!("knowledge/bulk{i}.md")), "bulk\n").unwrap();
         }
-        assert!(rescan_changed(&mut conn, dir.path(), None).unwrap().is_none());
-        assert!(stale(&conn, dir.path(), None).unwrap(), "fallback leaves the full scan to do it");
+        assert!(rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().is_none());
+        assert!(stale(&conn, dir.path(), None, &RingRules::default()).unwrap(), "fallback leaves the full scan to do it");
     }
 
     #[test]
@@ -2296,23 +2346,23 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert!(recall(&conn, "zulqar", 5).unwrap().is_empty());
 
         // Promotion: the ring-5 marker is removed.
         std::fs::write(dir.path().join("knowledge/staged.md"), "promoted zulqar\n").unwrap();
         // Demotion: a public file becomes staged.
         std::fs::write(dir.path().join("knowledge/normal.md"), "---\nring: 5\n---\npublic wembly fact\n").unwrap();
-        let r = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("incremental");
+        let r = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("incremental");
         assert_eq!(r.skipped_high_ring, 1);
         assert_eq!(recall(&conn, "zulqar", 5).unwrap().len(), 1, "promoted file is indexed");
         assert!(recall(&conn, "wembly", 5).unwrap().is_empty(), "demoted file left the index");
-        assert!(!stale(&conn, dir.path(), None).unwrap(), "skipped-file stats are tracked too");
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap(), "skipped-file stats are tracked too");
         // The tracked skipped file changing again is still an incremental step.
         std::fs::write(dir.path().join("knowledge/normal.md"), "---\nring: 5\n---\nstill hidden, edited\n").unwrap();
-        let r = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("incremental");
+        let r = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("incremental");
         assert_eq!(r.skipped_high_ring, 1);
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -2320,12 +2370,12 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "alpha\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
         std::fs::write(dir.path().join("knowledge/a.md"), "alpha beta, much longer now\n").unwrap();
-        assert!(stale(&conn, dir.path(), None).unwrap());
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        assert!(stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
         assert_eq!(recall(&conn, "beta", 5).unwrap().len(), 1);
     }
 }

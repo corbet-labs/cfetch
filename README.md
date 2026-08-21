@@ -13,15 +13,17 @@ the highest privilege, and when statements contradict, the lower ring wins:
 |------|------|----------|-------------------|
 | 0 | Invariants | Hard guards, never-do rules | always injected |
 | 1 | Policy | Locked-in decisions, standing authorities | always injected |
-| 2 | Behavior | Distilled feedback: how to work | selective injection |
+| 2 | Behavior | Distilled feedback: how to work | injected where it applies |
 | 3 | Knowledge | Curated facts: hosts, projects, world | on demand (`recall`) |
 | 4 | State | Todo queues, working notes | on demand (`recall`) |
 | 5 | Staging | Promotion candidates, quarantined | never implicitly |
 | 6 | Exhaust | Raw capture from sessions | never implicitly |
 
-A file's ring defaults by location and can be overridden per file with
-`ring: N` frontmatter. Rings 0–1 are the resident set, injected at session
-start through Claude Code hooks. Rings 0–4 are searchable; every hit carries a
+A file's ring defaults by location — the mapping is yours, see
+[Configuration](#configuration) — and can be overridden per file with
+`ring: N` frontmatter. Rings 0–1 are injected at session start through Claude
+Code hooks; a ring-2 file is injected too, but only into the sessions it is
+scoped to (a host, a repo). Rings 0–4 are searchable; every hit carries a
 ring-prefixed, content-addressed citation, so the id itself reveals how much to
 trust the statement. Rings 5–6 (automatic capture and its staging area) never
 reach an agent's context implicitly — captured exhaust is untrusted input by
@@ -114,12 +116,12 @@ defaults):
 
 ```json
 {
-  "brain_root": "/home/you/agents",
+  "brain_root": "/home/you/notes",
   "resident": [
     { "path": "AGENT.md", "ring": 1 },
-    { "path": "mind/invariants.md", "ring": 0 }
+    { "path": "rules/invariants.md", "ring": 0 }
   ],
-  "code_roots": ["projects/github"],
+  "code_roots": ["projects"],
   "budget_chars": 6000,
   "ledger_max_sessions": 200
 }
@@ -127,19 +129,114 @@ defaults):
 
 - `brain_root` — the knowledge tree (default `~/agents`, or `$CFETCH_BRAIN`).
 - `resident` — files injected verbatim (budget-clipped) at session start, in
-  order. Only rings 0–1 may be resident; anything else is refused at load
-  time. An explicitly empty list means "inject nothing" — useful where the
-  harness already auto-loads these files, so they are not paid for twice.
+  order. Rings 0–1 may be injected anywhere; ring 2 only with a `scope` (see
+  below); rings 3+ are refused at load time. An explicitly empty list means
+  "inject nothing" — useful where the harness already auto-loads these files,
+  so they are not paid for twice.
 - `code_roots` — roots for the code index, relative to `brain_root` unless
   absolute. Empty means `<brain_root>/projects/github`.
 - `budget_chars` — hard cap on the injected digest.
 - `ledger_max_sessions` — sessions kept in the injection ledger.
 
-Ring assignment: `AGENT.md` and the memory index default to ring 1, distilled
-memories to ring 2, `todo/` to ring 4, everything else to ring 3; a
-`ring: N` frontmatter key overrides. Secrets directories, secret-shaped
-filenames (`.env`, `*.key`, `*credentials*`, ...), logs, and archives are
-excluded from indexing as a hard boundary, not as configuration.
+### Ring assignment (`ring_rules`)
+
+Which ring a file lands on is a property of your tree, so it is configuration.
+`ring_rules` is an ORDERED list; the **first matching rule wins**, so a
+specific rule goes above a general one and nothing depends on counting prefix
+characters. A prefix ending in `/` matches the whole subtree; a prefix without
+a trailing slash matches that exact path only (`AGENT.md` never captures
+`AGENT.md.bak`); the empty prefix `""` matches everything and is how a list
+declares its own catch-all. A path no rule matches lands on **ring 3**. A
+`ring: N` key in a file's frontmatter still overrides whatever the rules say.
+
+The shipped default, which you replace wholesale by setting the key:
+
+```json
+{
+  "ring_rules": [
+    { "prefix": "AGENT.md", "ring": 1 },
+    { "prefix": "README.md", "ring": 1 },
+    { "prefix": "mind/memories/MEMORY.md", "ring": 1 },
+    { "prefix": "mind/memories/", "ring": 2 },
+    { "prefix": "todo/", "ring": 4 }
+  ]
+}
+```
+
+A tree organized differently just says so — for example:
+
+```json
+{
+  "ring_rules": [
+    { "prefix": "rules/invariants.md", "ring": 0 },
+    { "prefix": "handbook/", "ring": 1 },
+    { "prefix": "habits/", "ring": 2 },
+    { "prefix": "tasks/", "ring": 4 },
+    { "prefix": "", "ring": 3 }
+  ]
+}
+```
+
+Rings run 0–6; a rule naming anything higher is refused at load.
+
+### Exclusions (`exclude_prefixes`)
+
+Two layers, deliberately:
+
+- **Hard boundary, not configurable.** The secrets directory
+  (`mind/secrets/`), logs (`logs/`), and git internals (any `.git/`, at any
+  depth) never enter the index and are never watched — no config can lift
+  that. Secret-shaped filenames (`.env*`, `*.key`, `*.pem`, `*credential*`,
+  `*password*`, `*secret*`) are refused wherever they live, and secret-shaped
+  paths are withheld from session capture as well.
+- **Your own exclusions.** `exclude_prefixes` adds to that boundary. The
+  shipped value is `["projects/", "knowledge/archive/"]` — repo clones belong
+  to the code index rather than the prose index, and an archive is retired
+  knowledge you should not recall by accident. Both are conventions, so both
+  are yours to change:
+
+```json
+{ "exclude_prefixes": ["vendor/", "attachments/", "scratch/"] }
+```
+
+A prefix matches on path components, so `drafts` excludes `drafts/note.md`
+but never `draftsman.md`; a trailing slash is optional.
+
+### Scoped injection
+
+Injection is policy, not a fixed resident set: with many domains there is no
+universal most-important file. Any resident entry may carry a `scope`, and
+only sessions it matches receive it.
+
+```json
+{
+  "resident": [
+    { "path": "AGENT.md", "ring": 1 },
+    { "path": "rules/build-host.md", "ring": 1,
+      "scope": { "hosts": ["build-box"] } },
+    { "path": "habits/widget-review.md", "ring": 2,
+      "scope": { "repos": ["widget", "widget-docs"] } },
+    { "path": "rules/invariants.md", "ring": 0,
+      "scope": { "always": true } }
+  ]
+}
+```
+
+- `hosts` — machine names. Matched against this machine's hostname, either in
+  full or by its first label (`build-box` also matches
+  `build-box.example.net`).
+- `repos` — the name of the directory the session was started in (the last
+  path component of the agent's working directory).
+- `always` — inject regardless of host and repo. An entry with no `scope` at
+  all already means everywhere; `always` states it explicitly so that adding
+  one host to the list later cannot narrow it by accident.
+- `hosts` and `repos` are ORed: an entry listing both arrives on any listed
+  host AND in any listed repo, not only where the two coincide.
+
+Ring 2 (distilled behavior) is injectable only WITH a scope — that is what
+makes it selective rather than a second unconditional set. `cfetch selfcheck`
+prints which entries the current host and directory left out, so a file that
+stops arriving is explainable without reading the config.
 
 Mutable state (index database, ledger, heartbeats) lives per-host in
 `~/.local/state/cfetch` — never inside the brain tree, which may be shared

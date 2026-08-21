@@ -1,11 +1,14 @@
-//! The resident set: ring-0/1 content injected unconditionally at session
-//! start. Budget-clipped with honest truncation markers; private blocks are
-//! removed fail-closed (an unclosed <private> swallows to end of input —
-//! degrade to MORE private, never less).
+//! The resident set: ring-0/1 content injected at session start, per POLICY —
+//! each entry declares the sessions it belongs to and only those receive it.
+//! Budget-clipped with honest truncation markers; private blocks are removed
+//! fail-closed (an unclosed <private> swallows to end of input — degrade to
+//! MORE private, never less).
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use crate::config::Config;
+use crate::hook_io::HookEvent;
 
 const OPEN: &str = "<private>";
 const CLOSE: &str = "</private>";
@@ -81,21 +84,67 @@ pub fn strip_private(s: &str) -> String {
     out
 }
 
+/// The session an injection decision is made for. Two coordinates, because
+/// those are the two an agent session actually has at SessionStart: which
+/// machine it runs on, and what it is working on.
+#[derive(Debug, Clone)]
+pub struct SessionScope {
+    pub host: String,
+    /// The working directory's own name — the repo, as the agent sees it.
+    pub repo: Option<String>,
+}
+
+impl SessionScope {
+    /// From a hook event. The repo name is the LAST component of the event's
+    /// `cwd`: no filesystem walk, because the hook path must not stat its way
+    /// up a tree that may be an NFS mount.
+    pub fn from_event(event: &HookEvent) -> SessionScope {
+        SessionScope::from_cwd(event.cwd.as_deref())
+    }
+
+    pub fn from_cwd(cwd: Option<&str>) -> SessionScope {
+        SessionScope { host: crate::serve::hostname(), repo: repo_name(cwd) }
+    }
+
+    /// For non-hook callers (selfcheck): this process's own working directory.
+    pub fn current() -> SessionScope {
+        let cwd = std::env::current_dir().ok();
+        SessionScope::from_cwd(cwd.as_deref().and_then(Path::to_str))
+    }
+}
+
+fn repo_name(cwd: Option<&str>) -> Option<String> {
+    let trimmed = cwd?.trim_end_matches('/');
+    let name = Path::new(trimmed).file_name()?.to_string_lossy().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 pub struct ResidentDigest {
     pub text: String,
     /// (source label, chars contributed) — selfcheck reporting and, from
     /// Milestone 5, per-source injection booking.
     pub sources: Vec<(String, usize)>,
+    /// Labels of the entries this session's scope excluded. Reported rather
+    /// than dropped: a resident file that stops arriving must be explainable
+    /// without reading the config.
+    pub skipped_by_scope: Vec<String>,
 }
 
-/// Builds the injected digest. Each file gets a proportional share of the
-/// budget; a file over its share is clipped with a marker naming the file so
-/// the model knows where the rest lives.
-pub fn build(cfg: &Config) -> ResidentDigest {
+/// Builds the injected digest for ONE session. Entries whose scope does not
+/// match the session are left out entirely — they cost no budget and are not
+/// booked. Each surviving file gets a proportional share of the budget; a
+/// file over its share is clipped with a marker naming the file so the model
+/// knows where the rest lives.
+pub fn build(cfg: &Config, scope: &SessionScope) -> ResidentDigest {
     let mut sections: Vec<(String, String)> = Vec::new();
+    let mut skipped_by_scope: Vec<String> = Vec::new();
     for entry in &cfg.resident {
-        let path = cfg.resolve(&entry.path);
         let label = format!("ring-{} {}", entry.ring, entry.path.display());
+        if !entry.scope.matches(&scope.host, scope.repo.as_deref()) {
+            skipped_by_scope.push(label);
+            continue;
+        }
+        let path = cfg.resolve(&entry.path);
         match std::fs::read_to_string(&path) {
             Ok(raw) => {
                 let clean = strip_private(&raw);
@@ -112,7 +161,7 @@ pub fn build(cfg: &Config) -> ResidentDigest {
     }
 
     if sections.is_empty() {
-        return ResidentDigest { text: String::new(), sources: Vec::new() };
+        return ResidentDigest { text: String::new(), sources: Vec::new(), skipped_by_scope };
     }
 
     // The budget is a HARD cap on the whole digest: headers and clip markers
@@ -144,14 +193,126 @@ pub fn build(cfg: &Config) -> ResidentDigest {
         let _ = write!(text, "== {label} ==\n{clipped}\n\n");
         sources.push((label, clipped.len()));
     }
-    ResidentDigest { text: text.trim_end().to_string(), sources }
+    ResidentDigest { text: text.trim_end().to_string(), sources, skipped_by_scope }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ResidentEntry;
+    use crate::config::{ResidentEntry, Scope};
     use std::path::PathBuf;
+
+    /// A brain with four resident files and the scopes the injection policy
+    /// is meant to discriminate on.
+    fn scoped_cfg(dir: &std::path::Path) -> Config {
+        for name in ["everywhere.md", "on-host.md", "in-repo.md", "elsewhere.md"] {
+            std::fs::write(dir.join(name), format!("body of {name}\n")).unwrap();
+        }
+        Config {
+            brain_root: dir.to_path_buf(),
+            resident: vec![
+                ResidentEntry {
+                    path: PathBuf::from("everywhere.md"),
+                    ring: 1,
+                    scope: Scope::default(),
+                },
+                ResidentEntry {
+                    path: PathBuf::from("on-host.md"),
+                    ring: 1,
+                    scope: Scope { hosts: vec!["build-box".into()], ..Scope::default() },
+                },
+                ResidentEntry {
+                    path: PathBuf::from("in-repo.md"),
+                    ring: 1,
+                    scope: Scope { repos: vec!["widget".into()], ..Scope::default() },
+                },
+                ResidentEntry {
+                    path: PathBuf::from("elsewhere.md"),
+                    ring: 1,
+                    scope: Scope {
+                        hosts: vec!["other-box".into()],
+                        repos: vec!["gadget".into()],
+                        always: false,
+                    },
+                },
+            ],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn session_scope_reads_the_repo_from_the_hook_event_cwd() {
+        let event: HookEvent =
+            serde_json::from_str(r#"{"session_id":"s1","cwd":"/srv/work/widget"}"#).unwrap();
+        let scope = SessionScope::from_event(&event);
+        assert_eq!(scope.repo.as_deref(), Some("widget"));
+        assert!(!scope.host.is_empty(), "the host is always known");
+
+        let trailing: HookEvent = serde_json::from_str(r#"{"cwd":"/srv/work/widget/"}"#).unwrap();
+        assert_eq!(SessionScope::from_event(&trailing).repo.as_deref(), Some("widget"));
+
+        let no_cwd: HookEvent = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert!(SessionScope::from_event(&no_cwd).repo.is_none());
+    }
+
+    #[test]
+    fn injection_selects_by_host_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = scoped_cfg(dir.path());
+        let scope = SessionScope { host: "build-box".into(), repo: Some("sprocket".into()) };
+        let d = build(&cfg, &scope);
+        assert!(d.text.contains("body of everywhere.md"), "an unscoped entry is always in");
+        assert!(d.text.contains("body of on-host.md"), "the host matches");
+        assert!(!d.text.contains("body of in-repo.md"), "wrong repo");
+        assert!(!d.text.contains("body of elsewhere.md"), "neither host nor repo matches");
+        assert_eq!(d.skipped_by_scope.len(), 2, "skips are reported, never silent");
+    }
+
+    #[test]
+    fn injection_selects_by_repo_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = scoped_cfg(dir.path());
+        let scope = SessionScope { host: "laptop".into(), repo: Some("widget".into()) };
+        let d = build(&cfg, &scope);
+        assert!(d.text.contains("body of everywhere.md"));
+        assert!(d.text.contains("body of in-repo.md"), "the repo matches");
+        assert!(!d.text.contains("body of on-host.md"));
+        assert!(!d.text.contains("body of elsewhere.md"));
+    }
+
+    #[test]
+    fn a_session_matching_nothing_still_gets_the_unscoped_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = scoped_cfg(dir.path());
+        let scope = SessionScope { host: "laptop".into(), repo: None };
+        let d = build(&cfg, &scope);
+        assert!(d.text.contains("body of everywhere.md"));
+        assert_eq!(d.sources.len(), 1, "only the unscoped entry is booked");
+        assert_eq!(d.skipped_by_scope.len(), 3);
+    }
+
+    #[test]
+    fn scoped_out_entries_do_not_consume_the_budget() {
+        // The share each injected file gets is computed over the entries that
+        // actually reach the session, never over the whole configured list.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = scoped_cfg(dir.path());
+        for name in ["everywhere.md", "on-host.md", "in-repo.md", "elsewhere.md"] {
+            std::fs::write(dir.path().join(name), "word ".repeat(4000)).unwrap();
+        }
+        cfg.budget_chars = 2000;
+        let all = build(&cfg, &SessionScope { host: "build-box".into(), repo: Some("widget".into()) });
+        let one = build(&cfg, &SessionScope { host: "laptop".into(), repo: None });
+        assert_eq!(all.sources.len(), 3, "everywhere + host + repo; `elsewhere` matches neither");
+        assert_eq!(one.sources.len(), 1);
+        assert!(one.text.len() <= 2000, "the budget is still a hard cap");
+        assert!(
+            one.sources[0].1 > all.sources[0].1,
+            "the surviving entry gets the whole budget: {} vs {}",
+            one.sources[0].1,
+            all.sources[0].1
+        );
+    }
 
     #[test]
     fn private_blocks_are_removed() {
@@ -194,14 +355,14 @@ mod tests {
             brain_root: dir.path().to_path_buf(),
             resident: ["a.md", "b.md", "c.md"]
                 .iter()
-                .map(|n| ResidentEntry { path: PathBuf::from(n), ring: 1 })
+                .map(|n| ResidentEntry { path: PathBuf::from(n), ring: 1, scope: Scope::default() })
                 .collect(),
             code_roots: Vec::new(),
             budget_chars: 2000,
             ledger_max_sessions: 10,
             ..Config::default()
         };
-        let d = build(&cfg);
+        let d = build(&cfg, &SessionScope { host: "any-host".into(), repo: None });
         assert!(d.text.len() <= 2000, "digest was {} chars for a 2000 budget", d.text.len());
         assert_eq!(d.text.matches("[clipped at ").count(), 3);
     }
@@ -235,13 +396,13 @@ mod tests {
         std::fs::write(&big, "line\n".repeat(5000)).unwrap();
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
-            resident: vec![ResidentEntry { path: PathBuf::from("big.md"), ring: 0 }],
+            resident: vec![ResidentEntry { path: PathBuf::from("big.md"), ring: 0, scope: Scope::default() }],
             code_roots: Vec::new(),
             budget_chars: 1000,
             ledger_max_sessions: 10,
             ..Config::default()
         };
-        let d = build(&cfg);
+        let d = build(&cfg, &SessionScope { host: "any-host".into(), repo: None });
         assert!(d.text.len() < 1400, "digest was {} chars", d.text.len());
         assert!(d.text.contains("[clipped at "));
     }
@@ -251,13 +412,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
-            resident: vec![ResidentEntry { path: PathBuf::from("absent.md"), ring: 1 }],
+            resident: vec![ResidentEntry { path: PathBuf::from("absent.md"), ring: 1, scope: Scope::default() }],
             code_roots: Vec::new(),
             budget_chars: 1000,
             ledger_max_sessions: 10,
             ..Config::default()
         };
-        let d = build(&cfg);
+        let d = build(&cfg, &SessionScope { host: "any-host".into(), repo: None });
         assert!(d.text.contains("resident file missing"));
     }
 }

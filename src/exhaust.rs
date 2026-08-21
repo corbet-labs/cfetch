@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use rusqlite::Connection;
 
+use crate::config::RingRules;
 use crate::hook_io::HookEvent;
 
 /// Bump on schema change. Exhaust is data: a mismatch is an error for a human
@@ -372,11 +373,13 @@ pub fn secret_path(path: &str) -> bool {
 /// PostToolUse capture: Bash -> 'bash' (redacted command + norm + error
 /// hint), Write|Edit|MultiEdit -> 'write' (path + resolved ring for brain
 /// files), Read -> 'read'. Anything else, or missing fields, records
-/// nothing. `brain_root` locates the brain for ring resolution.
+/// nothing. `brain_root` locates the brain for ring resolution, `rules` the
+/// configured taxonomy that resolves it.
 pub fn capture_post_tool(
     conn: &Connection,
     event: &HookEvent,
     brain_root: &Path,
+    rules: &RingRules,
 ) -> anyhow::Result<()> {
     let session = event.session();
     let str_field = |key: &str| {
@@ -398,7 +401,7 @@ pub fn capture_post_tool(
         }
         Some("Write" | "Edit" | "MultiEdit") => {
             let Some(path) = str_field("file_path") else { return Ok(()) };
-            record(conn, session, "write", &write_payload(path, brain_root))
+            record(conn, session, "write", &write_payload(path, brain_root, rules))
         }
         Some("Read") => {
             let Some(path) = str_field("file_path") else { return Ok(()) };
@@ -418,11 +421,11 @@ fn file_payload(path: &str) -> serde_json::Value {
 /// hot-file trap stays pure SQL over `json_extract` (the same pattern as
 /// bash `norm`). Withheld paths carry NO ring, which keeps them out of the
 /// trap by construction.
-fn write_payload(path: &str, brain_root: &Path) -> serde_json::Value {
+fn write_payload(path: &str, brain_root: &Path, rules: &RingRules) -> serde_json::Value {
     if secret_path(path) {
         return serde_json::json!({"file_path": WITHHELD});
     }
-    match brain_ring(brain_root, path) {
+    match brain_ring(brain_root, path, rules) {
         Some(ring) => serde_json::json!({"file_path": path, "ring": ring}),
         None => serde_json::json!({"file_path": path}),
     }
@@ -432,9 +435,9 @@ fn write_payload(path: &str, brain_root: &Path) -> serde_json::Value {
 /// path, overridden by a `ring:` frontmatter key read from a BOUNDED prefix
 /// (the hook path never reads whole files). `None` for paths outside the
 /// brain — code files carry no ring and are churn by contract.
-fn brain_ring(brain_root: &Path, path: &str) -> Option<u8> {
+fn brain_ring(brain_root: &Path, path: &str, rules: &RingRules) -> Option<u8> {
     let rel = Path::new(path).strip_prefix(brain_root).ok()?;
-    let by_location = crate::index::default_ring(&rel.to_string_lossy());
+    let by_location = crate::index::default_ring(&rel.to_string_lossy(), rules);
     Some(frontmatter_ring_bounded(Path::new(path)).unwrap_or(by_location))
 }
 
@@ -665,7 +668,7 @@ mod tests {
     const BRAIN: &str = "/b/agents";
 
     fn cap(conn: &Connection, event: &HookEvent) -> anyhow::Result<()> {
-        capture_post_tool(conn, event, Path::new(BRAIN))
+        capture_post_tool(conn, event, Path::new(BRAIN), &RingRules::default())
     }
 
     fn bash_event(session: &str, cmd: &str, failed: bool) -> HookEvent {
@@ -1116,6 +1119,7 @@ mod tests {
                     &conn,
                     &file_event(s, "Write", &p.to_string_lossy()),
                     brain.path(),
+                    &RingRules::default(),
                 )
                 .unwrap();
             }

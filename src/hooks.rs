@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::hook_io::{Emit, HookEvent};
+use crate::resident::SessionScope;
 use crate::{daemon, exhaust, govern, heartbeat, ledger, paths, resident, session_state, transcript};
 
 const DAEMON_BUDGET: Duration = Duration::from_millis(250);
@@ -42,11 +43,12 @@ pub fn run(event_name: &str) {
 /// Direct-read fallback with a hard deadline: the tree may be NFS, and a hung
 /// mount must not eat the whole hook timeout. The worker thread is detached on
 /// overrun.
-fn resident_with_deadline(cfg: &Config) -> String {
+fn resident_with_deadline(cfg: &Config, scope: &SessionScope) -> String {
     let cfg = cfg.clone();
+    let scope = scope.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(resident::build(&cfg).text);
+        let _ = tx.send(resident::build(&cfg, &scope).text);
     });
     rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
 }
@@ -64,13 +66,18 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     // model even when the config is the thing that broke — otherwise the one
     // surface built to announce breakage is suppressed by the breakage.
     let cfg = Config::load();
+    // Which entries this session is entitled to is decided from the session
+    // itself — the machine and the directory the agent was started in.
+    let scope = SessionScope::from_event(event);
     let (digest, max_sessions) = match &cfg {
         Ok(cfg) => {
             // Prefer the warm daemon; fall back to a bounded direct read —
-            // session start works with no daemon at all.
-            let digest = match daemon::call("resident", DAEMON_BUDGET) {
+            // session start works with no daemon at all. The daemon shares
+            // the host but not the cwd, so the scope travels with the call.
+            let req = serde_json::json!({ "op": "resident", "cwd": event.cwd });
+            let digest = match daemon::call_req(&req, DAEMON_BUDGET) {
                 Some(r) if r.ok => r.digest.unwrap_or_default(),
-                _ => resident_with_deadline(cfg),
+                _ => resident_with_deadline(cfg, &scope),
             };
             (digest, cfg.ledger_max_sessions)
         }
@@ -165,8 +172,11 @@ fn post_tool_cadence(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyho
         return Ok(());
     }
     let mut st = session_state::load(state_dir, event.session());
+    // The refresh re-injects ring-0 rules, so it obeys the same per-entry
+    // scope SessionStart did — a file this session never received must not
+    // arrive by the back door 25 tool calls later.
     if let Some(n) = st.count_tool_event(cfg.governance.reinject_every)
-        && let Some(rules) = govern::top_ring0_rules(cfg)
+        && let Some(rules) = govern::top_ring0_rules(cfg, &SessionScope::from_event(event))
     {
         st.queue_reminder(&format!("rules-{n}"), &rules);
     }
@@ -188,7 +198,7 @@ fn post_tool_capture(
         return Ok(());
     }
     let conn = exhaust::open(state_dir)?;
-    exhaust::capture_post_tool(&conn, event, &cfg.brain_root)
+    exhaust::capture_post_tool(&conn, event, &cfg.brain_root, &cfg.rings())
 }
 
 /// Turn summary + the 6->5 flagging traps (from wt/capture). Emits nothing —
@@ -542,6 +552,7 @@ mod tests {
             resident: vec![crate::config::ResidentEntry {
                 path: std::path::PathBuf::from("rules.md"),
                 ring: 0,
+                scope: crate::config::Scope::default(),
             }],
             governance: crate::config::GovernanceConfig { enabled, reinject_every },
             ..Config::default()

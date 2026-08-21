@@ -172,7 +172,8 @@ fn selfcheck() -> anyhow::Result<()> {
             println!("FAIL  brain root missing: {}", cfg.brain_root.display());
             hard_failures += 1;
         }
-        let digest = resident::build(cfg);
+        let scope = resident::SessionScope::current();
+        let digest = resident::build(cfg, &scope);
         if digest.text.is_empty() {
             println!("warn  resident digest is empty — nothing will be injected");
         } else {
@@ -183,6 +184,17 @@ fn selfcheck() -> anyhow::Result<()> {
             );
             for (label, chars) in &digest.sources {
                 println!("        {label}: {chars} chars");
+            }
+        }
+        if !digest.skipped_by_scope.is_empty() {
+            println!(
+                "ok    {} resident entr(ies) out of scope for host {}{}",
+                digest.skipped_by_scope.len(),
+                scope.host,
+                scope.repo.as_deref().map(|r| format!(" / repo {r}")).unwrap_or_default(),
+            );
+            for label in &digest.skipped_by_scope {
+                println!("        {label}: not injected here");
             }
         }
     }
@@ -268,7 +280,7 @@ fn scan(background: bool) -> anyhow::Result<()> {
     {
         let mut conn = index::open(&paths::state_dir())?;
         let native = paths::native_projects_root();
-        let report = index::scan(&mut conn, &cfg.brain_root, Some(&native))?;
+        let report = index::scan(&mut conn, &cfg.brain_root, Some(&native), &cfg.rings())?;
         println!(
             "indexed {} docs, {} blocks (generation {}, {} file(s) skipped as ring 5+)",
             report.docs, report.blocks, report.generation, report.skipped_high_ring
@@ -571,7 +583,7 @@ fn recall(
         return recall_served(&resp, id, json);
     }
     let native = paths::native_projects_root();
-    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
+    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
 
     if let Some(cite) = id {
         let blocks = index::expand(&conn, cite)?;

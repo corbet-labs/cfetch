@@ -326,7 +326,7 @@ pub fn origin_of(cfg: &Config) -> String {
     hostname()
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     // uname(2) is portable (Linux + macOS + BSD); /proc is Linux-only and
     // left `origin` as "unknown-host" on every non-Linux serving host.
     let node = rustix::system::uname();
@@ -363,7 +363,7 @@ pub struct ServeHandle {
 /// set, never a byte more. 3 is settled by registering in the background
 /// (see `start`), with `settled` withheld until registration completes so no
 /// answer claims freshness it cannot have.
-fn watchable_dirs(brain_root: &Path) -> Vec<PathBuf> {
+fn watchable_dirs(brain_root: &Path, rules: &crate::config::RingRules) -> Vec<PathBuf> {
     let mut dirs = vec![brain_root.to_path_buf()];
     let walker = ignore::WalkBuilder::new(brain_root)
         .hidden(true)
@@ -376,7 +376,7 @@ fn watchable_dirs(brain_root: &Path) -> Vec<PathBuf> {
         }
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
         let rel = rel.to_string_lossy();
-        if rel.is_empty() || crate::index::excluded_dir(&rel) {
+        if rel.is_empty() || crate::index::excluded_dir(&rel, rules) {
             continue;
         }
         dirs.push(entry.path().to_path_buf());
@@ -423,7 +423,7 @@ mod watch_scope_tests {
         // The wineprefix-style escape hatch that walked the whole rootfs.
         std::os::unix::fs::symlink(outside.path(), brain.path().join("knowledge/z")).unwrap();
 
-        let dirs = watchable_dirs(brain.path());
+        let dirs = watchable_dirs(brain.path(), &crate::config::RingRules::default());
         let rel: Vec<String> = dirs
             .iter()
             .map(|d| d.strip_prefix(brain.path()).unwrap().to_string_lossy().to_string())
@@ -446,7 +446,7 @@ mod watch_scope_tests {
         let brain = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
         std::fs::write(brain.path().join("knowledge/a.md"), "x\n").unwrap();
-        for d in watchable_dirs(brain.path()) {
+        for d in watchable_dirs(brain.path(), &crate::config::RingRules::default()) {
             assert!(d.is_dir(), "{d:?} is not a directory");
         }
     }
@@ -539,9 +539,10 @@ pub fn start(cfg: &Config) -> anyhow::Result<ServeHandle> {
         let watcher = watcher.clone();
         let state = state.clone();
         let brain_root = cfg.brain_root.clone();
+        let rules = cfg.rings();
         let wake_tx = wake_tx.clone();
         move || {
-            let dirs = watchable_dirs(&brain_root);
+            let dirs = watchable_dirs(&brain_root, &rules);
             let (ok, failed) = register_watches(&watcher, &dirs);
             if failed > 0 {
                 eprintln!(
@@ -597,7 +598,7 @@ fn worker(
             // Re-enumerating on the backstop cadence keeps the watch set
             // convergent without ever following a symlink.
             if state.watches_ready() {
-                let dirs = watchable_dirs(&cfg.brain_root);
+                let dirs = watchable_dirs(&cfg.brain_root, &cfg.rings());
                 if watched.is_empty() {
                     watched = dirs.iter().cloned().collect();
                 } else {
@@ -643,10 +644,11 @@ fn apply(
         }
     }
     let Some(c) = conn.as_mut() else { return };
+    let rules = cfg.rings();
     let target = state.pending_now();
     let dirty = target > state.applied_now();
     let need_scan = if backstop {
-        dirty || index::stale(c, &cfg.brain_root, Some(native)).unwrap_or(true)
+        dirty || index::stale(c, &cfg.brain_root, Some(native), &rules).unwrap_or(true)
     } else {
         dirty
     };
@@ -654,9 +656,9 @@ fn apply(
         // Incremental first: re-scan only the changed files. `None` (diff too
         // large, basis changed) and errors alike fall back to the full scan —
         // the correctness floor either way.
-        let result = match index::rescan_changed(c, &cfg.brain_root, Some(native)) {
+        let result = match index::rescan_changed(c, &cfg.brain_root, Some(native), &rules) {
             Ok(Some(r)) => Ok(r),
-            Ok(None) | Err(_) => index::scan(c, &cfg.brain_root, Some(native)),
+            Ok(None) | Err(_) => index::scan(c, &cfg.brain_root, Some(native), &rules),
         };
         match result {
             Ok(r) => state.mark_applied(target, r.generation),

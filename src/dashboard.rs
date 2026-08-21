@@ -202,7 +202,7 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
 pub fn run() -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let native = paths::native_projects_root();
-    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
+    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
 
     // A panicking TUI must never leave the terminal raw.
     let default_hook = std::panic::take_hook();

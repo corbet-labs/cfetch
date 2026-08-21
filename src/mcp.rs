@@ -170,7 +170,7 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "cfetch_recall" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
             let native = paths::native_projects_root();
-            let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
+            let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
             let hits = index::recall(&conn, query, if limit == 0 { 8 } else { limit })?;
             if hits.is_empty() {
                 return Ok(format!("no hits for \"{query}\""));
@@ -193,7 +193,7 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "cfetch_expand" => {
             let cite = args.get("cite").and_then(Value::as_str).unwrap_or("");
             let native = paths::native_projects_root();
-            let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
+            let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
             let blocks = index::expand(&conn, cite)?;
             if blocks.is_empty() {
                 return Ok(format!("no block with citation {cite}"));

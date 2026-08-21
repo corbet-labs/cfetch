@@ -36,6 +36,11 @@ struct Request {
     path: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// SessionStart's working directory, for the resident op: the daemon
+    /// shares the host with its caller but not the cwd, so the repo half of
+    /// the injection scope has to travel with the request.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -262,7 +267,8 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
             // after a config edit.
             match Config::load() {
                 Ok(cfg) => {
-                    let d = resident::build(&cfg);
+                    let scope = resident::SessionScope::from_cwd(req.cwd.as_deref());
+                    let d = resident::build(&cfg, &scope);
                     (Response { ok: true, digest: Some(d.text), ..Response::default() }, false)
                 }
                 Err(e) => (Response::err(e.to_string()), false),
@@ -593,6 +599,24 @@ pub fn status() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_request_carries_the_session_cwd() {
+        // The daemon shares the host with its caller but not the working
+        // directory; without this field every scoped entry would be decided
+        // against the daemon's own cwd.
+        let req: Request =
+            serde_json::from_str(r#"{"op":"resident","cwd":"/srv/work/widget"}"#).unwrap();
+        assert_eq!(req.cwd.as_deref(), Some("/srv/work/widget"));
+        let scope = resident::SessionScope::from_cwd(req.cwd.as_deref());
+        assert_eq!(scope.repo.as_deref(), Some("widget"));
+
+        // An older client sends no cwd at all: host-scoped entries still
+        // resolve, repo-scoped ones simply do not match.
+        let old: Request = serde_json::from_str(r#"{"op":"resident"}"#).unwrap();
+        assert!(old.cwd.is_none());
+        assert!(resident::SessionScope::from_cwd(None).repo.is_none());
+    }
 
     #[test]
     fn scan_coordinator_is_single_flight() {

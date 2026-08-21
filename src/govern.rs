@@ -12,6 +12,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::Config;
+use crate::resident::SessionScope;
 use crate::session_state::SessionState;
 
 /// ~100 tokens at the chars/3.5 heuristic — hard cap on one rule refresh.
@@ -59,14 +60,15 @@ pub fn queue_staging_visibility(st: &mut SessionState, exhaust_db: &Path) -> boo
 }
 
 /// The top ring-0 rules as one "[cfetch rule refresh]" block: description
-/// frontmatter lines of the resident config's ring-0 files (or, with no
-/// resident config at all, of the brain's `mind/memories` files declaring
-/// `ring: 0`), first `RULES_MAX_LINES`, capped at `RULES_MAX_CHARS`.
-pub fn top_ring0_rules(cfg: &Config) -> Option<String> {
+/// frontmatter lines of the resident config's ring-0 files THIS session is
+/// entitled to (or, with no resident config at all, of the brain's
+/// `mind/memories` files declaring `ring: 0`), first `RULES_MAX_LINES`,
+/// capped at `RULES_MAX_CHARS`.
+pub fn top_ring0_rules(cfg: &Config, scope: &SessionScope) -> Option<String> {
     let descriptions = if cfg.resident.is_empty() {
-        memories_ring0_descriptions(&cfg.brain_root.join("mind/memories"))
+        memories_ring0_descriptions(&cfg.brain_root, &behavior_dirs(cfg))
     } else {
-        resident_ring0_descriptions(cfg)
+        resident_ring0_descriptions(cfg, scope)
     };
     if descriptions.is_empty() {
         return None;
@@ -86,11 +88,16 @@ pub fn top_ring0_rules(cfg: &Config) -> Option<String> {
     Some(text)
 }
 
-/// Descriptions of the resident config's ring-0 files, in config order.
-/// Unreadable files and files without a description contribute nothing.
-fn resident_ring0_descriptions(cfg: &Config) -> Vec<String> {
+/// Descriptions of the resident config's ring-0 files, in config order,
+/// filtered by the session's injection scope. Unreadable files and files
+/// without a description contribute nothing.
+fn resident_ring0_descriptions(cfg: &Config, scope: &SessionScope) -> Vec<String> {
     let mut out = Vec::new();
-    for entry in cfg.resident.iter().filter(|e| e.ring == 0) {
+    for entry in cfg
+        .resident
+        .iter()
+        .filter(|e| e.ring == 0 && e.scope.matches(&scope.host, scope.repo.as_deref()))
+    {
         if out.len() == RULES_MAX_LINES {
             break;
         }
@@ -102,15 +109,31 @@ fn resident_ring0_descriptions(cfg: &Config) -> Vec<String> {
     out
 }
 
-/// Descriptions of `mind/memories` files declaring `ring: 0`, in filename
-/// order (read_dir order is arbitrary; the "first 3" must be deterministic).
-fn memories_ring0_descriptions(dir: &Path) -> Vec<String> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut files: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
-        .collect();
+/// The directories the configured taxonomy puts behavioral memory in: every
+/// ring rule naming a SUBTREE (a prefix ending in `/`) on rings 0-2. With the
+/// shipped rules that is the distilled-memories directory; with a custom
+/// taxonomy it is whatever that taxonomy calls the same thing — the fallback
+/// follows the config instead of assuming one tree's layout.
+fn behavior_dirs(cfg: &Config) -> Vec<PathBuf> {
+    cfg.ring_rules
+        .iter()
+        .filter(|r| r.ring <= 2 && r.prefix.ends_with('/'))
+        .map(|r| PathBuf::from(r.prefix.trim_end_matches('/')))
+        .collect()
+}
+
+/// Descriptions of files declaring `ring: 0` under `dirs`, in path order
+/// (read_dir order is arbitrary; the "first 3" must be deterministic).
+fn memories_ring0_descriptions(brain_root: &Path, dirs: &[PathBuf]) -> Vec<String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(brain_root.join(dir)) else { continue };
+        files.extend(
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md")),
+        );
+    }
     files.sort();
     let mut out = Vec::new();
     for f in files {
@@ -186,7 +209,13 @@ fn frontmatter_value(text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, GovernanceConfig, ResidentEntry};
+
+    /// A session matching no particular host or repo — enough for every
+    /// unscoped entry, which is what these fixtures use.
+    fn any_session() -> SessionScope {
+        SessionScope { host: "any-host".into(), repo: None }
+    }
+    use crate::config::{Config, GovernanceConfig, ResidentEntry, Scope};
     use crate::exhaust;
     use serde_json::json;
 
@@ -208,7 +237,13 @@ mod tests {
         for i in 0..n {
             let path = format!("/b/agents/knowledge/hot{i}.md");
             for s in ["s1", "s2"] {
-                exhaust::capture_post_tool(&conn, &write_event(s, &path), brain).unwrap();
+                exhaust::capture_post_tool(
+                    &conn,
+                    &write_event(s, &path),
+                    brain,
+                    &crate::config::RingRules::default(),
+                )
+                .unwrap();
             }
         }
         exhaust::record_stop(&conn, "s2").unwrap();
@@ -330,12 +365,12 @@ mod tests {
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
             resident: vec![
-                ResidentEntry { path: PathBuf::from("guards.md"), ring: 0 },
-                ResidentEntry { path: PathBuf::from("policy.md"), ring: 1 },
+                ResidentEntry { path: PathBuf::from("guards.md"), ring: 0, scope: Scope::default() },
+                ResidentEntry { path: PathBuf::from("policy.md"), ring: 1, scope: Scope::default() },
             ],
             ..Config::default()
         };
-        let rules = top_ring0_rules(&cfg).unwrap();
+        let rules = top_ring0_rules(&cfg, &any_session()).unwrap();
         assert!(rules.starts_with("[cfetch rule refresh]"));
         assert!(rules.contains("destruction is human-gated"));
         assert!(!rules.contains("policy line"), "ring-1 files are not rule-refresh material");
@@ -368,10 +403,40 @@ mod tests {
             resident: Vec::new(),
             ..Config::default()
         };
-        let rules = top_ring0_rules(&cfg).unwrap();
+        let rules = top_ring0_rules(&cfg, &any_session()).unwrap();
         assert!(rules.contains("rule alpha"));
         assert!(rules.contains("rule delta"));
         assert!(!rules.contains("behavior beta"), "ring-2 memories must not surface");
+    }
+
+    #[test]
+    fn ring0_rules_fallback_follows_custom_ring_rules() {
+        // A tree that calls its behavioral memory something else: the
+        // fallback reads the config's subtree, not a hardcoded one.
+        let dir = tempfile::tempdir().unwrap();
+        let handbook = dir.path().join("handbook");
+        std::fs::create_dir_all(&handbook).unwrap();
+        std::fs::write(
+            handbook.join("a.md"),
+            "---\nring: 0\ndescription: house rule alpha\n---\n",
+        )
+        .unwrap();
+        let memories = dir.path().join("mind/memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        std::fs::write(
+            memories.join("b.md"),
+            "---\nring: 0\ndescription: not this tree\n---\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            brain_root: dir.path().to_path_buf(),
+            resident: Vec::new(),
+            ring_rules: vec![crate::config::RingRule { prefix: "handbook/".into(), ring: 1 }],
+            ..Config::default()
+        };
+        let rules = top_ring0_rules(&cfg, &any_session()).unwrap();
+        assert!(rules.contains("house rule alpha"));
+        assert!(!rules.contains("not this tree"), "the shipped layout has no privilege here");
     }
 
     #[test]
@@ -391,7 +456,7 @@ mod tests {
             resident: Vec::new(),
             ..Config::default()
         };
-        let rules = top_ring0_rules(&cfg).unwrap();
+        let rules = top_ring0_rules(&cfg, &any_session()).unwrap();
         assert!(rules.len() <= 350, "rule refresh was {} chars for a ~100-token cap", rules.len());
         assert!(!rules.contains("rule number 3"), "only the first 3 descriptions are taken");
         assert!(!rules.contains("rule number 4"));
@@ -404,17 +469,17 @@ mod tests {
         std::fs::write(dir.path().join("p.md"), "---\ndescription: d\n---\n").unwrap();
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
-            resident: vec![ResidentEntry { path: PathBuf::from("p.md"), ring: 1 }],
+            resident: vec![ResidentEntry { path: PathBuf::from("p.md"), ring: 1, scope: Scope::default() }],
             ..Config::default()
         };
-        assert_eq!(top_ring0_rules(&cfg), None);
+        assert_eq!(top_ring0_rules(&cfg, &any_session()), None);
         // No resident config and no memories dir at all.
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
             resident: Vec::new(),
             ..Config::default()
         };
-        assert_eq!(top_ring0_rules(&cfg), None);
+        assert_eq!(top_ring0_rules(&cfg, &any_session()), None);
     }
 
     #[test]

@@ -326,7 +326,7 @@ pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let client = EmbedClient::new(&cfg.embeddings)?;
     let native = crate::paths::native_projects_root();
-    let mut conn = index::ensure_fresh(&crate::paths::state_dir(), &cfg.brain_root, Some(&native))?;
+    let mut conn = index::ensure_fresh(&crate::paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
     let report = run(&mut conn, &client, batch)?;
     println!(
         "embed-index complete: {} embedded this run, {} block(s) total",
@@ -694,7 +694,7 @@ mod tests {
         std::fs::write(p, "- one\n- two\n- three\n- four\n- five\n").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = index::open(state.path()).unwrap();
-        index::scan(&mut conn, brain.path(), None).unwrap();
+        index::scan(&mut conn, brain.path(), None, &crate::config::RingRules::default()).unwrap();
         (brain, state, conn)
     }
 
