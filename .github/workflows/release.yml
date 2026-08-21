@@ -1,7 +1,14 @@
-# Tag v* -> GitHub release with a Linux binary. The runner's glibc-linked
-# release build is uploaded as-is; LICENSE.md rides along because FSL requires
-# the terms to accompany every redistribution. Uses only the workflow's own
-# GITHUB_TOKEN (via the contents: write permission) — no configured secrets.
+# Tag v* -> GitHub release with a binary for every supported platform.
+# LICENSE.md rides along because FSL requires the terms to accompany every
+# redistribution. Uses only the workflow's own GITHUB_TOKEN (via the
+# contents: write permission) — no configured secrets.
+#
+# ARTIFACT NAMING: <os>-cfetch-<arch>-<tag>. The silicon and microarchitecture
+# axes of the full scheme (<os>-cfetch-<silicon>[-<level>][-bin]-<version>,
+# e.g. linux-cfetch-amd-v3-v1.2.3) describe which INFERENCE engine is linked
+# in. Nothing is linked in yet — these binaries call out to an endpoint — so
+# naming them by silicon would claim a capability they do not have. The axis
+# arrives with integrated inference, and these names extend into it.
 name: Release
 
 on:
@@ -12,20 +19,60 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.artifact }})
+    strategy:
+      # One platform failing must not silently ship a partial release; every
+      # platform's result stays visible and the publish job gates on all.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-cfetch-x86_64
+            bin: cfetch
+          - os: macos-latest
+            artifact: mac-cfetch-arm64
+            bin: cfetch
+          - os: macos-13
+            artifact: mac-cfetch-x86_64
+            bin: cfetch
+          - os: windows-latest
+            artifact: win-cfetch-x86_64.exe
+            bin: cfetch.exe
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release --locked
-      - name: Stage artifacts
+      - name: Stage artifact
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/release/cfetch dist/cfetch-x86_64-unknown-linux-gnu
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  publish:
+    # Gates on every platform: a release that is missing a supported platform
+    # is a broken promise, not a partial success.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+      - name: Collect
+        run: |
+          mkdir -p dist
+          find staged -type f -exec cp {} dist/ \;
           cp LICENSE.md dist/LICENSE.md
+          ls -la dist
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/cfetch-x86_64-unknown-linux-gnu
-            dist/LICENSE.md
+          files: dist/*
+          fail_on_unmatched_files: true
