@@ -1592,6 +1592,59 @@ mod tests {
         assert_eq!(default_ring("mind/memories/feedback_x.md", &r), 2);
         assert_eq!(default_ring("knowledge/hosts/example/storage.md", &r), 3);
         assert_eq!(default_ring("todo/active/task/STATUS.md", &r), 4);
+        assert_eq!(default_ring("staging/cfetch/hot-file-1234abcd.md", &r), 5);
+        assert_eq!(default_ring("staging/cfetch/dismissed/hot-file-1234abcd.md", &r), 5);
+    }
+
+    #[test]
+    fn staged_ring5_candidates_are_never_recalled() {
+        // Ring 5 is the ladder's quarantine: staging files sit in the same
+        // tree as everything else and must still be invisible to recall and
+        // injection. Fabricate a tree with a REAL staged candidate, scan it,
+        // and prove nothing of it comes back.
+        let dir = brain(&[("knowledge/live.md", "the reachable fact zulqar\n")]);
+        let staging_dir = dir.path().join("staging/cfetch");
+        crate::staging::write(
+            &staging_dir,
+            &crate::staging::Candidate {
+                id: "hot-file-deadbeef".into(),
+                reason: "hot-file".into(),
+                session: "s1".into(),
+                host: "host-alpha".into(),
+                ts: 1,
+                kind: "write".into(),
+                payload: serde_json::json!({"file_path": "/b/knowledge/x.md", "quarantined": "zulqar"}),
+            },
+        )
+        .unwrap();
+        // A dismissed candidate is kept in the tree too, and is just as quiet.
+        crate::staging::write(
+            &staging_dir,
+            &crate::staging::Candidate {
+                id: "hot-file-cafebabe".into(),
+                reason: "hot-file".into(),
+                session: "s1".into(),
+                host: "host-beta".into(),
+                ts: 2,
+                kind: "write".into(),
+                payload: serde_json::json!({"note": "zulqar"}),
+            },
+        )
+        .unwrap();
+        crate::staging::dismiss(&staging_dir, "hot-file-cafebabe").unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "only the ring-3 knowledge file is indexed");
+        assert_eq!(report.skipped_high_ring, 2, "both candidates are skipped as ring 5");
+        assert!(report.skipped.iter().all(|p| p.starts_with("staging/")));
+        assert_eq!(recall(&conn, "zulqar", 10).unwrap().len(), 1, "only the ring-3 hit");
+        assert_eq!(recall(&conn, "zulqar", 10).unwrap()[0].path, "knowledge/live.md");
+        assert!(
+            recall(&conn, "hot-file", 10).unwrap().is_empty(),
+            "no staged candidate is recallable, by any of its words"
+        );
     }
 
     #[test]

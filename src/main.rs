@@ -13,14 +13,17 @@ mod hooks;
 mod index;
 mod install;
 mod ipc;
+mod jsonl;
 mod ledger;
 mod lockfile;
 mod markers;
 mod mcp;
+mod migrate;
 mod paths;
 mod resident;
 mod serve;
 mod session_state;
+mod staging;
 mod transcript;
 mod vectors;
 
@@ -100,7 +103,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Review ring-5 staging: auto-flagged exhaust (local only, never injected)
+    /// Review ring-5 staging: auto-flagged exhaust in the tree, shared across
+    /// hosts, never injected
     Staging {
         #[command(subcommand)]
         action: StagingAction,
@@ -135,9 +139,9 @@ enum StagingAction {
         json: bool,
     },
     /// Mark a candidate consumed (a distillation session has taken it)
-    Consume { id: i64 },
-    /// Drop a candidate from staging without consuming it
-    Dismiss { id: i64 },
+    Consume { id: String },
+    /// Move a candidate out of staging without promoting it
+    Dismiss { id: String },
 }
 
 #[derive(Subcommand)]
@@ -208,6 +212,30 @@ fn selfcheck() -> anyhow::Result<()> {
             println!("FAIL  state dir {}: {e}", state.display());
             hard_failures += 1;
         }
+    }
+
+    if let Some(cfg) = &cfg {
+        // Rings 5 and 6 are records in the TREE, not per-host state. Report
+        // where they are without creating them: a diagnostic must not be the
+        // thing that first writes into the brain.
+        let logs = paths::logs_dir(&cfg.brain_root);
+        let staging = paths::staging_dir(&cfg.brain_root);
+        let host = paths::host_id();
+        println!(
+            "ok    ring-6 exhaust + ledger: {} (this host writes as {host})",
+            logs.display()
+        );
+        println!(
+            "ok    ring-5 staging: {} ({} candidate(s) pending, all hosts)",
+            staging.display(),
+            staging::pending_count(&staging)
+        );
+        for note in ledger::read(&logs).unreadable {
+            println!("warn  ledger stream unreadable: {note}");
+        }
+    }
+    if let Some(note) = migrate::legacy_note(&state) {
+        println!("warn  {note}");
     }
 
     match daemon::call("ping", std::time::Duration::from_millis(300)) {
@@ -696,48 +724,72 @@ fn recall(
     Ok(())
 }
 
-/// Ring-5 staging review. Read side only: flagging happens in the Stop hook's
-/// traps. Nothing here is ever injected into a session or synced off-host.
-fn staging(action: StagingAction) -> anyhow::Result<()> {
-    let conn = exhaust::open(&paths::state_dir())?;
+/// Ring-5 staging review over the shared tree. Flagging happens in the Stop
+/// hook's traps; this is the human side of the ladder. Candidates from EVERY
+/// host are listed, because the staging directory is one directory.
+fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let ex = exhaust::Exhaust::from_config(&cfg);
+    let state_dir = paths::state_dir();
+    // A legacy per-host exhaust.db is imported once, and said out loud.
+    if let Some(r) = migrate::import_legacy_exhaust(&state_dir, &ex)? {
+        println!(
+            "imported {} event(s) and {} ring-5 candidate(s) from {} into the tree",
+            r.events,
+            r.staged,
+            r.db.display()
+        );
+    }
+    let dir = ex.staging_dir.clone();
     match action {
         StagingAction::List { json } => {
-            let rows = exhaust::staging_list(&conn)?;
+            let rows = staging::list(&dir);
             if json {
                 let arr: Vec<_> = rows
                     .iter()
-                    .map(|r| {
-                        let payload: serde_json::Value = serde_json::from_str(&r.payload)
-                            .unwrap_or_else(|_| serde_json::Value::String(r.payload.clone()));
+                    .map(|c| {
                         serde_json::json!({
-                            "id": r.id, "reason": r.reason, "kind": r.kind,
-                            "session_id": r.session_id, "ts": r.ts, "payload": payload,
+                            "id": c.id, "reason": c.reason, "kind": c.kind,
+                            "session_id": c.session, "host": c.host, "ts": c.ts,
+                            "payload": c.payload,
                         })
                     })
                     .collect();
                 println!("{}", serde_json::json!(arr));
             } else if rows.is_empty() {
                 println!("staging is empty — no flagged exhaust awaiting review");
+                println!("  ({})", dir.display());
             } else {
-                for r in &rows {
-                    let session = r.session_id.get(..8).unwrap_or(&r.session_id);
-                    println!("#{}  {}  {}  session {}  {}", r.id, r.reason, r.kind, session, r.payload);
+                for c in &rows {
+                    let session = c.session.get(..8).unwrap_or(&c.session);
+                    println!(
+                        "{}  {}  {}  {}  session {}  {}",
+                        c.id, c.reason, c.kind, c.host, session, c.payload
+                    );
                 }
                 println!("\ndistill a candidate, then: cfetch staging consume <id> | dismiss <id>");
             }
         }
         StagingAction::Consume { id } => {
-            if exhaust::consume(&conn, id)? {
-                println!("consumed #{id}");
+            if staging::consume(&dir, &id)? {
+                // The file is gone, so the stream is what remembers the
+                // decision and keeps the trap from re-staging it.
+                let _ = ex.record_decision(&id, "consume");
+                println!("consumed {id}");
             } else {
-                anyhow::bail!("no staged candidate #{id} (never flagged, or already consumed/dismissed)");
+                anyhow::bail!(
+                    "no staged candidate {id} (never flagged, or already consumed/dismissed)"
+                );
             }
         }
         StagingAction::Dismiss { id } => {
-            if exhaust::dismiss(&conn, id)? {
-                println!("dismissed #{id}");
+            if staging::dismiss(&dir, &id)? {
+                let _ = ex.record_decision(&id, "dismiss");
+                println!("dismissed {id} (kept in {}/dismissed)", dir.display());
             } else {
-                anyhow::bail!("no staged candidate #{id} (never flagged, or already consumed/dismissed)");
+                anyhow::bail!(
+                    "no staged candidate {id} (never flagged, or already consumed/dismissed)"
+                );
             }
         }
     }
@@ -750,7 +802,8 @@ fn audit_cmd(json: bool) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let report = audit::build(&audit::AuditPaths::defaults(), cfg.budget_chars, now);
+    let ledger = ledger::load_from(&paths::logs_dir(&cfg.brain_root));
+    let report = audit::build(&audit::AuditPaths::defaults(), &ledger, cfg.budget_chars, now);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -761,11 +814,22 @@ fn audit_cmd(json: bool) -> anyhow::Result<()> {
 
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
-    let quarantines = ledger::quarantine_count(&paths::state_dir());
-    if quarantines > 0 {
-        println!("ledger: {quarantines} quarantined corrupt file(s) — torn writes occurred (ledger.json.corrupt-*)");
+    // Diagnostics must survive a broken config: the paths below fall back to
+    // the defaults rather than making `status` the second casualty.
+    let cfg = match config::Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("config: {e} — showing the default locations below");
+            config::Config::default()
+        }
+    };
+    let logs = paths::logs_dir(&cfg.brain_root);
+    let loaded = ledger::read(&logs);
+    for note in &loaded.unreadable {
+        println!("ledger: UNREADABLE stream {note}");
     }
-    let ledger = ledger::load();
+    let hosts: Vec<String> = loaded.hosts.iter().cloned().collect();
+    let ledger = loaded.ledger;
     let sessions = ledger.sessions.len();
     let injected: u64 = ledger
         .sessions
@@ -773,7 +837,12 @@ fn status() -> anyhow::Result<()> {
         .flat_map(|s| s.by_source.values())
         .map(|t| t.tokens_estimated)
         .sum();
-    println!("ledger: {sessions} session(s)");
+    println!(
+        "ledger: {sessions} session(s) from {} host(s){} in {}",
+        hosts.len(),
+        if hosts.is_empty() { String::new() } else { format!(" ({})", hosts.join(", ")) },
+        logs.display()
+    );
     println!("  estimated: ~{injected} tokens injected by cfetch (chars/3.5 heuristic)");
     // Measured truth from transcripts, side by side with the estimate — and
     // clearly labeled absent when the transcript could not be parsed.
@@ -813,18 +882,43 @@ fn status() -> anyhow::Result<()> {
             None => println!("delivery: unverifiable (transcript format drift)"),
         },
     }
+    // Ring 5/6 live in the tree, so their figures are the fleet's, not this
+    // machine's.
+    let ex = exhaust::Exhaust::from_config(&cfg);
+    let ring56 = ex.stats();
+    if ring56.staged_total > 0 {
+        let reasons = ring56
+            .staged_by_reason
+            .iter()
+            .map(|(r, n)| format!("{r}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "staging: {} ring-5 candidate(s) awaiting distillation [{reasons}] in {}",
+            ring56.staged_total,
+            ex.staging_dir.display()
+        );
+    } else {
+        println!("staging: no ring-5 candidates awaiting distillation");
+    }
+    println!(
+        "exhaust: {} of ring-6 stream in {}",
+        jsonl::human_bytes(ring56.bytes),
+        logs.display()
+    );
     // Semantic coverage belongs in status, not only in a query's warning:
     // an operator must be able to SEE that the vectors are missing before a
     // ranking quietly falls back to lexical.
-    if let Ok(cfg) = config::Config::load()
-        && cfg.embeddings.enabled
-    {
+    if cfg.embeddings.enabled {
         match semantic_status(&cfg) {
             Ok(line) => println!("{line}"),
             Err(e) => println!("semantic: unavailable ({e})"),
         }
     }
     let state = paths::state_dir();
+    if let Some(note) = migrate::legacy_note(&state) {
+        println!("{note}");
+    }
     let bytes: u64 = std::fs::read_dir(&state)
         .map(|rd| {
             rd.flatten()
@@ -898,7 +992,7 @@ fn main() {
             }
         }
         Command::Staging { action } => {
-            if let Err(e) = staging(action) {
+            if let Err(e) = staging_cmd(action) {
                 eprintln!("cfetch staging: {e}");
                 std::process::exit(1);
             }

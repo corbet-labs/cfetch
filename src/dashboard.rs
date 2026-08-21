@@ -94,11 +94,12 @@ struct Stats {
     hooks: Vec<(String, u32, Option<u64>)>, // name, consecutive_failures, last_ok
     sessions: usize,
     injected_tokens: u64,
-    quarantines: usize,
+    /// Ledger streams this binary refused to read (a future format version).
+    unreadable_streams: usize,
     index: IndexView,
     staging_total: i64,
     staging_by_reason: Vec<(String, i64)>,
-    exhaust_events: i64,
+    exhaust_bytes: u64,
 }
 
 fn index_view(source: &Source) -> IndexView {
@@ -137,11 +138,14 @@ fn index_view(source: &Source) -> IndexView {
     }
 }
 
-fn gather(source: &Source, state: &Path) -> Stats {
+fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
     let hb = heartbeat::load_from(state);
-    let l = ledger::load_from(state);
-    // Read-only, fail-silent: an absent exhaust DB simply reports zeros.
-    let staging = exhaust::stats(state);
+    // The ledger and ring-5/6 figures come from the TREE, so this pane shows
+    // the whole fleet's numbers, not just this machine's.
+    let loaded = ledger::read(&paths::logs_dir(&cfg.brain_root));
+    let l = loaded.ledger;
+    // Read-only, fail-silent: an absent tree simply reports zeros.
+    let staging = exhaust::Exhaust::from_config(cfg).stats();
     Stats {
         daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
         hooks: hb
@@ -156,11 +160,11 @@ fn gather(source: &Source, state: &Path) -> Stats {
             .flat_map(|s| s.by_source.values())
             .map(|t| t.tokens_estimated)
             .sum(),
-        quarantines: ledger::quarantine_count(state),
+        unreadable_streams: loaded.unreadable.len(),
         index: index_view(source),
         staging_total: staging.staged_total,
         staging_by_reason: staging.staged_by_reason,
-        exhaust_events: staging.events,
+        exhaust_bytes: staging.bytes,
     }
 }
 
@@ -206,14 +210,14 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         Line::from(vec![
             daemon_span,
             index_span(&s.index),
-            Span::raw(format!("   exhaust: {} event(s)", s.exhaust_events)),
+            Span::raw(format!("   exhaust: {}", crate::jsonl::human_bytes(s.exhaust_bytes))),
         ]),
         Line::from(format!(
             "ledger: {} session(s), ~{} tokens injected{}",
             s.sessions,
             s.injected_tokens,
-            if s.quarantines > 0 {
-                format!("   ⚠ {} quarantined corrupt ledger(s)", s.quarantines)
+            if s.unreadable_streams > 0 {
+                format!("   ⚠ {} unreadable ledger stream(s)", s.unreadable_streams)
             } else {
                 String::new()
             }
@@ -356,12 +360,12 @@ pub fn run() -> anyhow::Result<()> {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
     let mut app = App { query: String::new(), hits: Vec::new(), status: "no query yet".into() };
-    let mut stats = gather(&source, &state);
+    let mut stats = gather(&cfg, &source, &state);
     let mut last_refresh = std::time::Instant::now();
 
     let result: anyhow::Result<()> = loop {
         if last_refresh.elapsed() > Duration::from_secs(2) {
-            stats = gather(&source, &state);
+            stats = gather(&cfg, &source, &state);
             last_refresh = std::time::Instant::now();
         }
         if let Err(e) = terminal.draw(|f| draw(f, &stats, &app)) {
@@ -435,7 +439,7 @@ mod tests {
             token_file: dir.path().join("absent-token"),
         });
         let source = open_source(&cfg, dir.path());
-        let stats = gather(&source, dir.path());
+        let stats = gather(&cfg, &source, dir.path());
         assert!(
             !dir.path().join("index.db").exists(),
             "a none-tier host must open (and create) NO local index"
@@ -475,7 +479,7 @@ mod tests {
             hooks: Vec::new(),
             sessions: 0,
             injected_tokens: 0,
-            quarantines: 0,
+            unreadable_streams: 0,
             index: IndexView::Served {
                 origin: "storage-1".into(),
                 generation: 91,
@@ -483,7 +487,7 @@ mod tests {
             },
             staging_total: 0,
             staging_by_reason: Vec::new(),
-            exhaust_events: 0,
+            exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&s));
         assert!(text.contains("served by storage-1"), "{text}");
@@ -497,22 +501,22 @@ mod tests {
     }
 
     #[test]
-    fn header_reports_failing_hooks_and_quarantines() {
+    fn header_reports_failing_hooks_and_unreadable_streams() {
         let s = Stats {
             daemon_version: None,
             hooks: vec![("stop".into(), 5, None), ("session-start".into(), 0, Some(1))],
             sessions: 2,
             injected_tokens: 1234,
-            quarantines: 1,
+            unreadable_streams: 1,
             index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
-            exhaust_events: 0,
+            exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&s));
         assert!(text.contains("daemon down"));
         assert!(text.contains("FAILING: stop (5×)"));
-        assert!(text.contains("quarantined"));
+        assert!(text.contains("unreadable ledger stream(s)"));
         assert!(text.contains("r1:2 r3:400"));
         assert!(text.contains("staging: 0 candidates"), "empty staging still renders");
     }
@@ -524,7 +528,7 @@ mod tests {
             hooks: Vec::new(),
             sessions: 0,
             injected_tokens: 0,
-            quarantines: 0,
+            unreadable_streams: 0,
             index: IndexView::Local {
                 docs_by_ring: Vec::new(),
                 blocks: 0,
@@ -539,7 +543,7 @@ mod tests {
                 ("recurring-failure".into(), 2),
                 ("hot-file".into(), 1),
             ],
-            exhaust_events: 4321,
+            exhaust_bytes: 4321 * 1024,
         };
         let lines = header_lines(&s);
         let text = flat_text(&lines);
@@ -549,7 +553,7 @@ mod tests {
             ),
             "got: {text}"
         );
-        assert!(text.contains("exhaust: 4321 event(s)"), "got: {text}");
+        assert!(text.contains("exhaust: 4.2 MiB"), "got: {text}");
         let staging_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("staging:")))

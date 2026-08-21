@@ -45,11 +45,13 @@ pub fn queue_status_nudge(st: &mut SessionState, brain_root: &Path) -> bool {
     )
 }
 
-/// Capture-visibility: unconsumed flagged rows are invisible by design (rings
-/// 5-6 are never injected), so their COUNT is surfaced instead — with the
-/// command that shows them. Returns whether anything was queued.
-pub fn queue_staging_visibility(st: &mut SessionState, exhaust_db: &Path) -> bool {
-    let n = staging_pending(exhaust_db);
+/// Capture-visibility: staged candidates are invisible by design (rings 5-6
+/// are never injected), so their COUNT is surfaced instead — with the command
+/// that shows them. The count covers the whole shared staging directory, so a
+/// candidate another host flagged is announced here too. Returns whether
+/// anything was queued.
+pub fn queue_staging_visibility(st: &mut SessionState, staging_dir: &Path) -> bool {
+    let n = crate::staging::pending_count(staging_dir);
     if n < 1 {
         return false;
     }
@@ -153,19 +155,6 @@ fn memories_ring0_descriptions(brain_root: &Path, dirs: &[PathBuf]) -> Vec<Strin
     out
 }
 
-/// Flagged, unconsumed staging rows, counted through a read-only open so a
-/// missing DB is never created and a busy one is a 0, not a stall.
-fn staging_pending(db: &Path) -> i64 {
-    use rusqlite::OpenFlags;
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let Ok(conn) = rusqlite::Connection::open_with_flags(db, flags) else { return 0 };
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
-    conn.query_row("SELECT count(*) FROM events WHERE flag = 1 AND consumed = 0", [], |r| {
-        r.get(0)
-    })
-    .unwrap_or(0)
-}
-
 /// `rel` (brain-root-relative) is exactly `todo/active/<task>/STATUS.md`.
 fn is_active_status(rel: &Path) -> bool {
     let parts: Vec<&str> = rel
@@ -228,17 +217,21 @@ mod tests {
         }
     }
 
-    /// An exhaust DB with exactly `n` staged (flagged, unconsumed) candidates,
-    /// produced through the real capture + trap path (hot-file: the same
-    /// ring-3 brain file written in two distinct sessions).
-    fn staged_db(dir: &Path, n: usize) -> PathBuf {
+    /// A staging directory holding exactly `n` candidates, produced through
+    /// the real capture + trap path (hot-file: the same ring-3 brain file
+    /// written in two distinct sessions).
+    fn staged_tree(dir: &Path, n: usize) -> PathBuf {
         let brain = Path::new("/b/agents");
-        let conn = exhaust::open(dir).unwrap();
+        let ex = exhaust::Exhaust::new(
+            dir.join("logs/cfetch"),
+            dir.join("staging/cfetch"),
+            "h1".into(),
+            1 << 20,
+        );
         for i in 0..n {
             let path = format!("/b/agents/knowledge/hot{i}.md");
             for s in ["s1", "s2"] {
-                exhaust::capture_post_tool(
-                    &conn,
+                ex.capture_post_tool(
                     &write_event(s, &path),
                     brain,
                     &crate::config::RingRules::default(),
@@ -246,8 +239,8 @@ mod tests {
                 .unwrap();
             }
         }
-        exhaust::record_stop(&conn, "s2").unwrap();
-        dir.join("exhaust.db")
+        ex.record_stop("s2").unwrap();
+        ex.staging_dir
     }
 
     #[test]
@@ -299,11 +292,11 @@ mod tests {
     }
 
     #[test]
-    fn staging_visibility_counts_unconsumed_rows() {
+    fn staging_visibility_counts_pending_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let db = staged_db(dir.path(), 2);
+        let staging = staged_tree(dir.path(), 2);
         let mut st = SessionState::default();
-        assert!(queue_staging_visibility(&mut st, &db));
+        assert!(queue_staging_visibility(&mut st, &staging));
         assert_eq!(
             st.drain_reminders(),
             vec!["[cfetch: 2 staged candidate(s) await distillation — cfetch staging list]"
@@ -313,20 +306,18 @@ mod tests {
 
     #[test]
     fn staging_visibility_silent_when_nothing_is_staged() {
-        // No DB at all: nothing queued, and the read-only probe must not
+        // No staging directory at all: nothing queued, and the probe must not
         // create one.
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("exhaust.db");
+        let staging = dir.path().join("staging/cfetch");
         let mut st = SessionState::default();
-        assert!(!queue_staging_visibility(&mut st, &db));
-        assert!(!db.exists(), "read-only probe must not create the exhaust db");
-        // A DB whose candidates are all consumed: also silent.
-        let db = staged_db(dir.path(), 1);
-        let conn = exhaust::open(dir.path()).unwrap();
-        let id = exhaust::staging_list(&conn).unwrap()[0].id;
-        exhaust::consume(&conn, id).unwrap();
-        drop(conn);
-        assert!(!queue_staging_visibility(&mut st, &db));
+        assert!(!queue_staging_visibility(&mut st, &staging));
+        assert!(!staging.exists(), "a read-only probe must not create tree state");
+        // A queue whose candidates were all consumed: also silent.
+        let staging = staged_tree(dir.path(), 1);
+        let id = crate::staging::list(&staging)[0].id.clone();
+        crate::staging::consume(&staging, &id).unwrap();
+        assert!(!queue_staging_visibility(&mut st, &staging));
         assert!(st.drain_reminders().is_empty());
     }
 

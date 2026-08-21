@@ -27,8 +27,9 @@ scoped to (a host, a repo). Rings 0–4 are searchable; every hit carries a
 ring-prefixed, content-addressed citation, so the id itself reveals how much to
 trust the statement. Rings 5–6 (automatic capture and its staging area) never
 reach an agent's context implicitly — captured exhaust is untrusted input by
-definition. Automatic capture, the promotion traps and the staging queue are
-live, as are recall, the code index, scoped injection, MCP and the dashboard.
+definition, and both live as plain text in the tree so any host can review
+them. Automatic capture, the promotion traps and the staging queue are live,
+as are recall, the code index, scoped injection, MCP and the dashboard.
 
 ## One brain, many machines
 
@@ -171,7 +172,8 @@ defaults):
   ],
   "code_roots": ["projects"],
   "budget_chars": 6000,
-  "ledger_max_sessions": 200
+  "exhaust_max_bytes": 33554432,
+  "ledger_max_bytes": 8388608
 }
 ```
 
@@ -188,7 +190,9 @@ defaults):
   backstop — so `cfetch find` and `cfetch map` answer on a freshly started host
   without anyone running `cfetch scan` by hand.
 - `budget_chars` — hard cap on the injected digest.
-- `ledger_max_sessions` — sessions kept in the injection ledger.
+- `exhaust_max_bytes` — writer-side cap on this host's ring-6 exhaust stream
+  before it rotates; two rotated generations are kept.
+- `ledger_max_bytes` — the same, for this host's ledger stream.
 
 ### Ring assignment (`ring_rules`)
 
@@ -210,7 +214,8 @@ The shipped default, which you replace wholesale by setting the key:
     { "prefix": "README.md", "ring": 1 },
     { "prefix": "mind/memories/MEMORY.md", "ring": 1 },
     { "prefix": "mind/memories/", "ring": 2 },
-    { "prefix": "todo/", "ring": 4 }
+    { "prefix": "todo/", "ring": 4 },
+    { "prefix": "staging/", "ring": 5 }
   ]
 }
 ```
@@ -230,6 +235,11 @@ A tree organized differently just says so — for example:
 ```
 
 Rings run 0–6; a rule naming anything higher is refused at load.
+
+`staging/` is shipped as ring 5 because the LOCATION decides: a staged
+candidate whose frontmatter is stripped or hand-mangled is still never
+recallable. Point the rule elsewhere if your staging area lives elsewhere, but
+do not delete it — ring 5 is the ladder's quarantine.
 
 ### Exclusions (`exclude_prefixes`)
 
@@ -358,10 +368,31 @@ r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
 
 `cfetch status` prints the same coverage before you need it.
 
-Mutable state (index database, ledger, heartbeats) lives per-host in
-`~/.local/state/cfetch` — never inside the brain tree, which may be shared
-between machines over NFS. Derived ARTIFACTS are the exception: vectors are
-shared content, so they live in the tree (self-ignoring for git).
+## What lives where
+
+The tree is the only storage of record, and that includes the automatic half
+of the ladder:
+
+```
+<brain_root>/logs/cfetch/exhaust-<host>.jsonl   ring-6 capture, append-only
+<brain_root>/logs/cfetch/ledger-<host>.jsonl    injection + measured usage
+<brain_root>/staging/cfetch/<id>.md             ring-5 candidates (ring: 5)
+<brain_root>/staging/cfetch/dismissed/<id>.md   candidates ruled out, kept
+```
+
+Both stream formats are versioned line by line (`{"v":1,…}`) and refused
+rather than guessed at on a version this binary does not know. One file per
+host means concurrent machines never interleave, and every reader — `cfetch
+status`, `cfetch audit`, `cfetch staging list` — folds ALL of them, so a
+candidate flagged on one machine is visible to a distillation session on
+another.
+
+Everything else cfetch keeps is DERIVED and rebuildable: the index database,
+heartbeats and session state live per-host in `~/.local/state/cfetch`, never
+inside the shared tree, which may be shared between machines over NFS. Vectors
+are the one derived exception: they are a property of the CONTENT rather than
+of a machine, so they live in `<brain_root>/state/cfetch/vectors/`
+(self-ignoring for git) and every host that can reach the tree reads them.
 
 ## License
 

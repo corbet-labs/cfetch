@@ -129,6 +129,10 @@ fn default_ring_rules() -> Vec<RingRule> {
         RingRule { prefix: "mind/memories/".into(), ring: 2 },
         // Working state: queues and task notes.
         RingRule { prefix: "todo/".into(), ring: 4 },
+        // Ring-5 staging candidates. The LOCATION decides, so a candidate
+        // whose frontmatter is stripped or hand-mangled is still never
+        // recallable — this exclusion cannot be edited away file by file.
+        RingRule { prefix: "staging/".into(), ring: 5 },
         // Everything else is curated knowledge; see UNMATCHED_RING.
     ]
 }
@@ -201,7 +205,7 @@ pub struct ResidentEntry {
     pub scope: Scope,
 }
 
-/// Ring-6 exhaust capture (PostToolUse/Stop -> exhaust.db).
+/// Ring-6 exhaust capture (PostToolUse/Stop -> the tree's exhaust stream).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureConfig {
     /// On by default: exhaust is the raw material every later promotion is
@@ -439,9 +443,14 @@ pub struct Config {
     /// Hard cap on the injected digest, in characters.
     #[serde(default = "default_budget_chars")]
     pub budget_chars: usize,
-    /// Sessions kept in the injection ledger (writer-side retention).
-    #[serde(default = "default_ledger_max_sessions")]
-    pub ledger_max_sessions: usize,
+    /// Writer-side byte cap on THIS host's exhaust stream before it rotates
+    /// (`<brain_root>/logs/cfetch/exhaust-<host>.jsonl`). Two rotated
+    /// generations are kept, so the footprint per host is at most 3x this.
+    #[serde(default = "default_exhaust_max_bytes")]
+    pub exhaust_max_bytes: u64,
+    /// Same, for this host's ledger stream.
+    #[serde(default = "default_ledger_max_bytes")]
+    pub ledger_max_bytes: u64,
     /// Ring-6 exhaust capture.
     #[serde(default)]
     pub capture: CaptureConfig,
@@ -472,8 +481,16 @@ fn default_budget_chars() -> usize {
     6000
 }
 
-fn default_ledger_max_sessions() -> usize {
-    200
+/// 32 MiB of ring-6 exhaust per host before rotation — months of capture at
+/// typical line sizes, and small next to any brain tree.
+fn default_exhaust_max_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+/// The ledger books a few lines per turn, so a quarter of the exhaust cap
+/// covers far more history than the audit window ever asks for.
+fn default_ledger_max_bytes() -> u64 {
+    8 * 1024 * 1024
 }
 
 impl Default for Config {
@@ -487,7 +504,8 @@ impl Default for Config {
             }],
             code_roots: Vec::new(),
             budget_chars: default_budget_chars(),
-            ledger_max_sessions: default_ledger_max_sessions(),
+            exhaust_max_bytes: default_exhaust_max_bytes(),
+            ledger_max_bytes: default_ledger_max_bytes(),
             capture: CaptureConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             recall: RecallConfig::default(),
@@ -640,6 +658,23 @@ mod tests {
             Config::load_from(&p).is_err(),
             "`always` must not smuggle an unconditional ring-2 set back in"
         );
+    }
+
+    #[test]
+    fn stream_caps_default_and_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.exhaust_max_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.ledger_max_bytes, 8 * 1024 * 1024);
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"exhaust_max_bytes": 1048576}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.exhaust_max_bytes, 1048576);
+        assert_eq!(cfg.ledger_max_bytes, 8 * 1024 * 1024, "a partial file keeps the other default");
+        // A config written for the SQLite era still loads: the retired
+        // ledger_max_sessions key is simply ignored.
+        std::fs::write(&p, r#"{"ledger_max_sessions": 200, "resident": []}"#).unwrap();
+        assert!(Config::load_from(&p).is_ok());
     }
 
     #[test]

@@ -103,7 +103,7 @@ impl SessionScope {
     }
 
     pub fn from_cwd(cwd: Option<&str>) -> SessionScope {
-        SessionScope { host: crate::serve::hostname(), repo: repo_name(cwd) }
+        SessionScope { host: crate::paths::hostname(), repo: repo_name(cwd) }
     }
 
     /// For non-hook callers (selfcheck): this process's own working directory.
@@ -359,7 +359,6 @@ mod tests {
                 .collect(),
             code_roots: Vec::new(),
             budget_chars: 2000,
-            ledger_max_sessions: 10,
             ..Config::default()
         };
         let d = build(&cfg, &SessionScope { host: "any-host".into(), repo: None });
@@ -399,7 +398,6 @@ mod tests {
             resident: vec![ResidentEntry { path: PathBuf::from("big.md"), ring: 0, scope: Scope::default() }],
             code_roots: Vec::new(),
             budget_chars: 1000,
-            ledger_max_sessions: 10,
             ..Config::default()
         };
         let d = build(&cfg, &SessionScope { host: "any-host".into(), repo: None });
@@ -415,7 +413,6 @@ mod tests {
             resident: vec![ResidentEntry { path: PathBuf::from("absent.md"), ring: 1, scope: Scope::default() }],
             code_roots: Vec::new(),
             budget_chars: 1000,
-            ledger_max_sessions: 10,
             ..Config::default()
         };
         let d = build(&cfg, &SessionScope { host: "any-host".into(), repo: None });

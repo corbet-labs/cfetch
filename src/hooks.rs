@@ -8,9 +8,41 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::hook_io::{Emit, HookEvent};
 use crate::resident::SessionScope;
-use crate::{daemon, exhaust, govern, heartbeat, ledger, paths, resident, session_state, transcript};
+use crate::{
+    daemon, exhaust, govern, heartbeat, ledger, migrate, paths, resident, session_state,
+    transcript,
+};
 
 const DAEMON_BUDGET: Duration = Duration::from_millis(250);
+
+/// Where this host books its ledger lines: the tree's log directory, this
+/// host's identity, and the writer-side byte cap. Derived from the config,
+/// with working defaults when the config is the thing that broke — booking is
+/// a fact of record and must not stop because a setting is unreadable.
+struct LedgerSink {
+    dir: std::path::PathBuf,
+    host: String,
+    cap: u64,
+}
+
+impl LedgerSink {
+    fn of(cfg: Option<&Config>) -> LedgerSink {
+        let defaults = Config::default();
+        LedgerSink {
+            dir: paths::logs_dir(cfg.map_or(&defaults.brain_root, |c| &c.brain_root)),
+            host: paths::host_id(),
+            cap: cfg.map_or(defaults.ledger_max_bytes, |c| c.ledger_max_bytes),
+        }
+    }
+
+    fn book(&self, session: &str, source: &str, chars: usize) {
+        ledger::book_injection(&self.dir, &self.host, self.cap, session, source, chars);
+    }
+
+    fn book_measured(&self, session: &str, usage: &ledger::MeasuredUsage) {
+        ledger::book_measured(&self.dir, &self.host, self.cap, session, usage);
+    }
+}
 
 /// Files above this byte size get symbol-slice hints at pre-read. A
 /// metadata-only gate: the hook path must never read file bodies (a full
@@ -69,19 +101,18 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     // Which entries this session is entitled to is decided from the session
     // itself — the machine and the directory the agent was started in.
     let scope = SessionScope::from_event(event);
-    let (digest, max_sessions) = match &cfg {
+    let digest = match &cfg {
         Ok(cfg) => {
             // Prefer the warm daemon; fall back to a bounded direct read —
             // session start works with no daemon at all. The daemon shares
             // the host but not the cwd, so the scope travels with the call.
             let req = serde_json::json!({ "op": "resident", "cwd": event.cwd });
-            let digest = match daemon::call_req(&req, DAEMON_BUDGET) {
+            match daemon::call_req(&req, DAEMON_BUDGET) {
                 Some(r) if r.ok => r.digest.unwrap_or_default(),
                 _ => resident_with_deadline(cfg, &scope),
-            };
-            (digest, cfg.ledger_max_sessions)
+            }
         }
-        Err(_) => (String::new(), 200),
+        Err(_) => String::new(),
     };
 
     let reason = event.start_reason();
@@ -110,7 +141,7 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     }
 
     let emitted = emit.finish();
-    ledger::book(event.session(), "resident-digest", emitted, max_sessions);
+    LedgerSink::of(cfg.as_ref().ok()).book(event.session(), "resident-digest", emitted);
     // The config failure still counts as a hook failure for the heartbeat.
     cfg.map(|_| ())
 }
@@ -119,13 +150,14 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
 /// zero-extra-turn delivery channel for everything queued at Stop and by the
 /// cadence counter.
 fn user_prompt(event: &HookEvent) -> anyhow::Result<()> {
-    user_prompt_drain(&paths::state_dir(), event, ledger_max_sessions())
+    let cfg = Config::load().ok();
+    user_prompt_drain(&paths::state_dir(), &LedgerSink::of(cfg.as_ref()), event)
 }
 
 fn user_prompt_drain(
     state_dir: &Path,
+    sink: &LedgerSink,
     event: &HookEvent,
-    max_sessions: usize,
 ) -> anyhow::Result<()> {
     // Reminders describe the primary session's own activity; a subagent
     // prompt must never receive them — nor consume them out of the queue.
@@ -144,7 +176,7 @@ fn user_prompt_drain(
     }
     // ONE JSON object regardless of how many reminders were queued.
     let emitted = emit.finish();
-    ledger::book_in(state_dir, event.session(), "reminders", emitted, max_sessions);
+    sink.book(event.session(), "reminders", emitted);
     Ok(())
 }
 
@@ -157,7 +189,7 @@ fn stop_govern(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyhow::Res
     }
     let mut st = session_state::load(state_dir, event.session());
     let mut dirty = govern::queue_status_nudge(&mut st, &cfg.brain_root);
-    dirty |= govern::queue_staging_visibility(&mut st, &state_dir.join("exhaust.db"));
+    dirty |= govern::queue_staging_visibility(&mut st, &paths::staging_dir(&cfg.brain_root));
     if dirty {
         session_state::store(state_dir, event.session(), &st);
     }
@@ -185,20 +217,15 @@ fn post_tool_cadence(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyho
     Ok(())
 }
 
-/// Ring-6 exhaust capture (from wt/capture). The exhaust DB lives in the
-/// LOCAL state dir (never NFS), so a direct short-timeout write stays inside
-/// the hook latency budget without involving the daemon — and capture keeps
-/// working when no daemon runs at all. Emits nothing.
-fn post_tool_capture(
-    state_dir: &std::path::Path,
-    cfg: &Config,
-    event: &HookEvent,
-) -> anyhow::Result<()> {
+/// Ring-6 exhaust capture (from wt/capture). One `O_APPEND` line into this
+/// host's stream in the tree: no daemon, no fsync, no read — the whole write
+/// path is a single short append, so it stays inside the hook latency budget
+/// even when the tree is a network mount. Emits nothing.
+fn post_tool_capture(cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
     if !cfg.capture.enabled {
         return Ok(());
     }
-    let conn = exhaust::open(state_dir)?;
-    exhaust::capture_post_tool(&conn, event, &cfg.brain_root, &cfg.rings())
+    exhaust::Exhaust::from_config(cfg).capture_post_tool(event, &cfg.brain_root, &cfg.rings())
 }
 
 /// Turn summary + the 6->5 flagging traps (from wt/capture). Emits nothing —
@@ -208,12 +235,12 @@ fn stop_capture(state_dir: &std::path::Path, cfg: &Config, event: &HookEvent) ->
     if !cfg.capture.enabled {
         return Ok(());
     }
-    let conn = exhaust::open(state_dir)?;
-    exhaust::record_stop(&conn, event.session())
-}
-
-fn ledger_max_sessions() -> usize {
-    Config::load().map(|c| c.ledger_max_sessions).unwrap_or(200)
+    let ex = exhaust::Exhaust::from_config(cfg);
+    // A legacy per-host exhaust.db moves into the tree once, silently: a hook
+    // emits nothing, so the CLI is where the note about it is printed.
+    let imported = migrate::import_legacy_exhaust(state_dir, &ex);
+    ex.record_stop(event.session())?;
+    imported.map(|_| ())
 }
 
 /// The Read tool's target file, if this is a Read invocation we track.
@@ -290,6 +317,7 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let cfg = Config::load().ok();
     let state_dir = paths::state_dir();
     let mut st = session_state::load(&state_dir, event.session());
     let mut emit = Emit::new("PreToolUse");
@@ -310,8 +338,8 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
         // hook contract (silence over errors) outranks the client routing
         // contract's explicit-error rule here; the CLI/MCP surfaces do the
         // loud reporting for a dead serving host.
-        let hints = match Config::load().ok().and_then(|c| c.client.serving) {
-            Some(cs) => remote_slices(&cs, path, MAX_SLICE_HINTS),
+        let hints = match cfg.as_ref().and_then(|c| c.client.serving.as_ref()) {
+            Some(cs) => remote_slices(cs, path, MAX_SLICE_HINTS),
             None => symbol_slices(&state_dir.join("index.db"), path, MAX_SLICE_HINTS),
         };
         if !hints.is_empty() && st.should_hint_slices(path) {
@@ -330,7 +358,7 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
     }
     if emitted > 0 {
         // Book our own injection — advice that costs tokens is not free.
-        ledger::book(event.session(), "read-advisory", emitted, ledger_max_sessions());
+        LedgerSink::of(cfg.as_ref()).book(event.session(), "read-advisory", emitted);
     }
     Ok(())
 }
@@ -345,7 +373,7 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
         let state_dir = paths::state_dir();
         match Config::load() {
             Ok(cfg) => {
-                if let Err(e) = post_tool_capture(&state_dir, &cfg, event) {
+                if let Err(e) = post_tool_capture(&cfg, event) {
                     first_err = Some(e);
                 }
                 if let Err(e) = post_tool_cadence(&state_dir, &cfg, event) {
@@ -406,18 +434,19 @@ fn post_tool_track(event: &HookEvent) -> anyhow::Result<()> {
 fn stop(event: &HookEvent) -> anyhow::Result<()> {
     let mut first_err: Option<anyhow::Error> = None;
     let state_dir = paths::state_dir();
-    match Config::load() {
+    let cfg = Config::load();
+    match &cfg {
         Ok(cfg) => {
-            if let Err(e) = stop_capture(&state_dir, &cfg, event) {
+            if let Err(e) = stop_capture(&state_dir, cfg, event) {
                 first_err = Some(e);
             }
-            if let Err(e) = stop_govern(&state_dir, &cfg, event) {
+            if let Err(e) = stop_govern(&state_dir, cfg, event) {
                 first_err.get_or_insert(e);
             }
         }
-        Err(e) => first_err = Some(e),
+        Err(e) => first_err = Some(anyhow::anyhow!("{e}")),
     }
-    if let Err(e) = stop_measure(event) {
+    if let Err(e) = stop_measure(&LedgerSink::of(cfg.as_ref().ok()), event) {
         first_err.get_or_insert(e);
     }
     match first_err {
@@ -430,18 +459,14 @@ fn stop(event: &HookEvent) -> anyhow::Result<()> {
 /// are cumulative, so the ledger books only the delta above its watermark. An
 /// unparseable transcript books NOTHING — status then labels the numbers
 /// estimated instead of inventing measured zeros.
-fn stop_measure(event: &HookEvent) -> anyhow::Result<()> {
+fn stop_measure(sink: &LedgerSink, event: &HookEvent) -> anyhow::Result<()> {
     // A subagent's usage belongs to its own transcript, not this ledger row.
     if event.is_subagent() {
         return Ok(());
     }
     let Some(tp) = event.transcript_path.as_deref() else { return Ok(()) };
     let Some(usage) = transcript::scan(Path::new(tp)) else { return Ok(()) };
-    ledger::book_measured(
-        event.session(),
-        &ledger::MeasuredUsage::from(&usage),
-        ledger_max_sessions(),
-    );
+    sink.book_measured(event.session(), &ledger::MeasuredUsage::from(&usage));
     Ok(())
 }
 
@@ -464,6 +489,11 @@ mod tests {
     use crate::config::CaptureConfig;
     use serde_json::json;
 
+    /// Books straight into a tempdir, standing in for the tree's logs dir.
+    fn test_sink(dir: &Path) -> LedgerSink {
+        LedgerSink { dir: dir.to_path_buf(), host: "test-host".into(), cap: 1 << 20 }
+    }
+
     fn bash_event(cmd: &str) -> HookEvent {
         HookEvent {
             session_id: Some("s1".into()),
@@ -473,27 +503,60 @@ mod tests {
         }
     }
 
+    /// A config whose brain tree is a tempdir, so capture writes into a
+    /// throwaway `logs/cfetch` instead of the operator's tree.
+    fn tree_cfg(brain: &Path, capture: bool) -> Config {
+        Config {
+            brain_root: brain.to_path_buf(),
+            capture: CaptureConfig { enabled: capture },
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn capture_disabled_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg =
-            Config { capture: CaptureConfig { enabled: false }, ..Config::default() };
-        post_tool_capture(dir.path(), &cfg, &bash_event("ls")).unwrap();
-        stop_capture(dir.path(), &cfg, &bash_event("ls")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = tree_cfg(brain.path(), false);
+        post_tool_capture(&cfg, &bash_event("ls")).unwrap();
+        stop_capture(state.path(), &cfg, &bash_event("ls")).unwrap();
         assert!(
-            !dir.path().join("exhaust.db").exists(),
-            "disabled capture must not even create the exhaust db"
+            !paths::logs_dir(brain.path()).exists(),
+            "disabled capture must not even create the exhaust stream"
         );
     }
 
     #[test]
-    fn capture_enabled_records_the_event() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::default();
-        post_tool_capture(dir.path(), &cfg, &bash_event("cargo build")).unwrap();
-        let conn = exhaust::open(dir.path()).unwrap();
-        let n: i64 = conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 1);
+    fn capture_enabled_appends_one_line_to_the_tree() {
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = tree_cfg(brain.path(), true);
+        post_tool_capture(&cfg, &bash_event("cargo build")).unwrap();
+        let records =
+            crate::jsonl::read_all(&paths::logs_dir(brain.path()), exhaust::STREAM).records;
+        assert_eq!(records.len(), 1, "one tool call, one appended line");
+        assert_eq!(records[0].kind(), "bash");
+        assert_eq!(records[0].value("payload").unwrap()["command"], "cargo build");
+    }
+
+    #[test]
+    fn stop_capture_stages_into_the_shared_tree() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = tree_cfg(brain.path(), true);
+        let hot = brain.path().join("knowledge/hot.md");
+        for session in ["s1", "s2"] {
+            let event = HookEvent {
+                session_id: Some(session.into()),
+                tool_name: Some("Write".into()),
+                tool_input: Some(json!({"file_path": hot.to_string_lossy()})),
+                ..Default::default()
+            };
+            post_tool_capture(&cfg, &event).unwrap();
+        }
+        stop_capture(state.path(), &cfg, &bash_event("done")).unwrap();
+        let staged = crate::staging::list(&paths::staging_dir(brain.path()));
+        assert_eq!(staged.len(), 1, "the hot-file trap staged a ring-5 candidate");
+        assert_eq!(staged[0].reason, "hot-file");
     }
 
     #[test]
@@ -505,7 +568,8 @@ mod tests {
         session_state::store(dir.path(), "s1", &st);
 
         let event = HookEvent { session_id: Some("s1".into()), ..Default::default() };
-        user_prompt_drain(dir.path(), &event, 10).unwrap();
+        let sink = test_sink(dir.path());
+        user_prompt_drain(dir.path(), &sink, &event).unwrap();
 
         let back = session_state::load(dir.path(), "s1");
         assert!(back.queued_reminders.is_empty(), "delivery must empty the queue");
@@ -516,7 +580,7 @@ mod tests {
         assert!(booked.chars > 0);
 
         // A second prompt delivers (and books) nothing further.
-        user_prompt_drain(dir.path(), &event, 10).unwrap();
+        user_prompt_drain(dir.path(), &sink, &event).unwrap();
         let ledger = ledger::load_from(dir.path());
         assert_eq!(ledger.sessions["s1"].by_source["reminders"].count, 1);
     }
@@ -533,7 +597,7 @@ mod tests {
             agent_id: Some("a1".into()),
             ..Default::default()
         };
-        user_prompt_drain(dir.path(), &sub, 10).unwrap();
+        user_prompt_drain(dir.path(), &test_sink(dir.path()), &sub).unwrap();
         let back = session_state::load(dir.path(), "s1");
         assert_eq!(back.queued_reminders.len(), 1, "a subagent must not consume the queue");
         assert!(ledger::load_from(dir.path()).sessions.is_empty(), "and books nothing");

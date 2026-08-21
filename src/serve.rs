@@ -340,28 +340,7 @@ pub fn origin_of(cfg: &Config) -> String {
     {
         return o.clone();
     }
-    hostname()
-}
-
-pub(crate) fn hostname() -> String {
-    // uname(2) is portable across the unixes (Linux + macOS + BSD); /proc is
-    // Linux-only and left `origin` as "unknown-host" on every other unix.
-    // Windows has neither: `COMPUTERNAME` is the equivalent the session
-    // manager always sets.
-    #[cfg(unix)]
-    let node = {
-        let uname = rustix::system::uname();
-        uname.nodename().to_string_lossy().trim().to_string()
-    };
-    #[cfg(windows)]
-    let node = std::env::var("COMPUTERNAME").unwrap_or_default().trim().to_string();
-    if !node.is_empty() {
-        return node;
-    }
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown-host".to_string())
+    crate::paths::hostname()
 }
 
 /// Keeps the watcher alive for the daemon's lifetime.
@@ -849,7 +828,7 @@ mod tests {
     fn the_serving_origin_is_never_empty() {
         // "unknown-host" was the macOS symptom of reading /proc; an empty
         // origin would be a worse one — every coherence label carries it.
-        assert!(!hostname().is_empty());
+        assert!(!crate::paths::hostname().is_empty());
         assert!(!origin_of(&Config::default()).is_empty());
     }
 

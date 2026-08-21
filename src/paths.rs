@@ -1,6 +1,11 @@
-//! Filesystem locations. The state dir is per-host LOCAL on purpose: the SQLite
-//! index (Milestone 2) cannot live on NFS, and hook state must never land in the
-//! shared brain tree.
+//! Filesystem locations.
+//!
+//! Two homes, deliberately: the state dir is per-host LOCAL (derived indexes,
+//! sockets, heartbeat — rebuildable, never NFS), while everything that is a
+//! FACT OF RECORD lives in the shared brain tree. Ring-6 exhaust, the ledger
+//! and ring-5 staging belong to the second group: they are the ladder's raw
+//! material, and material only one machine can see is material the fleet does
+//! not have.
 //!
 //! Every location keeps the same override environment variable on every
 //! platform (`HOME`, `CFETCH_STATE_DIR`, `CFETCH_CONFIG`, `CFETCH_BRAIN`);
@@ -65,7 +70,8 @@ fn windows_config_path(home: &Path, app_data: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Per-host mutable state: heartbeat, ledger, daemon endpoint.
+/// Per-host mutable state: heartbeat, derived indexes, daemon socket fallback.
+/// Nothing of record lives here.
 pub fn state_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("CFETCH_STATE_DIR") {
         return PathBuf::from(d);
@@ -128,6 +134,50 @@ pub fn default_brain_root() -> PathBuf {
 /// host, and never a per-host database's private property.
 pub fn shared_vector_dir(brain_root: &std::path::Path) -> PathBuf {
     brain_root.join("state/cfetch/vectors")
+}
+
+/// Append-only JSONL streams of record (ring-6 exhaust, injection ledger).
+/// Under `logs/`, which the index excludes wholesale — the streams are record,
+/// not recallable prose, and a per-tool-call append must never churn the
+/// serving daemon's watcher.
+pub fn logs_dir(brain_root: &Path) -> PathBuf {
+    brain_root.join("logs/cfetch")
+}
+
+/// Ring-5 staging: one markdown file per candidate, shared across hosts.
+pub fn staging_dir(brain_root: &Path) -> PathBuf {
+    brain_root.join("staging/cfetch")
+}
+
+/// Identity stamped into this host's stream file names and staged candidates.
+/// `CFETCH_HOST` overrides it — a container or a test needs to be able to say
+/// who it is without renaming the machine.
+pub fn host_id() -> String {
+    let raw = std::env::var("CFETCH_HOST")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(hostname);
+    crate::jsonl::sanitize_host(raw.trim())
+}
+
+/// This machine's name. `uname(2)` is portable across the unixes (Linux,
+/// macOS, BSD) where `/proc` is not; Windows has neither, and `COMPUTERNAME`
+/// is the equivalent its session manager always sets.
+pub fn hostname() -> String {
+    #[cfg(unix)]
+    let node = {
+        let uname = rustix::system::uname();
+        uname.nodename().to_string_lossy().trim().to_string()
+    };
+    #[cfg(windows)]
+    let node = std::env::var("COMPUTERNAME").unwrap_or_default().trim().to_string();
+    if !node.is_empty() {
+        return node;
+    }
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 #[cfg(test)]

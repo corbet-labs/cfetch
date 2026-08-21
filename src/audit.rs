@@ -35,8 +35,6 @@ pub struct AuditPaths {
     pub mcp_json: PathBuf,
     /// Resolves `@~/` imports.
     pub home: PathBuf,
-    /// Ledger location.
-    pub state_dir: PathBuf,
     /// Where session transcripts live (native layout: one dir per project).
     pub transcripts_root: PathBuf,
 }
@@ -51,7 +49,6 @@ impl AuditPaths {
                 .map(|d| d.join(".mcp.json"))
                 .unwrap_or_else(|_| PathBuf::from(".mcp.json")),
             home,
-            state_dir: paths::state_dir(),
             transcripts_root: paths::native_projects_root(),
         }
     }
@@ -216,14 +213,21 @@ struct SourceAgg {
     max_session_chars: u64,
 }
 
-/// Builds the report. `now` is a parameter so window math is testable.
-pub fn build(paths: &AuditPaths, budget_chars: usize, now: u64) -> AuditReport {
+/// Builds the report. The `ledger` is the DERIVED fleet view folded from the
+/// tree's ledger streams (see [`crate::ledger::read`]) — the audit prices what
+/// it is handed and never reaches for a store of its own. `now` is a parameter
+/// so window math is testable.
+pub fn build(
+    paths: &AuditPaths,
+    ledger: &crate::ledger::Ledger,
+    budget_chars: usize,
+    now: u64,
+) -> AuditReport {
     let claude_md = claude_md_cost(&paths.claude_md, &paths.home);
     let mcp = vec![mcp_file(&paths.settings_json), mcp_file(&paths.mcp_json)];
 
     // Booked injections + measured usage, windowed. The budget is per
     // session, so the warning keys on the per-session peak per source.
-    let ledger = crate::ledger::load_from(&paths.state_dir);
     let cutoff = now.saturating_sub(WINDOW_DAYS * 86_400);
     let mut per_source: BTreeMap<String, SourceAgg> = BTreeMap::new();
     let mut measured_sessions = 0usize;
@@ -439,8 +443,6 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers": {"project-db": {}}}"#).unwrap();
-        let state = dir.join("state");
-        std::fs::create_dir_all(&state).unwrap();
         let transcripts = dir.join("projects");
         std::fs::create_dir_all(&transcripts).unwrap();
         AuditPaths {
@@ -448,13 +450,8 @@ mod tests {
             settings_json: claude.join("settings.json"),
             mcp_json: dir.join(".mcp.json"),
             home: dir.to_path_buf(),
-            state_dir: state,
             transcripts_root: transcripts,
         }
-    }
-
-    fn write_ledger(state_dir: &Path, l: &Ledger) {
-        std::fs::write(state_dir.join("ledger.json"), serde_json::to_string(l).unwrap()).unwrap();
     }
 
     fn session(
@@ -487,7 +484,7 @@ mod tests {
     fn fabricated_home_prices_claude_md_imports_and_mcp() {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &Ledger::default(), 6000, NOW);
 
         let md = r.claude_md.as_ref().expect("CLAUDE.md exists in the fabricated home");
         assert_eq!(md.lines, 5);
@@ -524,9 +521,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
         std::fs::write(&p.claude_md, "x\n".repeat(CLAUDE_MD_WARN_LINES + 1)).unwrap();
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &Ledger::default(), 6000, NOW);
         assert!(r.claude_md.unwrap().over_line_warning);
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &Ledger::default(), 6000, NOW);
         assert!(render(&r).contains("WARN"), "the line warning must reach the rendered report");
     }
 
@@ -535,12 +532,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
         std::fs::remove_file(&p.claude_md).unwrap();
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &Ledger::default(), 6000, NOW);
         assert!(r.claude_md.is_none());
         assert!(render(&r).contains("not found"), "absence is a line, never silence");
         // Absent MCP files are labeled too.
         std::fs::remove_file(&p.mcp_json).unwrap();
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &Ledger::default(), 6000, NOW);
         assert!(!r.mcp[1].present);
         assert!(render(&r).contains("not present"));
     }
@@ -558,8 +555,7 @@ mod tests {
             "s2".into(),
             session(NOW - 200, &[("read-advisory", 2, 400, 115)], MeasuredUsage::default()),
         );
-        write_ledger(&p.state_dir, &l);
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &l, 6000, NOW);
         let digest = r.sources.iter().find(|s| s.source == "resident-digest").unwrap();
         assert!(digest.over_budget_warning, "13000 chars > 2x 6000 budget");
         assert_eq!(digest.max_session_chars, 13_000);
@@ -585,8 +581,7 @@ mod tests {
             "fresh".into(),
             session(NOW - 3600, &[("read-advisory", 1, 50, 15)], MeasuredUsage::default()),
         );
-        write_ledger(&p.state_dir, &l);
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &l, 6000, NOW);
         assert_eq!(r.sources.len(), 1, "only the in-window session's sources appear");
         assert_eq!(r.sources[0].source, "read-advisory");
         assert_eq!(r.measured_api_calls, 0, "out-of-window measured usage is excluded too");
@@ -597,7 +592,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
         // Empty transcripts root, empty ledger: BOTH gaps must be named.
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &Ledger::default(), 6000, NOW);
         assert!(r.gaps.iter().any(|g| g.contains("no transcripts found")), "gaps: {:?}", r.gaps);
         assert!(r.gaps.iter().any(|g| g.contains("no measured usage")), "gaps: {:?}", r.gaps);
         let text = render(&r);
@@ -617,8 +612,7 @@ mod tests {
                 MeasuredUsage { api_calls: 4, input_tokens: 10, ..Default::default() },
             ),
         );
-        write_ledger(&p.state_dir, &l);
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &l, 6000, NOW);
         assert!(r.gaps.is_empty(), "gaps must close when data exists: {:?}", r.gaps);
         assert!(render(&r).contains("none"));
     }
@@ -644,8 +638,7 @@ mod tests {
                 MeasuredUsage { api_calls: 20, input_tokens: 5, ..Default::default() },
             ),
         );
-        write_ledger(&p.state_dir, &l);
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &l, 6000, NOW);
         let rec = r.recurring.as_ref().expect("digest bookings + measured calls => recurring cost");
         assert_eq!(rec.digest_tokens_estimated, 900, "mean digest tokens per session");
         assert_eq!(rec.api_calls_per_session, 30, "mean api calls per measured session");
@@ -658,8 +651,7 @@ mod tests {
             "s1".into(),
             session(NOW - 100, &[("resident-digest", 1, 2800, 800)], MeasuredUsage::default()),
         );
-        write_ledger(&p.state_dir, &l);
-        let r = build(&p, 6000, NOW);
+        let r = build(&p, &l, 6000, NOW);
         assert!(r.recurring.is_none());
         assert!(render(&r).contains("unavailable"));
     }

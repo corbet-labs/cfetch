@@ -1,109 +1,274 @@
-//! Ring-6 exhaust: raw capture of what the agent actually did, plus the 6->5
-//! flagging traps and the ring-5 staging store.
+//! Ring-6 exhaust: raw capture of what the agent actually did, the 6->5
+//! flagging traps, and the hand-off into ring-5 staging.
 //!
-//! Unlike `index.db` (a disposable derived cache), `exhaust.db` is DATA — the
-//! raw material ring 5 is distilled from. It is never dropped on schema
-//! mismatch and cannot be rebuilt from anywhere. It stays per-host LOCAL
-//! (state dir, never NFS) and never leaves the machine: rings 5-6 are
-//! untrusted by definition, surfaced through `cfetch staging` only, never
-//! injected into a session.
+//! Exhaust is DATA OF RECORD, so it lives in the tree — one append-only JSONL
+//! stream per host at `<brain_root>/logs/cfetch/exhaust-<host>.jsonl` (see
+//! [`crate::jsonl`] for the format, its version envelope and its byte cap).
+//! It used to be a SQLite database in the per-host state dir, which made a
+//! candidate flagged on one machine invisible to a distillation session on
+//! another; the tree is the only storage of record, and this is part of it.
+//! No database survives here: the traps stream the stream.
 //!
 //! Secrets are redacted at FIRST capture (commands) or withheld entirely
 //! (secret-shaped paths) so every downstream consumer inherits the guard.
-//! Retention is enforced in the write path itself — a cap only enforced by a
-//! cleanup job is not a cap. Flagged-unconsumed staging rows are EXEMPT from
-//! the event cap (they are ring-5 candidates awaiting a human and deleting
-//! them silently loses the ladder's input); staging has its own separate
-//! high bound that stages an explicit warning when it overflows.
 //!
-//! The 6->5 crossing is automatic and cheap SQL, run from the Stop hook:
+//! The 6->5 crossing runs from the Stop hook over a BOUNDED window of the
+//! local host's stream — the traps are heuristics over recent behavior, and a
+//! hook whose cost grows with history is a hook that eventually stalls:
 //! - fix-discovered: a command failed, then the same normalized command later
-//!   succeeded in the same session — both events carry the story.
+//!   succeeded in the same session — the candidate carries both.
 //! - recurring-failure: the same normalized command failed in >=2 sessions.
 //! - hot-file: a brain file resolving to rings 0-3 written in >=2 distinct
 //!   sessions, or >=10 times in one session. Code files and ring-4 working
 //!   files are churn by contract and never fire.
 //!
-//! Flag = promoted to staging (`flag=1`). Flagging is idempotent (an event is
-//! never flagged twice; the first reason wins). `consumed` encodes the staging
-//! outcome: 0 = awaiting review, 1 = consumed by distillation, 2 = dismissed.
+//! Flagging is idempotent WITHOUT any writer-side bookkeeping: a candidate's
+//! id is a hash of the trap's key, so the existence of `<id>.md` under staging
+//! (pending or dismissed) is the whole "already flagged" test — and it holds
+//! across hosts, because the staging directory is shared. A candidate consumed
+//! on THIS host is remembered through its `consume` record in the stream; one
+//! consumed on another host may legitimately stage again here, which is a
+//! second look at a live pattern rather than a lost one.
 //!
-//! Bash payloads store the buglog-style normalized command (`norm`) at
-//! capture time, and write payloads store the file's resolved ring, so the
-//! traps stay pure SQL over `json_extract`.
+//! Bash payloads store the buglog-style normalized command (`norm`) at capture
+//! time, and write payloads store the file's resolved ring, so the traps stay
+//! cheap field lookups rather than re-derivations.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context as _;
-use rusqlite::Connection;
-
-use crate::config::RingRules;
+use crate::config::{Config, RingRules};
 use crate::hook_io::HookEvent;
+use crate::jsonl::{self, Record};
+use crate::staging::{self, Candidate};
 
-/// Bump on schema change. Exhaust is data: a mismatch is an error for a human
-/// (or a future migration), never a delete-and-rebuild.
-const SCHEMA_VERSION: i64 = 1;
+/// Stream name: files are `exhaust-<host>.jsonl`.
+pub const STREAM: &str = "exhaust";
 
-/// Writer-side retention cap on events OUTSIDE staging. Flagged-unconsumed
-/// rows are never deleted by this cap — see [`MAX_STAGED`].
-pub const MAX_EVENTS: i64 = 20_000;
+/// How much of the local stream's tail the Stop-hook traps read: ~7k recent
+/// events at typical line sizes. Bounded on purpose — this is the one read on
+/// the hook path, it happens once per TURN, and the tree it reads from may be
+/// a network mount. Traps are heuristics over recent behavior; a pattern
+/// older than this window is history, not a live signal.
+pub const TRAP_WINDOW_BYTES: u64 = 1024 * 1024;
 
-/// Separate high bound on staging (flag=1, consumed=0). Overflow drops the
-/// oldest candidates and stages one explicit 'staging-overflow' warning in
-/// their place: silent loss of ring-5 candidates is unacceptable, and so is
-/// silent unbounded growth.
-pub const MAX_STAGED: i64 = 2_000;
+/// Upper bound on PENDING ring-5 candidates. Reaching it stages one explicit
+/// `staging-full` candidate and stops adding more: unlike the old row cap,
+/// nothing a human has not yet reviewed is ever deleted to make room.
+pub const MAX_STAGED: usize = 2_000;
+
+/// Captured commands are clamped so one line stays small enough to be written
+/// (and appended) as a single unit.
+const MAX_COMMAND_CHARS: usize = 2_000;
 
 const REDACTED: &str = "<redacted>";
 /// Stored instead of a secret-shaped file path — even the path leaks.
 pub const WITHHELD: &str = "<secret path withheld>";
 
-fn db_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("exhaust.db")
+/// The ring-6/5 surfaces bound to one brain tree and one host identity.
+#[derive(Debug, Clone)]
+pub struct Exhaust {
+    /// Where the JSONL streams live (`<brain_root>/logs/cfetch`).
+    pub logs_dir: PathBuf,
+    /// Where ring-5 candidates live (`<brain_root>/staging/cfetch`).
+    pub staging_dir: PathBuf,
+    /// This host's identity, stamped into file names and candidates.
+    pub host: String,
+    /// Writer-side byte cap for the exhaust stream.
+    pub max_bytes: u64,
 }
 
-/// Opens (creating if needed) the exhaust DB. A schema-version mismatch on a
-/// non-empty DB is an ERROR: this store is data, never disposable.
-pub fn open(state_dir: &Path) -> anyhow::Result<Connection> {
-    std::fs::create_dir_all(state_dir)?;
-    let path = db_path(state_dir);
-    let conn = Connection::open(&path)
-        .with_context(|| format!("open exhaust db {}", path.display()))?;
-    // Short timeout: this DB is written from the hook path, which must degrade
-    // to a dropped event rather than stall the agent's tool loop.
-    conn.busy_timeout(std::time::Duration::from_millis(200))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version != SCHEMA_VERSION {
-        let tables: i64 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
-            [],
-            |r| r.get(0),
-        )?;
-        if tables > 0 {
-            anyhow::bail!(
-                "exhaust db {} has schema v{version}, this binary expects v{SCHEMA_VERSION}; \
-                 exhaust is data — migrate it, it will not be dropped",
-                path.display()
-            );
-        }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+impl Exhaust {
+    pub fn new(logs_dir: PathBuf, staging_dir: PathBuf, host: String, max_bytes: u64) -> Exhaust {
+        Exhaust { logs_dir, staging_dir, host, max_bytes }
     }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS events(
-           id INTEGER PRIMARY KEY,
-           session_id TEXT NOT NULL,
-           ts INTEGER NOT NULL,
-           kind TEXT NOT NULL,
-           payload TEXT NOT NULL,
-           flag INTEGER NOT NULL DEFAULT 0,
-           flag_reason TEXT,
-           consumed INTEGER NOT NULL DEFAULT 0
-         );
-         CREATE INDEX IF NOT EXISTS events_session ON events(session_id);
-         CREATE INDEX IF NOT EXISTS events_staging ON events(flag, consumed);",
-    )?;
-    Ok(conn)
+
+    pub fn from_config(cfg: &Config) -> Exhaust {
+        Exhaust::new(
+            crate::paths::logs_dir(&cfg.brain_root),
+            crate::paths::staging_dir(&cfg.brain_root),
+            crate::paths::host_id(),
+            cfg.exhaust_max_bytes,
+        )
+    }
+
+    /// Appends one ring-6 event. This is the whole hook write path: one
+    /// `O_APPEND` line, no fsync, no read, no scan.
+    pub fn record(
+        &self,
+        session: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        jsonl::append(
+            &self.logs_dir,
+            STREAM,
+            &self.host,
+            self.max_bytes,
+            serde_json::json!({"kind": kind, "session": session, "payload": payload}),
+        )
+    }
+
+    /// [`Exhaust::record`] with an explicit timestamp. Only the legacy import
+    /// uses it: history carried into the tree must keep the moment it
+    /// happened, not the moment it was moved.
+    pub fn record_at(
+        &self,
+        ts: i64,
+        session: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        jsonl::append(
+            &self.logs_dir,
+            STREAM,
+            &self.host,
+            self.max_bytes,
+            serde_json::json!({"ts": ts, "kind": kind, "session": session, "payload": payload}),
+        )
+    }
+
+    /// PostToolUse capture: Bash -> 'bash' (redacted command + norm + error
+    /// hint), Write|Edit|MultiEdit -> 'write' (path + resolved ring for brain
+    /// files), Read -> 'read'. Anything else, or missing fields, records
+    /// nothing. `brain_root` locates the brain for ring resolution, `rules`
+    /// the configured taxonomy that resolves it.
+    pub fn capture_post_tool(
+        &self,
+        event: &HookEvent,
+        brain_root: &Path,
+        rules: &RingRules,
+    ) -> anyhow::Result<()> {
+        let session = event.session();
+        let str_field = |key: &str| {
+            event.tool_input.as_ref().and_then(|i| i.get(key)).and_then(serde_json::Value::as_str)
+        };
+        match event.tool_name.as_deref() {
+            Some("Bash") => {
+                let Some(cmd) = str_field("command") else { return Ok(()) };
+                let redacted = clamp(&redact_secrets(cmd), MAX_COMMAND_CHARS);
+                let norm = clamp(&normalize_command(&redacted), MAX_COMMAND_CHARS);
+                self.record(
+                    session,
+                    "bash",
+                    &serde_json::json!({
+                        "command": redacted, "norm": norm, "failed": tool_failed(event),
+                    }),
+                )
+            }
+            Some("Write" | "Edit" | "MultiEdit") => {
+                let Some(path) = str_field("file_path") else { return Ok(()) };
+                self.record(session, "write", &write_payload(path, brain_root, rules))
+            }
+            Some("Read") => {
+                let Some(path) = str_field("file_path") else { return Ok(()) };
+                self.record(session, "read", &file_payload(path))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Stop: writes one 'turn' summary event (counts by kind this session),
+    /// then runs the 6->5 traps over the bounded window and stages what fires.
+    pub fn record_stop(&self, session: &str) -> anyhow::Result<()> {
+        let window =
+            jsonl::read_tail(&self.logs_dir, STREAM, &self.host, TRAP_WINDOW_BYTES);
+
+        let mut counts = serde_json::Map::new();
+        for r in &window.records {
+            if r.str("session") != session {
+                continue;
+            }
+            if matches!(r.kind(), "bash" | "write" | "read") {
+                let n = counts.entry(r.kind().to_string()).or_insert(serde_json::Value::from(0));
+                *n = serde_json::Value::from(n.as_i64().unwrap_or(0) + 1);
+            }
+        }
+        self.record(session, "turn", &serde_json::Value::Object(counts))?;
+
+        let decided = consumed_ids(&window.records);
+        let mut pending: Option<usize> = None;
+        for candidate in traps(session, &self.host, &window.records) {
+            if decided.contains(&candidate.id) || staging::exists(&self.staging_dir, &candidate.id)
+            {
+                continue;
+            }
+            let count = match pending {
+                Some(n) => n,
+                None => *pending.insert(staging::pending_count(&self.staging_dir)),
+            };
+            if count >= MAX_STAGED {
+                self.stage_full_notice(session)?;
+                break;
+            }
+            if staging::write(&self.staging_dir, &candidate)? {
+                pending = Some(count + 1);
+                self.record(
+                    session,
+                    "stage",
+                    &serde_json::json!({"id": candidate.id, "reason": candidate.reason}),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Records a staging decision so the traps do not re-stage what this host
+    /// has already dealt with. Dismissals need no record (the moved file is
+    /// its own marker); consumption deletes the file, so this IS the marker.
+    pub fn record_decision(&self, id: &str, decision: &str) -> anyhow::Result<()> {
+        self.record("cli", decision, &serde_json::json!({"id": id}))
+    }
+
+    /// One explicit candidate saying the queue is full. Idempotent by id, so
+    /// an overflowing store converges instead of churning out a warning per
+    /// Stop.
+    fn stage_full_notice(&self, session: &str) -> anyhow::Result<()> {
+        let id = staging::id_for("staging-full", "");
+        if staging::exists(&self.staging_dir, &id) {
+            return Ok(());
+        }
+        let candidate = Candidate {
+            id: id.clone(),
+            reason: "staging-full".into(),
+            session: session.to_string(),
+            host: self.host.clone(),
+            ts: now(),
+            kind: "warning".into(),
+            payload: serde_json::json!({
+                "cap": MAX_STAGED,
+                "note": "ring-5 staging is at its cap; no further candidates are staged until \
+                         the queue is drained (cfetch staging list)",
+            }),
+        };
+        if staging::write(&self.staging_dir, &candidate)? {
+            self.record(session, "stage", &serde_json::json!({"id": id, "reason": "staging-full"}))?;
+        }
+        Ok(())
+    }
+
+    /// Ring-5/6 counts for read-only reporting surfaces. FAIL SILENT by
+    /// design: an absent tree yields zeros — a reporting pane must never
+    /// create ring-6 state.
+    pub fn stats(&self) -> ExhaustStats {
+        let s = staging::stats(&self.staging_dir);
+        ExhaustStats {
+            staged_total: s.total as i64,
+            staged_by_reason: s.by_reason.into_iter().map(|(r, n)| (r, n as i64)).collect(),
+            bytes: jsonl::footprint(&self.logs_dir, STREAM),
+        }
+    }
+}
+
+/// Ring-5/6 figures for the dashboard.
+#[derive(Default)]
+pub struct ExhaustStats {
+    /// Ring-5 candidates awaiting review, across every host.
+    pub staged_total: i64,
+    /// Per-reason breakdown of `staged_total`, in trap order.
+    pub staged_by_reason: Vec<(String, i64)>,
+    /// Bytes of exhaust stream on disk — the store's footprint, without
+    /// reading a line of it.
+    pub bytes: u64,
 }
 
 fn now() -> i64 {
@@ -113,78 +278,182 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Appends one event, enforcing retention in the same write path.
-pub fn record(
-    conn: &Connection,
-    session: &str,
-    kind: &str,
-    payload: &serde_json::Value,
-) -> anyhow::Result<()> {
-    record_with_caps(conn, session, kind, payload, MAX_EVENTS, MAX_STAGED)
+fn clamp(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    s.chars().take(max_chars).collect::<String>() + "…"
 }
 
-fn record_with_caps(
-    conn: &Connection,
-    session: &str,
-    kind: &str,
-    payload: &serde_json::Value,
-    events_cap: i64,
-    staged_cap: i64,
-) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT INTO events(session_id, ts, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![session, now(), kind, payload.to_string()],
-    )?;
-    // Retention NEVER touches flagged-unconsumed rows: those are staging —
-    // ring-5 candidates a human has not reviewed yet. Consumed and dismissed
-    // rows are ordinary history again and age out with everything else.
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM events WHERE NOT (flag = 1 AND consumed = 0)",
-        [],
-        |r| r.get(0),
-    )?;
-    if count > events_cap {
-        conn.execute(
-            "DELETE FROM events WHERE id IN (
-               SELECT id FROM events WHERE NOT (flag = 1 AND consumed = 0)
-                ORDER BY id LIMIT ?1)",
-            [count - events_cap],
-        )?;
-    }
-    enforce_staging_cap(conn, session, staged_cap)
+/// Ids this host has already consumed — their staging files are gone, so the
+/// stream is what remembers them.
+fn consumed_ids(records: &[Record]) -> std::collections::HashSet<String> {
+    records
+        .iter()
+        .filter(|r| r.kind() == "consume")
+        .filter_map(|r| r.value("payload")?.get("id")?.as_str().map(str::to_string))
+        .collect()
 }
 
-/// Caps staging (flag=1, consumed=0) at `cap`. On overflow the OLDEST
-/// candidates are dropped and one flagged 'staging-overflow' warning event is
-/// staged in their place, so the loss shows up in `cfetch staging list`
-/// instead of happening silently. The warning row counts toward the cap
-/// (the result is exactly `cap` rows), so an overflowed store converges
-/// instead of churning out a warning per write.
-fn enforce_staging_cap(conn: &Connection, session: &str, cap: i64) -> anyhow::Result<()> {
-    let staged: i64 = conn.query_row(
-        "SELECT count(*) FROM events WHERE flag = 1 AND consumed = 0",
-        [],
-        |r| r.get(0),
-    )?;
-    if staged <= cap {
-        return Ok(());
+/// One captured bash event, flattened out of its record.
+struct BashRow<'a> {
+    session: &'a str,
+    norm: &'a str,
+    command: &'a str,
+    failed: bool,
+    ts: i64,
+}
+
+/// One captured write event with a resolved brain ring.
+struct WriteRow<'a> {
+    session: &'a str,
+    path: &'a str,
+    ring: i64,
+    ts: i64,
+}
+
+fn bash_rows<'a>(records: &'a [Record]) -> Vec<BashRow<'a>> {
+    records
+        .iter()
+        .filter(|r| r.kind() == "bash")
+        .filter_map(|r| {
+            let p = r.value("payload")?.as_object()?;
+            Some(BashRow {
+                session: r.str("session"),
+                norm: p.get("norm")?.as_str()?,
+                command: p.get("command").and_then(|v| v.as_str()).unwrap_or_default(),
+                failed: p.get("failed").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                ts: r.ts,
+            })
+        })
+        .collect()
+}
+
+fn write_rows<'a>(records: &'a [Record]) -> Vec<WriteRow<'a>> {
+    records
+        .iter()
+        .filter(|r| r.kind() == "write")
+        .filter_map(|r| {
+            let p = r.value("payload")?.as_object()?;
+            Some(WriteRow {
+                session: r.str("session"),
+                path: p.get("file_path")?.as_str()?,
+                // Withheld secret paths carry NO ring, so they can never
+                // aggregate into a fake hot file.
+                ring: p.get("ring")?.as_i64()?,
+                ts: r.ts,
+            })
+        })
+        .collect()
+}
+
+/// The 6->5 crossing, in most-specific-first order. Pure over the window: the
+/// caller decides what is new by asking the staging directory.
+fn traps(session: &str, host: &str, records: &[Record]) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let bash = bash_rows(records);
+    let writes = write_rows(records);
+    fix_discovered(session, host, &bash, &mut out);
+    recurring_failure(host, &bash, &mut out);
+    hot_files(session, host, &writes, &mut out);
+    out
+}
+
+/// (a) fix-discovered: a normalized command failed, then the same normalized
+/// command succeeded LATER in the stopping session. One candidate per norm,
+/// carrying both halves of the story.
+fn fix_discovered(session: &str, host: &str, bash: &[BashRow<'_>], out: &mut Vec<Candidate>) {
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, failure) in bash.iter().enumerate() {
+        if failure.session != session || !failure.failed || seen.contains(&failure.norm) {
+            continue;
+        }
+        let Some(fix) = bash[i + 1..]
+            .iter()
+            .find(|s| s.session == session && !s.failed && s.norm == failure.norm)
+        else {
+            continue;
+        };
+        seen.push(failure.norm);
+        out.push(Candidate {
+            id: staging::id_for("fix-discovered", &format!("{session}\u{0}{}", failure.norm)),
+            reason: "fix-discovered".into(),
+            session: session.to_string(),
+            host: host.to_string(),
+            ts: fix.ts,
+            kind: "bash".into(),
+            payload: serde_json::json!({
+                "norm": failure.norm,
+                "failed_command": failure.command,
+                "fixed_command": fix.command,
+            }),
+        });
     }
-    let dropped = staged - cap + 1;
-    conn.execute(
-        "DELETE FROM events WHERE id IN (
-           SELECT id FROM events WHERE flag = 1 AND consumed = 0 ORDER BY id LIMIT ?1)",
-        [dropped],
-    )?;
-    conn.execute(
-        "INSERT INTO events(session_id, ts, kind, payload, flag, flag_reason)
-         VALUES (?1, ?2, 'warning', ?3, 1, 'staging-overflow')",
-        rusqlite::params![
-            session,
-            now(),
-            serde_json::json!({"dropped": dropped, "cap": cap}).to_string()
-        ],
-    )?;
-    Ok(())
+}
+
+/// (b) recurring-failure: the same normalized command failed in >= 2 distinct
+/// sessions. Cross-session by definition, so it looks at the whole window.
+fn recurring_failure(host: &str, bash: &[BashRow<'_>], out: &mut Vec<Candidate>) {
+    let mut by_norm: std::collections::BTreeMap<&str, (Vec<&str>, &str, i64)> =
+        std::collections::BTreeMap::new();
+    for row in bash.iter().filter(|b| b.failed) {
+        let entry = by_norm.entry(row.norm).or_insert_with(|| (Vec::new(), row.command, row.ts));
+        if !entry.0.contains(&row.session) {
+            entry.0.push(row.session);
+        }
+        entry.2 = row.ts;
+    }
+    for (norm, (sessions, command, ts)) in by_norm {
+        if sessions.len() < 2 {
+            continue;
+        }
+        out.push(Candidate {
+            id: staging::id_for("recurring-failure", norm),
+            reason: "recurring-failure".into(),
+            session: sessions.last().copied().unwrap_or_default().to_string(),
+            host: host.to_string(),
+            ts,
+            kind: "bash".into(),
+            payload: serde_json::json!({
+                "norm": norm, "command": command, "sessions": sessions.len(),
+            }),
+        });
+    }
+}
+
+/// (c) hot-file: a brain file resolving to rings 0-3 written in >= 2 distinct
+/// sessions OR >= 10 times in the stopping session. Code files carry no ring
+/// and ring-4 working files are churn by contract, so neither ever fires.
+fn hot_files(session: &str, host: &str, writes: &[WriteRow<'_>], out: &mut Vec<Candidate>) {
+    let mut by_path: std::collections::BTreeMap<&str, (Vec<&str>, usize, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for w in writes.iter().filter(|w| (0..=3).contains(&w.ring)) {
+        let entry = by_path.entry(w.path).or_insert_with(|| (Vec::new(), 0, w.ring, w.ts));
+        if !entry.0.contains(&w.session) {
+            entry.0.push(w.session);
+        }
+        if w.session == session {
+            entry.1 += 1;
+        }
+        entry.3 = w.ts;
+    }
+    for (path, (sessions, in_session, ring, ts)) in by_path {
+        if sessions.len() < 2 && in_session < 10 {
+            continue;
+        }
+        out.push(Candidate {
+            id: staging::id_for("hot-file", path),
+            reason: "hot-file".into(),
+            session: session.to_string(),
+            host: host.to_string(),
+            ts,
+            kind: "write".into(),
+            payload: serde_json::json!({
+                "file_path": path, "ring": ring,
+                "sessions": sessions.len(), "writes_this_session": in_session,
+            }),
+        });
+    }
 }
 
 /// Redacts secret-shaped material from a shell command: values of
@@ -370,47 +639,6 @@ pub fn secret_path(path: &str) -> bool {
         || base == "id_ed25519"
 }
 
-/// PostToolUse capture: Bash -> 'bash' (redacted command + norm + error
-/// hint), Write|Edit|MultiEdit -> 'write' (path + resolved ring for brain
-/// files), Read -> 'read'. Anything else, or missing fields, records
-/// nothing. `brain_root` locates the brain for ring resolution, `rules` the
-/// configured taxonomy that resolves it.
-pub fn capture_post_tool(
-    conn: &Connection,
-    event: &HookEvent,
-    brain_root: &Path,
-    rules: &RingRules,
-) -> anyhow::Result<()> {
-    let session = event.session();
-    let str_field = |key: &str| {
-        event.tool_input.as_ref().and_then(|i| i.get(key)).and_then(serde_json::Value::as_str)
-    };
-    match event.tool_name.as_deref() {
-        Some("Bash") => {
-            let Some(cmd) = str_field("command") else { return Ok(()) };
-            let redacted = redact_secrets(cmd);
-            let norm = normalize_command(&redacted);
-            record(
-                conn,
-                session,
-                "bash",
-                &serde_json::json!({
-                    "command": redacted, "norm": norm, "failed": tool_failed(event),
-                }),
-            )
-        }
-        Some("Write" | "Edit" | "MultiEdit") => {
-            let Some(path) = str_field("file_path") else { return Ok(()) };
-            record(conn, session, "write", &write_payload(path, brain_root, rules))
-        }
-        Some("Read") => {
-            let Some(path) = str_field("file_path") else { return Ok(()) };
-            record(conn, session, "read", &file_payload(path))
-        }
-        _ => Ok(()),
-    }
-}
-
 fn file_payload(path: &str) -> serde_json::Value {
     let stored = if secret_path(path) { WITHHELD } else { path };
     serde_json::json!({"file_path": stored})
@@ -418,9 +646,9 @@ fn file_payload(path: &str) -> serde_json::Value {
 
 /// Write payload: the path (or the withheld placeholder) plus, for files
 /// under `brain_root`, the resolved ring — computed at capture time so the
-/// hot-file trap stays pure SQL over `json_extract` (the same pattern as
-/// bash `norm`). Withheld paths carry NO ring, which keeps them out of the
-/// trap by construction.
+/// hot-file trap stays a field lookup (the same pattern as bash `norm`).
+/// Withheld paths carry NO ring, which keeps them out of the trap by
+/// construction. `rules` is the configured taxonomy the ring resolves through.
 fn write_payload(path: &str, brain_root: &Path, rules: &RingRules) -> serde_json::Value {
     if secret_path(path) {
         return serde_json::json!({"file_path": WITHHELD});
@@ -474,201 +702,35 @@ fn tool_failed(event: &HookEvent) -> bool {
         .any(|k| obj.get(*k).and_then(serde_json::Value::as_bool) == Some(true))
 }
 
-/// Stop: writes one 'turn' summary event (counts by kind this session), then
-/// runs the 6->5 traps.
-pub fn record_stop(conn: &Connection, session: &str) -> anyhow::Result<()> {
-    let mut counts = serde_json::Map::new();
-    let mut stmt = conn.prepare(
-        "SELECT kind, count(*) FROM events
-          WHERE session_id = ?1 AND kind IN ('bash', 'write', 'read')
-          GROUP BY kind ORDER BY kind",
-    )?;
-    let per_kind = stmt.query_map([session], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-    for row in per_kind {
-        let (kind, n) = row?;
-        counts.insert(kind, serde_json::Value::from(n));
-    }
-    record(conn, session, "turn", &serde_json::Value::Object(counts))?;
-    run_traps(conn, session)
-}
-
-/// The 6->5 crossing. Each trap is one UPDATE guarded by `flag = 0`, so an
-/// already-flagged event is never re-flagged (the first reason wins) and a
-/// re-run is a no-op. Traps run in most-specific-first order.
-fn run_traps(conn: &Connection, session: &str) -> anyhow::Result<()> {
-    // (a) fix-discovered: a normalized command failed, then the same
-    // normalized command succeeded LATER in the same session. Both the
-    // failure and the fix carry the story, so both are staged.
-    conn.execute(
-        "UPDATE events SET flag = 1, flag_reason = 'fix-discovered'
-          WHERE flag = 0 AND session_id = ?1 AND kind = 'bash'
-            AND json_extract(payload, '$.norm') IN (
-              SELECT json_extract(f.payload, '$.norm') FROM events f
-               WHERE f.session_id = ?1 AND f.kind = 'bash'
-                 AND json_extract(f.payload, '$.failed')
-                 AND EXISTS (
-                   SELECT 1 FROM events s
-                    WHERE s.session_id = ?1 AND s.kind = 'bash'
-                      AND NOT json_extract(s.payload, '$.failed')
-                      AND json_extract(s.payload, '$.norm') =
-                          json_extract(f.payload, '$.norm')
-                      AND s.id > f.id))",
-        [session],
-    )?;
-    // (b) recurring-failure: the same normalized command failed in >= 2
-    // distinct sessions (any session — the pattern is cross-session by
-    // definition, so this trap scans globally).
-    conn.execute(
-        "UPDATE events SET flag = 1, flag_reason = 'recurring-failure'
-          WHERE flag = 0 AND kind = 'bash' AND json_extract(payload, '$.failed')
-            AND json_extract(payload, '$.norm') IN (
-              SELECT json_extract(payload, '$.norm') FROM events
-               WHERE kind = 'bash' AND json_extract(payload, '$.failed')
-               GROUP BY json_extract(payload, '$.norm')
-              HAVING count(DISTINCT session_id) >= 2)",
-        [],
-    )?;
-    // (c) hot-file: a brain file resolving to rings 0-3 (the ring is stored
-    // in the write payload at capture time; code files carry none and ring-4
-    // working files are churn by contract), written in >= 2 distinct
-    // sessions OR >= 10 times in the stopping session. Only the LATEST write
-    // is staged (one candidate per hot file), and a file that already
-    // produced a flag never fires again (sum(flag) = 0). Withheld secret
-    // paths never carry a ring, so their shared placeholder can never
-    // aggregate into a fake hot file.
-    conn.execute(
-        "UPDATE events SET flag = 1, flag_reason = 'hot-file'
-          WHERE flag = 0 AND kind = 'write'
-            AND id IN (
-              SELECT max(w.id) FROM events w
-               WHERE w.kind = 'write'
-                 AND json_extract(w.payload, '$.ring') BETWEEN 0 AND 3
-               GROUP BY json_extract(w.payload, '$.file_path')
-              HAVING (count(DISTINCT w.session_id) >= 2
-                      OR sum(w.session_id = ?1) >= 10)
-                 AND sum(w.flag) = 0)",
-        [session],
-    )?;
-    // The traps are where staging grows, so the staging bound is enforced
-    // here as well as in the write path.
-    enforce_staging_cap(conn, session, MAX_STAGED)
-}
-
-/// One ring-5 staging candidate (a flagged, unconsumed event).
-pub struct Staged {
-    pub id: i64,
-    pub session_id: String,
-    pub ts: i64,
-    pub kind: String,
-    pub payload: String,
-    pub reason: String,
-}
-
-/// Flagged, unconsumed events, newest first.
-pub fn staging_list(conn: &Connection) -> anyhow::Result<Vec<Staged>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, session_id, ts, kind, payload, coalesce(flag_reason, '')
-           FROM events WHERE flag = 1 AND consumed = 0 ORDER BY id DESC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(Staged {
-            id: r.get(0)?,
-            session_id: r.get(1)?,
-            ts: r.get(2)?,
-            kind: r.get(3)?,
-            payload: r.get(4)?,
-            reason: r.get(5)?,
-        })
-    })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
-}
-
-/// Marks a staged candidate consumed (a distillation session took it).
-/// Returns false when no such candidate is staged.
-pub fn consume(conn: &Connection, id: i64) -> anyhow::Result<bool> {
-    mark(conn, id, 1)
-}
-
-/// Drops a staged candidate without consuming it. Returns false when no such
-/// candidate is staged. The row keeps `flag=1` so the traps stay idempotent.
-pub fn dismiss(conn: &Connection, id: i64) -> anyhow::Result<bool> {
-    mark(conn, id, 2)
-}
-
-fn mark(conn: &Connection, id: i64, state: i64) -> anyhow::Result<bool> {
-    let n = conn.execute(
-        "UPDATE events SET consumed = ?2 WHERE id = ?1 AND flag = 1 AND consumed = 0",
-        rusqlite::params![id, state],
-    )?;
-    Ok(n > 0)
-}
-
-/// Ring-5/6 counts for read-only reporting surfaces (the dashboard).
-#[derive(Default)]
-pub struct ExhaustStats {
-    /// Flagged, unconsumed staging candidates awaiting review.
-    pub staged_total: i64,
-    /// Per-reason breakdown of `staged_total`, in trap order; absent
-    /// reasons are omitted.
-    pub staged_by_reason: Vec<(String, i64)>,
-    /// Total captured ring-6 events — the store's footprint.
-    pub events: i64,
-}
-
-/// Counts staging candidates by flag reason plus total events. FAIL SILENT
-/// by design: an absent or unreadable exhaust DB yields zeros — a reporting
-/// pane must never create ring-6 state or contend with the hook writers,
-/// hence the read-only open.
-pub fn stats(state_dir: &Path) -> ExhaustStats {
-    use rusqlite::OpenFlags;
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let Ok(conn) = Connection::open_with_flags(db_path(state_dir), flags) else {
-        return ExhaustStats::default();
-    };
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
-    let staged_by_reason: Vec<(String, i64)> = conn
-        .prepare(
-            "SELECT coalesce(flag_reason, '?'), count(*) FROM events
-              WHERE flag = 1 AND consumed = 0
-              GROUP BY flag_reason
-              ORDER BY CASE flag_reason
-                         WHEN 'fix-discovered' THEN 0
-                         WHEN 'recurring-failure' THEN 1
-                         WHEN 'hot-file' THEN 2
-                         ELSE 3 END, flag_reason",
-        )
-        .and_then(|mut s| {
-            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
-        .unwrap_or_default();
-    ExhaustStats {
-        staged_total: staged_by_reason.iter().map(|(_, n)| n).sum(),
-        staged_by_reason,
-        events: conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).unwrap_or(0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    type Row = (i64, String, String, String, i64, Option<String>, i64);
-
-    fn open_tmp() -> (tempfile::TempDir, Connection) {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = open(dir.path()).unwrap();
-        (dir, conn)
-    }
 
     /// Test brain root: capture resolves write rings against this prefix.
     /// The files need not exist — ring resolution then falls back to the
     /// location default, exactly like production on a deleted file.
     const BRAIN: &str = "/b/agents";
 
-    fn cap(conn: &Connection, event: &HookEvent) -> anyhow::Result<()> {
-        capture_post_tool(conn, event, Path::new(BRAIN), &RingRules::default())
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        ex: Exhaust,
+    }
+
+    fn fixture(host: &str) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = Exhaust::new(
+            dir.path().join("logs/cfetch"),
+            dir.path().join("staging/cfetch"),
+            host.to_string(),
+            1 << 20,
+        );
+        Fixture { _dir: dir, ex }
+    }
+
+    /// A second host writing into the SAME tree.
+    fn peer(f: &Fixture, host: &str) -> Exhaust {
+        Exhaust::new(f.ex.logs_dir.clone(), f.ex.staging_dir.clone(), host.into(), 1 << 20)
     }
 
     fn bash_event(session: &str, cmd: &str, failed: bool) -> HookEvent {
@@ -690,37 +752,431 @@ mod tests {
         }
     }
 
-    /// (id, session_id, kind, payload, flag, flag_reason, consumed), by id.
-    fn rows(conn: &Connection) -> Vec<Row> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_id, kind, payload, flag, flag_reason, consumed
-                 FROM events ORDER BY id",
-            )
-            .unwrap();
-        let it = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                ))
-            })
-            .unwrap();
-        it.map(Result::unwrap).collect()
+    impl Fixture {
+        fn cap(&self, event: &HookEvent) {
+            self.ex.capture_post_tool(event, Path::new(BRAIN), &RingRules::default()).unwrap();
+        }
+
+        fn stop(&self, session: &str) {
+            self.ex.record_stop(session).unwrap();
+        }
+
+        fn records(&self) -> Vec<Record> {
+            jsonl::read_all(&self.ex.logs_dir, STREAM).records
+        }
+
+        fn staged(&self) -> Vec<Candidate> {
+            staging::list(&self.ex.staging_dir)
+        }
     }
 
-    /// (id, flag_reason) of flagged events, by id.
-    fn flagged(conn: &Connection) -> Vec<(i64, String)> {
-        rows(conn)
-            .into_iter()
-            .filter(|r| r.4 == 1)
-            .map(|r| (r.0, r.5.unwrap_or_default()))
-            .collect()
+    #[test]
+    fn capture_appends_versioned_lines_to_this_hosts_stream() {
+        let f = fixture("host-alpha");
+        f.cap(&bash_event("s1", "cargo build", false));
+        let path = jsonl::stream_path(&f.ex.logs_dir, STREAM, "host-alpha");
+        assert!(path.is_file(), "the stream file carries the host name");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1, "one event, one line");
+        let line: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(line["v"], 1);
+        assert_eq!(line["host"], "host-alpha");
+        assert_eq!(line["kind"], "bash");
+        assert_eq!(line["session"], "s1");
+        assert_eq!(line["payload"]["command"], "cargo build");
+    }
+
+    #[test]
+    fn bash_capture_is_redacted_session_keyed_and_error_hinted() {
+        let f = fixture("h1");
+        f.cap(&bash_event("s1", "export API_TOKEN=abc123", true));
+        f.cap(&bash_event("s2", "ls", false));
+        let all = f.records();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].str("session"), "s1");
+        assert_eq!(all[0].kind(), "bash");
+        let p = all[0].value("payload").unwrap();
+        assert_eq!(p["command"], "export API_TOKEN=<redacted>");
+        assert_eq!(p["failed"], true);
+        assert_eq!(p["norm"], "export api_token=<redacted>");
+        assert_eq!(all[1].str("session"), "s2");
+        assert_eq!(all[1].value("payload").unwrap()["failed"], false);
+    }
+
+    #[test]
+    fn secret_paths_are_withheld_at_capture() {
+        let f = fixture("h1");
+        f.cap(&file_event("s1", "Write", "/home/x/.env.production"));
+        f.cap(&file_event("s1", "Edit", "/home/x/mind/secrets/koyeb.yml"));
+        f.cap(&file_event("s1", "Read", "/home/x/server.pem"));
+        f.cap(&file_event("s1", "Write", "/home/x/src/main.rs"));
+        let all = f.records();
+        assert_eq!(all.len(), 4);
+        for r in &all[..3] {
+            assert_eq!(r.value("payload").unwrap()["file_path"], WITHHELD);
+        }
+        assert_eq!(all[3].value("payload").unwrap()["file_path"], "/home/x/src/main.rs");
+    }
+
+    #[test]
+    fn tool_error_field_counts_as_failure() {
+        let f = fixture("h1");
+        let mut ev = bash_event("s1", "ls", false);
+        ev.tool_error = Some(json!("exit status 1"));
+        f.cap(&ev);
+        assert_eq!(f.records()[0].value("payload").unwrap()["failed"], true);
+    }
+
+    #[test]
+    fn non_capture_tools_and_missing_fields_are_ignored() {
+        let f = fixture("h1");
+        let mut glob = bash_event("s1", "x", false);
+        glob.tool_name = Some("Glob".into());
+        f.cap(&glob);
+        let mut no_cmd = bash_event("s1", "x", false);
+        no_cmd.tool_input = Some(json!({"description": "no command field"}));
+        f.cap(&no_cmd);
+        let mut no_path = file_event("s1", "Write", "x");
+        no_path.tool_input = Some(json!({}));
+        f.cap(&no_path);
+        assert!(f.records().is_empty());
+        f.cap(&file_event("s1", "MultiEdit", "/a/b.rs"));
+        f.cap(&file_event("s1", "Read", "/a/b.rs"));
+        let all = f.records();
+        assert_eq!(all[0].kind(), "write");
+        assert_eq!(all[1].kind(), "read");
+    }
+
+    #[test]
+    fn long_commands_are_clamped_so_one_event_stays_one_short_line() {
+        let f = fixture("h1");
+        f.cap(&bash_event("s1", &"x".repeat(MAX_COMMAND_CHARS * 3), false));
+        let raw = std::fs::read_to_string(jsonl::stream_path(&f.ex.logs_dir, STREAM, "h1"))
+            .unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        assert!(raw.len() < 3 * MAX_COMMAND_CHARS, "line stayed small: {}", raw.len());
+    }
+
+    #[test]
+    fn the_stream_rotates_at_its_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = Exhaust::new(
+            dir.path().join("logs/cfetch"),
+            dir.path().join("staging/cfetch"),
+            "h1".into(),
+            1000,
+        );
+        for i in 0..200 {
+            ex.record("s1", "bash", &json!({"i": i})).unwrap();
+        }
+        let files = jsonl::stream_paths(&ex.logs_dir, STREAM);
+        assert!(files.len() > 1, "the cap rotated the live file");
+        assert!(files.len() <= jsonl::MAX_ROTATIONS + 1, "at most 2 rotations are kept");
+        for p in &files {
+            assert!(
+                std::fs::metadata(p).unwrap().len() <= 1000 + 128,
+                "no generation exceeds the cap: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn stop_records_turn_summary_counts() {
+        let f = fixture("h1");
+        f.cap(&bash_event("s1", "cargo test", true));
+        f.cap(&bash_event("s1", "ls", false));
+        f.cap(&file_event("s1", "Write", "/a/b.rs"));
+        f.cap(&file_event("s1", "Read", "/a/b.rs"));
+        f.cap(&bash_event("s2", "other session", false));
+        f.stop("s1");
+        let all = f.records();
+        let turn = all.iter().rev().find(|r| r.kind() == "turn").unwrap();
+        assert_eq!(turn.str("session"), "s1");
+        let p = turn.value("payload").unwrap();
+        assert_eq!(p["bash"], 2, "s2 activity must not leak into s1's summary");
+        assert_eq!(p["write"], 1);
+        assert_eq!(p["read"], 1);
+    }
+
+    #[test]
+    fn fix_discovered_trap_stages_one_candidate_carrying_both_halves() {
+        let f = fixture("h1");
+        f.cap(&bash_event("s1", "cargo test --lib", true));
+        f.cap(&bash_event("s1", "echo unrelated", false));
+        // Same normalized command (case + whitespace noise), now succeeding.
+        f.cap(&bash_event("s1", "CARGO   TEST --lib", false));
+        f.stop("s1");
+        let staged = f.staged();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].reason, "fix-discovered");
+        assert_eq!(staged[0].payload["failed_command"], "cargo test --lib");
+        assert_eq!(staged[0].payload["fixed_command"], "CARGO   TEST --lib");
+        f.stop("s1");
+        assert_eq!(f.staged(), staged, "the trap must be idempotent");
+    }
+
+    #[test]
+    fn no_fix_flag_when_success_precedes_failure() {
+        let f = fixture("h1");
+        f.cap(&bash_event("s1", "cargo test", false));
+        f.cap(&bash_event("s1", "cargo test", true));
+        f.stop("s1");
+        assert!(f.staged().is_empty(), "success BEFORE failure is not a discovered fix");
+    }
+
+    #[test]
+    fn recurring_failure_trap_fires_once() {
+        let f = fixture("h1");
+        // Same normalized command (paths normalize away) failing in 2 sessions.
+        f.cap(&bash_event("s1", "bash /tmp/deploy.sh", true));
+        f.cap(&bash_event("s2", "bash /opt/deploy.sh", true));
+        f.stop("s2");
+        let staged = f.staged();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].reason, "recurring-failure");
+        assert_eq!(staged[0].payload["sessions"], 2);
+        f.stop("s2");
+        f.stop("s1");
+        assert_eq!(f.staged(), staged, "the trap must be idempotent");
+    }
+
+    #[test]
+    fn hot_file_counts_only_brain_rings_0_to_3() {
+        let f = fixture("h1");
+        for _ in 0..10 {
+            f.cap(&file_event("s1", "Write", "/elsewhere/churn.rs"));
+            f.cap(&file_event("s1", "Write", "/b/agents/todo/active/x/STATUS.md"));
+            f.cap(&file_event("s1", "Write", "/b/agents/knowledge/hosts/server.md"));
+        }
+        f.stop("s1");
+        let staged = f.staged();
+        assert_eq!(staged.len(), 1, "code and ring-4 working files never fire");
+        assert_eq!(staged[0].reason, "hot-file");
+        assert_eq!(staged[0].payload["file_path"], "/b/agents/knowledge/hosts/server.md");
+        assert_eq!(staged[0].payload["ring"], 3, "the candidate carries the resolved ring");
+        f.stop("s1");
+        assert_eq!(f.staged().len(), 1, "the trap must be idempotent");
+    }
+
+    #[test]
+    fn hot_file_needs_ten_writes_within_one_session() {
+        let f = fixture("h1");
+        for _ in 0..9 {
+            f.cap(&file_event("s1", "Write", "/b/agents/knowledge/one.md"));
+        }
+        f.stop("s1");
+        assert!(f.staged().is_empty(), "9 same-session writes are churn, not heat");
+        f.cap(&file_event("s1", "Write", "/b/agents/knowledge/one.md"));
+        f.stop("s1");
+        assert_eq!(f.staged().len(), 1, "the 10th write crosses the threshold");
+    }
+
+    #[test]
+    fn hot_file_fires_across_two_sessions_and_only_once() {
+        let f = fixture("h1");
+        f.cap(&file_event("s1", "Write", "/b/agents/knowledge/two.md"));
+        f.stop("s1");
+        assert!(f.staged().is_empty(), "one session alone is no cross-session pattern");
+        f.cap(&file_event("s2", "Write", "/b/agents/knowledge/two.md"));
+        f.stop("s2");
+        assert_eq!(f.staged().len(), 1);
+        f.stop("s2");
+        f.stop("s1");
+        assert_eq!(f.staged().len(), 1, "the trap must be idempotent across sessions");
+    }
+
+    #[test]
+    fn hot_file_respects_frontmatter_ring_override() {
+        // A knowledge file declaring itself ring 5 is quarantined content and
+        // never a candidate; a todo file declaring ring 3 counts.
+        let brain = tempfile::tempdir().unwrap();
+        let quarantined = brain.path().join("knowledge/q.md");
+        std::fs::create_dir_all(quarantined.parent().unwrap()).unwrap();
+        std::fs::write(&quarantined, "---\nring: 5\n---\nbody\n").unwrap();
+        let promoted = brain.path().join("todo/notes.md");
+        std::fs::create_dir_all(promoted.parent().unwrap()).unwrap();
+        std::fs::write(&promoted, "---\nring: 3\n---\nbody\n").unwrap();
+
+        let f = fixture("h1");
+        for s in ["s1", "s2"] {
+            for p in [&quarantined, &promoted] {
+                f.ex
+                    .capture_post_tool(
+                        &file_event(s, "Write", &p.to_string_lossy()),
+                        brain.path(),
+                        &RingRules::default(),
+                    )
+                    .unwrap();
+            }
+            f.stop(s);
+        }
+        let staged = f.staged();
+        assert_eq!(staged.len(), 1, "the ring-5 override quarantines, the ring-3 override admits");
+        assert_eq!(staged[0].payload["file_path"], promoted.to_string_lossy().as_ref());
+        assert_eq!(staged[0].payload["ring"], 3);
+    }
+
+    #[test]
+    fn hot_file_never_aggregates_withheld_paths() {
+        // Two DIFFERENT secret files under the brain share one stored
+        // placeholder across two sessions: they must not merge into a fake hot
+        // file (withheld payloads carry no ring).
+        let f = fixture("h1");
+        f.cap(&file_event("s1", "Write", "/b/agents/knowledge/api-password.md"));
+        f.cap(&file_event("s2", "Write", "/b/agents/knowledge/db-password.md"));
+        f.stop("s2");
+        assert!(f.staged().is_empty());
+    }
+
+    #[test]
+    fn consumed_candidates_do_not_re_stage_on_this_host() {
+        let f = fixture("h1");
+        for s in ["s1", "s2"] {
+            f.cap(&file_event(s, "Write", "/b/agents/knowledge/one.md"));
+        }
+        f.stop("s2");
+        let id = f.staged()[0].id.clone();
+        assert!(staging::consume(&f.ex.staging_dir, &id).unwrap());
+        f.ex.record_decision(&id, "consume").unwrap();
+        f.stop("s2");
+        assert!(f.staged().is_empty(), "a consumed candidate must not come back");
+    }
+
+    #[test]
+    fn dismissed_candidates_do_not_re_stage_on_any_host() {
+        let f = fixture("host-alpha");
+        for s in ["s1", "s2"] {
+            f.cap(&file_event(s, "Write", "/b/agents/knowledge/one.md"));
+        }
+        f.stop("s2");
+        let id = f.staged()[0].id.clone();
+        assert!(staging::dismiss(&f.ex.staging_dir, &id).unwrap());
+        f.stop("s2");
+        assert!(f.staged().is_empty(), "the dismissed file is the tree-wide marker");
+        // …including for a different host writing the same pattern.
+        let other = peer(&f, "host-beta");
+        for s in ["s3", "s4"] {
+            other
+                .capture_post_tool(
+                    &file_event(s, "Write", "/b/agents/knowledge/one.md"),
+                    Path::new(BRAIN),
+                    &RingRules::default(),
+                )
+                .unwrap();
+        }
+        other.record_stop("s4").unwrap();
+        assert!(f.staged().is_empty(), "candidate ids are content-addressed, not per host");
+    }
+
+    #[test]
+    fn two_hosts_share_one_staging_queue_and_one_log_directory() {
+        // The defect this change fixes: what host alpha flags, host beta sees.
+        let f = fixture("host-alpha");
+        let beta = peer(&f, "host-beta");
+        for s in ["s1", "s2"] {
+            f.cap(&file_event(s, "Write", "/b/agents/knowledge/alpha.md"));
+            beta.capture_post_tool(
+                &file_event(s, "Write", "/b/agents/knowledge/beta.md"),
+                Path::new(BRAIN),
+                &RingRules::default(),
+            )
+            .unwrap();
+        }
+        f.stop("s2");
+        beta.record_stop("s2").unwrap();
+
+        let staged = f.staged();
+        assert_eq!(staged.len(), 2, "both hosts' candidates are in one queue");
+        let hosts: Vec<&str> = staged.iter().map(|c| c.host.as_str()).collect();
+        assert!(hosts.contains(&"host-alpha") && hosts.contains(&"host-beta"));
+        assert_eq!(
+            staged,
+            staging::list(&beta.staging_dir),
+            "and every host lists the same queue"
+        );
+
+        // Each host's exhaust went to its OWN file; reads see both.
+        assert!(jsonl::stream_path(&f.ex.logs_dir, STREAM, "host-alpha").is_file());
+        assert!(jsonl::stream_path(&f.ex.logs_dir, STREAM, "host-beta").is_file());
+        let all = jsonl::read_all(&f.ex.logs_dir, STREAM);
+        assert!(all.records.iter().any(|r| r.host == "host-alpha"));
+        assert!(all.records.iter().any(|r| r.host == "host-beta"));
+        assert!(all.unreadable.is_empty());
+    }
+
+    #[test]
+    fn staging_cap_stages_one_explicit_notice_and_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = Exhaust::new(
+            dir.path().join("logs/cfetch"),
+            dir.path().join("staging/cfetch"),
+            "h1".into(),
+            1 << 20,
+        );
+        // Fill staging to the cap with hand-made candidates, then make the
+        // traps fire.
+        for i in 0..MAX_STAGED {
+            staging::write(
+                &ex.staging_dir,
+                &Candidate {
+                    id: format!("filler-{i:05}"),
+                    reason: "hot-file".into(),
+                    session: "s0".into(),
+                    host: "h1".into(),
+                    ts: 1,
+                    kind: "write".into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        }
+        for s in ["s1", "s2"] {
+            ex.capture_post_tool(
+                &file_event(s, "Write", "/b/agents/knowledge/hot.md"),
+                Path::new(BRAIN),
+                &RingRules::default(),
+            )
+            .unwrap();
+        }
+        ex.record_stop("s2").unwrap();
+        let staged = staging::list(&ex.staging_dir);
+        assert_eq!(staged.len(), MAX_STAGED + 1, "the queue grew by exactly the notice");
+        assert_eq!(staged.iter().filter(|c| c.reason == "staging-full").count(), 1);
+        assert_eq!(
+            staged.iter().filter(|c| c.reason == "hot-file" && c.session == "s2").count(),
+            0,
+            "no new candidate is admitted past the cap"
+        );
+        ex.record_stop("s2").unwrap();
+        assert_eq!(
+            staging::list(&ex.staging_dir).len(),
+            MAX_STAGED + 1,
+            "an overflowed queue converges instead of churning notices"
+        );
+    }
+
+    #[test]
+    fn stats_report_staging_by_reason_and_the_stream_footprint() {
+        let f = fixture("h1");
+        let empty = f.ex.stats();
+        assert_eq!(empty.staged_total, 0);
+        assert_eq!(empty.bytes, 0);
+        assert!(!f.ex.logs_dir.exists(), "a reporting surface must never create ring-6 state");
+
+        for s in ["s1", "s2"] {
+            f.cap(&file_event(s, "Write", "/b/agents/knowledge/one.md"));
+            f.cap(&bash_event(s, "bash /tmp/deploy.sh", true));
+        }
+        f.stop("s2");
+        let s = f.ex.stats();
+        assert_eq!(s.staged_total, 2);
+        assert_eq!(
+            s.staged_by_reason,
+            vec![("recurring-failure".to_string(), 1), ("hot-file".to_string(), 1)],
+            "reasons in trap order"
+        );
+        assert!(s.bytes > 0);
     }
 
     #[test]
@@ -736,24 +1192,15 @@ mod tests {
             ("curl --api-key sk-live-abc", "curl --api-key <redacted>"),
             // URL userinfo
             (
-                "git clone https://julian:hunter2@github.com/x/y.git",
+                "git clone https://user:hunter2@github.com/x/y.git",
                 "git clone https://<redacted>@github.com/x/y.git",
             ),
             // JWT
-            (
-                "echo eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcDEF123",
-                "echo <redacted>",
-            ),
+            ("echo eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcDEF123", "echo <redacted>"),
             // 32+ hex run
-            (
-                "verify deadbeefdeadbeefdeadbeefdeadbeef",
-                "verify <redacted>",
-            ),
+            ("verify deadbeefdeadbeefdeadbeefdeadbeef", "verify <redacted>"),
             // 32+ mixed-case base64 run
-            (
-                "echo VGhpc0lzQVNlY3JldFZhbHVlMTIzNDU2Nzg5MA==",
-                "echo <redacted>",
-            ),
+            ("echo VGhpc0lzQVNlY3JldFZhbHVlMTIzNDU2Nzg5MA==", "echo <redacted>"),
         ];
         for (input, want) in cases {
             assert_eq!(redact_secrets(input), want, "input: {input}");
@@ -803,418 +1250,5 @@ mod tests {
         for no in ["/home/x/src/main.rs", "/home/x/keyboard.md", "notes/envelope-budget.md"] {
             assert!(!secret_path(no), "must pass through: {no}");
         }
-    }
-
-    #[test]
-    fn secret_paths_are_withheld_at_capture() {
-        let (_d, conn) = open_tmp();
-        cap(&conn, &file_event("s1", "Write", "/home/x/.env.production")).unwrap();
-        cap(&conn, &file_event("s1", "Edit", "/home/x/mind/secrets/koyeb.yml"))
-            .unwrap();
-        cap(&conn, &file_event("s1", "Read", "/home/x/server.pem")).unwrap();
-        cap(&conn, &file_event("s1", "Write", "/home/x/src/main.rs")).unwrap();
-        let all = rows(&conn);
-        assert_eq!(all.len(), 4);
-        for r in &all[..3] {
-            let p: serde_json::Value = serde_json::from_str(&r.3).unwrap();
-            assert_eq!(p["file_path"], WITHHELD, "row {}", r.0);
-        }
-        let p: serde_json::Value = serde_json::from_str(&all[3].3).unwrap();
-        assert_eq!(p["file_path"], "/home/x/src/main.rs");
-    }
-
-    #[test]
-    fn bash_capture_is_redacted_session_keyed_and_error_hinted() {
-        let (_d, conn) = open_tmp();
-        cap(&conn, &bash_event("s1", "export API_TOKEN=abc123", true)).unwrap();
-        cap(&conn, &bash_event("s2", "ls", false)).unwrap();
-        let all = rows(&conn);
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].1, "s1");
-        assert_eq!(all[0].2, "bash");
-        let p: serde_json::Value = serde_json::from_str(&all[0].3).unwrap();
-        assert_eq!(p["command"], "export API_TOKEN=<redacted>");
-        assert_eq!(p["failed"], true);
-        assert_eq!(p["norm"], "export api_token=<redacted>");
-        assert_eq!(all[1].1, "s2");
-        let p2: serde_json::Value = serde_json::from_str(&all[1].3).unwrap();
-        assert_eq!(p2["failed"], false);
-    }
-
-    #[test]
-    fn tool_error_field_counts_as_failure() {
-        let (_d, conn) = open_tmp();
-        let mut ev = bash_event("s1", "ls", false);
-        ev.tool_error = Some(json!("exit status 1"));
-        cap(&conn, &ev).unwrap();
-        let p: serde_json::Value = serde_json::from_str(&rows(&conn)[0].3).unwrap();
-        assert_eq!(p["failed"], true);
-    }
-
-    #[test]
-    fn non_capture_tools_and_missing_fields_are_ignored() {
-        let (_d, conn) = open_tmp();
-        let mut glob = bash_event("s1", "x", false);
-        glob.tool_name = Some("Glob".into());
-        cap(&conn, &glob).unwrap();
-        let mut no_cmd = bash_event("s1", "x", false);
-        no_cmd.tool_input = Some(json!({"description": "no command field"}));
-        cap(&conn, &no_cmd).unwrap();
-        let mut no_path = file_event("s1", "Write", "x");
-        no_path.tool_input = Some(json!({}));
-        cap(&conn, &no_path).unwrap();
-        assert!(rows(&conn).is_empty());
-        // The three capture kinds map correctly.
-        cap(&conn, &file_event("s1", "MultiEdit", "/a/b.rs")).unwrap();
-        cap(&conn, &file_event("s1", "Read", "/a/b.rs")).unwrap();
-        let all = rows(&conn);
-        assert_eq!(all[0].2, "write");
-        assert_eq!(all[1].2, "read");
-    }
-
-    #[test]
-    fn retention_cap_holds_at_the_writer() {
-        let (_d, conn) = open_tmp();
-        for i in 0..8 {
-            record_with_caps(&conn, "s1", "bash", &json!({"command": i.to_string()}), 5, 100)
-                .unwrap();
-        }
-        let all = rows(&conn);
-        assert_eq!(all.len(), 5, "cap must hold in the write path");
-        assert_eq!(all[0].0, 4, "the oldest events are the ones deleted");
-    }
-
-    #[test]
-    fn retention_never_deletes_unreviewed_staging_rows() {
-        // REGRESSION: the retention sweep used to delete the oldest rows
-        // unconditionally, eating flagged-unconsumed staging candidates.
-        let (_d, conn) = open_tmp();
-        // Two staging candidates plus one DISMISSED row (ordinary history
-        // again), all older than everything that follows.
-        conn.execute_batch(
-            "INSERT INTO events(session_id, ts, kind, payload, flag, flag_reason, consumed)
-             VALUES ('s1', 1, 'write', '{}', 1, 'hot-file', 0),
-                    ('s1', 2, 'bash', '{}', 1, 'fix-discovered', 0),
-                    ('s1', 3, 'bash', '{}', 1, 'recurring-failure', 2);",
-        )
-        .unwrap();
-        for i in 0..10 {
-            record_with_caps(&conn, "s1", "bash", &json!({"i": i}), 4, 100).unwrap();
-        }
-        let all = rows(&conn);
-        let staged: Vec<i64> =
-            all.iter().filter(|r| r.4 == 1 && r.6 == 0).map(|r| r.0).collect();
-        assert_eq!(staged, vec![1, 2], "flagged-unconsumed rows survive every sweep at cap");
-        assert!(
-            !all.iter().any(|r| r.0 == 3),
-            "the dismissed row is ordinary history and ages out first"
-        );
-        let plain = all.iter().filter(|r| !(r.4 == 1 && r.6 == 0)).count();
-        assert_eq!(plain, 4, "the event cap holds over non-staging rows");
-    }
-
-    #[test]
-    fn staging_cap_drops_oldest_and_stages_a_warning() {
-        let (_d, conn) = open_tmp();
-        // Five staged candidates against a cap of 3: the three oldest go,
-        // one explicit warning takes their place, total staging == cap.
-        conn.execute_batch(
-            "INSERT INTO events(session_id, ts, kind, payload, flag, flag_reason, consumed)
-             VALUES ('s1', 1, 'write', '{}', 1, 'hot-file', 0),
-                    ('s1', 2, 'write', '{}', 1, 'hot-file', 0),
-                    ('s1', 3, 'write', '{}', 1, 'hot-file', 0),
-                    ('s1', 4, 'write', '{}', 1, 'hot-file', 0),
-                    ('s1', 5, 'write', '{}', 1, 'hot-file', 0);",
-        )
-        .unwrap();
-        record_with_caps(&conn, "s9", "bash", &json!({}), 100, 3).unwrap();
-        let staged = staging_list(&conn).unwrap();
-        assert_eq!(staged.len(), 3, "staging converges to exactly the cap");
-        assert_eq!(staged[0].kind, "warning");
-        assert_eq!(staged[0].reason, "staging-overflow");
-        let p: serde_json::Value = serde_json::from_str(&staged[0].payload).unwrap();
-        assert_eq!(p["dropped"], 3);
-        assert_eq!(p["cap"], 3);
-        assert_eq!(
-            (staged[1].id, staged[2].id),
-            (5, 4),
-            "the NEWEST candidates survive, the oldest are dropped"
-        );
-        // A further write at the same level churns no second warning.
-        record_with_caps(&conn, "s9", "bash", &json!({}), 100, 3).unwrap();
-        let again = staging_list(&conn).unwrap();
-        assert_eq!(again.len(), 3);
-        assert_eq!(again.iter().filter(|s| s.reason == "staging-overflow").count(), 1);
-    }
-
-    #[test]
-    fn stats_counts_staging_by_reason_and_events() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let conn = open(dir.path()).unwrap();
-            // Fabricated staging state: three flagged-unconsumed candidates
-            // across two reasons, one consumed, one plain unflagged event.
-            conn.execute_batch(
-                "INSERT INTO events(session_id, ts, kind, payload, flag, flag_reason, consumed)
-                 VALUES ('s1', 1, 'bash', '{}', 1, 'fix-discovered', 0),
-                        ('s1', 2, 'bash', '{}', 1, 'fix-discovered', 0),
-                        ('s2', 3, 'bash', '{}', 1, 'recurring-failure', 0),
-                        ('s2', 4, 'write', '{}', 1, 'hot-file', 1),
-                        ('s3', 5, 'read', '{}', 0, NULL, 0);",
-            )
-            .unwrap();
-        }
-        let s = stats(dir.path());
-        assert_eq!(s.events, 5);
-        assert_eq!(s.staged_total, 3, "consumed and unflagged rows do not count");
-        assert_eq!(
-            s.staged_by_reason,
-            vec![("fix-discovered".to_string(), 2), ("recurring-failure".to_string(), 1)],
-            "reasons in trap order, absent reasons omitted"
-        );
-    }
-
-    #[test]
-    fn stats_is_zero_when_db_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = stats(dir.path());
-        assert_eq!(s.events, 0);
-        assert_eq!(s.staged_total, 0);
-        assert!(s.staged_by_reason.is_empty());
-        assert!(
-            !dir.path().join("exhaust.db").exists(),
-            "a reporting surface must never create ring-6 state"
-        );
-    }
-
-    #[test]
-    fn stop_records_turn_summary_counts() {
-        let (_d, conn) = open_tmp();
-        cap(&conn, &bash_event("s1", "cargo test", true)).unwrap();
-        cap(&conn, &bash_event("s1", "ls", false)).unwrap();
-        cap(&conn, &file_event("s1", "Write", "/a/b.rs")).unwrap();
-        cap(&conn, &file_event("s1", "Read", "/a/b.rs")).unwrap();
-        cap(&conn, &bash_event("s2", "other session", false)).unwrap();
-        record_stop(&conn, "s1").unwrap();
-        let all = rows(&conn);
-        let turn = all.last().unwrap();
-        assert_eq!(turn.2, "turn");
-        assert_eq!(turn.1, "s1");
-        let p: serde_json::Value = serde_json::from_str(&turn.3).unwrap();
-        assert_eq!(p["bash"], 2, "s2 activity must not leak into s1's summary");
-        assert_eq!(p["write"], 1);
-        assert_eq!(p["read"], 1);
-    }
-
-    #[test]
-    fn fix_discovered_trap_fires_once() {
-        let (_d, conn) = open_tmp();
-        cap(&conn, &bash_event("s1", "cargo test --lib", true)).unwrap();
-        cap(&conn, &bash_event("s1", "echo unrelated", false)).unwrap();
-        // Same normalized command (case + whitespace noise), now succeeding.
-        cap(&conn, &bash_event("s1", "CARGO   TEST --lib", false)).unwrap();
-        record_stop(&conn, "s1").unwrap();
-        let first = flagged(&conn);
-        assert_eq!(first.len(), 2, "both the failure and the fix are the story");
-        assert!(first.iter().all(|(_, r)| r == "fix-discovered"));
-        record_stop(&conn, "s1").unwrap();
-        assert_eq!(flagged(&conn), first, "the trap must be idempotent");
-    }
-
-    #[test]
-    fn no_fix_flag_when_success_precedes_failure() {
-        let (_d, conn) = open_tmp();
-        cap(&conn, &bash_event("s1", "cargo test", false)).unwrap();
-        cap(&conn, &bash_event("s1", "cargo test", true)).unwrap();
-        record_stop(&conn, "s1").unwrap();
-        assert!(flagged(&conn).is_empty(), "success BEFORE failure is not a discovered fix");
-    }
-
-    #[test]
-    fn recurring_failure_trap_fires_once() {
-        let (_d, conn) = open_tmp();
-        // Same normalized command (paths normalize away) failing in 2 sessions.
-        cap(&conn, &bash_event("s1", "bash /tmp/deploy.sh", true)).unwrap();
-        cap(&conn, &bash_event("s2", "bash /opt/deploy.sh", true)).unwrap();
-        record_stop(&conn, "s2").unwrap();
-        let first = flagged(&conn);
-        assert_eq!(first.len(), 2);
-        assert!(first.iter().all(|(_, r)| r == "recurring-failure"));
-        record_stop(&conn, "s2").unwrap();
-        record_stop(&conn, "s1").unwrap();
-        assert_eq!(flagged(&conn), first, "the trap must be idempotent");
-    }
-
-    #[test]
-    fn hot_file_counts_only_brain_rings_0_to_3() {
-        // Ten same-session writes each: a code file (outside the brain, no
-        // ring) and a ring-4 todo file are churn by contract; the ring-3
-        // knowledge file is the only candidate, and its payload carries the
-        // ring.
-        let (_d, conn) = open_tmp();
-        for _ in 0..10 {
-            cap(&conn, &file_event("s1", "Write", "/elsewhere/churn.rs")).unwrap();
-            cap(&conn, &file_event("s1", "Write", "/b/agents/todo/active/x/STATUS.md")).unwrap();
-            cap(&conn, &file_event("s1", "Write", "/b/agents/knowledge/hosts/server.md")).unwrap();
-        }
-        record_stop(&conn, "s1").unwrap();
-        let f = flagged(&conn);
-        assert_eq!(f.len(), 1, "code and ring-4 working files never fire");
-        assert_eq!(f[0].1, "hot-file");
-        let all = rows(&conn);
-        let hit = all.iter().find(|r| r.0 == f[0].0).unwrap();
-        let p: serde_json::Value = serde_json::from_str(&hit.3).unwrap();
-        assert_eq!(p["file_path"], "/b/agents/knowledge/hosts/server.md");
-        assert_eq!(p["ring"], 3, "the staged payload must carry the resolved ring");
-        record_stop(&conn, "s1").unwrap();
-        assert_eq!(flagged(&conn).len(), 1, "the trap must be idempotent");
-    }
-
-    #[test]
-    fn hot_file_needs_ten_writes_within_one_session() {
-        let (_d, conn) = open_tmp();
-        for _ in 0..9 {
-            cap(&conn, &file_event("s1", "Write", "/b/agents/knowledge/one.md")).unwrap();
-        }
-        record_stop(&conn, "s1").unwrap();
-        assert!(flagged(&conn).is_empty(), "9 same-session writes are churn, not heat");
-        cap(&conn, &file_event("s1", "Write", "/b/agents/knowledge/one.md")).unwrap();
-        record_stop(&conn, "s1").unwrap();
-        assert_eq!(flagged(&conn).len(), 1, "the 10th write crosses the threshold");
-    }
-
-    #[test]
-    fn hot_file_fires_across_two_sessions_and_only_once() {
-        let (_d, conn) = open_tmp();
-        cap(&conn, &file_event("s1", "Write", "/b/agents/knowledge/two.md")).unwrap();
-        record_stop(&conn, "s1").unwrap();
-        assert!(flagged(&conn).is_empty(), "one session alone is no cross-session pattern");
-        cap(&conn, &file_event("s2", "Write", "/b/agents/knowledge/two.md")).unwrap();
-        record_stop(&conn, "s2").unwrap();
-        let f = flagged(&conn);
-        assert_eq!(f.len(), 1, "the same brain file written in 2 distinct sessions fires");
-        assert_eq!(f[0].1, "hot-file");
-        record_stop(&conn, "s2").unwrap();
-        record_stop(&conn, "s1").unwrap();
-        assert_eq!(flagged(&conn), f, "the trap must be idempotent across sessions");
-    }
-
-    #[test]
-    fn hot_file_respects_frontmatter_ring_override() {
-        // A knowledge file declaring itself ring 5 is quarantined content
-        // and never a candidate; a todo file declaring ring 3 counts. Real
-        // files this time — the override is read from the file itself.
-        let brain = tempfile::tempdir().unwrap();
-        let quarantined = brain.path().join("knowledge/q.md");
-        std::fs::create_dir_all(quarantined.parent().unwrap()).unwrap();
-        std::fs::write(&quarantined, "---\nring: 5\n---\nbody\n").unwrap();
-        let promoted = brain.path().join("todo/notes.md");
-        std::fs::create_dir_all(promoted.parent().unwrap()).unwrap();
-        std::fs::write(&promoted, "---\nring: 3\n---\nbody\n").unwrap();
-
-        let (_d, conn) = open_tmp();
-        for s in ["s1", "s2"] {
-            for p in [&quarantined, &promoted] {
-                capture_post_tool(
-                    &conn,
-                    &file_event(s, "Write", &p.to_string_lossy()),
-                    brain.path(),
-                    &RingRules::default(),
-                )
-                .unwrap();
-            }
-            record_stop(&conn, s).unwrap();
-        }
-        let f = flagged(&conn);
-        assert_eq!(f.len(), 1, "the ring-5 override quarantines, the ring-3 override admits");
-        let all = rows(&conn);
-        let hit = all.iter().find(|r| r.0 == f[0].0).unwrap();
-        let p: serde_json::Value = serde_json::from_str(&hit.3).unwrap();
-        assert_eq!(p["file_path"], promoted.to_string_lossy().as_ref());
-        assert_eq!(p["ring"], 3);
-    }
-
-    #[test]
-    fn hot_file_never_aggregates_withheld_paths() {
-        // Two DIFFERENT secret files under the brain share one stored
-        // placeholder across two sessions: they must not merge into a fake
-        // hot file (withheld payloads carry no ring).
-        let (_d, conn) = open_tmp();
-        cap(&conn, &file_event("s1", "Write", "/b/agents/knowledge/api-password.md")).unwrap();
-        cap(&conn, &file_event("s2", "Write", "/b/agents/knowledge/db-password.md")).unwrap();
-        record_stop(&conn, "s2").unwrap();
-        assert!(flagged(&conn).is_empty());
-    }
-
-    #[test]
-    fn consume_and_dismiss_leave_staging() {
-        let (_d, conn) = open_tmp();
-        for s in ["s1", "s2"] {
-            cap(&conn, &file_event(s, "Write", "/b/agents/knowledge/one.md")).unwrap();
-            cap(&conn, &file_event(s, "Write", "/b/agents/knowledge/two.md")).unwrap();
-        }
-        record_stop(&conn, "s1").unwrap();
-        record_stop(&conn, "s2").unwrap();
-        let staged = staging_list(&conn).unwrap();
-        assert_eq!(staged.len(), 2);
-        let (id1, id2) = (staged[1].id, staged[0].id);
-
-        assert!(consume(&conn, id1).unwrap());
-        assert!(!consume(&conn, id1).unwrap(), "consuming twice must report nothing to do");
-        assert!(dismiss(&conn, id2).unwrap());
-        assert!(!dismiss(&conn, id2).unwrap());
-        assert!(!consume(&conn, id2).unwrap(), "dismissed candidates are gone from staging");
-        assert!(staging_list(&conn).unwrap().is_empty());
-
-        // Consumed and dismissed stay distinguishable, and both keep flag=1 so
-        // the traps stay idempotent.
-        let all = rows(&conn);
-        let r1 = all.iter().find(|r| r.0 == id1).unwrap();
-        let r2 = all.iter().find(|r| r.0 == id2).unwrap();
-        assert_eq!((r1.4, r1.6), (1, 1));
-        assert_eq!((r2.4, r2.6), (1, 2));
-        record_stop(&conn, "s1").unwrap();
-        record_stop(&conn, "s2").unwrap();
-        assert!(staging_list(&conn).unwrap().is_empty(), "consumed/dismissed never re-stage");
-    }
-
-    #[test]
-    fn staging_lists_newest_first() {
-        let (_d, conn) = open_tmp();
-        for s in ["s1", "s2"] {
-            cap(&conn, &file_event(s, "Write", "/b/agents/knowledge/one.md")).unwrap();
-        }
-        record_stop(&conn, "s2").unwrap();
-        for s in ["s1", "s2"] {
-            cap(&conn, &file_event(s, "Write", "/b/agents/knowledge/two.md")).unwrap();
-        }
-        record_stop(&conn, "s2").unwrap();
-        let staged = staging_list(&conn).unwrap();
-        assert_eq!(staged.len(), 2);
-        assert!(staged[0].id > staged[1].id, "newest first");
-        assert_eq!(staged[0].reason, "hot-file");
-        assert_eq!(staged[0].session_id, "s2");
-        assert!(staged[0].payload.contains("/b/agents/knowledge/two.md"));
-    }
-
-    #[test]
-    fn schema_mismatch_preserves_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("exhaust.db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 99i64).unwrap();
-            conn.execute_batch("CREATE TABLE keepsake(x)").unwrap();
-        }
-        assert!(open(dir.path()).is_err(), "mismatch must be an error, not a rebuild");
-        let conn = Connection::open(&path).unwrap();
-        let n: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'keepsake'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(n, 1, "exhaust is data; nothing may delete it");
     }
 }
