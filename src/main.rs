@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod dashboard;
 mod exhaust;
+mod graph;
 mod heartbeat;
 mod hook_io;
 mod hooks;
@@ -48,7 +49,12 @@ enum Command {
         remove: bool,
     },
     /// Rebuild the recall index and sync the code index
-    Scan,
+    Scan {
+        /// Hand the (slow) code scan to the daemon's background thread;
+        /// falls back inline with a warning when the daemon is unreachable
+        #[arg(long = "async")]
+        background: bool,
+    },
     /// Locate a symbol or file in the code index, with exact line ranges
     Find {
         query: String,
@@ -56,6 +62,15 @@ enum Command {
         limit: usize,
         #[arg(long)]
         json: bool,
+    },
+    /// Print a repo map fitted to a token budget, ordered by import-graph importance
+    Map {
+        /// Personalize the ranking toward files whose path or symbols match this term
+        #[arg(long)]
+        focus: Option<String>,
+        /// Token budget the rendered map must fit
+        #[arg(long, default_value_t = 1500)]
+        budget_tokens: u64,
     },
     /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
     Recall {
@@ -178,25 +193,53 @@ fn selfcheck() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn scan() -> anyhow::Result<()> {
+fn scan(background: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
+    {
+        let mut conn = index::open(&paths::state_dir())?;
+        let native = paths::native_projects_root();
+        let report = index::scan(&mut conn, &cfg.brain_root, Some(&native))?;
+        println!(
+            "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
+            report.docs, report.blocks, report.skipped_high_ring
+        );
+        // Connection dropped here: the daemon's scan thread is the next writer.
+    }
+    if background {
+        match daemon::call("scan-code", std::time::Duration::from_secs(1)) {
+            Some(r) if r.ok => {
+                println!("code scan running in the daemon (watch: cfetch status)");
+                return Ok(());
+            }
+            Some(r) => {
+                println!("daemon refused: {}", r.error.unwrap_or_else(|| "unknown error".into()));
+                return Ok(());
+            }
+            None => println!("warning: daemon unreachable — running the code scan inline"),
+        }
+    }
     let mut conn = index::open(&paths::state_dir())?;
-    let native = paths::native_projects_root();
-    let report = index::scan(&mut conn, &cfg.brain_root, Some(&native))?;
-    println!(
-        "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
-        report.docs, report.blocks, report.skipped_high_ring
-    );
     let code = code::scan_code(&mut conn, &cfg.effective_code_roots())?;
-    println!("code: {} files, {} symbols (re)parsed", code.files, code.symbols);
+    println!(
+        "code: {} files, {} symbols (re)parsed, {} import edges",
+        code.files, code.symbols, code.edges
+    );
     Ok(())
 }
 
 fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
-    let cfg = config::Config::load()?;
-    let mut conn = index::open(&paths::state_dir())?;
-    code::scan_code(&mut conn, &cfg.effective_code_roots())?;
+    // Serves the existing snapshot ONLY: a full code scan over NFS roots
+    // takes minutes and must never ride on an interactive lookup. `cfetch
+    // scan` (or the daemon's background scan) owns index freshness.
+    let conn = index::open(&paths::state_dir())?;
     let hits = code::find(&conn, query, limit)?;
+    if let Some(r) = daemon::call("scan-status", std::time::Duration::from_millis(250))
+        && let Some(s) = r.scan
+        && s.running
+    {
+        // stderr so --json stdout stays parseable.
+        eprintln!("note: a code scan is running — results may be stale");
+    }
     if json {
         let arr: Vec<_> = hits
             .iter()
@@ -204,6 +247,7 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
                 serde_json::json!({
                     "path": h.path, "name": h.name, "kind": h.kind,
                     "lines": [h.start_line, h.end_line], "tokens_estimated": h.token_estimate,
+                    "rank_pct": h.rank_pct,
                 })
             })
             .collect();
@@ -211,7 +255,11 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if hits.is_empty() {
-        println!("no hits for \"{query}\"");
+        if code::file_count(&conn)? == 0 {
+            println!("code index is empty — run `cfetch scan` (or `cfetch scan --async`)");
+        } else {
+            println!("no hits for \"{query}\"");
+        }
         return Ok(());
     }
     for h in &hits {
@@ -222,6 +270,26 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
             ),
             _ => println!("{}  (file match)", h.path),
         }
+    }
+    Ok(())
+}
+
+fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let conn = index::open(&paths::state_dir())?;
+    let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
+    if m.lines.is_empty() {
+        println!("code index is empty — run `cfetch scan` first");
+        return Ok(());
+    }
+    if focus.is_some() && !m.focus_matched {
+        eprintln!("note: --focus matched no path or symbol — showing the unpersonalized map");
+    }
+    for line in &m.lines {
+        println!("{line}");
+    }
+    if m.lines.len() < m.total_files {
+        println!("… {} more file(s) beyond the token budget", m.total_files - m.lines.len());
     }
     Ok(())
 }
@@ -455,8 +523,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Scan => {
-            if let Err(e) = scan() {
+        Command::Scan { background } => {
+            if let Err(e) = scan(background) {
                 eprintln!("cfetch scan: {e}");
                 std::process::exit(1);
             }
@@ -464,6 +532,12 @@ fn main() {
         Command::Find { query, limit, json } => {
             if let Err(e) = find(&query, limit, json) {
                 eprintln!("cfetch find: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Map { focus, budget_tokens } => {
+            if let Err(e) = map_cmd(focus.as_deref(), budget_tokens) {
+                eprintln!("cfetch map: {e}");
                 std::process::exit(1);
             }
         }

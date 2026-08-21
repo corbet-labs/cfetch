@@ -3,11 +3,13 @@
 //! anything heavier than a file read lives behind this Unix socket.
 //!
 //! Protocol: one JSON object per line in, one per line out, then the server
-//! closes the connection. Milestone 1 ops: ping, resident, health, shutdown.
+//! closes the connection. Ops: ping, resident, health, scan-code,
+//! scan-status, shutdown.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,101 @@ pub struct Response {
     pub degraded_hooks: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanStatus>,
+}
+
+/// Counts from the most recent SUCCESSFUL code scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanCounts {
+    pub files: usize,
+    pub symbols: usize,
+    pub edges: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanStatus {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_finished: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_counts: Option<ScanCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Single-flight gate for the background code scan. A scan over NFS code
+/// roots takes minutes, so the daemon runs it on a detached thread; a second
+/// request while one runs is REFUSED, not queued — the second scan would only
+/// re-read the same tree.
+pub struct ScanCoordinator {
+    inner: Mutex<ScanStatus>,
+}
+
+impl ScanCoordinator {
+    pub const fn new() -> Self {
+        ScanCoordinator {
+            inner: Mutex::new(ScanStatus {
+                running: false,
+                last_finished: None,
+                last_counts: None,
+                last_error: None,
+            }),
+        }
+    }
+
+    /// A panicked scan thread must not wedge status reporting.
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScanStatus> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claims the single scan slot; false while another scan runs.
+    pub fn try_begin(&self) -> bool {
+        let mut s = self.lock();
+        if s.running {
+            return false;
+        }
+        s.running = true;
+        true
+    }
+
+    /// Releases the slot. An error records `last_error` without erasing the
+    /// last good counts; a success clears the error.
+    pub fn complete(&self, result: Result<ScanCounts, String>) {
+        let mut s = self.lock();
+        s.running = false;
+        s.last_finished = Some(now_secs());
+        match result {
+            Ok(c) => {
+                s.last_counts = Some(c);
+                s.last_error = None;
+            }
+            Err(e) => s.last_error = Some(e),
+        }
+    }
+
+    pub fn status(&self) -> ScanStatus {
+        self.lock().clone()
+    }
+}
+
+impl Default for ScanCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static SCAN: ScanCoordinator = ScanCoordinator::new();
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn run_code_scan() -> Result<ScanCounts, String> {
+    let cfg = Config::load().map_err(|e| e.to_string())?;
+    let mut conn = crate::index::open(&paths::state_dir()).map_err(|e| e.to_string())?;
+    let r = crate::code::scan_code(&mut conn, &cfg.effective_code_roots()).map_err(|e| e.to_string())?;
+    Ok(ScanCounts { files: r.files, symbols: r.symbols, edges: r.edges })
 }
 
 /// Client call with a hard deadline. The hook path budget is ~250ms total; on
@@ -75,6 +172,29 @@ fn handle(req: &Request) -> (Response, bool) {
             let degraded = heartbeat::degraded().into_iter().map(|(n, _)| n).collect();
             (Response { ok: true, degraded_hooks: Some(degraded), ..Response::default() }, false)
         }
+        "scan-code" => {
+            if SCAN.try_begin() {
+                // Detached worker: the daemon keeps answering while the scan
+                // (minutes on NFS) runs; a panic still releases the slot.
+                std::thread::spawn(|| {
+                    let result = std::panic::catch_unwind(run_code_scan)
+                        .unwrap_or_else(|_| Err("code scan thread panicked".to_string()));
+                    SCAN.complete(result);
+                });
+                (Response { ok: true, scan: Some(SCAN.status()), ..Response::default() }, false)
+            } else {
+                (
+                    Response {
+                        ok: false,
+                        error: Some("a code scan is already running".to_string()),
+                        scan: Some(SCAN.status()),
+                        ..Response::default()
+                    },
+                    false,
+                )
+            }
+        }
+        "scan-status" => (Response { ok: true, scan: Some(SCAN.status()), ..Response::default() }, false),
         "shutdown" => (Response { ok: true, ..Response::default() }, true),
         other => (
             Response { ok: false, error: Some(format!("unknown op: {other}")), ..Response::default() },
@@ -166,6 +286,23 @@ pub fn status() -> anyhow::Result<()> {
     match call("ping", Duration::from_millis(300)) {
         Some(r) => {
             println!("daemon: running (v{})", r.version.unwrap_or_default());
+            if let Some(s) = call("scan-status", Duration::from_millis(300)).and_then(|r| r.scan) {
+                if s.running {
+                    println!("code scan: running in the background");
+                } else if let Some(t) = s.last_finished {
+                    let ago = now_secs().saturating_sub(t);
+                    match &s.last_counts {
+                        Some(c) => println!(
+                            "code scan: finished {ago}s ago ({} files, {} symbols, {} import edges)",
+                            c.files, c.symbols, c.edges
+                        ),
+                        None => println!("code scan: finished {ago}s ago"),
+                    }
+                }
+                if let Some(e) = &s.last_error {
+                    println!("code scan: last error: {e}");
+                }
+            }
         }
         None => println!("daemon: not running ({})", paths::socket_path().display()),
     }
@@ -183,4 +320,39 @@ pub fn status() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_coordinator_is_single_flight() {
+        let c = ScanCoordinator::new();
+        assert!(c.try_begin());
+        assert!(!c.try_begin(), "a second scan must be refused while one runs");
+        assert!(c.status().running);
+        c.complete(Ok(ScanCounts { files: 3, symbols: 5, edges: 2 }));
+        let s = c.status();
+        assert!(!s.running);
+        assert!(s.last_finished.is_some());
+        assert_eq!(s.last_counts.as_ref().map(|c| c.files), Some(3));
+        assert!(c.try_begin(), "a finished scan frees the slot");
+    }
+
+    #[test]
+    fn scan_coordinator_error_keeps_last_good_counts() {
+        let c = ScanCoordinator::new();
+        assert!(c.try_begin());
+        c.complete(Ok(ScanCounts { files: 7, symbols: 9, edges: 1 }));
+        assert!(c.try_begin());
+        c.complete(Err("boom".to_string()));
+        let s = c.status();
+        assert!(!s.running);
+        assert_eq!(s.last_error.as_deref(), Some("boom"));
+        assert_eq!(s.last_counts.as_ref().map(|c| c.files), Some(7), "an error must not erase the last good counts");
+        assert!(c.try_begin());
+        c.complete(Ok(ScanCounts { files: 8, symbols: 9, edges: 1 }));
+        assert!(c.status().last_error.is_none(), "success clears the error");
+    }
 }
