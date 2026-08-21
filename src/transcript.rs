@@ -42,20 +42,21 @@ pub fn scan(path: &Path) -> Option<TranscriptUsage> {
     scan_text(&std::fs::read_to_string(path).ok()?)
 }
 
-fn scan_text(text: &str) -> Option<TranscriptUsage> {
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    // Schema probe: >=50% of the first PROBE_LINES lines must be JSON
-    // objects, or the whole file is treated as unparseable.
+/// Schema probe shared by every extractor: at least half of the first
+/// PROBE_LINES non-empty lines must parse as JSON objects, or the file is
+/// treated as unparseable (callers return `None`, never a measured zero).
+fn probe_ok(lines: &[&str]) -> bool {
     let probe = &lines[..lines.len().min(PROBE_LINES)];
-    let yield_count = probe
+    let yielded = probe
         .iter()
         .filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v.is_object()))
         .count();
-    if yield_count * 2 < probe.len() {
+    yielded * 2 >= probe.len()
+}
+
+fn scan_text(text: &str) -> Option<TranscriptUsage> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() || !probe_ok(&lines) {
         return None;
     }
 
@@ -82,6 +83,99 @@ fn scan_text(text: &str) -> Option<TranscriptUsage> {
         total.cache_creation_input_tokens += cc;
     }
     Some(total)
+}
+
+/// Transcript-VERIFIED hook delivery: `Some((fired, delivered))` where
+/// `fired` counts records mentioning our hook command (`cfetch hook`) and
+/// `delivered` counts how many of those carried a non-empty
+/// `additionalContext` into the conversation. Ground truth for "did the
+/// injection actually enter context" — hook self-reports drifted ~20x
+/// upstream. `None` means "could not verify": file unreadable, schema probe
+/// refused, or zero hook records recognized (a transcript whose hook records
+/// we no longer recognize must read as unverifiable, never as zero).
+pub fn verified_injections(path: &Path) -> Option<(u64, u64)> {
+    verified_injections_text(&std::fs::read_to_string(path).ok()?)
+}
+
+fn verified_injections_text(text: &str) -> Option<(u64, u64)> {
+    /// Our hook invocations as they appear in the harness's record of the
+    /// command it ran (`'<abs path>/cfetch' hook <event>`).
+    const HOOK_NEEDLE: &str = "cfetch hook";
+
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() || !probe_ok(&lines) {
+        return None;
+    }
+    let mut fired = 0u64;
+    let mut delivered = 0u64;
+    for line in &lines {
+        if !line.contains(HOOK_NEEDLE) {
+            continue;
+        }
+        // Only JSON-object records count — a stray mention inside prose (a
+        // user message quoting the command) is not a hook record... but the
+        // harness nests hook records inside larger objects, so the needle
+        // check on the raw line is the recognizer and the parse is the gate.
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if !v.is_object() {
+            continue;
+        }
+        fired += 1;
+        if has_nonempty_additional_context(&v) {
+            delivered += 1;
+        }
+    }
+    // Zero recognized hook records: cannot distinguish "hooks never fired"
+    // from "the record shape drifted" — unverifiable, not zero.
+    if fired == 0 {
+        return None;
+    }
+    Some((fired, delivered))
+}
+
+/// Recursive search for a non-empty `additionalContext` (either harness
+/// spelling) anywhere in the record — the exact nesting has drifted across
+/// versions, the key name is the stable part.
+fn has_nonempty_additional_context(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => m.iter().any(|(k, val)| {
+            ((k == "additionalContext" || k == "additional_context")
+                && val.as_str().is_some_and(|s| !s.trim().is_empty()))
+                || has_nonempty_additional_context(val)
+        }),
+        serde_json::Value::Array(a) => a.iter().any(has_nonempty_additional_context),
+        _ => false,
+    }
+}
+
+/// Most recently modified `*.jsonl` under `root`. The native layout is
+/// `~/.claude/projects/<project-slug>/<session-id>.jsonl`, so one directory
+/// level is walked; flat files directly under `root` are accepted too.
+pub fn newest_transcript(root: &Path) -> Option<std::path::PathBuf> {
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let mut consider = |p: std::path::PathBuf| {
+        if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            return;
+        }
+        if let Ok(mtime) = std::fs::metadata(&p).and_then(|m| m.modified())
+            && best.as_ref().is_none_or(|(t, _)| mtime > *t)
+        {
+            best = Some((mtime, p));
+        }
+    };
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                for e in rd.flatten() {
+                    consider(e.path());
+                }
+            }
+        } else {
+            consider(p);
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Extracts (message id, usage) from one transcript line. Assistant lines
@@ -187,5 +281,85 @@ mod tests {
         assert!(scan(Path::new("/nonexistent/cfetch-transcript.jsonl")).is_none());
         assert!(scan_text("").is_none());
         assert!(scan_text("\n  \n").is_none());
+    }
+
+    /// A hook_success-style record as the harness writes it: the invoked
+    /// command plus (optionally) the hook's JSON output with its context.
+    fn hook_line(cmd: &str, ctx: Option<&str>) -> String {
+        match ctx {
+            Some(c) => format!(
+                r#"{{"type":"system","subtype":"hook_success","hookCommand":"'{cmd}'","output":{{"hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":"{c}"}}}}}}"#
+            ),
+            None => {
+                format!(r#"{{"type":"system","subtype":"hook_success","hookCommand":"'{cmd}'"}}"#)
+            }
+        }
+    }
+
+    #[test]
+    fn verified_delivery_counts_firings_and_nonempty_context() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#.to_string(),
+            hook_line("/usr/local/bin/cfetch hook session-start", Some("[cfetch resident memory]")),
+            hook_line("/usr/local/bin/cfetch hook stop", None),
+            // Fired but delivered nothing: empty context must not count.
+            hook_line("/usr/local/bin/cfetch hook pre-tool", Some("")),
+            // Another tool's hook is not ours.
+            hook_line("/opt/other-brain hook whatever", Some("noise")),
+            assistant_line("msg_a", 1, 1, 0, 0),
+        ];
+        assert_eq!(verified_injections_text(&lines.join("\n")), Some((3, 1)));
+    }
+
+    #[test]
+    fn verified_delivery_accepts_snake_case_and_drifted_nesting() {
+        let line = r#"{"role":"system","content":[{"hook":{"command":"cfetch hook session-start","additional_context":"resident digest"}}]}"#;
+        assert_eq!(verified_injections_text(line), Some((1, 1)));
+    }
+
+    #[test]
+    fn verified_delivery_refuses_garbage_and_unrecognized_formats() {
+        // Majority non-JSON: the schema probe refuses the whole file.
+        let mut lines: Vec<String> = (0..12).map(|i| format!("garbage {i}")).collect();
+        for _ in 0..8 {
+            lines.push(hook_line("cfetch hook stop", None));
+        }
+        assert_eq!(verified_injections_text(&lines.join("\n")), None);
+        // Valid JSON but zero recognizable hook records: unverifiable — a
+        // drifted format must never be reported as zero firings.
+        let clean = [
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            r#"{"type":"progress","n":1}"#,
+        ]
+        .join("\n");
+        assert_eq!(verified_injections_text(&clean), None);
+        // A non-JSON line mentioning the command is not a record.
+        let torn =
+            [r#"{"type":"user","message":{"content":"x"}}"#, "ran cfetch hook stop by hand"]
+                .join("\n");
+        assert_eq!(verified_injections_text(&torn), None);
+        assert_eq!(verified_injections_text(""), None);
+        assert!(verified_injections(Path::new("/nonexistent/cfetch-t.jsonl")).is_none());
+    }
+
+    #[test]
+    fn newest_transcript_picks_latest_jsonl_and_ignores_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-home-x-repo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let old = proj.join("old.jsonl");
+        let new = proj.join("new.jsonl");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&new, "y").unwrap();
+        std::fs::write(proj.join("notes.txt"), "z").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+        assert_eq!(newest_transcript(dir.path()), Some(new));
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(newest_transcript(empty.path()), None);
+        assert_eq!(newest_transcript(Path::new("/nonexistent/cfetch-projects")), None);
     }
 }

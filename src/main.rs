@@ -1,3 +1,4 @@
+mod audit;
 mod code;
 mod config;
 mod daemon;
@@ -112,6 +113,12 @@ enum Command {
     Mcp,
     /// Verify the installation end to end; nonzero exit on hard failures
     Selfcheck,
+    /// Price the always-on context bill: CLAUDE.md + imports, MCP servers,
+    /// booked injection vs budget, position-weighted cost, measurement gaps
+    Audit {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show daemon, hook health, and state footprint
     Status,
 }
@@ -439,6 +446,21 @@ fn staging(action: StagingAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn audit_cmd(json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let report = audit::build(&audit::AuditPaths::defaults(), cfg.budget_chars, now);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", audit::render(&report));
+    }
+    Ok(())
+}
+
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
     let quarantines = ledger::quarantine_count(&paths::state_dir());
@@ -476,6 +498,22 @@ fn status() -> anyhow::Result<()> {
         );
     } else {
         println!("  measured:  none — no transcript usage booked yet, numbers above are estimates");
+    }
+    // Transcript-VERIFIED delivery: did our hook output actually enter the
+    // conversation? Read from the newest transcript, never assumed — and a
+    // drifted format is reported as unverifiable, never as zero.
+    let transcripts_root = paths::native_projects_root();
+    match transcript::newest_transcript(&transcripts_root) {
+        None => println!(
+            "delivery: no transcripts found under {} (measurement gap)",
+            transcripts_root.display()
+        ),
+        Some(t) => match transcript::verified_injections(&t) {
+            Some((fired, delivered)) => println!(
+                "delivery: {fired} hook firing(s) observed, {delivered} injection(s) verified (transcript)"
+            ),
+            None => println!("delivery: unverifiable (transcript format drift)"),
+        },
     }
     let state = paths::state_dir();
     let bytes: u64 = std::fs::read_dir(&state)
@@ -583,6 +621,12 @@ fn main() {
         Command::Selfcheck => {
             if let Err(e) = selfcheck() {
                 eprintln!("cfetch selfcheck: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Audit { json } => {
+            if let Err(e) = audit_cmd(json) {
+                eprintln!("cfetch audit: {e}");
                 std::process::exit(1);
             }
         }
