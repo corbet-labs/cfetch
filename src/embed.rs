@@ -418,6 +418,31 @@ pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `cfetch status` line for semantic recall. Coverage leads, because a
+/// half-embedded index is exactly the state that would otherwise degrade
+/// every hybrid query without anyone noticing.
+pub fn coverage_status_line(
+    spec: &crate::config::VectorSpec,
+    embedded: usize,
+    total: usize,
+    shared: usize,
+) -> String {
+    let health = if total == 0 {
+        "index is empty".to_string()
+    } else if embedded >= total {
+        "complete".to_string()
+    } else {
+        format!("run cfetch embed-index for the remaining {}", total - embedded)
+    };
+    format!(
+        "semantic: {embedded}/{total} blocks embedded — {health}\n  \
+         {} at {} dims ({}), shared store holds {shared} artifact(s)",
+        spec.model,
+        spec.dim,
+        spec.precision.as_str()
+    )
+}
+
 /// A semantic/hybrid answer, plus what was WRONG with it. `note` is the
 /// project's anti-silent-degradation contract in one field: a memory system
 /// that quietly returns worse answers is the failure this exists to prevent,
@@ -470,11 +495,28 @@ pub fn semantic_hits(
         // lexical "hybrid" is the degradation this project bans.
         return Ok(SemanticRecall { hits: index::recall(conn, query, limit)?, note });
     }
-    let mut qv = client
-        .embed(&[query])?
-        .into_iter()
-        .next()
-        .context("embeddings endpoint returned no vector for the query")?;
+    let embedded_query = client
+        .embed(&[query])
+        .and_then(|vs| vs.into_iter().next().context("endpoint returned no vector for the query"));
+    let mut qv = match embedded_query {
+        Ok(qv) => qv,
+        Err(e) => {
+            // Configured but not answering: the vectors are here, the thing
+            // that would place the QUERY among them is not. Degrade to
+            // lexical — and say exactly that, on one line, with the reason.
+            // (An UNCONFIGURED endpoint is a different thing and still
+            // errors above: you cannot degrade a feature you never enabled.)
+            let reason = format!("semantic: query embedding failed ({e:#}) — answering lexically");
+            let reason = reason.replace('\n', " ");
+            return Ok(SemanticRecall {
+                hits: index::recall(conn, query, limit)?,
+                note: Some(match note {
+                    Some(coverage) => format!("{coverage}; {reason}"),
+                    None => reason,
+                }),
+            });
+        }
+    };
     index::l2_normalize(&mut qv);
     let hits = if hybrid {
         index::hybrid_recall(conn, &spec, query, &qv, limit, cfg.recall.rrf_k)?
@@ -1082,6 +1124,18 @@ mod tests {
     }
 
     #[test]
+    fn the_status_line_states_coverage_and_the_artifact_spec() {
+        let spec = spec_for(1024);
+        let line = coverage_status_line(&spec, 0, 19478, 0);
+        assert!(line.contains("0/19478 blocks embedded"), "got: {line}");
+        assert!(line.contains("cfetch embed-index"), "got: {line}");
+        let line = coverage_status_line(&spec, 19478, 19478, 19478);
+        assert!(line.contains("complete"), "got: {line}");
+        assert!(line.contains("1024 dims") && line.contains("f16"), "got: {line}");
+        assert!(coverage_status_line(&spec, 0, 0, 0).contains("index is empty"));
+    }
+
+    #[test]
     fn zero_coverage_warns_with_the_numbers_and_answers_lexically() {
         let (brain, _state, conn) = five_block_index();
         let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
@@ -1101,7 +1155,7 @@ mod tests {
 
     #[test]
     fn partial_coverage_warns_with_the_numbers_and_still_ranks() {
-        let (brain, _state, mut conn) = five_block_index();
+        let (brain, _state, conn) = five_block_index();
         let spec = spec_for(2);
         index::ensure_vector_spec(&conn, &spec).unwrap();
         for (hash, _) in index::hashes_without_vectors(&conn, &spec, 2).unwrap() {
@@ -1113,7 +1167,30 @@ mod tests {
         let note = out.note.expect("partial coverage is degradation, and must be said");
         assert!(note.contains("2/5"), "got: {note}");
         assert!(!out.hits.is_empty());
-        let _ = &mut conn;
+    }
+
+    #[test]
+    fn an_unreachable_endpoint_degrades_to_labeled_lexical_never_to_nothing() {
+        // Vectors are all there; the endpoint that would embed the QUERY is
+        // down (a laptop off the VPN, a GPU box asleep). An agent must still
+        // get its lexical answer — and must be told what it did not get.
+        let (brain, _state, mut conn) = five_block_index();
+        let (url, _, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let cfg = semantic_config(brain.path(), &url);
+        let mut store = store_for(brain.path());
+        run(&mut conn, &EmbedClient::new(&cfg.embeddings).unwrap(), 8, &mut store).unwrap();
+
+        // Same config, an endpoint nothing listens on.
+        let dead = Config {
+            embeddings: EmbeddingsConfig { endpoint: "http://127.0.0.1:1".into(), ..cfg.embeddings },
+            ..cfg
+        };
+        let out = semantic_hits(&dead, &conn, "three", 5, true).unwrap();
+        let note = out.note.expect("a degraded answer must be labeled");
+        assert!(note.contains("query embedding failed"), "got: {note}");
+        assert!(note.contains("lexical"), "got: {note}");
+        assert!(!note.contains('\n'), "one-line note contract: {note}");
+        assert_eq!(out.hits.len(), 1, "the lexical answer still arrives");
     }
 
     #[test]

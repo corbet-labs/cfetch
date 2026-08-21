@@ -6,10 +6,15 @@
 //! recreated on any corruption. The git-tracked markdown stays the only source
 //! of truth.
 //!
-//! Citations are content-addressed: `r<ring>-<6 hex of sha256(normalized
+//! Citations are content-addressed: `r<ring>-<prefix of sha256(normalized
 //! block)>`. They survive reordering and unrelated edits; an edited entry
 //! becomes a new citation by construction. The ring prefix makes the trust
 //! level of a hit visible in the id itself.
+//!
+//! The FULL digest behind that prefix is the block's content address, and it
+//! is what every derived artifact is keyed by — so vectors survive a rebuild
+//! that recycles every rowid in the file, and an edit costs the embeddings of
+//! exactly the blocks that changed.
 
 use std::path::{Path, PathBuf};
 
@@ -1343,8 +1348,11 @@ pub fn hashes_without_vectors(
          WHERE v.content_hash IS NULL
          GROUP BY b.hash ORDER BY min(b.id) LIMIT ?3",
     )?;
+    // SQLite reads a negative LIMIT as unbounded — which is exactly what a
+    // caller asking for usize::MAX (a full hydrate) means.
+    let bound = i64::try_from(limit).unwrap_or(-1);
     let rows = stmt.query_map(
-        rusqlite::params![spec.model, spec.dim as i64, limit as i64],
+        rusqlite::params![spec.model, spec.dim as i64, bound],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     )?;
     Ok(rows.filter_map(Result::ok).collect())

@@ -290,9 +290,78 @@ makes it selective rather than a second unconditional set. `cfetch selfcheck`
 prints which entries the current host and directory left out, so a file that
 stops arriving is explainable without reading the config.
 
+### Semantic recall (`embeddings`)
+
+Off by default. Point it at any OpenAI-compatible `/embeddings` endpoint — a
+local llama.cpp server, LM Studio, vLLM, or a hosted API:
+
+```json
+{
+  "embeddings": {
+    "enabled": true,
+    "endpoint": "http://127.0.0.1:8080/v1",
+    "model": "embed-model",
+    "dimensions": 1024,
+    "precision": "f16",
+    "api_key_env": "MY_EMBED_KEY"
+  }
+}
+```
+
+- `dimensions` — the vector width to ask for and to store (default 1024). It
+  is sent to the endpoint as `dimensions`, which Matryoshka-trained embedders
+  honor; an endpoint that ignores it gets its vector truncated to that prefix
+  and re-normalized client-side. A model that cannot reach the width is an
+  error, never a silently narrower vector. Full native width is usually 8–16x
+  more than a documentation corpus can use, and it dominates the index file.
+- `precision` — `f16` (default) or `f32`. Half floats halve the artifact at a
+  cosine error far below the ranking's resolution.
+- `api_key_env` — the NAME of an environment variable holding the key, never
+  the key. Endpoints are SSRF-guarded: https or loopback only, private and
+  metadata ranges refused unless listed in `allow_hosts`.
+
+Then derive the vectors once:
+
+```console
+$ cfetch embed-index
+embedded 3187/3187 blocks
+embed-index complete: 3187 embedded this run, 0 imported from the shared store, 3187 block(s) total
+```
+
+Vectors are keyed by the CONTENT HASH of the block — the same digest the
+citation shows a prefix of. Two consequences:
+
+- Editing a file costs only the blocks that changed. A rescan keeps every
+  unchanged block's vector and prunes only hashes that left the tree.
+- They are a property of the content, not of a machine. They are written to
+  `<brain_root>/state/cfetch/vectors/` as one packed artifact file plus a
+  hash index per `(model, dimensions, precision)`. Any host that can reach
+  the tree READS them; only a host with an endpoint configured writes.
+  `embed-index` derives only hashes no host has derived yet, and resumes
+  where it stopped. The per-host database keeps a cache of the same vectors —
+  never the record. The shared store is append-only: a vector whose text left
+  YOUR tree may still be someone else's slice, so it is kept, and the artifact
+  count is printed next to the block coverage rather than quietly diverging
+  from it.
+
+`--semantic` ranks by cosine alone, `--hybrid` fuses it with BM25 (reciprocal
+rank fusion, `recall.rrf_k`). Neither degrades quietly: when vector coverage
+is partial or zero, the numbers are reported on stderr (and as
+`semantic_note` in `--json`) and the answer still comes back lexically.
+
+```console
+$ cfetch recall --hybrid zfs backup
+cfetch recall: semantic: 0/3187 blocks embedded — answering lexically only; run cfetch embed-index
+r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
+    Native filesystem backup only — never file-level tools between ZFS datasets ...
+```
+
+`cfetch status` prints the same coverage before you need it.
+
 Mutable state (index database, ledger, heartbeats) lives per-host in
 `~/.local/state/cfetch` — never inside the brain tree, which may be shared
-between machines over NFS.
+between machines over NFS. Derived ARTIFACTS are the exception: vectors are
+shared content, so they live in the tree (self-ignoring for git).
 
 ## License
 

@@ -813,6 +813,17 @@ fn status() -> anyhow::Result<()> {
             None => println!("delivery: unverifiable (transcript format drift)"),
         },
     }
+    // Semantic coverage belongs in status, not only in a query's warning:
+    // an operator must be able to SEE that the vectors are missing before a
+    // ranking quietly falls back to lexical.
+    if let Ok(cfg) = config::Config::load()
+        && cfg.embeddings.enabled
+    {
+        match semantic_status(&cfg) {
+            Ok(line) => println!("{line}"),
+            Err(e) => println!("semantic: unavailable ({e})"),
+        }
+    }
     let state = paths::state_dir();
     let bytes: u64 = std::fs::read_dir(&state)
         .map(|rd| {
@@ -825,6 +836,23 @@ fn status() -> anyhow::Result<()> {
         .unwrap_or(0);
     println!("state:  {} ({} KiB)", state.display(), bytes / 1024);
     Ok(())
+}
+
+/// Coverage of the configured embeddings spec, local cache and shared store
+/// side by side. A none-tier host reports the shared store alone — it holds
+/// no index to cover.
+fn semantic_status(cfg: &config::Config) -> anyhow::Result<String> {
+    let spec = cfg.embeddings.spec();
+    let shared = vectors::VectorStore::open(&cfg.brain_root, &spec)?.len();
+    if cfg.client.serving.is_some() {
+        return Ok(format!(
+            "semantic: no local index (none-tier) — shared store holds {shared} artifact(s) for {} at {} dims",
+            spec.model, spec.dim
+        ));
+    }
+    let conn = index::open_ro(&paths::state_dir())?;
+    let (embedded, total) = index::vector_coverage(&conn, &spec)?;
+    Ok(embed::coverage_status_line(&spec, embedded, total, shared))
 }
 
 fn main() {

@@ -23,6 +23,15 @@
 //! 20k-entry directory into a tree people open in Obsidian and rsync. The
 //! packed form reads whole in one sequential pass.
 //!
+//! The store is APPEND-ONLY. A vector whose text left this host's tree is not
+//! deleted here: the same content may still live in a slice another host
+//! holds, and this file is the group's record, not one host's cache. (The
+//! local cache in index.db IS pruned on every scan — that is what keeps
+//! coverage numbers honest.) Compaction, when it comes, has to be a
+//! group-wide operation that knows every holder; a local delete never is.
+//! `embed-index` and `status` print artifact count and block coverage side by
+//! side, so the gap between them is visible rather than mysterious.
+//!
 //! Crash consistency: the record is appended first, its index line second, so
 //! a torn tail can only ever leave an ORPHAN RECORD — never an index line
 //! pointing at bytes that are not there. Readers use `min(index lines,
