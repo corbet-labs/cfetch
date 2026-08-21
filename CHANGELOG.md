@@ -3,7 +3,7 @@
 Notable changes per release. cfetch is young and moving fast; anything not
 listed here is a fix or an internal change with no effect on behavior.
 
-## Unreleased
+## 0.8.0
 
 - **The drain barrier is sound on every platform, and says which path it is
   on.** Proving coverage with a sentinel works only where the watcher delivers
