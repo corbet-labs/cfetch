@@ -171,6 +171,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl ServeState {
     pub(crate) fn new(origin: String, state_dir: PathBuf, barrier_dir: PathBuf) -> Self {
+        // CANONICALIZE: macOS reports fs events under the canonical path
+        // (/var is a symlink to /private/var), so a sentinel written to the
+        // as-given path would never match the event path and every barrier
+        // would time out — the exact failure the macOS CI matrix caught on
+        // its first run. inotify reports paths as-watched, so canonicalizing
+        // both sides is correct on every platform.
+        let barrier_dir = std::fs::canonicalize(&barrier_dir).unwrap_or(barrier_dir);
         ServeState {
             origin,
             state_dir,
@@ -320,11 +327,16 @@ pub fn origin_of(cfg: &Config) -> String {
 }
 
 fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
+    // uname(2) is portable (Linux + macOS + BSD); /proc is Linux-only and
+    // left `origin` as "unknown-host" on every non-Linux serving host.
+    let node = rustix::system::uname();
+    let node = node.nodename().to_string_lossy().trim().to_string();
+    if !node.is_empty() {
+        return node;
+    }
+    std::env::var("HOSTNAME")
         .ok()
-        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "unknown-host".to_string())
 }
 
@@ -492,6 +504,9 @@ pub fn start(cfg: &Config) -> anyhow::Result<ServeHandle> {
     let state_dir = paths::state_dir();
     let barrier_dir = state_dir.join("barrier");
     std::fs::create_dir_all(&barrier_dir)?;
+    // Canonical from here on: the watch path and the sentinel path must agree
+    // with what the platform's event stream reports (see ServeState::new).
+    let barrier_dir = std::fs::canonicalize(&barrier_dir).unwrap_or(barrier_dir);
     // Leftover sentinels from a previous run would satisfy this run's low
     // sequence numbers; clear them.
     if let Ok(rd) = std::fs::read_dir(&barrier_dir) {
