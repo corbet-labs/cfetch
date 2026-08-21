@@ -320,6 +320,13 @@ pub struct ServeState {
     barrier_seq: AtomicU64,
     pub generation: AtomicU64,
     pub last_barrier_ms: AtomicU64,
+    /// Most recent measured cost of one full stat walk of the tree, in ms
+    /// (0 = never measured). The unordered barrier's entry fingerprint IS
+    /// that walk, and a walk longer than the barrier budget would blow the
+    /// bound the barrier promises — so it is consulted BEFORE walking. Fed by
+    /// the worker's backstop pass, which walks anyway, so the figure exists
+    /// before the first query that could claim freshness.
+    last_walk_ms: AtomicU64,
     /// Actual TCP listen address once bound (resolves ":0" configs).
     pub bind_addr: Mutex<Option<String>>,
 }
@@ -355,6 +362,7 @@ impl ServeState {
             barrier_seq: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             last_barrier_ms: AtomicU64::new(0),
+            last_walk_ms: AtomicU64::new(0),
             bind_addr: Mutex::new(None),
         }
     }
@@ -459,10 +467,31 @@ impl ServeState {
                 )),
             );
         };
+        // A barrier is BOUNDED before it is fresh. On a tree whose stat walk
+        // costs more than the whole budget, taking the entry fingerprint would
+        // blow the bound on every query — so refuse the walk and label the
+        // answer, naming both numbers so the operator can see what to fix.
+        // (The 60s backstop still converges the catalog underneath; the answer
+        // is stale-and-labeled, never silently stale.)
+        let budget_ms = timeout.as_millis() as u64;
+        let measured_ms = self.last_walk_ms.load(Ordering::Relaxed);
+        if measured_ms > budget_ms {
+            return self.finish(
+                start,
+                false,
+                Some(format!(
+                    "barrier over budget: this host's fs watcher is {}, so freshness is proven by \
+                     a stat fingerprint of the tree — and that walk measured {measured_ms} ms \
+                     against a {budget_ms} ms budget",
+                    self.mode.label()
+                )),
+            );
+        }
         // The entry fingerprint: every write that completed before this query
         // began is in it, because this walk started after the query did.
         let entry = basis.fingerprint();
         let entry_at = Instant::now();
+        self.note_walk_cost(entry_at - start);
         let target = lock(&self.progress).pending;
         let ready = |p: &Progress| {
             p.settled && p.watches_ready && p.applied >= target && covers(p, &entry, entry_at)
@@ -476,7 +505,7 @@ impl ServeState {
         }
         let mut fresh = true;
         let mut note = None;
-        if !self.wait_until(deadline, &ready) {
+        if !self.wait_until(deadline, ready) {
             fresh = false;
             let err = lock(&self.progress).last_error.clone();
             note = Some(match err {
@@ -495,6 +524,12 @@ impl ServeState {
         let waited_ms = start.elapsed().as_millis() as u64;
         self.last_barrier_ms.store(waited_ms, Ordering::Relaxed);
         BarrierOutcome { fresh, waited_ms, note }
+    }
+
+    /// Records what one full stat walk of the tree cost. Both the worker's
+    /// backstop and the unordered barrier's own entry walk report it.
+    pub(crate) fn note_walk_cost(&self, walk: Duration) {
+        self.last_walk_ms.store(walk.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Asks the rebuild worker for an immediate stat-fingerprint pass. A no-op
@@ -991,7 +1026,11 @@ fn apply(
     // entry, and the real walk is then later still.
     let mut walked: Option<String> = None;
     let need_scan = if backstop {
-        match index::staleness(c, &cfg.brain_root, Some(native), &rules) {
+        let result = index::staleness(c, &cfg.brain_root, Some(native), &rules);
+        // This walk is the same one the unordered barrier would take at query
+        // entry; its cost is what tells that barrier whether it can afford to.
+        state.note_walk_cost(pass_start.elapsed());
+        match result {
             Ok((stale, fingerprint)) => {
                 walked = Some(fingerprint);
                 dirty || stale
@@ -1434,6 +1473,31 @@ mod tests {
         let out = state.barrier(Duration::from_millis(50));
         assert!(!out.fresh);
         assert!(out.note.unwrap().contains("unordered (fingerprint)"));
+    }
+
+    #[test]
+    fn an_unordered_barrier_over_budget_answers_at_once_and_names_both_numbers() {
+        // A barrier is BOUNDED before it is fresh. Where one stat walk of the
+        // tree costs more than the whole budget — measured at 13.5 s on a real
+        // unpruned tree of 313k indexable directories, against 46 ms on a
+        // properly scoped brain — the walk itself would blow the bound, so it
+        // must not be taken. The answer is stale, labeled, and immediate.
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
+        std::fs::write(brain.path().join("knowledge/a.md"), "one\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state = unordered_state(brain.path(), dir.path());
+        state.mark_watches_ready();
+        state.mark_pass(0, 1, Some(fingerprint_of(brain.path())), Some(Instant::now()));
+        assert!(state.barrier(Duration::from_millis(500)).fresh, "covered: fresh at no cost");
+
+        state.note_walk_cost(Duration::from_millis(13_500));
+        let out = state.barrier(Duration::from_secs(5));
+        assert!(!out.fresh, "an unaffordable proof is not a proof");
+        assert!(out.waited_ms < 500, "the bound must hold: waited {} ms", out.waited_ms);
+        let note = out.note.unwrap();
+        assert!(note.contains("13500 ms"), "the cost must be named: {note}");
+        assert!(note.contains("5000 ms"), "the budget must be named: {note}");
     }
 
     #[test]
