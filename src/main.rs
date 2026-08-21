@@ -22,6 +22,7 @@ mod resident;
 mod serve;
 mod session_state;
 mod transcript;
+mod vectors;
 
 use clap::{Parser, Subcommand};
 

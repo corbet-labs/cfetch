@@ -122,6 +122,14 @@ pub fn default_brain_root() -> PathBuf {
     }
 }
 
+/// The SHARED vector artifact store, inside the brain tree: vectors are
+/// derived from shared content, so they are computed once per storage group
+/// and read by every host that can reach the tree — never recomputed per
+/// host, and never a per-host database's private property.
+pub fn shared_vector_dir(brain_root: &std::path::Path) -> PathBuf {
+    brain_root.join("state/cfetch/vectors")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

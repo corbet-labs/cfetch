@@ -1418,7 +1418,7 @@ mod path_shape_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RingRule;
+    use crate::config::{Precision, RingRule, VectorSpec};
 
     fn brain(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1850,64 +1850,173 @@ mod tests {
         assert_eq!(fused, vec![4, 9]);
     }
 
+    fn test_spec(dim: usize) -> VectorSpec {
+        VectorSpec { model: "test-model".into(), dim, precision: Precision::F16 }
+    }
+
+    fn embed_everything(conn: &Connection, spec: &VectorSpec, vector: &[f32]) {
+        for (hash, _) in hashes_without_vectors(conn, spec, 1000).unwrap() {
+            insert_vector(conn, &hash, spec, vector).unwrap();
+        }
+    }
+
+    #[test]
+    fn content_hash_is_the_full_digest_the_citation_truncates() {
+        // ONE hashing site: the citation is a prefix of the content address,
+        // so a vector keyed by hash always belongs to the cited block.
+        let h = content_hash("The  Quick   Fox");
+        assert_eq!(h.len(), 64, "full sha256 hex");
+        assert_eq!(h, content_hash("the quick fox"), "same normalization the citation uses");
+        assert_eq!(cite_id(3, "the quick fox"), format!("r3-{}", &h[..10]));
+        assert_eq!(cite_id(1, "the quick fox"), format!("r1-{}", &h[..10]), "ring labels, hash addresses");
+        assert_ne!(h, content_hash("the quick foxes"));
+    }
+
+    #[test]
+    fn f16_blobs_halve_the_bytes_and_round_trip_within_tolerance() {
+        let v: Vec<f32> = (0..8).map(|i| (i as f32 - 3.5) / 16.0).collect();
+        let blob = vec_to_blob(&v, Precision::F16);
+        assert_eq!(blob.len(), v.len() * 2, "half floats, half the bytes");
+        for (a, b) in v.iter().zip(blob_to_vec(&blob, Precision::F16).iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} -> {b}");
+        }
+        // f32 stays available and stays exact.
+        let blob32 = vec_to_blob(&v, Precision::F32);
+        assert_eq!(blob32.len(), v.len() * 4);
+        assert_eq!(blob_to_vec(&blob32, Precision::F32), v);
+        // The values a normalized component actually reaches, plus the edges.
+        for x in [0.0f32, 1.0, -1.0, 0.5, -0.03125, 1e-4, -1e-4, 6e-8] {
+            let back = blob_to_vec(&vec_to_blob(&[x], Precision::F16), Precision::F16)[0];
+            assert!((back - x).abs() <= 1e-3 * x.abs().max(1e-3), "{x} -> {back}");
+        }
+        // What actually matters: the ranking score survives the narrowing.
+        let mut a: Vec<f32> = (0..1024).map(|i| ((i % 17) as f32 - 8.0) / 9.0).collect();
+        let mut b: Vec<f32> = (0..1024).map(|i| ((i % 23) as f32 - 11.0) / 12.0).collect();
+        l2_normalize(&mut a);
+        l2_normalize(&mut b);
+        let exact = dot(&a, &b);
+        let narrowed = dot(
+            &blob_to_vec(&vec_to_blob(&a, Precision::F16), Precision::F16),
+            &blob_to_vec(&vec_to_blob(&b, Precision::F16), Precision::F16),
+        );
+        assert!((exact - narrowed).abs() < 1e-3, "cosine {exact} vs {narrowed}");
+    }
+
+    #[test]
+    fn corrupt_blobs_are_dropped_never_misread() {
+        // A trailing partial component means the blob is not what it claims.
+        assert!(blob_to_vec(&[0u8; 3], Precision::F16).len() == 1);
+        assert!(blob_to_vec(&[0u8; 5], Precision::F32).len() == 1);
+    }
+
     #[test]
     fn insert_normalizes_and_roundtrips_through_db() {
         let dir = brain(&[("knowledge/a.md", "- one\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
-        let missing = blocks_without_vectors(&conn, 10).unwrap();
+        let spec = test_spec(2);
+        let missing = hashes_without_vectors(&conn, &spec, 10).unwrap();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].1, "- one");
-        insert_vector(&conn, missing[0].0, &[3.0, 4.0]).unwrap();
+        assert_eq!(missing[0].0, content_hash("- one"), "the queue is keyed by content address");
+        insert_vector(&conn, &missing[0].0, &spec, &[3.0, 4.0]).unwrap();
         let blob: Vec<u8> = conn
-            .query_row("SELECT embedding FROM vectors WHERE block_id=?1", [missing[0].0], |r| r.get(0))
+            .query_row("SELECT embedding FROM vectors WHERE content_hash=?1", [&missing[0].0], |r| r.get(0))
             .unwrap();
-        let stored = blob_to_vec(&blob);
-        assert!((stored[0] - 0.6).abs() < 1e-6, "normalized at insert");
-        assert!((stored[1] - 0.8).abs() < 1e-6);
-        assert!(blocks_without_vectors(&conn, 10).unwrap().is_empty());
-        assert_eq!(vector_counts(&conn).unwrap(), (1, 1));
+        let stored = blob_to_vec(&blob, Precision::F16);
+        assert!((stored[0] - 0.6).abs() < 1e-3, "normalized at insert");
+        assert!((stored[1] - 0.8).abs() < 1e-3);
+        assert!(hashes_without_vectors(&conn, &spec, 10).unwrap().is_empty());
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 1));
     }
 
     #[test]
-    fn model_change_drops_vectors() {
+    fn a_spec_change_drops_vectors_and_a_repeat_keeps_them() {
         let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
-        assert!(!ensure_embed_model(&conn, "nomic-v1").unwrap(), "first model: nothing to drop");
-        assert!(!ensure_embed_dim(&conn, 2).unwrap());
-        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
-        }
-        assert_eq!(vector_counts(&conn).unwrap().0, 2);
-        assert!(!ensure_embed_model(&conn, "nomic-v1").unwrap(), "same model keeps vectors");
-        assert_eq!(vector_counts(&conn).unwrap().0, 2);
-        assert!(ensure_embed_model(&conn, "nomic-v2").unwrap(), "model change drops");
-        assert_eq!(vector_counts(&conn).unwrap().0, 0);
-        assert_eq!(blocks_without_vectors(&conn, 10).unwrap().len(), 2, "rebuild is first-class");
-        // dimension change behaves the same way
-        assert!(!ensure_embed_dim(&conn, 4).unwrap(), "dim was cleared by the model change");
-        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        }
-        assert!(ensure_embed_dim(&conn, 8).unwrap(), "dim change drops");
-        assert_eq!(vector_counts(&conn).unwrap().0, 0);
+        let spec = test_spec(2);
+        assert!(!ensure_vector_spec(&conn, &spec).unwrap(), "first run: nothing to drop");
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (2, 2));
+        assert!(!ensure_vector_spec(&conn, &spec).unwrap(), "same spec keeps vectors");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (2, 2));
+
+        let other_model = VectorSpec { model: "other".into(), ..spec.clone() };
+        assert!(ensure_vector_spec(&conn, &other_model).unwrap(), "model change drops");
+        assert_eq!(vector_coverage(&conn, &other_model).unwrap(), (0, 2));
+        embed_everything(&conn, &other_model, &[1.0, 0.0]);
+
+        let other_dim = VectorSpec { dim: 4, ..other_model.clone() };
+        assert!(ensure_vector_spec(&conn, &other_dim).unwrap(), "dimension change drops");
+        embed_everything(&conn, &other_dim, &[1.0, 0.0, 0.0, 0.0]);
+
+        let other_precision = VectorSpec { precision: Precision::F32, ..other_dim.clone() };
+        assert!(ensure_vector_spec(&conn, &other_precision).unwrap(), "precision change drops");
+        assert_eq!(vector_coverage(&conn, &other_precision).unwrap(), (0, 2));
+        assert_eq!(stored_vector_spec(&conn), Some(other_precision));
     }
 
     #[test]
-    fn rescan_drops_vectors_because_rowids_are_reused() {
+    fn rescan_preserves_vectors_for_unchanged_blocks() {
+        // THE regression: vectors used to be keyed by a volatile rowid, so
+        // every scan wiped the whole table and any markdown edit destroyed
+        // 100% of the embeddings. Content addressing makes an edit cost
+        // exactly the blocks that changed.
         let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
-        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
-        }
-        assert_eq!(vector_counts(&conn).unwrap().0, 2);
+        let spec = test_spec(2);
+        ensure_vector_spec(&conn, &spec).unwrap();
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (2, 2));
+
+        std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two\n- three\n").unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
-        assert_eq!(vector_counts(&conn).unwrap().0, 0, "full rebuild must clear derived vectors");
+        assert_eq!(
+            vector_coverage(&conn, &spec).unwrap(),
+            (2, 3),
+            "a full rebuild keeps every unchanged block's vector"
+        );
+        let missing = hashes_without_vectors(&conn, &spec, 10).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].1, "- three", "only the new block is queued");
+
+        // The incremental path must agree — it is the daemon's hot path.
+        embed_everything(&conn, &spec, &[0.0, 1.0]);
+        std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two\n- three\n- four\n").unwrap();
+        rescan_changed(&mut conn, dir.path(), None, &RingRules::default())
+            .unwrap()
+            .expect("small diff -> incremental");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (3, 4));
+    }
+
+    #[test]
+    fn an_edited_block_re_enters_the_queue_and_its_stale_vector_is_pruned() {
+        let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        let gone = content_hash("- two");
+
+        std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two, corrected\n").unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let missing = hashes_without_vectors(&conn, &spec, 10).unwrap();
+        assert_eq!(missing.len(), 1, "the edited block is queued again");
+        assert_eq!(missing[0].1, "- two, corrected");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 2));
+        let rows: i64 = conn.query_row("SELECT count(*) FROM vectors", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the vector of a hash no longer present is pruned");
+        assert!(
+            conn.query_row("SELECT 1 FROM vectors WHERE content_hash=?1", [&gone], |r| r.get::<_, i64>(0))
+                .is_err(),
+            "the superseded vector is gone, not orphaned"
+        );
     }
 
     #[test]
@@ -1920,27 +2029,28 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
         let assign = |text_frag: &str, v: &[f32]| {
-            let id: i64 = conn
+            let hash: String = conn
                 .query_row(
-                    "SELECT id FROM blocks WHERE text LIKE '%' || ?1 || '%'",
+                    "SELECT hash FROM blocks WHERE text LIKE '%' || ?1 || '%'",
                     [text_frag],
                     |r| r.get(0),
                 )
                 .unwrap();
-            insert_vector(&conn, id, v).unwrap();
+            insert_vector(&conn, &hash, &spec, v).unwrap();
         };
         assign("pools", &[1.0, 0.0]);
         assign("stalwart", &[0.0, 1.0]);
         let mut q = vec![0.9f32, 0.1];
         l2_normalize(&mut q);
-        let hits = semantic_recall(&conn, &q, 10).unwrap();
+        let hits = semantic_recall(&conn, &spec, &q, 10).unwrap();
         assert_eq!(hits.len(), 2, "unembedded block cannot appear");
         assert!(hits[0].path.ends_with("zfs.md"), "closest vector first");
         assert!(hits[1].path.ends_with("mail.md"));
         assert!(hits[0].cite.starts_with("r3-"), "hits carry the normal citation shape");
         // limit applies
-        assert_eq!(semantic_recall(&conn, &q, 1).unwrap().len(), 1);
+        assert_eq!(semantic_recall(&conn, &spec, &q, 1).unwrap().len(), 1);
     }
 
     #[test]
@@ -1955,13 +2065,14 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
-        let mut stmt = conn.prepare("SELECT id FROM blocks ORDER BY id").unwrap();
-        let ids: Vec<i64> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
+        let spec = test_spec(2);
+        let mut stmt = conn.prepare("SELECT hash FROM blocks ORDER BY id").unwrap();
+        let hashes: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
         drop(stmt);
-        insert_vector(&conn, ids[0], &[1.0, 0.0]).unwrap(); // a.md: far from query
-        insert_vector(&conn, ids[1], &[0.0, 1.0]).unwrap(); // b.md: close to query
+        insert_vector(&conn, &hashes[0], &spec, &[1.0, 0.0]).unwrap(); // a.md: far from query
+        insert_vector(&conn, &hashes[1], &spec, &[0.0, 1.0]).unwrap(); // b.md: close to query
         let q = vec![0.0f32, 1.0];
-        let hits = hybrid_recall(&conn, "zfs", &q, 10, 2.0).unwrap();
+        let hits = hybrid_recall(&conn, &spec, "zfs", &q, 10, 2.0).unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert!(paths.contains(&"knowledge/a.md"), "lexical-only hit present");
         assert!(paths.contains(&"knowledge/b.md"), "semantic-only hit present");
@@ -2330,11 +2441,10 @@ mod tests {
         let mut conn = open(state.path()).unwrap();
         let r1 = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(r1.generation, 1);
-        // Vectors on every block: unchanged docs must keep theirs.
-        for (id, _) in blocks_without_vectors(&conn, 100).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
-        }
-        let vectors_before = vector_counts(&conn).unwrap().0;
+        // Vectors on every block: unchanged CONTENT must keep theirs.
+        let spec = test_spec(2);
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        let vectors_before = vector_coverage(&conn, &spec).unwrap().0;
 
         // Change one file, add one (with a wikilink), delete one.
         std::fs::write(dir.path().join("knowledge/b.md"), "- keep this\n- brand new fact\n").unwrap();
@@ -2366,11 +2476,16 @@ mod tests {
         let linked = linked_docs(&conn, &["knowledge/d.md".to_string()], 8).unwrap();
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].0, "knowledge/a.md");
-        // Unchanged docs kept their vectors; changed/removed lost theirs.
-        let (vectors_after, _) = vector_counts(&conn).unwrap();
+        // Unchanged BLOCKS kept their vectors — including the untouched line
+        // of the doc that changed. Only genuinely new text needs embedding.
+        let (vectors_after, blocks_after) = vector_coverage(&conn, &spec).unwrap();
         let a_blocks = 3; // heading + 2 table rows
-        assert_eq!(vectors_after, a_blocks, "only the untouched doc's vectors survive");
-        assert!(vectors_before > vectors_after);
+        assert_eq!(vectors_after, a_blocks + 1, "a.md's blocks plus b.md's kept line");
+        assert_eq!(blocks_after, a_blocks + 3, "b.md's two lines and d.md's one");
+        assert_eq!(vectors_before, a_blocks + 2, "c.md's block was embedded too, then pruned");
+        let queued: Vec<String> =
+            hashes_without_vectors(&conn, &spec, 10).unwrap().into_iter().map(|(_, t)| t).collect();
+        assert_eq!(queued, vec!["- brand new fact", "arrived later, see [[a]]"]);
 
         // A no-op rescan commits nothing and keeps the generation.
         let r3 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();

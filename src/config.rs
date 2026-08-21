@@ -220,6 +220,48 @@ fn default_capture_enabled() -> bool {
     true
 }
 
+/// Stored width of one vector component. f16 halves the artifact (and the
+/// bytes every host has to move) at a cosine error far below the ranking's
+/// resolution — normalized components live in [-1, 1], where f16 keeps ~3
+/// decimal digits. f32 stays available for anyone who wants the exact
+/// endpoint output back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    #[default]
+    F16,
+    F32,
+}
+
+impl Precision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Precision::F16 => "f16",
+            Precision::F32 => "f32",
+        }
+    }
+
+    /// Bytes one component occupies on disk — the record stride of every
+    /// vector artifact.
+    pub fn width(self) -> usize {
+        match self {
+            Precision::F16 => 2,
+            Precision::F32 => 4,
+        }
+    }
+}
+
+/// The identity of a vector artifact: `(model, dim, precision)`. Every vector
+/// in the store and in the local cache belongs to exactly one of these, and a
+/// query only ever scores vectors of ITS spec — mixing models, widths or
+/// dimensions produces numbers that look like similarity and are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSpec {
+    pub model: String,
+    pub dim: usize,
+    pub precision: Precision,
+}
+
 /// Embeddings backend: any OpenAI-compatible `/embeddings` endpoint (a
 /// llama.cpp server, LM Studio, vLLM, or a hosted API). Disabled by default — semantic
 /// recall is opt-in, and the client is NEVER called from hook entrypoints
@@ -248,6 +290,28 @@ pub struct EmbeddingsConfig {
     /// per batched item (see embed::batch_timeout).
     #[serde(default = "default_embed_timeout_secs")]
     pub timeout_secs: u64,
+    /// Vector width to ask the endpoint for and to store. Modern embedders
+    /// are Matryoshka-trained: the request carries `dimensions`, and a model
+    /// that ignores it gets truncated client-side and re-normalized. 1024 is
+    /// the default because a 4096-dim vector over this corpus is 8-16x
+    /// oversized — it dominated the index file and measurably slowed the
+    /// scan without buying ranking quality.
+    #[serde(default = "default_embed_dimensions")]
+    pub dimensions: usize,
+    /// Stored component width (see [`Precision`]).
+    #[serde(default)]
+    pub precision: Precision,
+}
+
+impl EmbeddingsConfig {
+    /// The artifact identity this configuration asks for.
+    pub fn spec(&self) -> VectorSpec {
+        VectorSpec {
+            model: self.model.clone(),
+            dim: self.dimensions,
+            precision: self.precision,
+        }
+    }
 }
 
 impl Default for EmbeddingsConfig {
@@ -259,12 +323,18 @@ impl Default for EmbeddingsConfig {
             allow_hosts: Vec::new(),
             api_key_env: String::new(),
             timeout_secs: default_embed_timeout_secs(),
+            dimensions: default_embed_dimensions(),
+            precision: Precision::default(),
         }
     }
 }
 
 fn default_embed_timeout_secs() -> u64 {
     10
+}
+
+fn default_embed_dimensions() -> usize {
+    1024
 }
 
 /// The governance loop: Stop-side reminder producers plus instruction-decay
@@ -612,6 +682,44 @@ mod tests {
         // partial block keeps the timeout default
         std::fs::write(&p, r#"{"embeddings": {"enabled": true}}"#).unwrap();
         assert_eq!(Config::load_from(&p).unwrap().embeddings.timeout_secs, 10);
+    }
+
+    #[test]
+    fn embeddings_dimensions_and_precision_defaults_and_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.embeddings.dimensions, 1024, "default width: 1024, not the model native size");
+        assert_eq!(cfg.embeddings.precision, Precision::F16, "default: half floats");
+        assert_eq!(EmbeddingsConfig::default().dimensions, 1024, "Default impl must agree with serde");
+        assert_eq!(EmbeddingsConfig::default().precision, Precision::F16);
+
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"embeddings": {"dimensions": 512, "precision": "f32"}}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.embeddings.dimensions, 512);
+        assert_eq!(cfg.embeddings.precision, Precision::F32);
+
+        // An unknown width is a typo, not a policy: refused at load.
+        std::fs::write(&p, r#"{"embeddings": {"precision": "bfloat16"}}"#).unwrap();
+        assert!(Config::load_from(&p).is_err(), "unknown precision must be loud");
+    }
+
+    #[test]
+    fn vector_spec_carries_model_dim_and_precision() {
+        let spec = EmbeddingsConfig {
+            model: "nomic".into(),
+            dimensions: 256,
+            precision: Precision::F32,
+            ..EmbeddingsConfig::default()
+        }
+        .spec();
+        assert_eq!(spec.model, "nomic");
+        assert_eq!(spec.dim, 256);
+        assert_eq!(spec.precision, Precision::F32);
+        assert_eq!(Precision::F16.width(), 2);
+        assert_eq!(Precision::F32.width(), 4);
+        assert_eq!(Precision::F16.as_str(), "f16");
+        assert_eq!(Precision::F32.as_str(), "f32");
     }
 
     #[test]

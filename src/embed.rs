@@ -460,9 +460,40 @@ mod tests {
             enabled: true,
             endpoint: url.to_string(),
             model: "test-model".to_string(),
+            dimensions: 2,
             ..EmbeddingsConfig::default()
         })
         .unwrap()
+    }
+
+    /// Response whose vectors are `width` long regardless of the requested
+    /// `dimensions` — the endpoint that ignores the parameter.
+    fn canned_width(body: &str, width: usize) -> String {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let n = v["input"].as_array().unwrap().len();
+        let rows: Vec<String> = (0..n)
+            .map(|i| {
+                let comps: Vec<String> = (0..width).map(|d| format!("{}", (i + d + 1) as f32)).collect();
+                format!(r#"{{"object":"embedding","index":{i},"embedding":[{}]}}"#, comps.join(","))
+            })
+            .collect();
+        http_response(200, &format!(r#"{{"object":"list","data":[{}]}}"#, rows.join(",")))
+    }
+
+    /// Response honoring the requested `dimensions` (Matryoshka-style
+    /// truncation at the endpoint), falling back to `native` when absent.
+    fn canned_honoring_dimensions(body: &str, native: usize) -> String {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let width = v["dimensions"].as_u64().map(|d| d as usize).unwrap_or(native);
+        canned_width(body, width.min(native))
+    }
+
+    fn spec_for(dim: usize) -> crate::config::VectorSpec {
+        crate::config::VectorSpec {
+            model: "test-model".into(),
+            dim,
+            precision: crate::config::Precision::F16,
+        }
     }
 
     // ---- SSRF guard ----
@@ -698,15 +729,23 @@ mod tests {
         (brain, state, conn)
     }
 
+    /// A shared store over the given brain tree, at the 2-d test spec.
+    fn store_for(brain: &std::path::Path) -> crate::vectors::VectorStore {
+        crate::vectors::VectorStore::open(brain, &spec_for(2)).unwrap()
+    }
+
     #[test]
     fn embed_index_embeds_all_blocks_in_batches() {
-        let (_brain, _state, mut conn) = five_block_index();
+        let (brain, _state, mut conn) = five_block_index();
         let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
         let client = client_for(&url);
-        let report = run(&mut conn, &client, 2).unwrap();
+        let mut store = store_for(brain.path());
+        let report = run(&mut conn, &client, 2, &mut store).unwrap();
         assert_eq!(report.embedded, 5);
+        assert_eq!(report.imported, 0);
         assert_eq!(report.total_blocks, 5);
-        assert_eq!(index::vector_counts(&conn).unwrap(), (5, 5));
+        assert_eq!(index::vector_coverage(&conn, &spec_for(2)).unwrap(), (5, 5));
+        assert_eq!(store.len(), 5, "the shared tree is the record, not index.db");
         let sizes: Vec<usize> = bodies
             .lock()
             .unwrap()
@@ -727,22 +766,28 @@ mod tests {
 
     #[test]
     fn embed_index_is_resumable_after_midway_failure() {
-        let (_brain, _state, mut conn) = five_block_index();
+        let (brain, _state, mut conn) = five_block_index();
         // First server: batch 1 succeeds, batch 2 fails -> run() errors, but
         // the first batch's vectors are already committed.
         let (url_a, _, _) = spawn_server(|n, body| {
             if n == 0 { canned_embeddings(body, 0.0) } else { http_response(500, "{}") }
         });
         let client_a = client_for(&url_a);
-        assert!(run(&mut conn, &client_a, 2).is_err());
-        assert_eq!(index::vector_counts(&conn).unwrap().0, 2, "committed batch survives the failure");
+        let mut store = store_for(brain.path());
+        assert!(run(&mut conn, &client_a, 2, &mut store).is_err());
+        assert_eq!(
+            index::vector_coverage(&conn, &spec_for(2)).unwrap().0,
+            2,
+            "committed batch survives the failure"
+        );
+        assert_eq!(store.len(), 2, "and it survives in the SHARED store, not only locally");
 
         // Second server: healthy. Only the 3 missing blocks get embedded.
         let (url_b, bodies_b, _) = spawn_server(|_, body| canned_embeddings(body, 100.0));
         let client_b = client_for(&url_b);
-        let report = run(&mut conn, &client_b, 2).unwrap();
+        let report = run(&mut conn, &client_b, 2, &mut store).unwrap();
         assert_eq!(report.embedded, 3, "resume embeds only what is missing");
-        assert_eq!(index::vector_counts(&conn).unwrap(), (5, 5));
+        assert_eq!(index::vector_coverage(&conn, &spec_for(2)).unwrap(), (5, 5));
         let inputs_b: Vec<String> = bodies_b
             .lock()
             .unwrap()
@@ -761,21 +806,217 @@ mod tests {
 
     #[test]
     fn embed_index_after_model_change_re_embeds_everything() {
-        let (_brain, _state, mut conn) = five_block_index();
+        let (brain, _state, mut conn) = five_block_index();
         let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
         let client = client_for(&url);
-        run(&mut conn, &client, 8).unwrap();
-        assert_eq!(index::vector_counts(&conn).unwrap(), (5, 5));
-        // Same endpoint, different model name -> full drop + re-embed.
-        let client2 = EmbedClient::new(&EmbeddingsConfig {
+        let mut store = store_for(brain.path());
+        run(&mut conn, &client, 8, &mut store).unwrap();
+        assert_eq!(index::vector_coverage(&conn, &spec_for(2)).unwrap(), (5, 5));
+        // Same endpoint, different model name -> a different artifact: full
+        // drop of the old cache, a NEW shared store, everything re-embedded.
+        let cfg2 = EmbeddingsConfig {
             enabled: true,
             endpoint: url.clone(),
             model: "other-model".to_string(),
+            dimensions: 2,
+            ..EmbeddingsConfig::default()
+        };
+        let client2 = EmbedClient::new(&cfg2).unwrap();
+        let mut store2 = crate::vectors::VectorStore::open(brain.path(), &cfg2.spec()).unwrap();
+        let report = run(&mut conn, &client2, 8, &mut store2).unwrap();
+        assert_eq!(report.embedded, 5, "model change drops vectors; all re-embedded");
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+        assert_eq!(store.len(), 5, "the old model's artifacts are untouched, not destroyed");
+        assert_eq!(store2.len(), 5);
+    }
+
+    // ---- dimensions and width ----
+
+    #[test]
+    fn the_configured_width_is_requested_and_enforced_client_side() {
+        // The endpoint here IGNORES `dimensions` and always answers 8-d, so
+        // the client must truncate and re-normalize (Matryoshka prefix).
+        let (url, bodies, _) = spawn_server(|_, body| canned_width(body, 8));
+        let client = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            dimensions: 4,
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        let report = run(&mut conn, &client2, 8).unwrap();
-        assert_eq!(report.embedded, 5, "model change drops vectors; all re-embedded");
-        assert_eq!(bodies.lock().unwrap().len(), 2);
+        let out = client.embed(&["alpha"]).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(sent["dimensions"], 4, "the request asks the endpoint for the width");
+        assert_eq!(out[0].len(), 4, "an endpoint that ignores it is sliced client-side");
+        let norm: f32 = out[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "re-normalized after slicing, got {norm}");
+        // The prefix is the model's first 4 components, direction preserved.
+        assert!(out[0][0] < out[0][1] && out[0][1] < out[0][2]);
+    }
+
+    #[test]
+    fn an_endpoint_honoring_dimensions_is_taken_at_its_word() {
+        let (url, _, _) = spawn_server(|_, body| canned_honoring_dimensions(body, 8));
+        let client = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            dimensions: 3,
+            ..EmbeddingsConfig::default()
+        })
+        .unwrap();
+        assert_eq!(client.embed(&["alpha"]).unwrap()[0].len(), 3);
+    }
+
+    #[test]
+    fn a_model_narrower_than_the_configured_width_is_loud() {
+        // Never pad, never silently store a shorter vector: the operator
+        // asked for a width this model cannot produce, and must hear it.
+        let (url, _, _) = spawn_server(|_, body| canned_width(body, 2));
+        let client = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            dimensions: 16,
+            ..EmbeddingsConfig::default()
+        })
+        .unwrap();
+        let err = client.embed(&["alpha"]).unwrap_err().to_string();
+        assert!(err.contains("16") && err.contains('2'), "both widths named: {err}");
+        assert!(err.contains("embeddings.dimensions"), "the fix is named: {err}");
+    }
+
+    #[test]
+    fn dimensions_are_honored_end_to_end_into_the_shared_store() {
+        let (brain, _state, mut conn) = five_block_index();
+        let (url, _, _) = spawn_server(|_, body| canned_width(body, 8));
+        let cfg = EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            dimensions: 4,
+            precision: crate::config::Precision::F16,
+            ..EmbeddingsConfig::default()
+        };
+        let client = EmbedClient::new(&cfg).unwrap();
+        let mut store = crate::vectors::VectorStore::open(brain.path(), &cfg.spec()).unwrap();
+        run(&mut conn, &client, 8, &mut store).unwrap();
+        let stored = store.get(&index::content_hash("- one")).unwrap().unwrap();
+        assert_eq!(stored.len(), 4, "the artifact carries the configured width");
+        let dim: i64 = conn.query_row("SELECT dim FROM vectors LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(dim, 4);
+        let blob_len: i64 =
+            conn.query_row("SELECT length(embedding) FROM vectors LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(blob_len, 8, "f16: 4 components in 8 bytes");
+        let file = crate::paths::shared_vector_dir(brain.path()).join("test-model-4-f16.bin");
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 5 * 8, "5 blocks x 4 f16 components");
+    }
+
+    // ---- compute-once across hosts ----
+
+    #[test]
+    fn a_second_host_reads_the_shared_store_and_embeds_nothing() {
+        let (brain, _state, mut conn) = five_block_index();
+        let (url, _, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let mut store = store_for(brain.path());
+        run(&mut conn, &client_for(&url), 8, &mut store).unwrap();
+        assert_eq!(store.len(), 5);
+
+        // Host B: same tree, its own empty state dir, and an endpoint that
+        // fails every request. Derived-once means it must never be called.
+        let state_b = tempfile::tempdir().unwrap();
+        let mut conn_b = index::open(state_b.path()).unwrap();
+        index::scan(&mut conn_b, brain.path(), None, &crate::config::RingRules::default()).unwrap();
+        let (url_b, bodies_b, _) = spawn_server(|_, _| http_response(500, r#"{"error":"no"}"#));
+        let mut store_b = store_for(brain.path());
+        let report = run(&mut conn_b, &client_for(&url_b), 8, &mut store_b).unwrap();
+        assert_eq!(report.embedded, 0, "nothing to derive: the group already derived it");
+        assert_eq!(report.imported, 5, "the shared artifacts are read, not recomputed");
+        assert!(bodies_b.lock().unwrap().is_empty(), "the endpoint was never called");
+        assert_eq!(index::vector_coverage(&conn_b, &spec_for(2)).unwrap(), (5, 5));
+    }
+
+    // ---- no silent degradation ----
+
+    fn semantic_config(brain: &std::path::Path, url: &str) -> Config {
+        Config {
+            brain_root: brain.to_path_buf(),
+            embeddings: EmbeddingsConfig {
+                enabled: true,
+                endpoint: url.to_string(),
+                model: "test-model".into(),
+                dimensions: 2,
+                ..EmbeddingsConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn zero_coverage_warns_with_the_numbers_and_answers_lexically() {
+        let (brain, _state, conn) = five_block_index();
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let cfg = semantic_config(brain.path(), &url);
+        let out = semantic_hits(&cfg, &conn, "three", 5, true).unwrap();
+        let note = out.note.expect("zero coverage must be reported, never hidden");
+        assert!(note.contains("0/5"), "the numbers are in the warning: {note}");
+        assert!(note.contains("cfetch embed-index"), "the fix is named: {note}");
+        assert_eq!(out.hits.len(), 1, "the lexical answer is still delivered");
+        assert!(out.hits[0].snippet.contains("three"));
+        assert!(bodies.lock().unwrap().is_empty(), "no point embedding a query nothing can match");
+        // --semantic degrades the same way: an answer plus the truth about it.
+        let out = semantic_hits(&cfg, &conn, "three", 5, false).unwrap();
+        assert!(out.note.is_some());
+        assert_eq!(out.hits.len(), 1);
+    }
+
+    #[test]
+    fn partial_coverage_warns_with_the_numbers_and_still_ranks() {
+        let (brain, _state, mut conn) = five_block_index();
+        let spec = spec_for(2);
+        index::ensure_vector_spec(&conn, &spec).unwrap();
+        for (hash, _) in index::hashes_without_vectors(&conn, &spec, 2).unwrap() {
+            index::insert_vector(&conn, &hash, &spec, &[1.0, 0.0]).unwrap();
+        }
+        let (url, _, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let cfg = semantic_config(brain.path(), &url);
+        let out = semantic_hits(&cfg, &conn, "one", 5, true).unwrap();
+        let note = out.note.expect("partial coverage is degradation, and must be said");
+        assert!(note.contains("2/5"), "got: {note}");
+        assert!(!out.hits.is_empty());
+        let _ = &mut conn;
+    }
+
+    #[test]
+    fn full_coverage_is_silent() {
+        let (brain, _state, mut conn) = five_block_index();
+        let (url, _, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let cfg = semantic_config(brain.path(), &url);
+        let mut store = store_for(brain.path());
+        run(&mut conn, &EmbedClient::new(&cfg.embeddings).unwrap(), 8, &mut store).unwrap();
+        let out = semantic_hits(&cfg, &conn, "one", 5, true).unwrap();
+        assert!(out.note.is_none(), "no warning when nothing is degraded: {:?}", out.note);
+        assert!(!out.hits.is_empty());
+    }
+
+    #[test]
+    fn a_query_host_hydrates_from_the_shared_store_before_answering() {
+        // The none-embed host: vectors exist in the tree, its index.db has
+        // none. It must answer semantically without an embed run of its own.
+        let (brain, _state, mut conn) = five_block_index();
+        let (url, _, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let cfg = semantic_config(brain.path(), &url);
+        let mut store = store_for(brain.path());
+        run(&mut conn, &EmbedClient::new(&cfg.embeddings).unwrap(), 8, &mut store).unwrap();
+
+        let state_b = tempfile::tempdir().unwrap();
+        let mut conn_b = index::open(state_b.path()).unwrap();
+        index::scan(&mut conn_b, brain.path(), None, &crate::config::RingRules::default()).unwrap();
+        assert_eq!(index::vector_coverage(&conn_b, &spec_for(2)).unwrap(), (0, 5));
+        let out = semantic_hits(&cfg, &conn_b, "one", 5, false).unwrap();
+        assert!(out.note.is_none(), "the tree covered it: {:?}", out.note);
+        assert!(!out.hits.is_empty());
+        assert_eq!(index::vector_coverage(&conn_b, &spec_for(2)).unwrap(), (5, 5));
     }
 }
