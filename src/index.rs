@@ -32,6 +32,7 @@ pub struct Block {
     pub text: String,
 }
 
+#[derive(Debug)]
 pub struct Hit {
     pub cite: String,
     pub path: String,
@@ -219,7 +220,7 @@ fn db_path(state_dir: &Path) -> PathBuf {
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
 /// disposable — mismatches are handled by delete-and-rebuild in `open()`.
-const SCHEMA_VERSION: i64 = 4; // 4: code_files.rank_pct + import_edges
+const SCHEMA_VERSION: i64 = 5; // 5: rank_pct + import_edges + vectors (merged)
 
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -261,7 +262,11 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
          );
          CREATE INDEX IF NOT EXISTS links_from ON links(from_doc);
          CREATE INDEX IF NOT EXISTS links_to ON links(to_doc);
-         CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(text, content='blocks', content_rowid='id');",
+         CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(text, content='blocks', content_rowid='id');
+         CREATE TABLE IF NOT EXISTS vectors(
+           block_id INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+           embedding BLOB NOT NULL
+         );",
     )?;
     Ok(conn)
 }
@@ -410,8 +415,12 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
         .filter_map(|src| std::fs::read_to_string(&src.abs).ok().map(|raw| (src, raw)))
         .collect();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Vectors MUST go with the blocks they describe: after `DELETE FROM
+    // blocks` SQLite reuses rowids from 1, so a stale vectors row would
+    // silently attach to an unrelated new block. Embeddings are derived data;
+    // `embed-index` rebuilds them resumably.
     tx.execute_batch(
-        "DELETE FROM blocks; DELETE FROM docs;
+        "DELETE FROM vectors; DELETE FROM blocks; DELETE FROM docs;
          INSERT INTO blocks_fts(blocks_fts) VALUES('delete-all');",
     )?;
     tx.execute(
@@ -538,6 +547,12 @@ fn fts_query(user_query: &str) -> String {
         .join(" OR ")
 }
 
+/// One-line, length-capped preview of a block for hit listings.
+fn snippet_of(text: &str) -> String {
+    let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    one.chars().take(160).collect()
+}
+
 pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<Hit>> {
     let fts = fts_query(query);
     if fts.is_empty() {
@@ -559,11 +574,7 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
             ring: r.get::<_, i64>(2)? as u8,
             start_line: r.get::<_, i64>(3)? as usize,
             end_line: r.get::<_, i64>(4)? as usize,
-            snippet: {
-                let t: String = r.get(5)?;
-                let one = t.split_whitespace().collect::<Vec<_>>().join(" ");
-                one.chars().take(160).collect()
-            },
+            snippet: snippet_of(&r.get::<_, String>(5)?),
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
@@ -587,6 +598,228 @@ pub fn expand(conn: &Connection, cite: &str) -> anyhow::Result<Vec<Block>> {
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
+}
+
+// ---- vector store (semantic + hybrid recall) ----
+//
+// Embeddings live INSIDE index.db as little-endian f32 blobs, one row per
+// block, L2-normalized at insert so cosine similarity reduces to a dot
+// product at query time. No vector-index dependency: at ~20k blocks a linear
+// scan in Rust is milliseconds, exact, and zero-dep (the sanctioned fallback
+// in DESIGN.md). A missing row means "not yet embedded" — that single fact
+// makes `embed-index` resumable for free.
+
+/// Little-endian f32 encoding — the on-disk vector format.
+pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`vec_to_blob`]; a trailing partial chunk (corrupt blob) is
+/// dropped rather than misread.
+pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// L2-normalizes in place; the zero vector is left untouched (it can never
+/// rank anyway).
+pub fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// Plain dot product — cosine similarity, given both sides are normalized.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn meta_get(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).ok()
+}
+
+fn meta_set(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [key, value],
+    )?;
+    Ok(())
+}
+
+/// Records the embedding model in meta; a DIFFERENT stored model drops every
+/// vector (and the stored dimension) — mixed-model similarity is meaningless,
+/// and rebuild is a first-class, resumable path. Returns true when vectors
+/// were dropped.
+pub fn ensure_embed_model(conn: &Connection, model: &str) -> anyhow::Result<bool> {
+    let stored = meta_get(conn, "embed_model");
+    if stored.as_deref() == Some(model) {
+        return Ok(false);
+    }
+    let dropping = stored.is_some();
+    conn.execute("DELETE FROM vectors", [])?;
+    // The dimension belongs to the model: clear it so the next embed run
+    // re-learns it from the first response.
+    conn.execute("DELETE FROM meta WHERE key='embed_dim'", [])?;
+    meta_set(conn, "embed_model", model)?;
+    Ok(dropping)
+}
+
+/// Same contract as [`ensure_embed_model`] for the vector dimension (a model
+/// NAME can silently change dimension when the endpoint is reconfigured).
+pub fn ensure_embed_dim(conn: &Connection, dim: usize) -> anyhow::Result<bool> {
+    let stored = meta_get(conn, "embed_dim");
+    let dim_str = dim.to_string();
+    if stored.as_deref() == Some(dim_str.as_str()) {
+        return Ok(false);
+    }
+    let dropping = stored.is_some();
+    conn.execute("DELETE FROM vectors", [])?;
+    meta_set(conn, "embed_dim", &dim_str)?;
+    Ok(dropping)
+}
+
+/// Blocks with no vector row yet, in stable id order — the embed-index work
+/// queue. Missing row = not yet embedded (resumability contract).
+pub fn blocks_without_vectors(conn: &Connection, limit: usize) -> anyhow::Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.id, b.text FROM blocks b
+         LEFT JOIN vectors v ON v.block_id = b.id
+         WHERE v.block_id IS NULL
+         ORDER BY b.id LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// (embedded, total blocks) — progress reporting.
+pub fn vector_counts(conn: &Connection) -> anyhow::Result<(usize, usize)> {
+    let (v, b): (i64, i64) = conn.query_row(
+        "SELECT (SELECT count(*) FROM vectors), (SELECT count(*) FROM blocks)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((v as usize, b as usize))
+}
+
+/// Stores one block's embedding, L2-normalized, as a little-endian f32 blob.
+pub fn insert_vector(conn: &Connection, block_id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+    let mut v = embedding.to_vec();
+    l2_normalize(&mut v);
+    conn.execute(
+        "INSERT INTO vectors(block_id, embedding) VALUES(?1, ?2)
+         ON CONFLICT(block_id) DO UPDATE SET embedding=excluded.embedding",
+        rusqlite::params![block_id, vec_to_blob(&v)],
+    )?;
+    Ok(())
+}
+
+/// Hits for the given block ids, preserving the ids' order. Ids that no
+/// longer exist (index moved on) are silently skipped.
+fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.cite, d.path, d.ring, b.start_line, b.end_line, b.text
+         FROM blocks b JOIN docs d ON d.id = b.doc_id WHERE b.id = ?1",
+    )?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let hit = stmt.query_row([id], |r| {
+            Ok(Hit {
+                cite: r.get(0)?,
+                path: r.get(1)?,
+                ring: r.get::<_, i64>(2)? as u8,
+                start_line: r.get::<_, i64>(3)? as usize,
+                end_line: r.get::<_, i64>(4)? as usize,
+                snippet: snippet_of(&r.get::<_, String>(5)?),
+            })
+        });
+        if let Ok(hit) = hit {
+            out.push(hit);
+        }
+    }
+    Ok(out)
+}
+
+/// Block ids ranked by dot product against a normalized query vector —
+/// a full linear scan, exact by construction. Rows whose dimension does not
+/// match the query are skipped (transitional state during a model change).
+fn semantic_block_ids(conn: &Connection, query_vec: &[f32], limit: usize) -> anyhow::Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT block_id, embedding FROM vectors")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+    let mut scored: Vec<(i64, f32)> = rows
+        .filter_map(Result::ok)
+        .filter_map(|(id, blob)| {
+            let v = blob_to_vec(&blob);
+            (v.len() == query_vec.len()).then(|| (id, dot(&v, query_vec)))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    scored.truncate(limit);
+    Ok(scored.into_iter().map(|(id, _)| id).collect())
+}
+
+/// Pure cosine ranking over all stored vectors (query vector must be
+/// normalized). Blocks without vectors simply cannot appear.
+pub fn semantic_recall(conn: &Connection, query_vec: &[f32], limit: usize) -> anyhow::Result<Vec<Hit>> {
+    let ids = semantic_block_ids(conn, query_vec, limit)?;
+    hits_for_block_ids(conn, &ids)
+}
+
+/// BM25-ranked block ids for the same query shape [`recall`] uses.
+fn bm25_block_ids(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<i64>> {
+    let fts = fts_query(query);
+    if fts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT b.id FROM blocks_fts f
+         JOIN blocks b ON b.id = f.rowid
+         JOIN docs d ON d.id = b.doc_id
+         WHERE blocks_fts MATCH ?1
+         ORDER BY bm25(blocks_fts), d.ring ASC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![fts, limit as i64], |r| r.get(0))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Reciprocal rank fusion over ranked id lists: score(d) = Σ 1/(k + rank),
+/// rank starting at 1. Ties break by id for determinism.
+pub fn rrf_fuse(lists: &[Vec<i64>], k: f64) -> Vec<i64> {
+    let mut score: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    for list in lists {
+        for (i, id) in list.iter().enumerate() {
+            *score.entry(*id).or_default() += 1.0 / (k + (i + 1) as f64);
+        }
+    }
+    let mut items: Vec<(i64, f64)> = score.into_iter().collect();
+    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    items.into_iter().map(|(id, _)| id).collect()
+}
+
+/// BM25 list ⊕ semantic list via RRF — each fetched with a wider pool than
+/// the final limit so fusion has something to reorder.
+pub fn hybrid_recall(
+    conn: &Connection,
+    query: &str,
+    query_vec: &[f32],
+    limit: usize,
+    rrf_k: f64,
+) -> anyhow::Result<Vec<Hit>> {
+    let pool = (limit * 4).max(20);
+    let lexical = bm25_block_ids(conn, query, pool)?;
+    let semantic = semantic_block_ids(conn, query_vec, pool)?;
+    let mut fused = rrf_fuse(&[lexical, semantic], rrf_k);
+    fused.truncate(limit);
+    hits_for_block_ids(conn, &fused)
 }
 
 /// Ensures the index exists and is fresh, rebuilding when stale. Rebuilds are
@@ -890,6 +1123,174 @@ mod tests {
         scan(&mut conn, dir.path(), None).unwrap();
         let linked = linked_docs(&conn, &["knowledge/linker.md".to_string()], 8).unwrap();
         assert!(linked.is_empty(), "ambiguous stem must create no edge");
+    }
+
+    #[test]
+    fn f32_blob_roundtrip_is_little_endian() {
+        let v = vec![0.25f32, -1.5, 3.0];
+        let blob = vec_to_blob(&v);
+        assert_eq!(blob.len(), 12);
+        assert_eq!(&blob[0..4], &0.25f32.to_le_bytes());
+        assert_eq!(blob_to_vec(&blob), v);
+        // corrupt trailing partial chunk is dropped, not misread
+        assert_eq!(blob_to_vec(&blob[..10]), vec![0.25f32, -1.5]);
+    }
+
+    #[test]
+    fn cosine_on_known_vectors() {
+        let mut a = vec![3.0f32, 4.0];
+        l2_normalize(&mut a);
+        assert!((a[0] - 0.6).abs() < 1e-6);
+        assert!((a[1] - 0.8).abs() < 1e-6);
+        assert!((dot(&a, &a) - 1.0).abs() < 1e-6);
+        let mut x = vec![1.0f32, 0.0];
+        let mut y = vec![0.0f32, 1.0];
+        l2_normalize(&mut x);
+        l2_normalize(&mut y);
+        assert!(dot(&x, &y).abs() < 1e-6, "orthogonal vectors have cosine 0");
+        let mut d = vec![1.0f32, 1.0];
+        l2_normalize(&mut d);
+        assert!((dot(&d, &x) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        // zero vector: normalization must not divide by zero
+        let mut z = vec![0.0f32, 0.0];
+        l2_normalize(&mut z);
+        assert_eq!(z, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn rrf_fusion_on_hand_built_rankings_k2() {
+        // list 1: a b c   list 2: c a d
+        // K=2 scores: a = 1/3 + 1/4 = 0.583, c = 1/5 + 1/3 = 0.533,
+        //             b = 1/4 = 0.25,        d = 1/5 = 0.2
+        let fused = rrf_fuse(&[vec![1, 2, 3], vec![3, 1, 4]], 2.0);
+        assert_eq!(fused, vec![1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn rrf_ties_break_by_id_deterministically() {
+        // two disjoint single-item lists: equal scores, id order decides
+        let fused = rrf_fuse(&[vec![9], vec![4]], 2.0);
+        assert_eq!(fused, vec![4, 9]);
+    }
+
+    #[test]
+    fn insert_normalizes_and_roundtrips_through_db() {
+        let dir = brain(&[("knowledge/a.md", "- one\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let missing = blocks_without_vectors(&conn, 10).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].1, "- one");
+        insert_vector(&conn, missing[0].0, &[3.0, 4.0]).unwrap();
+        let blob: Vec<u8> = conn
+            .query_row("SELECT embedding FROM vectors WHERE block_id=?1", [missing[0].0], |r| r.get(0))
+            .unwrap();
+        let stored = blob_to_vec(&blob);
+        assert!((stored[0] - 0.6).abs() < 1e-6, "normalized at insert");
+        assert!((stored[1] - 0.8).abs() < 1e-6);
+        assert!(blocks_without_vectors(&conn, 10).unwrap().is_empty());
+        assert_eq!(vector_counts(&conn).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn model_change_drops_vectors() {
+        let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        assert!(!ensure_embed_model(&conn, "nomic-v1").unwrap(), "first model: nothing to drop");
+        assert!(!ensure_embed_dim(&conn, 2).unwrap());
+        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
+            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
+        }
+        assert_eq!(vector_counts(&conn).unwrap().0, 2);
+        assert!(!ensure_embed_model(&conn, "nomic-v1").unwrap(), "same model keeps vectors");
+        assert_eq!(vector_counts(&conn).unwrap().0, 2);
+        assert!(ensure_embed_model(&conn, "nomic-v2").unwrap(), "model change drops");
+        assert_eq!(vector_counts(&conn).unwrap().0, 0);
+        assert_eq!(blocks_without_vectors(&conn, 10).unwrap().len(), 2, "rebuild is first-class");
+        // dimension change behaves the same way
+        assert!(!ensure_embed_dim(&conn, 4).unwrap(), "dim was cleared by the model change");
+        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
+            insert_vector(&conn, id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        }
+        assert!(ensure_embed_dim(&conn, 8).unwrap(), "dim change drops");
+        assert_eq!(vector_counts(&conn).unwrap().0, 0);
+    }
+
+    #[test]
+    fn rescan_drops_vectors_because_rowids_are_reused() {
+        let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
+            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
+        }
+        assert_eq!(vector_counts(&conn).unwrap().0, 2);
+        scan(&mut conn, dir.path(), None).unwrap();
+        assert_eq!(vector_counts(&conn).unwrap().0, 0, "full rebuild must clear derived vectors");
+    }
+
+    #[test]
+    fn semantic_recall_ranks_by_cosine() {
+        let dir = brain(&[
+            ("knowledge/zfs.md", "pools and datasets\n"),
+            ("knowledge/mail.md", "stalwart smtp\n"),
+            ("knowledge/unembedded.md", "no vector here\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let assign = |text_frag: &str, v: &[f32]| {
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM blocks WHERE text LIKE '%' || ?1 || '%'",
+                    [text_frag],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_vector(&conn, id, v).unwrap();
+        };
+        assign("pools", &[1.0, 0.0]);
+        assign("stalwart", &[0.0, 1.0]);
+        let mut q = vec![0.9f32, 0.1];
+        l2_normalize(&mut q);
+        let hits = semantic_recall(&conn, &q, 10).unwrap();
+        assert_eq!(hits.len(), 2, "unembedded block cannot appear");
+        assert!(hits[0].path.ends_with("zfs.md"), "closest vector first");
+        assert!(hits[1].path.ends_with("mail.md"));
+        assert!(hits[0].cite.starts_with("r3-"), "hits carry the normal citation shape");
+        // limit applies
+        assert_eq!(semantic_recall(&conn, &q, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hybrid_recall_fuses_lexical_and_semantic() {
+        // "zfs" appears lexically only in doc A; doc B is only semantically
+        // close to the query vector. Hybrid must surface both, lexical hit
+        // first (it leads on BOTH its list rank and the fused score here).
+        let dir = brain(&[
+            ("knowledge/a.md", "zfs pools and datasets\n"),
+            ("knowledge/b.md", "storage volumes explained\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM blocks ORDER BY id").unwrap();
+        let ids: Vec<i64> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
+        drop(stmt);
+        insert_vector(&conn, ids[0], &[1.0, 0.0]).unwrap(); // a.md: far from query
+        insert_vector(&conn, ids[1], &[0.0, 1.0]).unwrap(); // b.md: close to query
+        let q = vec![0.0f32, 1.0];
+        let hits = hybrid_recall(&conn, "zfs", &q, 10, 2.0).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"knowledge/a.md"), "lexical-only hit present");
+        assert!(paths.contains(&"knowledge/b.md"), "semantic-only hit present");
+        // a.md: rank 1 lexical (1/3) + rank 2 semantic (1/4) = 0.583
+        // b.md: rank 1 semantic (1/3) = 0.333
+        assert_eq!(paths[0], "knowledge/a.md");
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod code;
 mod config;
 mod daemon;
 mod dashboard;
+mod embed;
 mod exhaust;
 mod graph;
 mod heartbeat;
@@ -82,6 +83,12 @@ enum Command {
         /// Also list docs wikilinked to the top hits (1-hop curated graph)
         #[arg(long)]
         expand: bool,
+        /// Rank purely by embedding cosine similarity (requires embeddings config)
+        #[arg(long, conflicts_with = "hybrid")]
+        semantic: bool,
+        /// Fuse BM25 and semantic rankings via reciprocal rank fusion
+        #[arg(long)]
+        hybrid: bool,
         #[arg(long, default_value_t = 8)]
         limit: usize,
         #[arg(long)]
@@ -91,6 +98,12 @@ enum Command {
     Staging {
         #[command(subcommand)]
         action: StagingAction,
+    },
+    /// Embed index blocks lacking vectors (resumable; requires embeddings config)
+    EmbedIndex {
+        /// Blocks per embeddings request
+        #[arg(long, default_value_t = 64)]
+        batch: usize,
     },
     /// Open the terminal dashboard: health, ledger, live recall
     Dashboard,
@@ -294,7 +307,16 @@ fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn recall(query: &str, id: Option<&str>, expand: bool, limit: usize, json: bool) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)] // thin CLI adapter, mirrors the flag set
+fn recall(
+    query: &str,
+    id: Option<&str>,
+    expand: bool,
+    semantic: bool,
+    hybrid: bool,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     let native = paths::native_projects_root();
     let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
@@ -324,7 +346,11 @@ fn recall(query: &str, id: Option<&str>, expand: bool, limit: usize, json: bool)
     if query.trim().is_empty() {
         anyhow::bail!("empty query (pass search terms or --id <citation>)");
     }
-    let hits = index::recall(&conn, query, limit)?;
+    let hits = if semantic || hybrid {
+        embed::semantic_hits(&cfg, &conn, query, limit, hybrid)?
+    } else {
+        index::recall(&conn, query, limit)?
+    };
     let linked = if expand && !hits.is_empty() {
         let top: Vec<String> = hits.iter().take(3).map(|h| h.path.clone()).collect();
         index::linked_docs(&conn, &top, 8)?
@@ -541,9 +567,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Recall { query, id, expand, limit, json } => {
-            if let Err(e) = recall(&query.join(" "), id.as_deref(), expand, limit, json) {
+        Command::Recall { query, id, expand, semantic, hybrid, limit, json } => {
+            if let Err(e) = recall(&query.join(" "), id.as_deref(), expand, semantic, hybrid, limit, json) {
                 eprintln!("cfetch recall: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::EmbedIndex { batch } => {
+            if let Err(e) = embed::embed_index_cmd(batch) {
+                eprintln!("cfetch embed-index: {e}");
                 std::process::exit(1);
             }
         }
