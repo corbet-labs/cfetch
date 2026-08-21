@@ -40,6 +40,11 @@ pub struct Hit {
     pub start_line: usize,
     pub end_line: usize,
     pub snippet: String,
+    /// Paths of suppressed duplicate copies of this logical block: same
+    /// content hash on a higher (or equal) ring — e.g. the native
+    /// auto-memory mirror of a brain file. Empty for a block that exists in
+    /// exactly one place.
+    pub mirrors: Vec<String>,
 }
 
 /// Location defaults for a brain-root-relative path; frontmatter `ring: N`
@@ -399,6 +404,10 @@ pub struct ScanReport {
     pub docs: usize,
     pub blocks: usize,
     pub skipped_high_ring: usize,
+    /// Doc paths of the files skipped as ring 5+ — including fail-closed
+    /// unparseable ring frontmatter — surfaced so a file quarantined by
+    /// accident is visible instead of silently absent from recall.
+    pub skipped: Vec<String>,
 }
 
 /// Full rebuild inside one transaction. The corpus is small markdown; a
@@ -433,7 +442,7 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [fingerprint],
     )?;
-    let mut report = ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0 };
+    let mut report = ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new() };
     // (doc_id, link stems) collected during insertion, resolved afterwards
     // when every doc is known.
     let mut pending_links: Vec<(i64, Vec<String>)> = Vec::new();
@@ -447,6 +456,7 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
         }
         if ring > MAX_INDEXED_RING {
             report.skipped_high_ring += 1;
+            report.skipped.push(src.doc_path);
             continue;
         }
         // Blank (not strip) private regions so line numbers stay accurate.
@@ -553,6 +563,42 @@ fn snippet_of(text: &str) -> String {
     one.chars().take(160).collect()
 }
 
+/// The content-hash part of a citation id (after the `r<ring>-` prefix): the
+/// key every copy of one logical block shares across stores and rings.
+fn cite_hash(cite: &str) -> &str {
+    cite.split_once('-').map_or(cite, |(_, hash)| hash)
+}
+
+/// Collapses hits carrying the same content hash: the native auto-memory
+/// store mirrors brain files, so one logical block would otherwise surface
+/// once per store. The lowest-ring copy survives, at the first occurrence's
+/// rank; the suppressed copies' paths land on the keeper's `mirrors`.
+fn dedup_by_content(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    let mut out: Vec<Hit> = Vec::new();
+    let mut slot_by_hash: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for hit in hits {
+        match slot_by_hash.get(cite_hash(&hit.cite)) {
+            Some(&slot) => {
+                let kept = &mut out[slot];
+                if hit.ring < kept.ring {
+                    let old = std::mem::replace(kept, hit);
+                    kept.mirrors = old.mirrors;
+                    kept.mirrors.push(old.path);
+                } else if hit.path != kept.path && !kept.mirrors.contains(&hit.path) {
+                    kept.mirrors.push(hit.path);
+                }
+            }
+            None => {
+                slot_by_hash.insert(cite_hash(&hit.cite).to_string(), out.len());
+                out.push(hit);
+            }
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
 pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<Hit>> {
     let fts = fts_query(query);
     if fts.is_empty() {
@@ -567,7 +613,9 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
          ORDER BY bm25(blocks_fts), d.ring ASC
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![fts, limit as i64], |r| {
+    // Twice the candidate pool: duplicate suppression must refill freed
+    // slots with the next-ranked hits, never shrink the result count.
+    let rows = stmt.query_map(rusqlite::params![fts, (limit * 2) as i64], |r| {
         Ok(Hit {
             cite: r.get(0)?,
             path: r.get(1)?,
@@ -575,19 +623,25 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
             start_line: r.get::<_, i64>(3)? as usize,
             end_line: r.get::<_, i64>(4)? as usize,
             snippet: snippet_of(&r.get::<_, String>(5)?),
+            mirrors: Vec::new(),
         })
     })?;
-    Ok(rows.filter_map(Result::ok).collect())
+    Ok(dedup_by_content(rows.filter_map(Result::ok).collect(), limit))
 }
 
 /// Expands a citation id to its full block(s) — the second disclosure layer.
-/// Content-addressing means an id can legitimately match in several files.
+/// Content-addressing means the HASH names the logical block while the ring
+/// prefix only labels one copy's trust level: expansion matches every copy
+/// sharing the hash (a mirror suppressed in recall stays reachable through
+/// the kept hit's cite), lowest ring first.
 pub fn expand(conn: &Connection, cite: &str) -> anyhow::Result<Vec<Block>> {
     let mut stmt = conn.prepare(
         "SELECT b.cite, d.path, d.ring, b.start_line, b.end_line, b.text
-         FROM blocks b JOIN docs d ON d.id = b.doc_id WHERE b.cite = ?1",
+         FROM blocks b JOIN docs d ON d.id = b.doc_id
+         WHERE substr(b.cite, instr(b.cite, '-') + 1) = ?1
+         ORDER BY d.ring ASC, d.path ASC, b.start_line ASC",
     )?;
-    let rows = stmt.query_map([cite], |r| {
+    let rows = stmt.query_map([cite_hash(cite)], |r| {
         Ok(Block {
             cite: r.get(0)?,
             path: r.get(1)?,
@@ -738,6 +792,7 @@ fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>
                 start_line: r.get::<_, i64>(3)? as usize,
                 end_line: r.get::<_, i64>(4)? as usize,
                 snippet: snippet_of(&r.get::<_, String>(5)?),
+                mirrors: Vec::new(),
             })
         });
         if let Ok(hit) = hit {
@@ -1290,6 +1345,118 @@ mod tests {
         // a.md: rank 1 lexical (1/3) + rank 2 semantic (1/4) = 0.583
         // b.md: rank 1 semantic (1/3) = 0.333
         assert_eq!(paths[0], "knowledge/a.md");
+    }
+
+    #[test]
+    fn recall_suppresses_native_mirror_duplicates() {
+        // The native auto-memory store mirrors brain files: the same logical
+        // block must surface ONCE, as its lowest-ring copy, with the
+        // suppressed paths recorded as mirrors.
+        let brain = brain(&[(
+            "mind/memories/MEMORY.md",
+            "- zvol on btrfs needs the nossd mount option\n",
+        )]);
+        let native = tempfile::tempdir().unwrap();
+        let mem = native.path().join("p/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("MEMORY.md"), "- zvol on btrfs needs the nossd mount option\n")
+            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        let hits = recall(&conn, "nossd", 5).unwrap();
+        assert_eq!(hits.len(), 1, "one logical block, one hit");
+        assert_eq!(hits[0].ring, 1, "the lowest-ring copy survives");
+        assert_eq!(hits[0].path, "mind/memories/MEMORY.md");
+        assert_eq!(hits[0].mirrors, vec!["native:p/MEMORY.md".to_string()]);
+    }
+
+    #[test]
+    fn dedup_keeps_lowest_ring_regardless_of_rank_order() {
+        let h = |cite: &str, path: &str, ring: u8| Hit {
+            cite: cite.into(),
+            path: path.into(),
+            ring,
+            start_line: 1,
+            end_line: 1,
+            snippet: String::new(),
+            mirrors: Vec::new(),
+        };
+        let hits = vec![
+            h("r2-aabbccddee", "native:p/MEMORY.md", 2),
+            h("r1-aabbccddee", "mind/memories/MEMORY.md", 1),
+            h("r3-0123456789", "knowledge/x.md", 3),
+        ];
+        let out = dedup_by_content(hits, 8);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].cite, "r1-aabbccddee", "lowest ring wins even when ranked second");
+        assert_eq!(out[0].mirrors, vec!["native:p/MEMORY.md".to_string()]);
+        assert_eq!(out[1].cite, "r3-0123456789");
+        assert!(out[1].mirrors.is_empty(), "a hit without duplicates is untouched");
+    }
+
+    #[test]
+    fn dedup_refills_freed_limit_slots() {
+        // The mirrored block is the shortest (= best BM25), so a naive
+        // LIMIT 2 would return both copies of it and lose the second logical
+        // block. Suppression must not shrink the result count.
+        let brain = brain(&[
+            ("mind/memories/MEMORY.md", "- flumox\n"),
+            ("knowledge/other.md", "flumox beta fact with more words\n"),
+        ]);
+        let native = tempfile::tempdir().unwrap();
+        let mem = native.path().join("p/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("MEMORY.md"), "- flumox\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        let hits = recall(&conn, "flumox", 2).unwrap();
+        assert_eq!(hits.len(), 2, "suppression must not shrink the result count");
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"mind/memories/MEMORY.md"));
+        assert!(paths.contains(&"knowledge/other.md"));
+        let kept = hits.iter().find(|h| h.path == "mind/memories/MEMORY.md").unwrap();
+        assert_eq!(kept.mirrors, vec!["native:p/MEMORY.md".to_string()]);
+    }
+
+    #[test]
+    fn expand_matches_hash_across_rings_lowest_first() {
+        let dir = brain(&[
+            ("knowledge/copy.md", "shared statement body\n"),
+            ("knowledge/promoted.md", "---\nring: 1\n---\nshared statement body\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "shared statement", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ring, 1);
+        assert_eq!(hits[0].mirrors, vec!["knowledge/copy.md".to_string()]);
+        let blocks = expand(&conn, &hits[0].cite).unwrap();
+        assert_eq!(blocks.len(), 2, "every copy of the logical block surfaces");
+        assert_eq!(blocks[0].ring, 1, "lowest ring first");
+        assert_eq!(blocks[0].path, "knowledge/promoted.md");
+        assert_eq!(blocks[1].ring, 3);
+        assert_eq!(blocks[1].path, "knowledge/copy.md");
+    }
+
+    #[test]
+    fn scan_reports_skipped_paths() {
+        let dir = brain(&[
+            ("knowledge/ok.md", "fine\n"),
+            ("knowledge/staged.md", "---\nring: 5\n---\nquarantined\n"),
+            ("knowledge/broken.md", "---\nring: banana\n---\nunparseable\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None).unwrap();
+        assert_eq!(report.skipped_high_ring, 2);
+        assert_eq!(
+            report.skipped,
+            vec!["knowledge/broken.md".to_string(), "knowledge/staged.md".to_string()],
+            "skipped paths listed in doc-path order"
+        );
     }
 
     #[test]

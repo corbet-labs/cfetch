@@ -495,6 +495,52 @@ fn mark(conn: &Connection, id: i64, state: i64) -> anyhow::Result<bool> {
     Ok(n > 0)
 }
 
+/// Ring-5/6 counts for read-only reporting surfaces (the dashboard).
+#[derive(Default)]
+pub struct ExhaustStats {
+    /// Flagged, unconsumed staging candidates awaiting review.
+    pub staged_total: i64,
+    /// Per-reason breakdown of `staged_total`, in trap order; absent
+    /// reasons are omitted.
+    pub staged_by_reason: Vec<(String, i64)>,
+    /// Total captured ring-6 events — the store's footprint.
+    pub events: i64,
+}
+
+/// Counts staging candidates by flag reason plus total events. FAIL SILENT
+/// by design: an absent or unreadable exhaust DB yields zeros — a reporting
+/// pane must never create ring-6 state or contend with the hook writers,
+/// hence the read-only open.
+pub fn stats(state_dir: &Path) -> ExhaustStats {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = Connection::open_with_flags(db_path(state_dir), flags) else {
+        return ExhaustStats::default();
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
+    let staged_by_reason: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT coalesce(flag_reason, '?'), count(*) FROM events
+              WHERE flag = 1 AND consumed = 0
+              GROUP BY flag_reason
+              ORDER BY CASE flag_reason
+                         WHEN 'fix-discovered' THEN 0
+                         WHEN 'recurring-failure' THEN 1
+                         WHEN 'hot-file' THEN 2
+                         ELSE 3 END, flag_reason",
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    ExhaustStats {
+        staged_total: staged_by_reason.iter().map(|(_, n)| n).sum(),
+        staged_by_reason,
+        events: conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).unwrap_or(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +764,46 @@ mod tests {
         let all = rows(&conn);
         assert_eq!(all.len(), 5, "cap must hold in the write path");
         assert_eq!(all[0].0, 4, "the oldest events are the ones deleted");
+    }
+
+    #[test]
+    fn stats_counts_staging_by_reason_and_events() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = open(dir.path()).unwrap();
+            // Fabricated staging state: three flagged-unconsumed candidates
+            // across two reasons, one consumed, one plain unflagged event.
+            conn.execute_batch(
+                "INSERT INTO events(session_id, ts, kind, payload, flag, flag_reason, consumed)
+                 VALUES ('s1', 1, 'bash', '{}', 1, 'fix-discovered', 0),
+                        ('s1', 2, 'bash', '{}', 1, 'fix-discovered', 0),
+                        ('s2', 3, 'bash', '{}', 1, 'recurring-failure', 0),
+                        ('s2', 4, 'write', '{}', 1, 'hot-file', 1),
+                        ('s3', 5, 'read', '{}', 0, NULL, 0);",
+            )
+            .unwrap();
+        }
+        let s = stats(dir.path());
+        assert_eq!(s.events, 5);
+        assert_eq!(s.staged_total, 3, "consumed and unflagged rows do not count");
+        assert_eq!(
+            s.staged_by_reason,
+            vec![("fix-discovered".to_string(), 2), ("recurring-failure".to_string(), 1)],
+            "reasons in trap order, absent reasons omitted"
+        );
+    }
+
+    #[test]
+    fn stats_is_zero_when_db_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+        assert_eq!(s.events, 0);
+        assert_eq!(s.staged_total, 0);
+        assert!(s.staged_by_reason.is_empty());
+        assert!(
+            !dir.path().join("exhaust.db").exists(),
+            "a reporting surface must never create ring-6 state"
+        );
     }
 
     #[test]

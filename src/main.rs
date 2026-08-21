@@ -224,6 +224,17 @@ fn scan(background: bool) -> anyhow::Result<()> {
             "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
             report.docs, report.blocks, report.skipped_high_ring
         );
+        // Name the skipped files (a malformed ring declaration also lands
+        // here, fail-closed) so a quarantined-by-accident file is visible.
+        if !report.skipped.is_empty() {
+            let shown: Vec<&str> = report.skipped.iter().take(10).map(String::as_str).collect();
+            let more = report.skipped.len() - shown.len();
+            println!(
+                "  skipped (ring 5+ or unparseable ring frontmatter): {}{}",
+                shown.join(", "),
+                if more > 0 { format!(" … and {more} more") } else { String::new() }
+            );
+        }
         // Connection dropped here: the daemon's scan thread is the next writer.
     }
     if background {
@@ -372,6 +383,7 @@ fn recall(
                 serde_json::json!({
                     "cite": h.cite, "path": h.path, "ring": h.ring,
                     "lines": [h.start_line, h.end_line], "snippet": h.snippet,
+                    "mirrors": h.mirrors,
                 })
             })
             .collect();
@@ -386,6 +398,9 @@ fn recall(
         for h in &hits {
             println!("{} {}:{}-{} (ring {})", h.cite, h.path, h.start_line, h.end_line, h.ring);
             println!("    {}", h.snippet);
+            if !h.mirrors.is_empty() {
+                println!("    (also at: {})", h.mirrors.join(", "));
+            }
         }
         if !linked.is_empty() {
             println!("\nlinked (curated wikilinks, 1 hop from top hits):");

@@ -71,10 +71,14 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             Ok(hits
                 .iter()
                 .map(|h| {
-                    format!(
+                    let mut line = format!(
                         "{} {}:{}-{} (ring {})\n    {}",
                         h.cite, h.path, h.start_line, h.end_line, h.ring, h.snippet
-                    )
+                    );
+                    if !h.mirrors.is_empty() {
+                        line.push_str(&format!("\n    (also at: {})", h.mirrors.join(", ")));
+                    }
+                    line
                 })
                 .collect::<Vec<_>>()
                 .join("\n"))

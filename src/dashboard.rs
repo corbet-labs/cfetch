@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::config::Config;
-use crate::{daemon, heartbeat, index, ledger, paths};
+use crate::{daemon, exhaust, heartbeat, index, ledger, paths};
 
 struct Stats {
     daemon_version: Option<String>,
@@ -24,6 +24,9 @@ struct Stats {
     blocks: i64,
     code_files: i64,
     symbols: i64,
+    staging_total: i64,
+    staging_by_reason: Vec<(String, i64)>,
+    exhaust_events: i64,
 }
 
 fn gather(conn: &rusqlite::Connection) -> Stats {
@@ -38,6 +41,8 @@ fn gather(conn: &rusqlite::Connection) -> Stats {
         })
         .unwrap_or_default();
     let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    // Read-only, fail-silent: an absent exhaust DB simply reports zeros.
+    let staging = exhaust::stats(&state);
     Stats {
         daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
         hooks: hb
@@ -57,6 +62,9 @@ fn gather(conn: &rusqlite::Connection) -> Stats {
         blocks: one("SELECT count(*) FROM blocks"),
         code_files: one("SELECT count(*) FROM code_files"),
         symbols: one("SELECT count(*) FROM symbols"),
+        staging_total: staging.staged_total,
+        staging_by_reason: staging.staged_by_reason,
+        exhaust_events: staging.events,
     }
 }
 
@@ -75,8 +83,8 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         Line::from(vec![
             daemon_span,
             Span::raw(format!(
-                "   index: {} blocks [{rings}]   code: {} files / {} symbols",
-                s.blocks, s.code_files, s.symbols
+                "   index: {} blocks [{rings}]   code: {} files / {} symbols   exhaust: {} event(s)",
+                s.blocks, s.code_files, s.symbols, s.exhaust_events
             )),
         ]),
         Line::from(format!(
@@ -90,6 +98,25 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             }
         )),
     ];
+    // Ring-5 staging: candidates awaiting a distillation session. Yellow the
+    // moment anything is pending — quarantine must not be invisible.
+    lines.push(if s.staging_total > 0 {
+        let reasons = s
+            .staging_by_reason
+            .iter()
+            .map(|(reason, n)| format!("{reason}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Line::from(Span::styled(
+            format!("staging: {} candidate(s) [{reasons}]", s.staging_total),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "staging: 0 candidates".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    });
     let failing: Vec<String> = s
         .hooks
         .iter()
@@ -130,7 +157,7 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(3),
             Constraint::Min(3),
             Constraint::Length(1),
@@ -241,6 +268,14 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn flat_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.clone().into_owned())
+            .collect()
+    }
+
     #[test]
     fn header_reports_failing_hooks_and_quarantines() {
         let s = Stats {
@@ -253,15 +288,55 @@ mod tests {
             blocks: 17000,
             code_files: 9000,
             symbols: 240000,
+            staging_total: 0,
+            staging_by_reason: Vec::new(),
+            exhaust_events: 0,
         };
-        let text: String = header_lines(&s)
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|sp| sp.content.clone().into_owned())
-            .collect();
+        let text = flat_text(&header_lines(&s));
         assert!(text.contains("daemon down"));
         assert!(text.contains("FAILING: stop (5×)"));
         assert!(text.contains("quarantined"));
         assert!(text.contains("r1:2 r3:400"));
+        assert!(text.contains("staging: 0 candidates"), "empty staging still renders");
+    }
+
+    #[test]
+    fn header_shows_staging_counts_and_exhaust_footprint() {
+        let s = Stats {
+            daemon_version: Some("0.5.0".into()),
+            hooks: Vec::new(),
+            sessions: 0,
+            injected_tokens: 0,
+            quarantines: 0,
+            docs_by_ring: Vec::new(),
+            blocks: 0,
+            code_files: 0,
+            symbols: 0,
+            staging_total: 6,
+            staging_by_reason: vec![
+                ("fix-discovered".into(), 3),
+                ("recurring-failure".into(), 2),
+                ("hot-file".into(), 1),
+            ],
+            exhaust_events: 4321,
+        };
+        let lines = header_lines(&s);
+        let text = flat_text(&lines);
+        assert!(
+            text.contains(
+                "staging: 6 candidate(s) [fix-discovered: 3, recurring-failure: 2, hot-file: 1]"
+            ),
+            "got: {text}"
+        );
+        assert!(text.contains("exhaust: 4321 event(s)"), "got: {text}");
+        let staging_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("staging:")))
+            .unwrap();
+        assert_eq!(
+            staging_line.spans[0].style.fg,
+            Some(Color::Yellow),
+            "candidates pending review render yellow"
+        );
     }
 }
