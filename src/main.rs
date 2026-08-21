@@ -19,6 +19,7 @@ mod lockfile;
 mod markers;
 mod mcp;
 mod migrate;
+mod net;
 mod paths;
 mod pipeline;
 mod rerank;
@@ -107,6 +108,11 @@ enum Command {
         slice: Option<String>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show this host's network identity (created on first use)
+    Identity {
         #[arg(long)]
         json: bool,
     },
@@ -950,6 +956,12 @@ fn status() -> anyhow::Result<()> {
         }
     }
     let state = paths::state_dir();
+    // The identity is what a peer grants a slice TO, so an operator needs to
+    // be able to read it off the machine it belongs to.
+    match net::endpoint_id(&state) {
+        Ok(id) => println!("identity: {id}"),
+        Err(e) => println!("identity: unavailable ({e})"),
+    }
     if let Some(note) = migrate::legacy_note(&state) {
         println!("{note}");
     }
@@ -1072,6 +1084,16 @@ fn main() {
             if let Err(e) = agents {
                 eprintln!("cfetch install (other agents): {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::Identity { json } => {
+            match net::endpoint_id(&paths::state_dir()) {
+                Ok(id) if json => println!("{}", serde_json::json!({"endpoint_id": id.to_string()})),
+                Ok(id) => println!("{id}"),
+                Err(e) => {
+                    eprintln!("cfetch identity: {e:#}");
+                    std::process::exit(1);
+                }
             }
         }
         Command::Slices { json } => {

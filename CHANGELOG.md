@@ -3,6 +3,17 @@
 Notable changes per release. cfetch is young and moving fast; anything not
 listed here is a fix or an internal change with no effect on behavior.
 
+## Unreleased
+
+- **Host identity.** Each host now has a persistent iroh keypair, created on
+  first use, whose public half is the endpoint id peers will grant slices to.
+  `cfetch identity` prints it and `cfetch status` names it. The key lives in
+  the per-host state directory and never in the brain tree — a shared tree
+  would hand every host the same identity, making a grant to one machine a
+  grant to all of them. A key that cannot be read is an error rather than a
+  fresh identity, because regenerating would orphan every grant naming the old
+  one.
+
 ## 0.8.0
 
 - **Slices.** Named prefix sets over the tree, nestable, with `cfetch slices`
