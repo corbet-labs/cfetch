@@ -27,8 +27,39 @@ scoped to (a host, a repo). Rings 0–4 are searchable; every hit carries a
 ring-prefixed, content-addressed citation, so the id itself reveals how much to
 trust the statement. Rings 5–6 (automatic capture and its staging area) never
 reach an agent's context implicitly — captured exhaust is untrusted input by
-definition. The capture/staging pipeline is still in progress; recall, the code
-index, injection, MCP, and the dashboard work today.
+definition. Automatic capture, the promotion traps and the staging queue are
+live, as are recall, the code index, scoped injection, MCP and the dashboard.
+
+## One brain, many machines
+
+cfetch does not replicate your knowledge across machines and hope the copies
+agree. The machine that **holds** the markdown runs a serving daemon; every
+other machine holds **nothing** and asks it:
+
+```console
+# on the machine with the files
+$ cfetch daemon start        # serve.enabled in config: watches the tree, answers queries
+
+# on any other machine (config: client.serving = { addr, token_file })
+$ cfetch recall zfs backup
+r3-b7e2519cc0 knowledge/hosts/backups.md:12-19 (ring 3)
+    The mirror job snapshots hourly and prunes by tier ...
+
+served by workstation (generation 412, fresh)
+```
+
+Two properties make that safe to rely on:
+
+- **Serve-fresh-or-wait.** Every query passes a drain barrier: the answer is
+  computed only after every write the daemon could already have seen has been
+  indexed. An agent reads its teammate's write, not the world before it.
+- **Freshness is never assumed.** Every answer carries its origin, catalog
+  generation, and a `fresh` flag. If the barrier expires the answer still
+  comes — labeled stale, with the reason. Silent staleness is the one failure
+  this design refuses.
+
+A machine that holds nothing opens no database, keeps no index, and needs no
+storage: it is a network call away from the whole brain.
 
 ## What you get
 
