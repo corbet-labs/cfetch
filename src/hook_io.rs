@@ -34,6 +34,8 @@ pub struct HookEvent {
     pub tool_input: Option<serde_json::Value>,
     pub tool_response: Option<serde_json::Value>,
     pub tool_use_id: Option<String>,
+    /// Some harness versions surface tool failure as its own field.
+    pub tool_error: Option<serde_json::Value>,
     // Stop
     pub stop_hook_active: Option<bool>,
     pub stop_reason: Option<String>,

@@ -15,6 +15,25 @@ pub struct ResidentEntry {
     pub ring: u8,
 }
 
+/// Ring-6 exhaust capture (PostToolUse/Stop -> exhaust.db).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureConfig {
+    /// On by default: exhaust is the raw material every later promotion is
+    /// distilled from; an empty ring 6 starves rings 5 and 2.
+    #[serde(default = "default_capture_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        CaptureConfig { enabled: default_capture_enabled() }
+    }
+}
+
+fn default_capture_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "paths::default_brain_root")]
@@ -33,6 +52,9 @@ pub struct Config {
     /// Sessions kept in the injection ledger (writer-side retention).
     #[serde(default = "default_ledger_max_sessions")]
     pub ledger_max_sessions: usize,
+    /// Ring-6 exhaust capture.
+    #[serde(default)]
+    pub capture: CaptureConfig,
 }
 
 fn default_budget_chars() -> usize {
@@ -51,6 +73,7 @@ impl Default for Config {
             code_roots: Vec::new(),
             budget_chars: default_budget_chars(),
             ledger_max_sessions: default_ledger_max_sessions(),
+            capture: CaptureConfig::default(),
         }
     }
 }
@@ -128,6 +151,17 @@ mod tests {
         let p = dir.path().join("config.json");
         std::fs::write(&p, r#"{"resident": [{"path": "x.md", "ring": 3}]}"#).unwrap();
         assert!(Config::load_from(&p).is_err());
+    }
+
+    #[test]
+    fn capture_defaults_on_and_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        assert!(Config::load_from(&p).unwrap().capture.enabled, "default: capture on");
+        std::fs::write(&p, r#"{"resident": []}"#).unwrap();
+        assert!(Config::load_from(&p).unwrap().capture.enabled, "partial file: capture on");
+        std::fs::write(&p, r#"{"capture": {"enabled": false}}"#).unwrap();
+        assert!(!Config::load_from(&p).unwrap().capture.enabled);
     }
 
     #[test]
