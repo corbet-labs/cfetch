@@ -34,8 +34,8 @@ fn default_capture_enabled() -> bool {
     true
 }
 
-/// Embeddings backend: an OpenAI-compatible `/embeddings` endpoint (in this
-/// house: llama-broker on the GPU platform). Disabled by default — semantic
+/// Embeddings backend: any OpenAI-compatible `/embeddings` endpoint (a
+/// llama.cpp server, LM Studio, vLLM, or a hosted API). Disabled by default — semantic
 /// recall is opt-in, and the client is NEVER called from hook entrypoints
 /// (hooks must not spend network time on the interactive path).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -48,6 +48,10 @@ pub struct EmbeddingsConfig {
     pub endpoint: String,
     #[serde(default)]
     pub model: String,
+    /// Exact hostnames/IPs the operator exempts from the private-range
+    /// refusal (mesh overlays, lab networks). Never exempts from https.
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

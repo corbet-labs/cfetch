@@ -45,14 +45,19 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 /// Address ranges no config value may point at (loopback is checked first
-/// and exempt). 100.64/10 (CGNAT) is deliberately NOT refused — the NetBird
-/// overlay lives there and is a legitimate https backend.
+/// and exempt). ALL non-public ranges are refused by default, including
+/// 100.64/10 (CGNAT) — in an arbitrary deployment that space can be someone
+/// else's internal network. Operators whose infrastructure legitimately
+/// lives in such a range (e.g. a WireGuard/mesh overlay) opt in explicitly
+/// with `embeddings.allow_hosts` in the config.
 fn forbidden_range(host: &str) -> Option<&'static str> {
     let ip: std::net::IpAddr = host.parse().ok()?;
     match ip {
         std::net::IpAddr::V4(v4) => {
             if v4.is_private() {
                 Some("private range (RFC 1918)")
+            } else if (v4.octets()[0] == 100) && (v4.octets()[1] & 0xc0) == 64 {
+                Some("shared/CGNAT range (100.64.0.0/10)")
             } else if v4.is_link_local() {
                 Some("link-local/metadata range (169.254.0.0/16)")
             } else if v4.is_unspecified() || v4.is_broadcast() {
@@ -77,9 +82,12 @@ fn forbidden_range(host: &str) -> Option<&'static str> {
 
 /// Validates a config-supplied endpoint URL against the egress policy:
 /// http/https only, loopback always allowed, everything else must be https
-/// AND outside private (RFC 1918), link-local/metadata (169.254/16), and
-/// IPv6 unique-local/link-local ranges.
-pub fn check_endpoint(url: &str) -> anyhow::Result<()> {
+/// AND outside private (RFC 1918), shared/CGNAT (100.64/10), link-local/
+/// metadata, and IPv6 unique-local/link-local ranges. `allow_hosts` is the
+/// operator's EXPLICIT per-host exemption from the range refusal (never from
+/// the https requirement): mesh overlays and lab networks opt in by listing
+/// the exact host, general deployments stay closed by default.
+pub fn check_endpoint(url: &str, allow_hosts: &[String]) -> anyhow::Result<()> {
     let (scheme, host) = split_url(url)?;
     anyhow::ensure!(
         scheme == "http" || scheme == "https",
@@ -88,8 +96,11 @@ pub fn check_endpoint(url: &str) -> anyhow::Result<()> {
     if is_loopback_host(&host) {
         return Ok(());
     }
-    if let Some(reason) = forbidden_range(&host) {
-        anyhow::bail!("endpoint host {host} refused: {reason}");
+    let exempted = allow_hosts.iter().any(|a| a.eq_ignore_ascii_case(&host));
+    if !exempted && let Some(reason) = forbidden_range(&host) {
+        anyhow::bail!(
+            "endpoint host {host} refused: {reason} (add it to embeddings.allow_hosts to permit deliberately)"
+        );
     }
     anyhow::ensure!(scheme == "https", "non-loopback endpoint must be https (got http://{host})");
     Ok(())
@@ -123,7 +134,7 @@ impl EmbedClient {
             !cfg.endpoint.is_empty() && !cfg.model.is_empty(),
             "embeddings not configured (embeddings.endpoint and embeddings.model required)"
         );
-        check_endpoint(&cfg.endpoint)?;
+        check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
             .timeout_global(Some(std::time::Duration::from_secs(10)))
@@ -374,6 +385,7 @@ mod tests {
             enabled: true,
             endpoint: url.to_string(),
             model: "test-model".to_string(),
+            allow_hosts: Vec::new(),
         })
         .unwrap()
     }
@@ -383,32 +395,38 @@ mod tests {
     #[test]
     fn ssrf_guard_matrix() {
         // https to a public host: ok
-        assert!(check_endpoint("https://api.example.com/v1").is_ok());
-        assert!(check_endpoint("https://api.example.com:8443/v1").is_ok());
+        assert!(check_endpoint("https://api.example.com/v1", &[]).is_ok());
+        assert!(check_endpoint("https://api.example.com:8443/v1", &[]).is_ok());
         // loopback: ok even over plain http
-        assert!(check_endpoint("http://127.0.0.1:8080").is_ok());
-        assert!(check_endpoint("http://localhost:1234/v1").is_ok());
-        assert!(check_endpoint("http://[::1]:8080").is_ok());
-        assert!(check_endpoint("https://127.0.0.1:8080/v1").is_ok());
+        assert!(check_endpoint("http://127.0.0.1:8080", &[]).is_ok());
+        assert!(check_endpoint("http://localhost:1234/v1", &[]).is_ok());
+        assert!(check_endpoint("http://[::1]:8080", &[]).is_ok());
+        assert!(check_endpoint("https://127.0.0.1:8080/v1", &[]).is_ok());
         // http to a public host: refused (bearer tokens in cleartext)
-        assert!(check_endpoint("http://example.com/v1").is_err());
+        assert!(check_endpoint("http://example.com/v1", &[]).is_err());
         // private / link-local / metadata ranges: refused on BOTH schemes
-        assert!(check_endpoint("http://10.0.0.5:11434").is_err());
-        assert!(check_endpoint("https://10.0.0.5").is_err());
-        assert!(check_endpoint("http://192.168.1.10:8080").is_err());
-        assert!(check_endpoint("https://192.168.0.1").is_err());
-        assert!(check_endpoint("https://172.16.0.1").is_err());
-        assert!(check_endpoint("http://169.254.169.254/latest/meta-data").is_err());
-        assert!(check_endpoint("https://169.254.169.254/latest/meta-data").is_err());
-        assert!(check_endpoint("https://[fe80::1]/v1").is_err());
-        assert!(check_endpoint("https://[fd00::1]/v1").is_err());
+        assert!(check_endpoint("http://10.0.0.5:11434", &[]).is_err());
+        assert!(check_endpoint("https://10.0.0.5", &[]).is_err());
+        assert!(check_endpoint("http://192.168.1.10:8080", &[]).is_err());
+        // CGNAT refused by default; allow_hosts exempts the exact host from the
+        // RANGE refusal only — https stays mandatory even for exempted hosts.
+        assert!(check_endpoint("https://100.64.0.7", &[]).is_err());
+        let allow = vec!["100.64.0.7".to_string()];
+        assert!(check_endpoint("https://100.64.0.7", &allow).is_ok());
+        assert!(check_endpoint("http://100.64.0.7", &allow).is_err());
+        assert!(check_endpoint("https://192.168.1.1", &[]).is_err());
+        assert!(check_endpoint("https://172.16.0.1", &[]).is_err());
+        assert!(check_endpoint("http://169.254.169.254/latest/meta-data", &[]).is_err());
+        assert!(check_endpoint("https://169.254.169.254/latest/meta-data", &[]).is_err());
+        assert!(check_endpoint("https://[fe80::1]/v1", &[]).is_err());
+        assert!(check_endpoint("https://[fd00::1]/v1", &[]).is_err());
         // scheme and shape violations
-        assert!(check_endpoint("ftp://example.com").is_err());
-        assert!(check_endpoint("file:///etc/passwd").is_err());
-        assert!(check_endpoint("not a url").is_err());
-        assert!(check_endpoint("https://").is_err());
+        assert!(check_endpoint("ftp://example.com", &[]).is_err());
+        assert!(check_endpoint("file:///etc/passwd", &[]).is_err());
+        assert!(check_endpoint("not a url", &[]).is_err());
+        assert!(check_endpoint("https://", &[]).is_err());
         // userinfo could smuggle credentials into logs / confuse host parsing
-        assert!(check_endpoint("https://user:pass@example.com/v1").is_err());
+        assert!(check_endpoint("https://user:pass@example.com/v1", &[]).is_err());
     }
 
     #[test]
@@ -420,6 +438,7 @@ mod tests {
             enabled: true,
             endpoint: String::new(),
             model: "m".into(),
+            allow_hosts: Vec::new(),
         })
         .unwrap_err();
         assert!(!err.to_string().is_empty());
@@ -427,6 +446,7 @@ mod tests {
             enabled: true,
             endpoint: "http://127.0.0.1:1".into(),
             model: String::new(),
+            allow_hosts: Vec::new(),
         })
         .unwrap_err();
         assert!(!err.to_string().is_empty());
@@ -573,6 +593,7 @@ mod tests {
             enabled: true,
             endpoint: url.clone(),
             model: "other-model".to_string(),
+            allow_hosts: Vec::new(),
         })
         .unwrap();
         let report = run(&mut conn, &client2, 8).unwrap();
