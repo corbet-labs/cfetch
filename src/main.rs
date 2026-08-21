@@ -8,6 +8,8 @@ mod index;
 mod install;
 mod ledger;
 mod lockfile;
+mod markers;
+mod mcp;
 mod paths;
 mod resident;
 
@@ -63,6 +65,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Serve recall/find/expand over MCP (stdio) for any MCP client
+    Mcp,
     /// Verify the installation end to end; nonzero exit on hard failures
     Selfcheck,
     /// Show daemon, hook health, and state footprint
@@ -310,6 +314,18 @@ fn main() {
             let path = settings.unwrap_or_else(install::default_settings_path);
             if let Err(e) = install::apply(&path, remove) {
                 eprintln!("cfetch install: {e}");
+                std::process::exit(1);
+            }
+            if !remove
+                && let Err(e) = install::install_agents()
+            {
+                eprintln!("cfetch install (other agents): {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Mcp => {
+            if let Err(e) = mcp::serve() {
+                eprintln!("cfetch mcp: {e}");
                 std::process::exit(1);
             }
         }
