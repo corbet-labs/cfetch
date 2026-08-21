@@ -368,6 +368,48 @@ r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
 
 `cfetch status` prints the same coverage before you need it.
 
+### Reranking (`rerank`)
+
+Off by default, and independent of how the candidates were found — it improves
+a lexical, semantic or hybrid list alike.
+
+```json
+{
+  "rerank": {
+    "enabled": true,
+    "endpoint": "http://127.0.0.1:8080/v1",
+    "model": "bge-reranker-v2-m3",
+    "candidates": 40
+  }
+}
+```
+
+Retrieval scores a query against a document it never sees beside it: BM25
+counts terms, and a bi-encoder compares two vectors that were built
+independently. A cross-encoder reads query and document TOGETHER and judges
+relevance far better — but it costs one forward pass per candidate, so it can
+only run over a shortlist. Recall proposes, rerank reorders.
+
+- `candidates` — how many hits are retrieved and sent to the cross-encoder.
+  Recall widens to this number and the answer is cut back to your `--limit`
+  afterwards, because a reranker can only promote what retrieval proposed.
+  Everything past the window keeps its retrieval order and follows.
+- Scores are whatever the model emits — cross-encoder logits are commonly
+  negative and unbounded. Only their ORDER is used, never their magnitude, and
+  equal scores keep retrieval order rather than shuffling.
+
+Reranking never decides whether an answer comes back. An unreachable endpoint,
+an unparseable response, or a score list that does not line up with what was
+sent all return the retrieval order with the reason attached (on stderr, and
+as `rerank_note` in `--json`).
+
+```console
+$ cfetch recall --hybrid zfs backup
+cfetch recall: rerank unavailable (POST http://127.0.0.1:8080/v1/rerank: connection refused) — answering in retrieval order
+r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
+    Native filesystem backup only — never file-level tools between ZFS datasets ...
+```
+
 ## What lives where
 
 The tree is the only storage of record, and that includes the automatic half

@@ -318,6 +318,54 @@ impl EmbeddingsConfig {
     }
 }
 
+/// Cross-encoder reranking of an already-retrieved candidate list.
+///
+/// Retrieval (BM25, vectors, their fusion) scores a query against a document
+/// it has never seen beside it. A cross-encoder reads the two TOGETHER and is
+/// far better at it — but it costs a forward pass per candidate, so it can
+/// only ever run over a shortlist, never over the corpus. That is exactly the
+/// shape here: recall proposes, rerank reorders.
+///
+/// Off by default. It is a second endpoint and a second dependency, and the
+/// lexical answer must never require one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RerankConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL; `/rerank` is appended. Same SSRF guard as embeddings.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+    /// Exact hostnames/IPs exempted from the private-range refusal.
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// NAME of the environment variable holding the API key, never the key.
+    #[serde(default)]
+    pub api_key_env: String,
+    #[serde(default = "default_rerank_timeout_secs")]
+    pub timeout_secs: u64,
+    /// How many top hits are sent to the cross-encoder. Everything past this
+    /// keeps its retrieval order and follows the reranked head, so raising it
+    /// buys quality at a linear cost in endpoint work.
+    #[serde(default = "default_rerank_candidates")]
+    pub candidates: usize,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        RerankConfig {
+            enabled: false,
+            endpoint: String::new(),
+            model: String::new(),
+            allow_hosts: Vec::new(),
+            api_key_env: String::new(),
+            timeout_secs: default_rerank_timeout_secs(),
+            candidates: default_rerank_candidates(),
+        }
+    }
+}
+
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         EmbeddingsConfig {
@@ -339,6 +387,14 @@ fn default_embed_timeout_secs() -> u64 {
 
 fn default_embed_dimensions() -> usize {
     1024
+}
+
+fn default_rerank_timeout_secs() -> u64 {
+    20
+}
+
+fn default_rerank_candidates() -> usize {
+    40
 }
 
 /// The governance loop: Stop-side reminder producers plus instruction-decay
@@ -457,6 +513,8 @@ pub struct Config {
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
+    pub rerank: RerankConfig,
+    #[serde(default)]
     pub recall: RecallConfig,
     /// Governance loop (reminder queue + cadence rule refresh).
     #[serde(default)]
@@ -508,6 +566,7 @@ impl Default for Config {
             ledger_max_bytes: default_ledger_max_bytes(),
             capture: CaptureConfig::default(),
             embeddings: EmbeddingsConfig::default(),
+            rerank: RerankConfig::default(),
             recall: RecallConfig::default(),
             governance: GovernanceConfig::default(),
             serve: ServeConfig::default(),

@@ -127,7 +127,7 @@ fn batch_timeout(base: std::time::Duration, items: usize) -> std::time::Duration
 /// `Bearer …` header value. Empty config = no auth. A value that cannot be
 /// an env var name is refused loudly — it is almost certainly a pasted key,
 /// and a key in the config file is exactly what this indirection prevents.
-fn resolve_auth(api_key_env: &str) -> anyhow::Result<Option<String>> {
+pub(crate) fn resolve_auth(api_key_env: &str, field: &str) -> anyhow::Result<Option<String>> {
     let name = api_key_env.trim();
     if name.is_empty() {
         return Ok(None);
@@ -136,12 +136,12 @@ fn resolve_auth(api_key_env: &str) -> anyhow::Result<Option<String>> {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     anyhow::ensure!(
         valid,
-        "embeddings.api_key_env {name:?} is not an environment variable NAME — \
+        "{field}.api_key_env {name:?} is not an environment variable NAME — \
          configure the variable's name, never the key itself"
     );
     let key = std::env::var(name)
-        .map_err(|_| anyhow::anyhow!("embeddings.api_key_env: environment variable {name} is not set"))?;
-    anyhow::ensure!(!key.trim().is_empty(), "embeddings.api_key_env: environment variable {name} is empty");
+        .map_err(|_| anyhow::anyhow!("{field}.api_key_env: environment variable {name} is not set"))?;
+    anyhow::ensure!(!key.trim().is_empty(), "{field}.api_key_env: environment variable {name} is empty");
     Ok(Some(format!("Bearer {}", key.trim())))
 }
 
@@ -184,7 +184,7 @@ impl EmbedClient {
             "embeddings not configured (embeddings.endpoint and embeddings.model required)"
         );
         check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
-        let auth = resolve_auth(&cfg.api_key_env)?;
+        let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
         let base_timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
@@ -319,7 +319,7 @@ impl EmbedClient {
 }
 
 /// First ~120 chars of an error body — enough to diagnose, never a dump.
-fn snippet(text: &str) -> String {
+pub(crate) fn snippet(text: &str) -> String {
     text.chars().take(120).collect()
 }
 
@@ -529,80 +529,7 @@ pub fn semantic_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
-    use std::sync::{Arc, Mutex};
-
-    // ---- minimal canned-response HTTP server (std TcpListener only) ----
-
-    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|w| w == needle)
-    }
-
-    /// Reads one HTTP request; returns (headers, body).
-    fn read_request(s: &mut std::net::TcpStream) -> Option<(String, String)> {
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 4096];
-        let header_end = loop {
-            let n = s.read(&mut tmp).ok()?;
-            if n == 0 {
-                return None;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let content_length = headers
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
-            })
-            .unwrap_or(0);
-        while buf.len() < header_end + content_length {
-            let n = s.read(&mut tmp).ok()?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        let body =
-            String::from_utf8_lossy(&buf[header_end..(header_end + content_length).min(buf.len())]).to_string();
-        Some((headers, body))
-    }
-
-    fn http_response(status: u16, body: &str) -> String {
-        format!(
-            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-    }
-
-    /// Spawns a one-connection-at-a-time server; `responder(request_no,
-    /// request_body)` produces the FULL http response. Returns (base_url,
-    /// recorded request bodies, recorded request headers).
-    #[allow(clippy::type_complexity)]
-    fn spawn_server<F>(responder: F) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>)
-    where
-        F: Fn(usize, &str) -> String + Send + 'static,
-    {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let bodies = Arc::new(Mutex::new(Vec::new()));
-        let headers = Arc::new(Mutex::new(Vec::new()));
-        let (recorded_bodies, recorded_headers) = (bodies.clone(), headers.clone());
-        std::thread::spawn(move || {
-            for (n, stream) in listener.incoming().enumerate() {
-                let Ok(mut s) = stream else { break };
-                let Some((hdrs, body)) = read_request(&mut s) else { continue };
-                recorded_bodies.lock().unwrap().push(body.clone());
-                recorded_headers.lock().unwrap().push(hdrs);
-                let _ = s.write_all(responder(n, &body).as_bytes());
-            }
-        });
-        (format!("http://127.0.0.1:{port}"), bodies, headers)
-    }
+    use crate::testhttp::{http_response, spawn_server};
 
     /// OpenAI-shaped response with one deterministic 2-d vector per input:
     /// input i (0-based, per request) -> [seed + i, 1.0]. Data rows are

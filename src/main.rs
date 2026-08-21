@@ -20,9 +20,12 @@ mod markers;
 mod mcp;
 mod migrate;
 mod paths;
+mod rerank;
 mod resident;
 mod serve;
 mod session_state;
+#[cfg(test)]
+mod testhttp;
 mod staging;
 mod transcript;
 mod vectors;
@@ -670,15 +673,48 @@ fn recall(
     // Semantic/hybrid answers carry their own degradation note: partial or
     // absent vector coverage is reported, never hidden behind a result that
     // silently fell back to lexical ranking.
+    // Reranking reads a WIDER list than it shows: a cross-encoder can only
+    // promote a statement that retrieval actually proposed, so retrieval runs
+    // to `candidates` and the answer is cut back to `limit` afterwards. When
+    // reranking is off, over-retrieving would be pure cost.
+    let reranker = if cfg.rerank.enabled {
+        match rerank::RerankClient::new(&cfg.rerank) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                // Misconfigured is not the same as unavailable: it can only be
+                // fixed by a human, so it is said once, plainly, and the
+                // lexical answer still comes back.
+                eprintln!("cfetch recall: rerank misconfigured ({e:#}) — answering in retrieval order");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let retrieve = reranker.as_ref().map_or(limit, |c| c.candidates().max(limit));
+
     let (hits, note) = if semantic || hybrid {
-        let out = embed::semantic_hits(&cfg, &conn, query, limit, hybrid)?;
+        let out = embed::semantic_hits(&cfg, &conn, query, retrieve, hybrid)?;
         (out.hits, out.note)
     } else {
-        (index::recall(&conn, query, limit)?, None)
+        (index::recall(&conn, query, retrieve)?, None)
     };
     if let Some(note) = &note {
         eprintln!("cfetch recall: {note}");
     }
+    let (hits, rerank_note) = match &reranker {
+        Some(client) => {
+            let out = rerank::apply(client, query, hits, |h: &index::Hit| h.snippet.clone());
+            (out.hits, out.note)
+        }
+        None => (hits, None),
+    };
+    if let Some(note) = &rerank_note {
+        eprintln!("cfetch recall: {note}");
+    }
+    // Back to what the caller asked for, after the reordering that needed more.
+    let mut hits = hits;
+    hits.truncate(limit);
     let linked = if expand && !hits.is_empty() {
         let top: Vec<String> = hits.iter().take(3).map(|h| h.path.clone()).collect();
         index::linked_docs(&conn, &top, 8)?
@@ -702,7 +738,13 @@ fn recall(
             .collect();
         // The note rides in the JSON too: an agent parsing stdout must see
         // the degradation its human would have read on stderr.
-        println!("{}", serde_json::json!({"hits": arr, "linked": links, "semantic_note": note}));
+        println!(
+            "{}",
+            serde_json::json!({
+                "hits": arr, "linked": links,
+                "semantic_note": note, "rerank_note": rerank_note,
+            })
+        );
     } else if hits.is_empty() {
         println!("no hits for \"{query}\"");
     } else {
@@ -913,6 +955,19 @@ fn status() -> anyhow::Result<()> {
         match semantic_status(&cfg) {
             Ok(line) => println!("{line}"),
             Err(e) => println!("semantic: unavailable ({e})"),
+        }
+    }
+    // Same reasoning for reranking: an operator must see that the second
+    // stage is configured and reachable BEFORE a query quietly answers in
+    // retrieval order.
+    if cfg.rerank.enabled {
+        match rerank::RerankClient::new(&cfg.rerank) {
+            Ok(c) => println!(
+                "rerank: {} over the top {} hit(s)",
+                c.model(),
+                c.candidates()
+            ),
+            Err(e) => println!("rerank: unavailable ({e})"),
         }
     }
     let state = paths::state_dir();

@@ -28,6 +28,11 @@ listed here is a fix or an internal change with no effect on behavior.
   versioned append-only JSONL streams per host; staging candidates are
   markdown files with content-addressed ids, so a candidate flagged on one
   machine is visible — and drainable — from any of them.
+- **Cross-encoder reranking.** An optional second stage reorders a retrieved
+  shortlist by reading query and document together, which no retrieval scorer
+  does. Recall widens to `rerank.candidates` and the answer is cut back
+  afterwards, so the reranker can only promote what retrieval proposed. Off by
+  default; every failure answers in retrieval order with the reason attached.
 - A serving daemon now indexes its own code roots on startup instead of
   waiting to be asked, `map` is answerable remotely, and the dashboard routes
   to its serving host rather than opening a local index it does not have.
