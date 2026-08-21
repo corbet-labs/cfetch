@@ -14,7 +14,11 @@ listed here is a fix or an internal change with no effect on behavior.
   entries cost no budget and are reported rather than silently dropped.
 - **Windows and macOS are supported platforms.** A local-channel abstraction
   (unix socket / loopback TCP with a per-daemon token), platform-native paths
-  and quoting, and a lock implementation per platform. CI runs all three.
+  and quoting, and a lock implementation per platform. Linux, macOS and
+  Windows all gate the build — a failure on any of them blocks. Served paths
+  are canonicalized in the process, so a repository answered by a Windows host
+  and by a Linux host returns identical lines rather than the same file under
+  two spellings.
 - **Semantic recall works on a living brain.** Vectors are keyed by content
   hash instead of a volatile row id, so editing one file no longer discards
   every embedding; they are stored as shared f16 artifacts (dimensions
