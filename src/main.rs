@@ -75,7 +75,7 @@ enum Command {
         #[arg(long)]
         focus: Option<String>,
         /// Token budget the rendered map must fit
-        #[arg(long, default_value_t = 1500)]
+        #[arg(long, default_value_t = graph::DEFAULT_MAP_BUDGET_TOKENS)]
         budget_tokens: u64,
     },
     /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
@@ -408,14 +408,19 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
-    let cfg = config::Config::load()?;
-    none_tier_guard(&cfg, "map")?;
-    let conn = index::open(&paths::state_dir())?;
-    let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
+/// Renders one repo map, whoever computed it. The serving host and the
+/// none-tier client print the SAME lines — only the coherence footer differs.
+/// `served_by` is the serving host's address when the map came over the wire:
+/// an empty remote index is not something the local host can fix by scanning.
+fn print_map(m: &serve::WireMap, focus: Option<&str>, served_by: Option<&str>) {
     if m.lines.is_empty() {
-        println!("code index is empty — run `cfetch scan` first");
-        return Ok(());
+        match served_by {
+            Some(addr) => println!(
+                "the code index on serving host {addr} is empty — scanning happens there, on the storage host"
+            ),
+            None => println!("code index is empty — run `cfetch scan` first"),
+        }
+        return;
     }
     if focus.is_some() && !m.focus_matched {
         eprintln!("note: --focus matched no path or symbol — showing the unpersonalized map");
@@ -426,6 +431,28 @@ fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     if m.lines.len() < m.total_files {
         println!("… {} more file(s) beyond the token budget", m.total_files - m.lines.len());
     }
+}
+
+fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    // None-tier: the serving host's code index answers, exactly as for find.
+    // (scan and embed-index stay local — they write.)
+    if let Some(cs) = &cfg.client.serving {
+        let body = serde_json::json!({
+            "op": "map", "focus": focus, "budget_tokens": budget_tokens,
+        });
+        let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
+        let m = resp
+            .map
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("serving host {} returned no map", cs.addr))?;
+        print_map(m, focus, Some(&cs.addr));
+        print_served_by(&resp);
+        return Ok(());
+    }
+    let conn = index::open(&paths::state_dir())?;
+    let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
+    print_map(&m.into(), focus, None);
     Ok(())
 }
 
@@ -839,8 +866,9 @@ fn main() {
             }
         }
         Command::Dashboard => {
-            let guard = config::Config::load().and_then(|c| none_tier_guard(&c, "dashboard"));
-            if let Err(e) = guard.and_then(|()| dashboard::run()) {
+            // No none-tier guard: the dashboard routes to the serving host
+            // like the rest of the read path.
+            if let Err(e) = dashboard::run() {
                 eprintln!("cfetch dashboard: {e}");
                 std::process::exit(1);
             }

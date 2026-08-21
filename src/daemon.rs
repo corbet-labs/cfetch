@@ -7,7 +7,12 @@
 //! closes the connection. Ops: ping, resident, health, scan-code,
 //! scan-status, serve-status, shutdown — plus, when serving mode is enabled
 //! (config `serve.enabled`), the barrier-gated query ops recall, expand,
-//! find, slices, generation and checksum.
+//! find, map, slices, generation and checksum.
+//!
+//! A serving daemon also keeps its OWN code index current: once the tree
+//! watches are registered it kicks the single-flight background code scan and
+//! repeats it on the fingerprint cadence. Nothing outside has to send
+//! `scan-code` for `find`/`map` to answer on a freshly started host.
 //!
 //! With `serve.bind` set, the SAME protocol is additionally served over TCP,
 //! gated by a bearer token (`token` field in every request; token sourced
@@ -23,7 +28,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +48,12 @@ struct Request {
     path: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// map op: personalize the ranking toward this term.
+    #[serde(default)]
+    focus: Option<String>,
+    /// map op: token budget the rendered map must fit.
+    #[serde(default)]
+    budget_tokens: Option<u64>,
     /// SessionStart's working directory, for the resident op: the daemon
     /// shares the host with its caller but not the cwd, so the repo half of
     /// the injection scope has to travel with the request.
@@ -88,6 +99,8 @@ pub struct Response {
     pub blocks: Option<Vec<serve::WireBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_hits: Option<Vec<serve::WireFindHit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub map: Option<serve::WireMap>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slices: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +205,16 @@ impl Default for ScanCoordinator {
 
 static SCAN: ScanCoordinator = ScanCoordinator::new();
 
+/// How often the scan cadence checks whether it may start.
+const SCAN_READY_POLL: Duration = Duration::from_millis(200);
+/// How long the first code scan waits for the markdown index to settle before
+/// starting regardless. SQLite has ONE writer: a cold code scan holds the write
+/// lock for as long as it walks, so letting the tree index (which the drain
+/// barrier depends on) finish first keeps a fresh host's answers fresh. The
+/// bound is there so a tree index that never settles cannot mean a code index
+/// that never exists.
+const FIRST_SCAN_SETTLE_WAIT: Duration = Duration::from_secs(300);
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -199,8 +222,95 @@ fn now_secs() -> u64 {
 fn run_code_scan() -> Result<ScanCounts, String> {
     let cfg = Config::load().map_err(|e| e.to_string())?;
     let mut conn = crate::index::open(&paths::state_dir()).map_err(|e| e.to_string())?;
+    // Background work with no interactive deadline: waiting out the tree
+    // index's write transaction beats failing on a locked database.
+    let _ = conn.busy_timeout(Duration::from_secs(30));
     let r = crate::code::scan_code(&mut conn, &cfg.effective_code_roots()).map_err(|e| e.to_string())?;
     Ok(ScanCounts { files: r.files, symbols: r.symbols, edges: r.edges })
+}
+
+/// Starts the background code scan unless one is already running. Returns
+/// whether THIS call started it (single flight: a refusal is not an error,
+/// the running scan re-reads the same tree anyway).
+fn begin_code_scan() -> bool {
+    if !SCAN.try_begin() {
+        return false;
+    }
+    // Detached worker: the daemon keeps answering while the scan (minutes on
+    // a cold network tree) runs; a panic still releases the slot.
+    std::thread::spawn(|| {
+        let result = std::panic::catch_unwind(run_code_scan)
+            .unwrap_or_else(|_| Err("code scan thread panicked".to_string()));
+        SCAN.complete(result);
+    });
+    true
+}
+
+/// The daemon's own code-scan cadence, on its own thread.
+///
+/// The deployed defect this fixes: a fresh serving host answered `find` and
+/// `map` with "no hits" until somebody sent `scan-code` by hand. A serving
+/// host owns its index lifecycle for the markdown tree already; the code index
+/// is the same obligation.
+///
+/// Waits for the tree watches first (registering them and walking the code
+/// roots at once would only contend for the same io), then kicks the
+/// single-flight scan and repeats it on the fingerprint cadence — the
+/// incremental scan is nearly free when nothing changed. Neither the listener
+/// nor the drain barrier ever waits on this: the scan runs detached and the
+/// barrier tracks the markdown watcher, not the code index.
+fn scan_cadence(
+    watches_ready: impl Fn() -> bool,
+    kick: impl Fn() -> bool,
+    poll: Duration,
+    cadence: Duration,
+    rounds: Option<usize>,
+) {
+    while !watches_ready() {
+        std::thread::sleep(poll);
+    }
+    let mut done = 0usize;
+    loop {
+        kick();
+        done += 1;
+        if rounds.is_some_and(|r| done >= r) {
+            return;
+        }
+        std::thread::sleep(cadence);
+    }
+}
+
+/// Whether the first code scan may start: the tree watches are registered and
+/// the tree index has settled — or the bounded wait for that has expired.
+fn first_scan_ready(state: &serve::ServeState, deadline: Instant) -> bool {
+    state.is_settled() || (state.watches_ready() && Instant::now() >= deadline)
+}
+
+/// The one line `cfetch status` leads with: which side of the serving topology
+/// this host is on. Burying it is how a none-tier host reads as "empty" when
+/// it is merely remote.
+pub fn mode_line(cfg: &Config, info: Option<&ServeInfo>) -> String {
+    if let Some(cs) = &cfg.client.serving {
+        return format!(
+            "mode: none-tier — no local index; recall/find/expand/map served by {}",
+            cs.addr
+        );
+    }
+    if cfg.serve.enabled {
+        return match info.filter(|i| i.enabled) {
+            Some(i) => format!(
+                "mode: serving host {} (generation {}, {})",
+                i.origin,
+                i.generation,
+                i.bind.clone().map_or_else(|| "unix socket only".to_string(), |b| format!("tcp {b}"))
+            ),
+            None => format!(
+                "mode: serving host {} (daemon down — generation unknown, nothing is being served)",
+                serve::origin_of(cfg)
+            ),
+        };
+    }
+    "mode: local index only (not serving, no serving host configured)".to_string()
 }
 
 /// Client call with a hard deadline. The hook path budget is ~250ms total; on
@@ -334,14 +444,7 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
             (Response { ok: true, degraded_hooks: Some(degraded), ..Response::default() }, false)
         }
         "scan-code" => {
-            if SCAN.try_begin() {
-                // Detached worker: the daemon keeps answering while the scan
-                // (minutes on NFS) runs; a panic still releases the slot.
-                std::thread::spawn(|| {
-                    let result = std::panic::catch_unwind(run_code_scan)
-                        .unwrap_or_else(|_| Err("code scan thread panicked".to_string()));
-                    SCAN.complete(result);
-                });
+            if begin_code_scan() {
                 (Response { ok: true, scan: Some(SCAN.status()), ..Response::default() }, false)
             } else {
                 (
@@ -412,6 +515,28 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
                         code_hits: Some(hits.into_iter().map(Into::into).collect()),
                         ..Response::default()
                     })
+                }),
+                false,
+            )
+        }
+        "map" => {
+            // The repo map is a pure read over the committed catalog, so it
+            // serves exactly like find: same barrier, same coherence labels.
+            // (scan and embed-index stay local to the storage host — they
+            // WRITE.) The code roots come from the serving host's config,
+            // reloaded per request like every other config read here.
+            let focus = req.focus.clone();
+            let budget = req.budget_tokens.unwrap_or(crate::graph::DEFAULT_MAP_BUDGET_TOKENS);
+            (
+                serve_query(ctx, |conn| {
+                    let cfg = Config::load()?;
+                    let m = crate::graph::map(
+                        conn,
+                        &cfg.effective_code_roots(),
+                        focus.as_deref(),
+                        budget,
+                    )?;
+                    Ok(Response { map: Some(m.into()), ..Response::default() })
                 }),
                 false,
             )
@@ -519,6 +644,22 @@ pub fn run() -> anyhow::Result<()> {
         });
     }
 
+    // The daemon's own code-scan cadence. Detached: the listener bind below
+    // must not wait for a code scan, and neither must any query.
+    if let Some(h) = &serve_handle {
+        let state = h.state.clone();
+        let deadline = Instant::now() + FIRST_SCAN_SETTLE_WAIT;
+        std::thread::spawn(move || {
+            scan_cadence(
+                || first_scan_ready(&state, deadline),
+                begin_code_scan,
+                SCAN_READY_POLL,
+                serve::FINGERPRINT_INTERVAL,
+                None,
+            );
+        });
+    }
+
     // A stale endpoint from a dead daemon is cleared; a live one is never
     // stolen (see `ipc::listen`).
     let listener = ipc::listen(local_token)?;
@@ -594,12 +735,18 @@ pub fn stop() -> anyhow::Result<()> {
 }
 
 pub fn status() -> anyhow::Result<()> {
+    // The mode LEADS: which side of the serving topology this host is on is
+    // the first thing an operator needs, not a footnote under the ledger.
+    let cfg = Config::load().ok();
+    let info = call("serve-status", Duration::from_millis(300)).and_then(|r| r.serve);
+    match &cfg {
+        Some(c) => println!("{}", mode_line(c, info.as_ref())),
+        None => println!("mode: unknown (config does not load)"),
+    }
     match call("ping", Duration::from_millis(300)) {
         Some(r) => {
             println!("daemon: running (v{})", r.version.unwrap_or_default());
-            if let Some(info) = call("serve-status", Duration::from_millis(300)).and_then(|r| r.serve)
-                && info.enabled
-            {
+            if let Some(info) = info.filter(|i| i.enabled) {
                 println!(
                     "serving: origin {}, generation {}, last barrier {} ms, {}",
                     info.origin,
@@ -627,11 +774,6 @@ pub fn status() -> anyhow::Result<()> {
             }
         }
         None => println!("daemon: not running ({})", ipc::describe()),
-    }
-    if let Ok(cfg) = Config::load()
-        && let Some(cs) = &cfg.client.serving
-    {
-        println!("client: recall/find/expand route to {} (none-tier; no local index)", cs.addr);
     }
     let degraded = heartbeat::degraded();
     if degraded.is_empty() {
@@ -706,9 +848,117 @@ mod tests {
     }
 
     #[test]
+    fn daemon_start_kicks_exactly_one_code_scan() {
+        // A fabricated daemon start: watch registration takes two polls, then
+        // the cadence runs two rounds. Round one begins THE scan (nobody sent
+        // `scan-code` — the daemon kicks itself); round two is refused because
+        // that scan is still running. Single flight, one scan.
+        use std::sync::atomic::AtomicUsize;
+        let polls = AtomicUsize::new(0);
+        let coord = ScanCoordinator::new();
+        let kicked = AtomicUsize::new(0);
+        let begun = AtomicUsize::new(0);
+        scan_cadence(
+            || polls.fetch_add(1, Ordering::SeqCst) >= 2,
+            || {
+                kicked.fetch_add(1, Ordering::SeqCst);
+                let started = coord.try_begin();
+                if started {
+                    begun.fetch_add(1, Ordering::SeqCst);
+                }
+                started
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Some(2),
+        );
+        assert!(
+            polls.load(Ordering::SeqCst) >= 3,
+            "the cadence must wait for watch registration before scanning"
+        );
+        assert_eq!(kicked.load(Ordering::SeqCst), 2, "the cadence repeats on the fingerprint tick");
+        assert_eq!(
+            begun.load(Ordering::SeqCst),
+            1,
+            "single flight: a second scan must not start while the first runs"
+        );
+        assert!(coord.status().running);
+    }
+
+    #[test]
+    fn the_first_code_scan_waits_for_the_tree_index_to_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = serve::ServeState::new(
+            "o".to_string(),
+            dir.path().to_path_buf(),
+            dir.path().join("barrier"),
+        );
+        let far = Instant::now() + Duration::from_secs(300);
+        assert!(!first_scan_ready(&state, far), "nothing is ready at startup");
+        state.mark_watches_ready();
+        assert!(
+            !first_scan_ready(&state, far),
+            "watches alone must not start a cold code scan against the tree index's writer"
+        );
+        state.mark_applied(0, 1);
+        assert!(first_scan_ready(&state, far), "a settled tree index releases the code scan");
+
+        // A tree index that never settles must not mean a code index that
+        // never exists: the bounded wait releases the scan anyway.
+        let stuck = serve::ServeState::new(
+            "o".to_string(),
+            dir.path().to_path_buf(),
+            dir.path().join("barrier"),
+        );
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(!first_scan_ready(&stuck, past), "watches are still the floor");
+        stuck.mark_watches_ready();
+        assert!(first_scan_ready(&stuck, past));
+    }
+
+    #[test]
+    fn status_states_the_serving_mode_in_one_line() {
+        let mut cfg = Config::default();
+        cfg.serve.enabled = true;
+        cfg.serve.origin = Some("storage-1".to_string());
+        let info = ServeInfo {
+            enabled: true,
+            origin: "storage-1".to_string(),
+            generation: 42,
+            last_barrier_ms: 3,
+            bind: Some("198.51.100.7:9737".to_string()),
+        };
+        let line = mode_line(&cfg, Some(&info));
+        assert!(line.starts_with("mode: serving host storage-1"), "{line}");
+        assert!(line.contains("generation 42"), "{line}");
+        assert!(line.contains("198.51.100.7:9737"), "{line}");
+        assert_eq!(line.lines().count(), 1, "the mode must be ONE line: {line}");
+        // Daemon down: still obviously a serving host, generation unknown.
+        let down = mode_line(&cfg, None);
+        assert!(down.starts_with("mode: serving host storage-1"), "{down}");
+        assert!(down.contains("daemon"), "{down}");
+    }
+
+    #[test]
+    fn status_states_the_none_tier_mode_in_one_line() {
+        let mut cfg = Config::default();
+        cfg.client.serving = Some(crate::config::ClientServingConfig {
+            addr: "198.51.100.7:9737".to_string(),
+            token_file: std::path::PathBuf::from("/var/empty/token"),
+        });
+        let line = mode_line(&cfg, None);
+        assert!(line.starts_with("mode: none-tier"), "{line}");
+        assert!(line.contains("198.51.100.7:9737"), "the serving address must be on the line: {line}");
+        assert_eq!(line.lines().count(), 1, "the mode must be ONE line: {line}");
+        // A host with neither role still says which mode it is in.
+        let plain = mode_line(&Config::default(), None);
+        assert!(plain.starts_with("mode: local"), "{plain}");
+    }
+
+    #[test]
     fn query_ops_refuse_when_serving_disabled() {
         let ctx = no_serve_ctx();
-        for op in ["recall", "expand", "find", "slices", "generation", "checksum"] {
+        for op in ["recall", "expand", "find", "map", "slices", "generation", "checksum"] {
             let (resp, shutdown) =
                 handle(&Request { op: op.to_string(), ..Request::default() }, &ctx);
             assert!(!resp.ok, "{op} must refuse without serve.enabled");

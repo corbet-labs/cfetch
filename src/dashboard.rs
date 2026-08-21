@@ -1,8 +1,15 @@
 //! Ratatui terminal dashboard: read-only view of the brain's health plus a
-//! live recall pane. One screen, no daemon required — everything read
-//! directly from local state and the index.
+//! live recall pane. One screen, no daemon required.
+//!
+//! The numbers come from whatever holds this host's index: the LOCAL index on
+//! a storage host, the SERVING host on a none-tier one. It opens a local index
+//! only where one legitimately exists — a none-tier host that opened one would
+//! render a second, silently stale truth beside its serving host's, which is
+//! the drift this screen exists to expose. When neither can answer, the header
+//! says so; zeros are never printed in place of an unavailable index.
 
 use std::io::Write as _;
+use std::path::Path;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -11,8 +18,76 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
-use crate::config::Config;
-use crate::{daemon, exhaust, heartbeat, index, ledger, paths};
+use crate::config::{ClientServingConfig, Config};
+use crate::{daemon, exhaust, heartbeat, index, ledger, paths, serve};
+
+/// Remote budget for the dashboard's own calls. Deliberately shorter than the
+/// CLI's: this screen refreshes on a timer and must not freeze on a slow drain
+/// barrier.
+const REMOTE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whoever can answer this host's queries.
+enum Source {
+    /// This host holds the index.
+    Local {
+        conn: rusqlite::Connection,
+        /// Serving identity, when this host also serves.
+        origin: Option<String>,
+    },
+    /// none-tier: the serving host answers, and no local index is opened.
+    Served(ClientServingConfig),
+    /// Neither — the reason is shown instead of numbers.
+    Unusable(String),
+}
+
+/// Picks the source from config alone. Infallible on purpose: a broken index
+/// is something to REPORT on the screen, not a reason to refuse to draw it.
+fn open_source(cfg: &Config, state: &Path) -> Source {
+    if let Some(cs) = &cfg.client.serving {
+        return Source::Served(cs.clone());
+    }
+    let native = paths::native_projects_root();
+    match index::ensure_fresh(state, &cfg.brain_root, Some(&native), &cfg.rings()) {
+        Ok(conn) => Source::Local {
+            conn,
+            origin: cfg.serve.enabled.then(|| serve::origin_of(cfg)),
+        },
+        Err(e) => Source::Unusable(format!("local index unavailable: {e}")),
+    }
+}
+
+/// Every remote failure names the serving host: a none-tier host has no local
+/// data to fall back on and must never merely look empty.
+fn served(
+    cs: &ClientServingConfig,
+    body: serde_json::Value,
+    timeout: Duration,
+) -> anyhow::Result<daemon::Response> {
+    serve::client_call(cs, body, timeout)
+        .map_err(|e| anyhow::anyhow!("serving host {} unavailable: {e}", cs.addr))
+}
+
+/// What the header can honestly say about the index behind this host.
+#[derive(Debug)]
+enum IndexView {
+    Local {
+        docs_by_ring: Vec<(u8, i64)>,
+        blocks: i64,
+        code_files: i64,
+        symbols: i64,
+        /// Serving identity, when this host also serves.
+        origin: Option<String>,
+        generation: u64,
+    },
+    Served {
+        origin: String,
+        generation: u64,
+        fresh: bool,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
 
 struct Stats {
     daemon_version: Option<String>,
@@ -20,29 +95,53 @@ struct Stats {
     sessions: usize,
     injected_tokens: u64,
     quarantines: usize,
-    docs_by_ring: Vec<(u8, i64)>,
-    blocks: i64,
-    code_files: i64,
-    symbols: i64,
+    index: IndexView,
     staging_total: i64,
     staging_by_reason: Vec<(String, i64)>,
     exhaust_events: i64,
 }
 
-fn gather(conn: &rusqlite::Connection) -> Stats {
-    let state = paths::state_dir();
-    let hb = heartbeat::load_from(&state);
-    let l = ledger::load();
-    let docs_by_ring = conn
-        .prepare("SELECT ring, count(*) FROM docs GROUP BY ring ORDER BY ring")
-        .and_then(|mut s| {
-            s.query_map([], |r| Ok((r.get::<_, i64>(0)? as u8, r.get::<_, i64>(1)?)))
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
-        .unwrap_or_default();
-    let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+fn index_view(source: &Source) -> IndexView {
+    match source {
+        Source::Local { conn, origin } => {
+            let docs_by_ring = conn
+                .prepare("SELECT ring, count(*) FROM docs GROUP BY ring ORDER BY ring")
+                .and_then(|mut s| {
+                    s.query_map([], |r| Ok((r.get::<_, i64>(0)? as u8, r.get::<_, i64>(1)?)))
+                        .map(|rows| rows.filter_map(Result::ok).collect())
+                })
+                .unwrap_or_default();
+            let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+            IndexView::Local {
+                docs_by_ring,
+                blocks: one("SELECT count(*) FROM blocks"),
+                code_files: one("SELECT count(*) FROM code_files"),
+                symbols: one("SELECT count(*) FROM symbols"),
+                origin: origin.clone(),
+                generation: index::generation(conn),
+            }
+        }
+        // One tiny barrier-gated round trip per refresh: the generation op is
+        // the same coherence label the CLI footer prints.
+        Source::Served(cs) => {
+            match served(cs, serde_json::json!({"op": "generation"}), REMOTE_STATUS_TIMEOUT) {
+                Ok(r) => IndexView::Served {
+                    origin: r.origin.unwrap_or_else(|| cs.addr.clone()),
+                    generation: r.generation.unwrap_or(0),
+                    fresh: r.fresh.unwrap_or(false),
+                },
+                Err(e) => IndexView::Unavailable { reason: e.to_string() },
+            }
+        }
+        Source::Unusable(reason) => IndexView::Unavailable { reason: reason.clone() },
+    }
+}
+
+fn gather(source: &Source, state: &Path) -> Stats {
+    let hb = heartbeat::load_from(state);
+    let l = ledger::load_from(state);
     // Read-only, fail-silent: an absent exhaust DB simply reports zeros.
-    let staging = exhaust::stats(&state);
+    let staging = exhaust::stats(state);
     Stats {
         daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
         hooks: hb
@@ -57,14 +156,44 @@ fn gather(conn: &rusqlite::Connection) -> Stats {
             .flat_map(|s| s.by_source.values())
             .map(|t| t.tokens_estimated)
             .sum(),
-        quarantines: ledger::quarantine_count(&state),
-        docs_by_ring,
-        blocks: one("SELECT count(*) FROM blocks"),
-        code_files: one("SELECT count(*) FROM code_files"),
-        symbols: one("SELECT count(*) FROM symbols"),
+        quarantines: ledger::quarantine_count(state),
+        index: index_view(source),
         staging_total: staging.staged_total,
         staging_by_reason: staging.staged_by_reason,
         exhaust_events: staging.events,
+    }
+}
+
+/// The index half of the header's first line, with the colour that says how
+/// much to trust it.
+fn index_span(v: &IndexView) -> Span<'static> {
+    match v {
+        IndexView::Local { docs_by_ring, blocks, code_files, symbols, origin, generation } => {
+            let rings = docs_by_ring
+                .iter()
+                .map(|(r, n)| format!("r{r}:{n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let serving = match origin {
+                Some(o) => format!("   serving as {o} (generation {generation})"),
+                None => format!("   generation {generation}"),
+            };
+            Span::raw(format!(
+                "   index: {blocks} blocks [{rings}]   code: {code_files} files / {symbols} symbols{serving}"
+            ))
+        }
+        IndexView::Served { origin, generation, fresh } => Span::styled(
+            if *fresh {
+                format!("   served by {origin} (generation {generation}, fresh)")
+            } else {
+                format!("   served by {origin} (generation {generation}) — STALE")
+            },
+            Style::default().fg(if *fresh { Color::Green } else { Color::Yellow }),
+        ),
+        IndexView::Unavailable { reason } => Span::styled(
+            format!("   NO INDEX: {reason}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
     }
 }
 
@@ -73,19 +202,11 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         Some(v) => Span::styled(format!("daemon v{v} ●"), Style::default().fg(Color::Green)),
         None => Span::styled("daemon down ○", Style::default().fg(Color::Red)),
     };
-    let rings = s
-        .docs_by_ring
-        .iter()
-        .map(|(r, n)| format!("r{r}:{n}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     let mut lines = vec![
         Line::from(vec![
             daemon_span,
-            Span::raw(format!(
-                "   index: {} blocks [{rings}]   code: {} files / {} symbols   exhaust: {} event(s)",
-                s.blocks, s.code_files, s.symbols, s.exhaust_events
-            )),
+            index_span(&s.index),
+            Span::raw(format!("   exhaust: {} event(s)", s.exhaust_events)),
         ]),
         Line::from(format!(
             "ledger: {} session(s), ~{} tokens injected{}",
@@ -147,9 +268,24 @@ fn ring_color(ring: u8) -> Color {
     }
 }
 
+/// The recall pane's query, routed exactly like `cfetch recall`: local index
+/// on a storage host, serving host on a none-tier one.
+fn recall_hits(source: &Source, query: &str, limit: usize) -> anyhow::Result<Vec<serve::WireHit>> {
+    match source {
+        Source::Local { conn, .. } => {
+            Ok(index::recall(conn, query, limit)?.into_iter().map(Into::into).collect())
+        }
+        Source::Served(cs) => {
+            let body = serde_json::json!({"op": "recall", "query": query, "limit": limit});
+            Ok(served(cs, body, serve::QUERY_TIMEOUT)?.hits.unwrap_or_default())
+        }
+        Source::Unusable(reason) => anyhow::bail!("{reason}"),
+    }
+}
+
 struct App {
     query: String,
-    hits: Vec<index::Hit>,
+    hits: Vec<serve::WireHit>,
     status: String,
 }
 
@@ -201,8 +337,8 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
 
 pub fn run() -> anyhow::Result<()> {
     let cfg = Config::load()?;
-    let native = paths::native_projects_root();
-    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
+    let state = paths::state_dir();
+    let source = open_source(&cfg, &state);
 
     // A panicking TUI must never leave the terminal raw.
     let default_hook = std::panic::take_hook();
@@ -220,12 +356,12 @@ pub fn run() -> anyhow::Result<()> {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
     let mut app = App { query: String::new(), hits: Vec::new(), status: "no query yet".into() };
-    let mut stats = gather(&conn);
+    let mut stats = gather(&source, &state);
     let mut last_refresh = std::time::Instant::now();
 
     let result: anyhow::Result<()> = loop {
         if last_refresh.elapsed() > Duration::from_secs(2) {
-            stats = gather(&conn);
+            stats = gather(&source, &state);
             last_refresh = std::time::Instant::now();
         }
         if let Err(e) = terminal.draw(|f| draw(f, &stats, &app)) {
@@ -241,7 +377,7 @@ pub fn run() -> anyhow::Result<()> {
                     KeyCode::Esc => break Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
                     KeyCode::Enter => {
-                        match index::recall(&conn, &app.query, 20) {
+                        match recall_hits(&source, &app.query, 20) {
                             Ok(hits) => {
                                 app.status = format!("{} hit(s) for \"{}\"", hits.len(), app.query);
                                 app.hits = hits;
@@ -276,6 +412,90 @@ mod tests {
             .collect()
     }
 
+    fn local_index() -> IndexView {
+        IndexView::Local {
+            docs_by_ring: vec![(1, 2), (3, 400)],
+            blocks: 17000,
+            code_files: 9000,
+            symbols: 240000,
+            origin: None,
+            generation: 5,
+        }
+    }
+
+    #[test]
+    fn none_tier_dashboard_never_opens_a_local_index() {
+        // The defect: the dashboard opened a LOCAL index unconditionally, so a
+        // none-tier host rendered an empty second truth next to its serving
+        // host's real one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config { brain_root: dir.path().join("brain"), ..Config::default() };
+        cfg.client.serving = Some(ClientServingConfig {
+            addr: "198.51.100.7:9737".to_string(),
+            token_file: dir.path().join("absent-token"),
+        });
+        let source = open_source(&cfg, dir.path());
+        let stats = gather(&source, dir.path());
+        assert!(
+            !dir.path().join("index.db").exists(),
+            "a none-tier host must open (and create) NO local index"
+        );
+        match &stats.index {
+            IndexView::Unavailable { reason } => {
+                assert!(reason.contains("198.51.100.7:9737"), "name the serving host: {reason}");
+            }
+            other => panic!("an unreachable serving host must be reported, got {other:?}"),
+        }
+        let text = flat_text(&header_lines(&stats));
+        assert!(text.contains("198.51.100.7:9737"), "{text}");
+        assert!(!text.contains("0 blocks"), "zeros must never stand in for a remote index: {text}");
+    }
+
+    #[test]
+    fn recall_failures_name_what_could_not_answer() {
+        // The recall pane routes like the CLI, so its failures must be as
+        // explicit: a none-tier host has nothing local to fall back on.
+        let dir = tempfile::tempdir().unwrap();
+        let cs = ClientServingConfig {
+            addr: "198.51.100.7:9737".to_string(),
+            token_file: dir.path().join("absent-token"),
+        };
+        let err = recall_hits(&Source::Served(cs), "anything", 5).unwrap_err().to_string();
+        assert!(err.contains("198.51.100.7:9737"), "name the serving host: {err}");
+        let err = recall_hits(&Source::Unusable("local index unavailable: boom".into()), "x", 5)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn header_shows_the_serving_origin_and_generation() {
+        let s = Stats {
+            daemon_version: Some("0.5.0".into()),
+            hooks: Vec::new(),
+            sessions: 0,
+            injected_tokens: 0,
+            quarantines: 0,
+            index: IndexView::Served {
+                origin: "storage-1".into(),
+                generation: 91,
+                fresh: true,
+            },
+            staging_total: 0,
+            staging_by_reason: Vec::new(),
+            exhaust_events: 0,
+        };
+        let text = flat_text(&header_lines(&s));
+        assert!(text.contains("served by storage-1"), "{text}");
+        assert!(text.contains("generation 91"), "{text}");
+        // A stale remote answer must say so rather than look authoritative.
+        let stale = Stats {
+            index: IndexView::Served { origin: "storage-1".into(), generation: 91, fresh: false },
+            ..s
+        };
+        assert!(flat_text(&header_lines(&stale)).contains("STALE"), "staleness must be labeled");
+    }
+
     #[test]
     fn header_reports_failing_hooks_and_quarantines() {
         let s = Stats {
@@ -284,10 +504,7 @@ mod tests {
             sessions: 2,
             injected_tokens: 1234,
             quarantines: 1,
-            docs_by_ring: vec![(1, 2), (3, 400)],
-            blocks: 17000,
-            code_files: 9000,
-            symbols: 240000,
+            index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
             exhaust_events: 0,
@@ -308,10 +525,14 @@ mod tests {
             sessions: 0,
             injected_tokens: 0,
             quarantines: 0,
-            docs_by_ring: Vec::new(),
-            blocks: 0,
-            code_files: 0,
-            symbols: 0,
+            index: IndexView::Local {
+                docs_by_ring: Vec::new(),
+                blocks: 0,
+                code_files: 0,
+                symbols: 0,
+                origin: None,
+                generation: 0,
+            },
             staging_total: 6,
             staging_by_reason: vec![
                 ("fix-discovered".into(), 3),

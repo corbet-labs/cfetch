@@ -720,6 +720,12 @@ pub fn recompute_ranks(conn: &Connection, roots: &[PathBuf]) -> anyhow::Result<(
 
 // ------------------------------------------------------------------ map
 
+/// Default token budget for a rendered repo map. Shared by the CLI flag and
+/// the serving protocol's `map` op so both sides render the same map when the
+/// caller says nothing.
+pub const DEFAULT_MAP_BUDGET_TOKENS: u64 = 1500;
+
+#[derive(Debug, Clone)]
 pub struct RepoMap {
     pub lines: Vec<String>,
     pub total_files: usize,

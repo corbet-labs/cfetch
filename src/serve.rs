@@ -17,9 +17,10 @@
 //! while the daemon was not running (or on filesystems inotify cannot see).
 //!
 //! This module also carries the CLIENT side: a none-tier host routes
-//! recall/find/expand to a serving host over TCP (bearer-token gated, same
-//! line-JSON protocol) and opens NO local index at all. Unreachable serving
-//! host = explicit error naming the host — never a fallback to local data.
+//! recall/find/expand/map to a serving host over TCP (bearer-token gated,
+//! same line-JSON protocol) and opens NO local index at all. Unreachable
+//! serving host = explicit error naming the host — never a fallback to local
+//! data.
 //!
 //! Perf note: an update tries `index::rescan_changed` first — a stat-diff
 //! that re-reads ONLY the changed files — and falls back to the full
@@ -44,8 +45,9 @@ use crate::{daemon, index, paths};
 pub const BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Event batches settle for this long before a rebuild picks them up.
 const DEBOUNCE: Duration = Duration::from_millis(50);
-/// Cadence of the stat-fingerprint correctness backstop.
-const FINGERPRINT_INTERVAL: Duration = Duration::from_secs(60);
+/// Cadence of the stat-fingerprint correctness backstop — and of the daemon's
+/// own code-scan refresh, which rides the same tick.
+pub const FINGERPRINT_INTERVAL: Duration = Duration::from_secs(60);
 /// Remote client connect budget.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Remote client full-query budget.
@@ -122,6 +124,19 @@ impl From<crate::code::FindHit> for WireFindHit {
             end_line: h.end_line,
             token_estimate: h.token_estimate,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireMap {
+    pub lines: Vec<String>,
+    pub total_files: usize,
+    pub focus_matched: bool,
+}
+
+impl From<crate::graph::RepoMap> for WireMap {
+    fn from(m: crate::graph::RepoMap) -> Self {
+        WireMap { lines: m.lines, total_files: m.total_files, focus_matched: m.focus_matched }
     }
 }
 
@@ -296,7 +311,9 @@ impl ServeState {
         lock(&self.progress).pending
     }
 
-    fn is_settled(&self) -> bool {
+    /// The startup backstop has applied AND the tree watches are registered:
+    /// the index describes the tree and nothing can slip past the barrier.
+    pub(crate) fn is_settled(&self) -> bool {
         let p = lock(&self.progress);
         p.settled && p.watches_ready
     }

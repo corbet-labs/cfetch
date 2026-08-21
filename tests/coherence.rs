@@ -153,6 +153,11 @@ impl Drop for Daemon {
 /// Spawns `cfetch daemon run` against its own state dir + config, waits until
 /// the local control channel answers ping.
 fn start_daemon(brain: &Path, state: &Path, serve_extra: Value) -> Daemon {
+    start_daemon_cfg(brain, state, serve_extra, json!({}))
+}
+
+/// `start_daemon` with extra top-level config keys (e.g. `code_roots`).
+fn start_daemon_cfg(brain: &Path, state: &Path, serve_extra: Value, cfg_extra: Value) -> Daemon {
     std::fs::create_dir_all(state).unwrap();
     let home = tempfile::tempdir().unwrap();
     let cfg_path = state.join("config.json");
@@ -162,12 +167,17 @@ fn start_daemon(brain: &Path, state: &Path, serve_extra: Value) -> Daemon {
             serve[k] = v.clone();
         }
     }
-    let cfg = json!({
+    let mut cfg = json!({
         "brain_root": brain.to_string_lossy(),
         "resident": [],
         "capture": {"enabled": false},
         "serve": serve,
     });
+    if let Some(map) = cfg_extra.as_object() {
+        for (k, v) in map {
+            cfg[k] = v.clone();
+        }
+    }
     std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
     let child = Command::new(BIN)
         .args(["daemon", "run"])
@@ -495,6 +505,154 @@ fn tcp_client_gets_the_same_guarantees() {
     let expanded = tcp_req(&addr, token, &json!({"op": "expand", "cite": cite}));
     assert_eq!(expanded["ok"], true);
     assert!(expanded["blocks"][0]["text"].as_str().unwrap().contains("rtk7"));
+}
+
+// ---- the daemon scans code by itself, and serves `map` ----
+
+/// The deployed defect: a fresh serving host answered `find`/`map` with "no
+/// hits" forever, because a code scan only ever ran when someone sent
+/// `scan-code` by hand. Nobody sends it here.
+#[test]
+fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
+    let brain = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
+    std::fs::write(brain.path().join("knowledge/a.md"), "- seed statement\n").unwrap();
+
+    // A small code tree for the code index: two files, one importing the other.
+    let code = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(code.path().join("proj/src")).unwrap();
+    std::fs::write(
+        code.path().join("proj/src/lib.rs"),
+        "pub fn alpha_helper() -> u32 { 1 }\npub struct AlphaThing;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        code.path().join("proj/src/main.rs"),
+        "mod lib;\nfn main() { let _ = lib::alpha_helper(); }\n",
+    )
+    .unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let token_dir = tempfile::tempdir().unwrap();
+    let token = "map-bearer-token";
+    let token_file = write_token_file(token_dir.path(), token);
+    let daemon = start_daemon_cfg(
+        brain.path(),
+        state.path(),
+        json!({
+            "bind": "127.0.0.1:0",
+            "origin": "storage-host",
+            "token_file": token_file.to_string_lossy(),
+        }),
+        json!({"code_roots": [code.path().to_string_lossy()]}),
+    );
+    let addr = daemon.tcp_addr();
+
+    // Nobody sends `scan-code`: the daemon must kick its own scan once the
+    // tree watches are registered.
+    let mut counts = None;
+    for _ in 0..300 {
+        let s = daemon.local().req(&json!({"op": "scan-status"}));
+        if s["scan"]["last_finished"].is_number() && !s["scan"]["running"].as_bool().unwrap_or(true) {
+            counts = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let s = counts.expect("the daemon must run a code scan on its own, unasked");
+    assert_eq!(s["scan"]["last_error"], Value::Null, "self-triggered scan failed: {s}");
+    assert!(
+        s["scan"]["last_counts"]["files"].as_u64().unwrap_or(0) >= 2,
+        "the self-triggered scan must have indexed the code tree: {s}"
+    );
+
+    // `find` now answers on a host nobody scanned by hand.
+    let f = daemon.local().req(&json!({"op": "find", "query": "alpha_helper"}));
+    assert_eq!(f["ok"], true, "{f}");
+    assert!(
+        !f["code_hits"].as_array().unwrap().is_empty(),
+        "a self-scanned host must answer find: {f}"
+    );
+
+    // `map` is servable: same lines over the socket, over TCP, and from the
+    // local CLI on the serving host itself.
+    let sock_map = daemon.local().req(&json!({"op": "map", "budget_tokens": 4000}));
+    assert_eq!(sock_map["ok"], true, "{sock_map}");
+    assert_eq!(sock_map["origin"], "storage-host", "map must carry the coherence labels: {sock_map}");
+    assert!(sock_map["generation"].is_number(), "{sock_map}");
+    let lines: Vec<String> = sock_map["map"]["lines"]
+        .as_array()
+        .expect("map lines")
+        .iter()
+        .map(|l| l.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        lines.iter().any(|l| l.contains("proj/src/lib.rs") && l.contains("alpha_helper")),
+        "map must list the indexed files with their symbols: {lines:?}"
+    );
+
+    let tcp_map = tcp_req(&addr, token, &json!({"op": "map", "budget_tokens": 4000}));
+    assert_eq!(tcp_map["map"]["lines"], sock_map["map"]["lines"], "tcp map must equal socket map");
+
+    // The serving host's own CLI, reading its local index directly.
+    let cli_home = tempfile::tempdir().unwrap();
+    let local_out = Command::new(BIN)
+        .args(["map", "--budget-tokens", "4000"])
+        .env("CFETCH_STATE_DIR", state.path())
+        .env("CFETCH_CONFIG", state.path().join("config.json"))
+        .env("HOME", cli_home.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(local_out.status.success(), "{}", String::from_utf8_lossy(&local_out.stderr));
+    let local_lines: Vec<String> = String::from_utf8_lossy(&local_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(local_lines, lines, "the local map and the served map must be the same lines");
+
+    // And a none-tier host gets exactly those lines from the serving host,
+    // instead of "map needs a local index".
+    let client_home = tempfile::tempdir().unwrap();
+    let client_state = tempfile::tempdir().unwrap();
+    let empty_brain = tempfile::tempdir().unwrap();
+    let client_cfg = client_state.path().join("config.json");
+    std::fs::write(
+        &client_cfg,
+        serde_json::to_string(&json!({
+            "brain_root": empty_brain.path().to_string_lossy(),
+            "resident": [],
+            "client": {"serving": {"addr": addr, "token_file": token_file.to_string_lossy()}},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let remote_out = Command::new(BIN)
+        .args(["map", "--budget-tokens", "4000"])
+        .env("CFETCH_STATE_DIR", client_state.path())
+        .env("CFETCH_CONFIG", &client_cfg)
+        .env("HOME", client_home.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    let remote_stdout = String::from_utf8_lossy(&remote_out.stdout);
+    assert!(
+        remote_out.status.success(),
+        "none-tier map failed: {remote_stdout}\n{}",
+        String::from_utf8_lossy(&remote_out.stderr)
+    );
+    let remote_lines: Vec<String> = remote_stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("served by "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(remote_lines, lines, "map must read the same locally and remotely");
+    assert!(remote_stdout.contains("served by storage-host"), "coherence footer missing: {remote_stdout}");
+    assert!(
+        !client_state.path().join("index.db").exists(),
+        "a none-tier map must open no local index"
+    );
 }
 
 // ---- none-tier CLI routing against a serving host ----

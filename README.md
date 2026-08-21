@@ -182,7 +182,11 @@ defaults):
   "inject nothing" — useful where the harness already auto-loads these files,
   so they are not paid for twice.
 - `code_roots` — roots for the code index, relative to `brain_root` unless
-  absolute. Empty means `<brain_root>/projects/github`.
+  absolute. Empty means `<brain_root>/projects/github`. A running daemon keeps
+  this index current on its own — an initial scan once its file watches are up,
+  then an incremental refresh on the same 60-second cadence as the integrity
+  backstop — so `cfetch find` and `cfetch map` answer on a freshly started host
+  without anyone running `cfetch scan` by hand.
 - `budget_chars` — hard cap on the injected digest.
 - `ledger_max_sessions` — sessions kept in the injection ledger.
 
