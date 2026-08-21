@@ -80,6 +80,20 @@ fn excluded(rel: &str) -> bool {
         || rel.contains("/.git/")
 }
 
+/// Directory form of [`excluded`]: true when nothing under `rel` can ever be
+/// indexed, so the serving watcher can skip the whole subtree. Kept beside
+/// `excluded` deliberately — a prefix added there must be reflected here or
+/// the watcher would register watches the indexer ignores.
+pub(crate) fn excluded_dir(rel: &str) -> bool {
+    let rel = rel.trim_end_matches('/');
+    rel == "mind/secrets"
+        || rel == "logs"
+        || rel == "projects"
+        || rel == "knowledge/archive"
+        || rel == ".git"
+        || excluded(&format!("{rel}/"))
+}
+
 /// Secret-shaped file names are refused even outside mind/secrets/ — capture
 /// the guard at the earliest point so every downstream store inherits it.
 fn secret_shaped(rel: &str) -> bool {

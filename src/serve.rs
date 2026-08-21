@@ -138,6 +138,10 @@ struct Progress {
     /// The startup backstop (or first rebuild) has completed — before this,
     /// nothing may claim freshness: events may have been missed while down.
     settled: bool,
+    /// Tree watch registration has finished. Freshness additionally requires
+    /// this: between listener bind and full registration, a write in a
+    /// not-yet-watched directory would be invisible to the barrier.
+    watches_ready: bool,
     /// Last index-update failure; cleared by the next success.
     last_error: Option<String>,
 }
@@ -207,7 +211,7 @@ impl ServeState {
         }
         if fresh {
             let target = lock(&self.progress).pending;
-            if !self.wait_until(deadline, |p| p.settled && p.applied >= target) {
+            if !self.wait_until(deadline, |p| p.settled && p.watches_ready && p.applied >= target) {
                 fresh = false;
                 let err = lock(&self.progress).last_error.clone();
                 note = Some(match err {
@@ -286,7 +290,18 @@ impl ServeState {
     }
 
     fn is_settled(&self) -> bool {
-        lock(&self.progress).settled
+        let p = lock(&self.progress);
+        p.settled && p.watches_ready
+    }
+
+    /// Registration thread glue: every tree watch is in place.
+    pub(crate) fn mark_watches_ready(&self) {
+        lock(&self.progress).watches_ready = true;
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn watches_ready(&self) -> bool {
+        lock(&self.progress).watches_ready
     }
 
     fn applied_now(&self) -> u64 {
@@ -316,7 +331,130 @@ fn hostname() -> String {
 /// Keeps the watcher alive for the daemon's lifetime.
 pub struct ServeHandle {
     pub state: Arc<ServeState>,
-    _watcher: notify::RecommendedWatcher,
+    _watcher: Arc<Mutex<notify::RecommendedWatcher>>,
+}
+
+/// Directories the INDEXER would walk — the exact set worth watching.
+///
+/// Three defects made a recursive watch on the tree root undeployable on a
+/// real brain, all found by deploying it (2026-08-21):
+///   1. it followed symlinks — a wineprefix `dosdevices/z: -> /` inside a
+///      checkout sent the watch walking the entire root filesystem;
+///   2. it watched subtrees the indexer excludes (`projects/`, gitignored
+///      scratch dumps), needing ~524k watches against a 524,288 default;
+///   3. registration ran before the listener bound, so a restart was a
+///      multi-minute serving outage.
+///
+/// Reusing the indexer's own walker settles 1 and 2 by construction: the same
+/// `ignore` walker, the same gitignore/hidden rules, `follow_links(false)`,
+/// and the same exclusion predicate — so the watch set is exactly the index
+/// set, never a byte more. 3 is settled by registering in the background
+/// (see `start`), with `settled` withheld until registration completes so no
+/// answer claims freshness it cannot have.
+fn watchable_dirs(brain_root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![brain_root.to_path_buf()];
+    let walker = ignore::WalkBuilder::new(brain_root)
+        .hidden(true)
+        .git_ignore(true)
+        .follow_links(false)
+        .build();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
+        let rel = rel.to_string_lossy();
+        if rel.is_empty() || crate::index::excluded_dir(&rel) {
+            continue;
+        }
+        dirs.push(entry.path().to_path_buf());
+    }
+    dirs
+}
+
+/// Registers one non-recursive watch per indexable directory. Non-recursive
+/// is what keeps a symlinked directory from dragging its target in: notify
+/// only ever sees the paths we hand it.
+fn register_watches(
+    watcher: &Arc<Mutex<notify::RecommendedWatcher>>,
+    dirs: &[PathBuf],
+) -> (usize, usize) {
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for dir in dirs {
+        let res = lock(watcher).watch(dir, notify::RecursiveMode::NonRecursive);
+        match res {
+            Ok(()) => ok += 1,
+            // A directory that vanished between walk and watch, or a watch
+            // limit hit: the 60s fingerprint backstop still covers it.
+            Err(_) => failed += 1,
+        }
+    }
+    (ok, failed)
+}
+
+#[cfg(test)]
+mod watch_scope_tests {
+    use super::*;
+
+    /// The three deployment defects, as tests: never follow a symlink out of
+    /// the tree, never watch what the indexer excludes, and watch only
+    /// directories that exist.
+    #[test]
+    fn watchable_dirs_skips_symlinks_and_excluded_subtrees() {
+        let brain = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("deep/deeper")).unwrap();
+        for d in ["knowledge/hosts", "mind/memories", "mind/secrets", "logs/x", "projects/repo/src", "knowledge/archive/old"] {
+            std::fs::create_dir_all(brain.path().join(d)).unwrap();
+        }
+        // The wineprefix-style escape hatch that walked the whole rootfs.
+        std::os::unix::fs::symlink(outside.path(), brain.path().join("knowledge/z")).unwrap();
+
+        let dirs = watchable_dirs(brain.path());
+        let rel: Vec<String> = dirs
+            .iter()
+            .map(|d| d.strip_prefix(brain.path()).unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert!(rel.iter().any(|r| r == "knowledge/hosts"));
+        assert!(rel.iter().any(|r| r == "mind/memories"));
+        assert!(!rel.iter().any(|r| r.starts_with("mind/secrets")), "secrets never watched: {rel:?}");
+        assert!(!rel.iter().any(|r| r.starts_with("logs")), "logs excluded: {rel:?}");
+        assert!(!rel.iter().any(|r| r.starts_with("projects")), "projects excluded: {rel:?}");
+        assert!(!rel.iter().any(|r| r.starts_with("knowledge/archive")), "archive excluded: {rel:?}");
+        assert!(
+            !dirs.iter().any(|d| d.starts_with(outside.path())),
+            "a symlinked directory must never drag its target in: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn every_watchable_dir_is_a_real_directory() {
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
+        std::fs::write(brain.path().join("knowledge/a.md"), "x\n").unwrap();
+        for d in watchable_dirs(brain.path()) {
+            assert!(d.is_dir(), "{d:?} is not a directory");
+        }
+    }
+
+    #[test]
+    fn freshness_requires_watch_registration() {
+        // A state whose backstop settled but whose watches are not yet
+        // registered must NOT be treated as settled: a write in an
+        // unregistered directory would be invisible to the barrier.
+        let dir = tempfile::tempdir().unwrap();
+        let state = ServeState::new(
+            "o".to_string(),
+            dir.path().to_path_buf(),
+            dir.path().join("barrier"),
+        );
+        state.mark_applied(0, 1);
+        assert!(!state.is_settled(), "settled must require watches_ready");
+        state.mark_watches_ready();
+        assert!(state.is_settled());
+    }
 }
 
 /// Parses `<barrier_dir>/b<seq>`; None for anything else (a real tree path).
@@ -363,33 +501,69 @@ pub fn start(cfg: &Config) -> anyhow::Result<ServeHandle> {
     }
     let state = Arc::new(ServeState::new(origin_of(cfg), state_dir, barrier_dir.clone()));
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
-    let mut watcher = notify::recommended_watcher({
+    let watcher = notify::recommended_watcher({
         let state = state.clone();
+        let wake_tx = wake_tx.clone();
         move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
                 on_event(&state, &wake_tx, &ev);
             }
         }
     })?;
-    watcher.watch(&cfg.brain_root, notify::RecursiveMode::Recursive)?;
-    watcher.watch(&barrier_dir, notify::RecursiveMode::NonRecursive)?;
+    let watcher = Arc::new(Mutex::new(watcher));
+    // The barrier directory is tiny and always watchable: register it inline
+    // so a barrier taken during startup still resolves.
+    lock(&watcher).watch(&barrier_dir, notify::RecursiveMode::NonRecursive)?;
+
+    // Tree watches are registered in the BACKGROUND: enumerating a large
+    // brain takes seconds to minutes, and the caller (daemon::run) must reach
+    // its listener bind immediately — a restart may never be a serving
+    // outage. Until this completes the worker withholds `settled`, so answers
+    // are labeled stale rather than wrongly fresh.
+    std::thread::spawn({
+        let watcher = watcher.clone();
+        let state = state.clone();
+        let brain_root = cfg.brain_root.clone();
+        let wake_tx = wake_tx.clone();
+        move || {
+            let dirs = watchable_dirs(&brain_root);
+            let (ok, failed) = register_watches(&watcher, &dirs);
+            if failed > 0 {
+                eprintln!(
+                    "cfetch serve: watching {ok} director(ies); {failed} could not be watched \
+                     (the 60s fingerprint backstop still covers them)"
+                );
+            }
+            state.mark_watches_ready();
+            // A directory may have appeared while we were registering.
+            let _ = wake_tx.send(());
+        }
+    });
+
     std::thread::spawn({
         let state = state.clone();
         let cfg = cfg.clone();
-        move || worker(&state, &cfg, &wake_rx)
+        let watcher = watcher.clone();
+        move || worker(&state, &cfg, &wake_rx, &watcher)
     });
     Ok(ServeHandle { state, _watcher: watcher })
 }
 
 /// The rebuild worker: drains event batches into index updates and runs the
 /// fingerprint backstop at start and every 60s.
-fn worker(state: &ServeState, cfg: &Config, wake: &mpsc::Receiver<()>) {
+fn worker(
+    state: &ServeState,
+    cfg: &Config,
+    wake: &mpsc::Receiver<()>,
+    watcher: &Arc<Mutex<notify::RecommendedWatcher>>,
+) {
     let native = paths::native_projects_root();
     let mut conn: Option<rusqlite::Connection> = None;
     // Startup backstop: whatever happened while the daemon was down is
     // invisible to the watcher.
     apply(state, &mut conn, cfg, &native, true);
     let mut last_backstop = Instant::now();
+    let mut watched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     loop {
         match wake.recv_timeout(FINGERPRINT_INTERVAL) {
             Ok(()) => {
@@ -403,6 +577,23 @@ fn worker(state: &ServeState, cfg: &Config, wake: &mpsc::Receiver<()>) {
         if last_backstop.elapsed() >= FINGERPRINT_INTERVAL {
             last_backstop = Instant::now();
             apply(state, &mut conn, cfg, &native, true);
+            // Directories created since the last sweep carry no watch of
+            // their own (watches are per-directory, non-recursive by design).
+            // Re-enumerating on the backstop cadence keeps the watch set
+            // convergent without ever following a symlink.
+            if state.watches_ready() {
+                let dirs = watchable_dirs(&cfg.brain_root);
+                if watched.is_empty() {
+                    watched = dirs.iter().cloned().collect();
+                } else {
+                    let fresh: Vec<PathBuf> =
+                        dirs.iter().filter(|d| !watched.contains(*d)).cloned().collect();
+                    if !fresh.is_empty() {
+                        register_watches(watcher, &fresh);
+                        watched.extend(fresh);
+                    }
+                }
+            }
         }
     }
 }
@@ -612,7 +803,9 @@ mod tests {
             dir.path().to_path_buf(),
             barrier_dir,
         ));
-        // Pending work exists and is not yet applied.
+        // A fully started server: watches registered (the registration
+        // thread's job), pending work exists and is not yet applied.
+        state.mark_watches_ready();
         state.note_event();
         // A fake watcher+worker: observes the sentinel, then applies.
         let sim = std::thread::spawn({
@@ -654,12 +847,26 @@ mod tests {
         let out = state.barrier(Duration::from_millis(100));
         sim.join().unwrap();
         assert!(!out.fresh, "unsettled startup must not serve fresh");
+        // Applying is not enough while tree watches are still registering:
+        // a write in an unwatched directory would be invisible.
         state.mark_applied(0, 1);
         std::thread::spawn({
             let state = state.clone();
             move || {
                 std::thread::sleep(Duration::from_millis(10));
                 state.note_sentinel(2);
+            }
+        })
+        .join()
+        .unwrap();
+        let out = state.barrier(Duration::from_millis(100));
+        assert!(!out.fresh, "unregistered watches must not serve fresh");
+        state.mark_watches_ready();
+        std::thread::spawn({
+            let state = state.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(10));
+                state.note_sentinel(3);
             }
         })
         .join()

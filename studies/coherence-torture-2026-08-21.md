@@ -29,3 +29,32 @@ end-to-end (dominated by process spawn + TCP round trips, not the barrier).
 The catalog's internal form (SQLite FTS5 in-process) is not observable in
 any measurement — coherence is a property of the barrier/generation design,
 not of the storage engine.
+
+## Watcher scope — three defects found by DEPLOYING (2026-08-21, same day)
+
+A declarative rollout attempt on the real fleet found what no unit test had:
+
+1. **Symlink escape**: the recursive watch followed a wineprefix
+   `dosdevices/z: -> /` inside a checkout and walked the entire root
+   filesystem.
+2. **Watching what the indexer ignores**: `projects/` and gitignored scratch
+   dumps pushed the requirement to ~524k watches against a 524,288 default.
+3. **Bind-after-registration**: the TCP listener came up only after full watch
+   registration (minutes), making every daemon restart a fleet-wide recall
+   outage once desktops are none-tier.
+
+Fix: watches are now derived from the INDEXER's own walker (same `ignore`
+settings, same exclusions, `follow_links(false)`), registered one
+non-recursive watch per indexable directory, in a BACKGROUND thread — and
+`settled` (hence freshness) is withheld until registration completes, so an
+answer served during startup is labeled stale rather than wrongly fresh.
+New directories are picked up on the 60s backstop cadence.
+
+Measured after the fix, against the real brain tree:
+- inotify watches: **90** (was ~524k required)
+- TCP listener bound: **< 0.5 s** after start (was minutes)
+- live write -> recall visible in ~2 s; deletion likewise
+- recall latency on the served tree: 23 ms
+
+Lesson worth keeping: the deployment attempt was the test. Three defects,
+zero of them reachable from a temp-dir fixture.
