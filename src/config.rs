@@ -369,6 +369,11 @@ pub struct VectorSpec {
     pub model: String,
     pub dim: usize,
     pub precision: Precision,
+    /// Text prepended to every DOCUMENT before embedding it. Part of the
+    /// artifact identity because it changes the stored vectors: two hosts
+    /// configured differently would otherwise write incompatible vectors into
+    /// the same shared file, and nothing would ever notice.
+    pub doc_prefix: String,
 }
 
 /// Embeddings backend: any OpenAI-compatible `/embeddings` endpoint (a
@@ -407,6 +412,19 @@ pub struct EmbeddingsConfig {
     /// scan without buying ranking quality.
     #[serde(default = "default_embed_dimensions")]
     pub dimensions: usize,
+    /// Text prepended to every DOCUMENT before embedding it.
+    ///
+    /// The other half of asymmetric retrieval. Some families want one — E5
+    /// wants `"passage: "`, EmbeddingGemma wants a `title:`/`text:` pair —
+    /// and some want documents raw, which is the default.
+    ///
+    /// Unlike [`Self::query_prefix`] this changes what is STORED, so it is
+    /// part of the artifact identity: the shared store is keyed by it and its
+    /// header records it exactly. Change it and the existing vectors are a
+    /// different artifact set that has to be re-derived — which is why it is
+    /// configuration and not something an agent should flip casually.
+    #[serde(default)]
+    pub document_prefix: String,
     /// Text prepended to a QUERY before embedding it, and to nothing else.
     ///
     /// Modern retrieval embedders are asymmetric: they are trained with an
@@ -438,6 +456,7 @@ impl EmbeddingsConfig {
             model: self.model.clone(),
             dim: self.dimensions,
             precision: self.precision,
+            doc_prefix: self.document_prefix.clone(),
         }
     }
 }
@@ -500,6 +519,7 @@ impl Default for EmbeddingsConfig {
             api_key_env: String::new(),
             timeout_secs: default_embed_timeout_secs(),
             dimensions: default_embed_dimensions(),
+            document_prefix: String::new(),
             query_prefix: String::new(),
             precision: Precision::default(),
         }

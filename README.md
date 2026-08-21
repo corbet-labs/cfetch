@@ -334,6 +334,13 @@ local llama.cpp server, LM Studio, vLLM, or a hosted API:
   and re-normalized client-side. A model that cannot reach the width is an
   error, never a silently narrower vector. Full native width is usually 8–16x
   more than a documentation corpus can use, and it dominates the index file.
+- `document_prefix` — the instruction the model expects on a DOCUMENT, if it
+  wants one (E5 wants `"passage: "`, EmbeddingGemma wants a `title:`/`text:`
+  pair, Qwen3 wants documents raw). Unlike the query prefix this changes what
+  is STORED, so it is part of the artifact identity: the shared store's
+  filename carries a digest of it and its header records it exactly. Two hosts
+  configured differently therefore write to different files instead of
+  appending incompatible vectors to one. Changing it means re-deriving.
 - `query_prefix` — the instruction this model expects on a QUERY, and on
   nothing else. Retrieval embedders are asymmetric: they are trained with an
   instruction on the query side and raw text on the document side, and they

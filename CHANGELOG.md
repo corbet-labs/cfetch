@@ -5,6 +5,14 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Document-side embedding prefixes, as part of the artifact identity.**
+  `embeddings.document_prefix` carries the instruction models like E5 and
+  EmbeddingGemma expect on documents. Because it changes every stored vector,
+  it is keyed into the shared artifact's filename and recorded exactly in its
+  header — two hosts configured differently write separate files rather than
+  appending incompatible vectors to one. Stores written before this exist
+  unchanged and keep working: no prefix line means raw documents, which is
+  what they hold.
 - **Invites and grants.** `cfetch invite <slice>` mints a one-time ticket,
   `cfetch join <ticket>` redeems it, `cfetch grants` shows who holds what.
   A ticket is an address plus a secret, NOT an authorization: the origin looks

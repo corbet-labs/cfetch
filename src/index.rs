@@ -1394,10 +1394,14 @@ pub fn stored_vector_spec(conn: &Connection) -> Option<VectorSpec> {
         "f32" => Precision::F32,
         _ => return None,
     };
-    Some(VectorSpec { model, dim, precision })
+    // Absent means the empty prefix: a cache written before document
+    // prefixes existed held raw-document vectors, which is exactly what an
+    // empty prefix means today.
+    let doc_prefix = meta_get(conn, "embed_doc_prefix").unwrap_or_default();
+    Some(VectorSpec { model, dim, precision, doc_prefix })
 }
 
-/// Records `(model, dim, precision)` in meta; a DIFFERENT stored spec drops
+/// Records `(model, dim, precision, doc_prefix)` in meta; a DIFFERENT stored spec drops
 /// every cached vector — vectors of two models, widths or precisions produce
 /// numbers that look like similarity and are not. Returns true when a drop
 /// happened. Re-filling is a first-class path: the shared store still holds
@@ -1412,6 +1416,7 @@ pub fn ensure_vector_spec(conn: &Connection, spec: &VectorSpec) -> anyhow::Resul
     meta_set(conn, "embed_model", &spec.model)?;
     meta_set(conn, "embed_dim", &spec.dim.to_string())?;
     meta_set(conn, "embed_precision", spec.precision.as_str())?;
+    meta_set(conn, "embed_doc_prefix", &spec.doc_prefix)?;
     Ok(dropping)
 }
 
@@ -2175,7 +2180,7 @@ mod tests {
     }
 
     fn test_spec(dim: usize) -> VectorSpec {
-        VectorSpec { model: "test-model".into(), dim, precision: Precision::F16 }
+        VectorSpec { model: "test-model".into(), dim, precision: Precision::F16, doc_prefix: String::new() }
     }
 
     fn embed_everything(conn: &Connection, spec: &VectorSpec, vector: &[f32]) {

@@ -47,11 +47,33 @@ use rusqlite::Connection;
 use crate::config::VectorSpec;
 use crate::index;
 
-/// First line of every `.idx` — a file that is not this is not ours.
-const MAGIC: &str = "cfetch-vectors v1";
+/// First line of every `.idx` — a file that is not one of these is not ours.
+///
+/// v1: magic, model, dim, precision.
+/// v2: the same plus `doc_prefix`, written only when there IS one, so a store
+/// written by an older cfetch stays byte-identical and keeps working.
+const MAGIC_V1: &str = "cfetch-vectors v1";
+const MAGIC_V2: &str = "cfetch-vectors v2";
 
-/// Header lines before the hash list: magic, model, dim, precision.
-const HEADER_LINES: usize = 4;
+const HEADER_LINES_V1: usize = 4;
+const HEADER_LINES_V2: usize = 5;
+
+/// How many header lines this spec's artifact carries.
+fn header_lines(spec: &VectorSpec) -> usize {
+    if spec.doc_prefix.is_empty() { HEADER_LINES_V1 } else { HEADER_LINES_V2 }
+}
+
+fn magic_for(spec: &VectorSpec) -> &'static str {
+    if spec.doc_prefix.is_empty() { MAGIC_V1 } else { MAGIC_V2 }
+}
+
+/// Short, stable, filename-safe digest of a document prefix.
+fn prefix_tag(prefix: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(prefix.as_bytes());
+    h.finalize().iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
 
 /// Up to this many missing vectors, a hydrate seeks per record instead of
 /// streaming the whole artifact file.
@@ -67,7 +89,16 @@ fn slug(spec: &VectorSpec) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    format!("{model}-{}-{}", spec.dim, spec.precision.as_str())
+    let base = format!("{model}-{}-{}", spec.dim, spec.precision.as_str());
+    // A document prefix changes every vector in the file, so it changes the
+    // FILE — otherwise two hosts with different prefixes would append
+    // incompatible records to one artifact and the header check would only
+    // catch it on the unlucky one that opened it second.
+    if spec.doc_prefix.is_empty() {
+        base
+    } else {
+        format!("{base}-{}", prefix_tag(&spec.doc_prefix))
+    }
 }
 
 /// A `(model, dim, precision)` artifact set on disk, with its hash list
@@ -89,6 +120,11 @@ impl VectorStore {
         anyhow::ensure!(
             !spec.model.contains(['\n', '\r']),
             "embeddings.model must not contain newlines"
+        );
+        anyhow::ensure!(
+            !spec.doc_prefix.contains(['\n', '\r']),
+            "embeddings.document_prefix must not contain newlines — it is stored on one \
+             header line, and a newline there would be read as the end of the header"
         );
         anyhow::ensure!(spec.dim > 0, "embeddings.dimensions must be at least 1");
         let dir = crate::paths::shared_vector_dir(brain_root);
@@ -118,13 +154,17 @@ impl VectorStore {
             Err(e) => return Err(anyhow::anyhow!("read {}: {e}", idx.display())),
         };
         let mut lines = raw.lines();
-        anyhow::ensure!(
-            lines.next() == Some(MAGIC),
-            "{} is not a cfetch vector index",
-            idx.display()
-        );
+        // Version by magic line: v1 has no doc_prefix and is what every store
+        // written before asymmetric documents looks like. Reading it stays
+        // supported forever — these files are expensive to rebuild.
+        let magic = lines.next().unwrap_or_default();
+        let count = match magic {
+            MAGIC_V1 => HEADER_LINES_V1,
+            MAGIC_V2 => HEADER_LINES_V2,
+            _ => anyhow::bail!("{} is not a cfetch vector index", idx.display()),
+        };
         let mut header = std::collections::HashMap::new();
-        for _ in 0..HEADER_LINES - 1 {
+        for _ in 0..count - 1 {
             let line = lines.next().context("truncated vector index header")?;
             let (k, v) = line.split_once(' ').context("malformed vector index header")?;
             header.insert(k.to_string(), v.to_string());
@@ -151,6 +191,18 @@ impl VectorStore {
             "{} holds a different precision than embeddings.precision={}",
             idx.display(),
             self.spec.precision.as_str()
+        );
+        // A v1 file carries no doc_prefix line, which MEANS the empty prefix —
+        // documents were embedded raw. Comparing it explicitly is what stops a
+        // host that has since configured a prefix from appending vectors of a
+        // different shape to the same file.
+        let stored_prefix = header.get("doc_prefix").map(String::as_str).unwrap_or("");
+        anyhow::ensure!(
+            stored_prefix == self.spec.doc_prefix,
+            "{} holds vectors embedded with document prefix {stored_prefix:?}, not {:?} — \
+             these are different artifacts and must not share a file",
+            idx.display(),
+            self.spec.doc_prefix
         );
         let listed: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
         let stored_records = std::fs::metadata(self.bin_path()).map(|m| m.len()).unwrap_or(0) as usize
@@ -250,21 +302,25 @@ impl VectorStore {
             .truncate(false)
             .open(self.idx_path())?;
         if idx.metadata()?.len() == 0 {
+            let magic = magic_for(&self.spec);
             write!(
                 idx,
-                "{MAGIC}\nmodel {}\ndim {}\nprecision {}\n",
+                "{magic}\nmodel {}\ndim {}\nprecision {}\n",
                 self.spec.model,
                 self.spec.dim,
                 self.spec.precision.as_str()
             )?;
+            if !self.spec.doc_prefix.is_empty() {
+                writeln!(idx, "doc_prefix {}", self.spec.doc_prefix)?;
+            }
         } else {
             // Rewrite the hash list whenever the view is shorter than the
             // file (an index line whose record never landed).
             let raw = std::fs::read_to_string(self.idx_path())?;
-            let listed = raw.lines().skip(HEADER_LINES).filter(|l| !l.is_empty()).count();
+            let hl = header_lines(&self.spec);
+            let listed = raw.lines().skip(hl).filter(|l| !l.is_empty()).count();
             if listed != self.hashes.len() {
-                let header: String =
-                    raw.lines().take(HEADER_LINES).map(|l| format!("{l}\n")).collect();
+                let header: String = raw.lines().take(hl).map(|l| format!("{l}\n")).collect();
                 let body: String = self.hashes.iter().map(|h| format!("{h}\n")).collect();
                 idx.set_len(0)?;
                 idx.seek(std::io::SeekFrom::Start(0))?;
@@ -381,7 +437,7 @@ mod tests {
     use crate::config::Precision;
 
     fn spec(dim: usize, precision: Precision) -> VectorSpec {
-        VectorSpec { model: "test-model".into(), dim, precision }
+        VectorSpec { model: "test-model".into(), dim, precision, doc_prefix: String::new() }
     }
 
     #[test]
@@ -428,7 +484,7 @@ mod tests {
     #[test]
     fn store_files_are_named_by_model_dim_and_precision() {
         let brain = tempfile::tempdir().unwrap();
-        let s = VectorSpec { model: "vendor/embed-8b".into(), dim: 8, precision: Precision::F32 };
+        let s = VectorSpec { model: "vendor/embed-8b".into(), dim: 8, precision: Precision::F32, doc_prefix: String::new() };
         let mut store = VectorStore::open(brain.path(), &s).unwrap();
         store.begin_write().unwrap().put("aa", &[1.0; 8]).unwrap();
         let dir = crate::paths::shared_vector_dir(brain.path());
@@ -457,13 +513,13 @@ mod tests {
         let brain = tempfile::tempdir().unwrap();
         let mut a = VectorStore::open(
             brain.path(),
-            &VectorSpec { model: "a/b".into(), dim: 4, precision: Precision::F16 },
+            &VectorSpec { model: "a/b".into(), dim: 4, precision: Precision::F16, doc_prefix: String::new() },
         )
         .unwrap();
         a.begin_write().unwrap().put("aa", &[1.0, 0.0, 0.0, 0.0]).unwrap();
         let err = VectorStore::open(
             brain.path(),
-            &VectorSpec { model: "a_b".into(), dim: 4, precision: Precision::F16 },
+            &VectorSpec { model: "a_b".into(), dim: 4, precision: Precision::F16, doc_prefix: String::new() },
         )
         .unwrap_err();
         assert!(err.to_string().contains("a/b"), "the stored model is named: {err}");
@@ -513,7 +569,7 @@ mod tests {
         let mut conn = index::open(state.path()).unwrap();
         index::scan(&mut conn, brain.path(), None, &crate::config::RingRules::default()).unwrap();
 
-        let old = VectorSpec { model: "old-model".into(), dim: 2, precision: Precision::F16 };
+        let old = VectorSpec { model: "old-model".into(), dim: 2, precision: Precision::F16, doc_prefix: String::new() };
         index::ensure_vector_spec(&conn, &old).unwrap();
         let hash = index::content_hash("- one");
         index::insert_vector(&conn, &hash, &old, &[1.0, 0.0]).unwrap();
@@ -551,5 +607,75 @@ mod tests {
         assert_eq!(hydrate(&conn, &store).unwrap(), 2);
         assert_eq!(index::vector_coverage(&conn, &s).unwrap(), (2, 2));
         assert_eq!(hydrate(&conn, &store).unwrap(), 0, "a second hydrate imports nothing");
+    }
+
+    // ---- document prefix as artifact identity
+
+    fn spec_pfx(dim: usize, prefix: &str) -> VectorSpec {
+        VectorSpec {
+            model: "test-model".into(),
+            dim,
+            precision: Precision::F16,
+            doc_prefix: prefix.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_document_prefix_makes_a_different_artifact_file() {
+        // Same model, same width, different prefix: the vectors are not
+        // comparable, so they must not land in one file.
+        let raw = slug(&spec_pfx(4, ""));
+        let pfx = slug(&spec_pfx(4, "passage: "));
+        assert_ne!(raw, pfx);
+        assert!(pfx.starts_with(&raw), "the prefixed name extends the base: {pfx}");
+        // Stable across runs, and different prefixes never collide.
+        assert_eq!(pfx, slug(&spec_pfx(4, "passage: ")));
+        assert_ne!(pfx, slug(&spec_pfx(4, "query: ")));
+    }
+
+    #[test]
+    fn a_store_refuses_vectors_embedded_under_another_prefix() {
+        let brain = tempfile::tempdir().unwrap();
+        let a = spec_pfx(2, "passage: ");
+        {
+            let mut store = VectorStore::open(brain.path(), &a).unwrap();
+            let mut w = store.begin_write().unwrap();
+            w.put("hash-one", &[1.0, 0.0]).unwrap();
+        }
+        // Reading it back under the SAME prefix works.
+        assert_eq!(VectorStore::open(brain.path(), &a).unwrap().len(), 1);
+
+        // Now force a different prefix onto the same filename and confirm the
+        // header check catches it, since the filename tag is only a hint.
+        let idx = VectorStore::open(brain.path(), &a).unwrap().idx_path();
+        let raw = std::fs::read_to_string(&idx).unwrap();
+        std::fs::write(&idx, raw.replace("doc_prefix passage: ", "doc_prefix other: ")).unwrap();
+        let e = VectorStore::open(brain.path(), &a).unwrap_err().to_string();
+        assert!(e.contains("document prefix"), "{e}");
+    }
+
+    #[test]
+    fn a_v1_store_still_opens_and_means_raw_documents() {
+        // Files written before document prefixes existed hold raw-document
+        // vectors. They are expensive to rebuild; reading them stays supported.
+        let brain = tempfile::tempdir().unwrap();
+        let raw_spec = spec_pfx(2, "");
+        {
+            let mut store = VectorStore::open(brain.path(), &raw_spec).unwrap();
+            let mut w = store.begin_write().unwrap();
+            w.put("hash-one", &[1.0, 0.0]).unwrap();
+        }
+        let idx = VectorStore::open(brain.path(), &raw_spec).unwrap().idx_path();
+        let head = std::fs::read_to_string(&idx).unwrap();
+        assert!(head.starts_with(MAGIC_V1), "no prefix must still write v1: {head}");
+        assert!(!head.contains("doc_prefix"), "v1 carries no prefix line");
+        assert_eq!(VectorStore::open(brain.path(), &raw_spec).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_prefix_containing_a_newline_is_refused_before_it_corrupts_a_header() {
+        let brain = tempfile::tempdir().unwrap();
+        let e = VectorStore::open(brain.path(), &spec_pfx(2, "a\nb")).unwrap_err().to_string();
+        assert!(e.contains("must not contain newlines"), "{e}");
     }
 }

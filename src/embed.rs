@@ -163,6 +163,9 @@ pub struct EmbedClient {
     /// Instruction prepended to a query, never to a document (see
     /// [`crate::config::EmbeddingsConfig::query_prefix`]).
     query_prefix: String,
+    /// Instruction prepended to every DOCUMENT, never to a query. Part of the
+    /// artifact identity (see [`crate::config::VectorSpec`]).
+    doc_prefix: String,
 }
 
 impl std::fmt::Debug for EmbedClient {
@@ -203,6 +206,7 @@ impl EmbedClient {
             base_timeout,
             dimensions: cfg.dimensions,
             query_prefix: cfg.query_prefix.clone(),
+            doc_prefix: cfg.document_prefix.clone(),
         })
     }
 
@@ -243,14 +247,30 @@ impl EmbedClient {
     }
 
     /// Interactive path (recall): one request under the tight base bound.
-    pub fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        self.embed_with_timeout(texts, self.base_timeout)
+    /// Embeds DOCUMENTS — text destined for the shared store — applying the
+    /// configured document prefix. The bound scales per batched item, because
+    /// a large batch on a slow backend is busy, not down.
+    ///
+    /// Applies `doc_prefix` to every input, then embeds. Kept in ONE place so
+    /// a document can never reach the endpoint half-prefixed, and a query can
+    /// never reach it prefixed as a document.
+    fn embed_prefixed(
+        &self,
+        texts: &[&str],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if self.doc_prefix.is_empty() {
+            return self.embed_with_timeout(texts, timeout);
+        }
+        let owned: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.doc_prefix)).collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        self.embed_with_timeout(&refs, timeout)
     }
 
     /// Batch path (embed-index): the bound scales base + per-item, because a
     /// large batch on a slow backend is busy, not down.
-    pub fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        self.embed_with_timeout(texts, batch_timeout(self.base_timeout, texts.len()))
+    pub fn embed_documents_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_prefixed(texts, batch_timeout(self.base_timeout, texts.len()))
     }
 
     /// Embeds ONE query, with the configured instruction prefix applied.
@@ -264,7 +284,7 @@ impl EmbedClient {
         } else {
             format!("{}{query}", self.query_prefix)
         };
-        self.embed(&[text.as_str()])?
+        self.embed_with_timeout(&[text.as_str()], self.base_timeout)?
             .into_iter()
             .next()
             .context("endpoint returned no vector for the query")
@@ -391,7 +411,7 @@ pub fn run(
         let mut writer = store.begin_write()?;
         loop {
             let texts: Vec<&str> = pending.iter().map(|(_, t)| t.as_str()).collect();
-            let vectors = client.embed_batch(&texts)?;
+            let vectors = client.embed_documents_batch(&texts)?;
             // Record first, cache second: the shared artifact is what the
             // group keeps, the local row is a convenience.
             for ((hash, _), vector) in pending.iter().zip(&vectors) {
@@ -607,6 +627,7 @@ mod tests {
             model: "test-model".into(),
             dim,
             precision: crate::config::Precision::F16,
+            doc_prefix: String::new(),
         }
     }
 
@@ -703,12 +724,43 @@ mod tests {
         let client = EmbedClient::new(&cfg).unwrap();
 
         client.embed_query("what is it").unwrap();
-        client.embed_batch(&["a stored block"]).unwrap();
+        client.embed_documents_batch(&["a stored block"]).unwrap();
         let sent = bodies.lock().unwrap();
         let q: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
         assert_eq!(q["input"], serde_json::json!(["Instruct: find it\nQuery: what is it"]));
         let d: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
         assert_eq!(d["input"], serde_json::json!(["a stored block"]), "documents stay raw");
+    }
+
+    #[test]
+    fn each_side_gets_its_own_prefix_and_never_the_others() {
+        // The whole point of asymmetric retrieval: an instruction on the
+        // query, a different one on the document, and neither leaking into
+        // the other. A document embedded with the query instruction is not
+        // the artifact every other host derived.
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let mut cfg = EmbeddingsConfig {
+            enabled: true,
+            endpoint: url.clone(),
+            model: "test-model".into(),
+            dimensions: 2,
+            ..EmbeddingsConfig::default()
+        };
+        cfg.query_prefix = "Q: ".into();
+        cfg.document_prefix = "D: ".into();
+        let client = EmbedClient::new(&cfg).unwrap();
+
+        client.embed_query("who").unwrap();
+        client.embed_documents_batch(&["what"]).unwrap();
+        client.embed_documents_batch(&["one", "two"]).unwrap();
+
+        let sent = bodies.lock().unwrap();
+        let q: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(q["input"], serde_json::json!(["Q: who"]), "query takes the query prefix only");
+        let d: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        assert_eq!(d["input"], serde_json::json!(["D: what"]));
+        let b: serde_json::Value = serde_json::from_str(&sent[2]).unwrap();
+        assert_eq!(b["input"], serde_json::json!(["D: one", "D: two"]), "every batched document");
     }
 
     #[test]
@@ -724,7 +776,7 @@ mod tests {
     fn embed_posts_openai_shape_and_orders_by_index() {
         let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 10.0));
         let client = client_for(&url);
-        let out = client.embed(&["alpha", "beta"]).unwrap();
+        let out = client.embed_documents_batch(&["alpha", "beta"]).unwrap();
         // response rows arrive reversed; `index` must restore input order
         assert_eq!(out, vec![vec![10.0, 1.0], vec![11.0, 1.0]]);
         let sent: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
@@ -739,14 +791,14 @@ mod tests {
                 .to_string()
         });
         let client = client_for(&url);
-        assert!(client.embed(&["x"]).is_err(), "a 3xx must be an error, never followed");
+        assert!(client.embed_documents_batch(&["x"]).is_err(), "a 3xx must be an error, never followed");
     }
 
     #[test]
     fn non_2xx_status_is_an_error() {
         let (url, _, _) = spawn_server(|_, _| http_response(500, r#"{"error":"boom"}"#));
         let client = client_for(&url);
-        let err = client.embed(&["x"]).unwrap_err();
+        let err = client.embed_documents_batch(&["x"]).unwrap_err();
         assert!(err.to_string().contains("500"), "status surfaced: {err}");
     }
 
@@ -758,7 +810,7 @@ mod tests {
             http_response(200, r#"{"object":"list","data":[{"index":0,"embedding":[1.0,0.0]}]}"#)
         });
         let client = client_for(&url);
-        assert!(client.embed(&["a", "b"]).is_err());
+        assert!(client.embed_documents_batch(&["a", "b"]).is_err());
     }
 
     // ---- auth header ----
@@ -779,7 +831,7 @@ mod tests {
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        client.embed(&["x"]).unwrap();
+        client.embed_documents_batch(&["x"]).unwrap();
         let sent = headers.lock().unwrap()[0].to_ascii_lowercase();
         assert!(sent.contains("authorization: bearer sk-cfetch-test"), "got headers:\n{sent}");
     }
@@ -788,7 +840,7 @@ mod tests {
     fn no_api_key_env_means_no_auth_header() {
         let (url, _, headers) = spawn_server(|_, body| canned_embeddings(body, 0.0));
         let client = client_for(&url);
-        client.embed(&["x"]).unwrap();
+        client.embed_documents_batch(&["x"]).unwrap();
         let sent = headers.lock().unwrap()[0].to_ascii_lowercase();
         assert!(!sent.contains("authorization:"), "no auth configured, none sent:\n{sent}");
     }
@@ -843,7 +895,10 @@ mod tests {
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        assert!(client.embed(&["x"]).is_err(), "recall must not wait for a slow backend");
+        // The interactive path is the QUERY embed — the batch path
+        // deliberately scales its bound per item, so asserting the tight
+        // bound there would be asserting the wrong thing.
+        assert!(client.embed_query("x").is_err(), "recall must not wait for a slow backend");
     }
 
     #[test]
@@ -863,7 +918,7 @@ mod tests {
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        let out = client.embed_batch(&["x"]).unwrap();
+        let out = client.embed_documents_batch(&["x"]).unwrap();
         assert_eq!(out.len(), 1);
     }
 
@@ -996,7 +1051,7 @@ mod tests {
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        let out = client.embed(&["alpha"]).unwrap();
+        let out = client.embed_documents_batch(&["alpha"]).unwrap();
         let sent: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
         assert_eq!(sent["dimensions"], 4, "the request asks the endpoint for the width");
         assert_eq!(out[0].len(), 4, "an endpoint that ignores it is sliced client-side");
@@ -1017,7 +1072,7 @@ mod tests {
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        assert_eq!(client.embed(&["alpha"]).unwrap()[0].len(), 3);
+        assert_eq!(client.embed_documents_batch(&["alpha"]).unwrap()[0].len(), 3);
     }
 
     #[test]
@@ -1033,7 +1088,7 @@ mod tests {
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        let err = client.embed(&["alpha"]).unwrap_err().to_string();
+        let err = client.embed_documents_batch(&["alpha"]).unwrap_err().to_string();
         assert!(err.contains("16") && err.contains('2'), "both widths named: {err}");
         assert!(err.contains("embeddings.dimensions"), "the fix is named: {err}");
     }
