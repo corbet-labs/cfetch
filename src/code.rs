@@ -28,6 +28,9 @@ pub struct FindHit {
     pub end_line: usize,
     pub score: i64,
     pub token_estimate: u64,
+    /// Import-graph importance percentile of the containing file (None when
+    /// the project has no resolvable import edges — no signal, no score).
+    pub rank_pct: Option<f64>,
 }
 
 enum Lang {
@@ -137,6 +140,14 @@ fn skip_dir(name: &str) -> bool {
 pub struct CodeScanReport {
     pub files: usize,
     pub symbols: usize,
+    /// Total import edges persisted after the scan (not just this pass's).
+    pub edges: usize,
+}
+
+/// Whether the code index would take this file at all (used by the import
+/// graph to refuse edges onto non-indexable targets).
+pub(crate) fn is_indexable(path: &Path) -> bool {
+    lang_of(path).is_some()
 }
 
 pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
@@ -145,7 +156,8 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
            id INTEGER PRIMARY KEY,
            path TEXT UNIQUE NOT NULL,
            mtime INTEGER NOT NULL,
-           size INTEGER NOT NULL
+           size INTEGER NOT NULL,
+           rank_pct REAL
          );
          CREATE TABLE IF NOT EXISTS symbols(
            id INTEGER PRIMARY KEY,
@@ -157,7 +169,15 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);",
     )?;
+    crate::graph::ensure_schema(conn)?;
     Ok(())
+}
+
+/// Row count of the code index — lets callers distinguish "no hits" from
+/// "never scanned".
+pub fn file_count(conn: &Connection) -> anyhow::Result<i64> {
+    ensure_schema(conn)?;
+    Ok(conn.query_row("SELECT count(*) FROM code_files", [], |r| r.get(0))?)
 }
 
 /// Incremental per-file sync: unchanged (mtime, size) files keep their rows —
@@ -165,7 +185,7 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
 /// shortcut does not carry over.
 pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<CodeScanReport> {
     ensure_schema(conn)?;
-    let mut report = CodeScanReport { files: 0, symbols: 0 };
+    let mut report = CodeScanReport { files: 0, symbols: 0, edges: 0 };
     let tx = conn.transaction()?;
     let mut seen: Vec<String> = Vec::new();
     for root in roots {
@@ -204,6 +224,10 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
             }
             let Ok(source) = std::fs::read_to_string(entry.path()) else { continue };
             let symbols = extract(entry.path(), &source).unwrap_or_default();
+            // Import edges refresh with the file that declares them; targets
+            // added later self-heal on the importer's next change.
+            let edges = crate::graph::extract_edges(entry.path(), &source, root);
+            crate::graph::replace_file_edges(&tx, &path_str, &edges)?;
             tx.execute("DELETE FROM code_files WHERE path=?1", [&path_str])?;
             tx.execute(
                 "INSERT INTO code_files(path, mtime, size) VALUES(?1, ?2, ?3)",
@@ -238,24 +262,38 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
             tx.execute("DELETE FROM code_files WHERE id=?1", [id])?;
         }
     }
+    // Importance follows the edges in the same transaction: a scan must
+    // never commit files whose stored percentiles describe an older graph.
+    crate::graph::prune_edges(&tx)?;
+    crate::graph::recompute_ranks(&tx, roots)?;
+    report.edges =
+        tx.query_row("SELECT count(*) FROM import_edges", [], |r| r.get::<_, i64>(0))? as usize;
     tx.commit()?;
     Ok(report)
 }
 
 /// Case- and separator-insensitive identifier normalization so that
 /// `resolve_cascade` matches `resolveCascadeTensor` and vice versa.
-fn norm_ident(s: &str) -> String {
+pub(crate) fn norm_ident(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase()
 }
 
+/// Importance is a SMALL additive tie-break only: the maximum bonus (4.0)
+/// stays below the smallest gap between match-kind scores (5), so an exact
+/// symbol in a leaf always beats a substring match in a hub.
+fn effective_score(h: &FindHit) -> f64 {
+    h.score as f64 + h.rank_pct.map_or(0.0, |p| p / 100.0 * 4.0)
+}
+
 /// Ranked symbol/file lookup. Match quality always beats everything else:
-/// exact symbol > symbol prefix > symbol substring > file-name matches.
+/// exact symbol > symbol prefix > symbol substring > file-name matches;
+/// within one match kind, the more-imported file wins.
 pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<FindHit>> {
     ensure_schema(conn)?;
     let q = norm_ident(query);
     let mut hits: Vec<FindHit> = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT s.name, s.kind, s.start_line, s.end_line, f.path
+        "SELECT s.name, s.kind, s.start_line, s.end_line, f.path, f.rank_pct
          FROM symbols s JOIN code_files f ON f.id = s.file_id",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -265,10 +303,11 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
             r.get::<_, i64>(2)? as usize,
             r.get::<_, i64>(3)? as usize,
             r.get::<_, String>(4)?,
+            r.get::<_, Option<f64>>(5)?,
         ))
     })?;
     for row in rows.filter_map(Result::ok) {
-        let (name, kind, start, end, path) = row;
+        let (name, kind, start, end, path, rank_pct) = row;
         let lname = norm_ident(&name);
         let score = if lname == q {
             100
@@ -289,11 +328,13 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
                 end_line: end,
                 score,
                 token_estimate: (lines as u64) * 12, // ~12 tokens/line heuristic
+                rank_pct,
             });
         }
     }
-    let mut fstmt = conn.prepare("SELECT path FROM code_files")?;
-    for path in fstmt.query_map([], |r| r.get::<_, String>(0))?.filter_map(Result::ok) {
+    let mut fstmt = conn.prepare("SELECT path, rank_pct FROM code_files")?;
+    let frows = fstmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?)))?;
+    for (path, rank_pct) in frows.filter_map(Result::ok) {
         let base = path.rsplit('/').next().unwrap_or(&path);
         let stem = norm_ident(base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base));
         let score = if stem == q {
@@ -314,10 +355,13 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
                 end_line: 1,
                 score,
                 token_estimate: 0,
+                rank_pct,
             });
         }
     }
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.path.cmp(&b.path)));
+    hits.sort_by(|a, b| {
+        effective_score(b).total_cmp(&effective_score(a)).then_with(|| a.path.cmp(&b.path))
+    });
     hits.truncate(limit);
     Ok(hits)
 }
@@ -400,6 +444,32 @@ mod tests {
         assert_eq!(hits[0].name.as_deref(), Some("resolveCascadeTensor"));
         assert_eq!(hits[0].score, 60, "snake_case query prefix-matches camelCase symbol");
         assert_eq!(find(&conn, "RESOLVE-CASCADE-TENSOR", 10).unwrap()[0].score, 100);
+    }
+
+    #[test]
+    fn find_importance_is_only_a_tie_break() {
+        let dir = tempfile::tempdir().unwrap();
+        // alpha.rs imports zebra.rs; main.rs imports both — zebra is the hub
+        // (2 in-links), alpha the leaf (1). Without the importance bonus the
+        // path tie-break would put alpha.rs before zebra.rs on equal scores.
+        std::fs::write(dir.path().join("main.rs"), "mod alpha;\nmod zebra;\nfn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("alpha.rs"), "use crate::zebra::zfun;\nfn cascade() {}\nfn cascade_two() {}\n")
+            .unwrap();
+        std::fs::write(dir.path().join("zebra.rs"), "fn cascade_one() {}\nfn zfun() {}\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let hits = find(&conn, "cascade", 10).unwrap();
+        // Exact match in the LEAF still beats prefix matches in the hub.
+        assert_eq!(hits[0].name.as_deref(), Some("cascade"));
+        assert_eq!(hits[0].score, 100);
+        // Equal-kind matches: the hub's higher percentile breaks the tie.
+        assert_eq!(hits[1].name.as_deref(), Some("cascade_one"), "hub wins the 60-60 tie: {:?}",
+            hits.iter().map(|h| (h.path.clone(), h.name.clone(), h.score)).collect::<Vec<_>>());
+        assert!(hits[1].path.ends_with("zebra.rs"));
+        assert_eq!(hits[2].name.as_deref(), Some("cascade_two"));
+        assert!(hits[1].rank_pct.unwrap() > hits[2].rank_pct.unwrap());
     }
 
     #[test]

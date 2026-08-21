@@ -95,8 +95,9 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         }
         "cfetch_find" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            let mut conn = index::open(&paths::state_dir())?;
-            code::scan_code(&mut conn, &cfg.effective_code_roots())?;
+            // Snapshot only — an implicit code scan (minutes on NFS) must
+            // never ride on an interactive tool call.
+            let conn = index::open(&paths::state_dir())?;
             let hits = code::find(&conn, query, if limit == 0 { 10 } else { limit })?;
             if hits.is_empty() {
                 return Ok(format!("no hits for \"{query}\""));
