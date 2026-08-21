@@ -1,16 +1,10 @@
 # Test + lint gate. Push is limited to main so a pull request runs once, not
 # twice. No secrets are used anywhere in this workflow.
 #
-# Platform tiers:
-#   - ubuntu-latest / macos-latest: supported. Test + clippy must pass.
-#   - windows-latest: PORTED, not yet promoted. The Windows port has landed
-#     (loopback control channel, dirs-mapped paths, cmd.exe hook quoting,
-#     FILE_SHARE_NONE lockfile), but it was written on a Linux builder with
-#     no Windows target available, so this job is the FIRST place it is
-#     actually compiled and run. continue-on-error stays until the job has
-#     been observed green; the moment it is, move windows-latest into the
-#     matrix above and delete this job — the PRD makes a failing platform a
-#     release blocker once its port lands.
+# All three platforms are SUPPORTED and blocking: test + clippy must pass on
+# Linux, macOS and Windows. Windows was promoted out of its experimental job
+# on 2026-08-21, the first run where it went green — the PRD makes a failing
+# platform a release blocker once its port has landed, and the port has.
 name: CI
 
 on:
@@ -25,7 +19,7 @@ jobs:
       # Keep every platform's result visible even when one fails.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -37,72 +31,3 @@ jobs:
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
 
-  windows-ported:
-    name: "Windows (ported — promotion gate, not yet blocking)"
-    runs-on: windows-latest
-    # Until this job has been seen green once, a Windows failure must not
-    # block the workflow: the point is a visible list of what still breaks,
-    # not a green lie and not a red wall.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Build
-        id: build
-        shell: bash
-        run: cargo build --locked 2>&1 | tee build.log
-      - name: Test
-        id: test
-        # Run even after a failed build so both commands' outcomes are
-        # individually visible in the job.
-        if: always()
-        shell: bash
-        run: cargo test --locked 2>&1 | tee test.log
-      - name: Clippy (zero warnings)
-        id: clippy
-        # Windows-only cfg blocks are linted nowhere else — a warning here is
-        # a real finding, not noise.
-        if: always()
-        shell: bash
-        run: cargo clippy --all-targets --locked -- -D warnings 2>&1 | tee clippy.log
-      - name: Summarize Windows breakage
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "## Windows (ported) result"
-            echo ""
-            echo "| Command | Outcome |"
-            echo "|---------|---------|"
-            echo "| cargo build --locked | ${{ steps.build.outcome }} |"
-            echo "| cargo test --locked | ${{ steps.test.outcome }} |"
-            echo "| cargo clippy -D warnings | ${{ steps.clippy.outcome }} |"
-            echo ""
-            if [ "${{ steps.build.outcome }}" = "success" ] && [ "${{ steps.test.outcome }}" = "success" ] && [ "${{ steps.clippy.outcome }}" = "success" ]; then
-              echo "Both commands passed on Windows. PROMOTE: move windows-latest into the \`test\` matrix and delete this job."
-            else
-              echo "The Windows port is incomplete or regressed — this list is the work."
-              echo ""
-              echo "### Compiler errors (deduplicated headers; full logs in the windows-build-logs artifact)"
-              errors=$(cat build.log test.log clippy.log 2>/dev/null | grep -E '^(error|warning)(\[|:)' | sort -u | head -n 100 || true)
-              if [ -n "$errors" ]; then
-                echo '```'
-                echo "$errors"
-                echo '```'
-              else
-                echo "(no compiler error lines captured — see the step logs and artifact)"
-              fi
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload Windows logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-build-logs
-          path: |
-            build.log
-            test.log
-            clippy.log
-          if-no-files-found: ignore
