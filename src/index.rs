@@ -94,7 +94,7 @@ fn secret_shaped(rel: &str) -> bool {
 /// FAIL CLOSED: a `ring:` key whose value does not parse cleanly yields 255
 /// (= skip the file). A malformed declaration on quarantined content must
 /// never fall back to an indexable default.
-fn frontmatter_ring(text: &str) -> (Option<u8>, usize) {
+pub(crate) fn frontmatter_ring(text: &str) -> (Option<u8>, usize) {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
         return (None, 0);

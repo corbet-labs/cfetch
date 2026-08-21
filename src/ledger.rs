@@ -307,13 +307,14 @@ mod tests {
     }
 
     #[test]
-    fn lock_is_released_and_stale_locks_are_stolen() {
+    fn lock_is_released_after_booking() {
+        // The lock file is PERMANENT (flock guards it; the fd is the lock) —
+        // release is proven by the next booking succeeding, and an old
+        // unheld file must not block booking either.
         let dir = tempfile::tempdir().unwrap();
         book_in(dir.path(), "s1", "resident", 10, 10);
-        assert!(!dir.path().join("ledger.lock").exists(), "lock must be released");
-        // A stale lock (old mtime) must not block booking.
         let lock = dir.path().join("ledger.lock");
-        std::fs::write(&lock, "999999").unwrap();
+        assert!(lock.exists(), "the lock file stays on disk after release");
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         let f = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
         f.set_modified(old).unwrap();

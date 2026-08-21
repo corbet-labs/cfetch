@@ -200,16 +200,18 @@ mod tests {
     }
 
     /// An exhaust DB with exactly `n` staged (flagged, unconsumed) candidates,
-    /// produced through the real capture + trap path (hot-file: 3 writes).
+    /// produced through the real capture + trap path (hot-file: the same
+    /// ring-3 brain file written in two distinct sessions).
     fn staged_db(dir: &Path, n: usize) -> PathBuf {
+        let brain = Path::new("/b/agents");
         let conn = exhaust::open(dir).unwrap();
         for i in 0..n {
-            for _ in 0..3 {
-                exhaust::capture_post_tool(&conn, &write_event("s1", &format!("/a/hot{i}.rs")))
-                    .unwrap();
+            let path = format!("/b/agents/knowledge/hot{i}.md");
+            for s in ["s1", "s2"] {
+                exhaust::capture_post_tool(&conn, &write_event(s, &path), brain).unwrap();
             }
         }
-        exhaust::record_stop(&conn, "s1").unwrap();
+        exhaust::record_stop(&conn, "s2").unwrap();
         dir.join("exhaust.db")
     }
 

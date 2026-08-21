@@ -11,8 +11,12 @@ use crate::{daemon, exhaust, govern, heartbeat, ledger, paths, resident, session
 
 const DAEMON_BUDGET: Duration = Duration::from_millis(250);
 
-/// Files above this line count get symbol-slice hints at pre-read.
-const LARGE_FILE_LINES: usize = 400;
+/// Files above this byte size get symbol-slice hints at pre-read. A
+/// metadata-only gate: the hook path must never read file bodies (a full
+/// read to count lines measured 292ms on a big file and is unbounded on
+/// NFS). Exact line counts, if ever wanted, come from the index at scan
+/// time — never from the hook path.
+const LARGE_FILE_BYTES: u64 = 16 * 1024;
 /// At most this many slice hints per advisory — an index dump is not a hint.
 const MAX_SLICE_HINTS: usize = 5;
 
@@ -184,7 +188,7 @@ fn post_tool_capture(
         return Ok(());
     }
     let conn = exhaust::open(state_dir)?;
-    exhaust::capture_post_tool(&conn, event)
+    exhaust::capture_post_tool(&conn, event, &cfg.brain_root)
 }
 
 /// Turn summary + the 6->5 flagging traps (from wt/capture). Emits nothing —
@@ -214,12 +218,10 @@ fn is_ranged(input: &serde_json::Value) -> bool {
     input.get("offset").is_some() || input.get("limit").is_some()
 }
 
-/// Number of lines in a file, byte-counted (no UTF-8 requirement). `None`
-/// when unreadable.
-fn line_count(path: &Path) -> Option<usize> {
-    let bytes = std::fs::read(path).ok()?;
-    let newlines = bytes.iter().filter(|b| **b == b'\n').count();
-    Some(newlines + usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n')))
+/// Metadata-only size gate for the slice-hint advisory. `false` when the
+/// file is unstattable — a missed hint beats a broken hook.
+fn is_large_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > LARGE_FILE_BYTES)
 }
 
 /// Read-only code-index query: named slices of `file_path`, largest first,
@@ -292,7 +294,7 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
         dirty = true;
     }
 
-    if line_count(Path::new(path)).is_some_and(|n| n > LARGE_FILE_LINES) {
+    if is_large_file(Path::new(path)) {
         // None-tier hosts (client.serving) hold NO local index: the probe
         // goes to the serving host instead. Failures yield no hints — the
         // hook contract (silence over errors) outranks the client routing
@@ -304,7 +306,8 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
         };
         if !hints.is_empty() && st.should_hint_slices(path) {
             emit.add_context(format!(
-                "[cfetch: {path} is >{LARGE_FILE_LINES} lines; known symbol slices: {}]",
+                "[cfetch: {path} is >{}KB; known symbol slices: {}]",
+                LARGE_FILE_BYTES / 1024,
                 hints.join(", ")
             ));
             dirty = true;
@@ -654,16 +657,16 @@ mod tests {
     }
 
     #[test]
-    fn line_count_counts_an_unterminated_last_line() {
+    fn large_file_gate_is_size_only_and_fails_quiet() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f.txt");
-        std::fs::write(&p, "a\nb\nc").unwrap();
-        assert_eq!(line_count(&p), Some(3));
-        std::fs::write(&p, "a\nb\n").unwrap();
-        assert_eq!(line_count(&p), Some(2));
-        std::fs::write(&p, "").unwrap();
-        assert_eq!(line_count(&p), Some(0));
-        assert_eq!(line_count(Path::new("/nonexistent/cfetch-linecount")), None);
+        std::fs::write(&p, vec![b'x'; LARGE_FILE_BYTES as usize]).unwrap();
+        assert!(!is_large_file(&p), "exactly the threshold is not large");
+        std::fs::write(&p, vec![b'x'; LARGE_FILE_BYTES as usize + 1]).unwrap();
+        assert!(is_large_file(&p));
+        std::fs::write(&p, "small").unwrap();
+        assert!(!is_large_file(&p));
+        assert!(!is_large_file(Path::new("/nonexistent/cfetch-large-gate")));
     }
 
     #[test]
