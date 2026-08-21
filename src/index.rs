@@ -557,6 +557,44 @@ fn source_fingerprint(files: &[SourceFile]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// The stat fingerprint of the tree AS IT IS NOW — one stat walk, no file
+/// bodies read. This is the value the 60s backstop compares against, and the
+/// coverage token the serving daemon's unordered drain barrier takes at query
+/// entry (see `serve::BarrierMode`).
+pub fn tree_fingerprint(
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> String {
+    source_fingerprint(&collect_files(brain_root, native_root, rules))
+}
+
+/// The fingerprint of the tree state the COMMITTED catalog describes, written
+/// inside each scan's transaction. `None` = never scanned.
+pub fn stored_fingerprint(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0)).ok()
+}
+
+/// One stat walk answering both questions the backstop asks: is the catalog
+/// stale, and what does the tree look like right now. A caller that needs the
+/// fingerprint too must never pay for a second walk.
+pub fn staleness(
+    conn: &Connection,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> anyhow::Result<(bool, String)> {
+    let current = tree_fingerprint(brain_root, native_root, rules);
+    let root_meta: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
+        .ok();
+    if root_meta.as_deref() != Some(brain_root.to_string_lossy().as_ref()) {
+        return Ok((true, current));
+    }
+    let stale = stored_fingerprint(conn).as_deref() != Some(current.as_str());
+    Ok((stale, current))
+}
+
 /// Cheap staleness decision: stat-only fingerprint comparison — no file
 /// bodies are read.
 pub fn stale(
@@ -565,17 +603,7 @@ pub fn stale(
     native_root: Option<&Path>,
     rules: &RingRules,
 ) -> anyhow::Result<bool> {
-    let root_meta: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
-        .ok();
-    if root_meta.as_deref() != Some(brain_root.to_string_lossy().as_ref()) {
-        return Ok(true);
-    }
-    let stored: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0))
-        .ok();
-    let current = source_fingerprint(&collect_files(brain_root, native_root, rules));
-    Ok(stored.as_deref() != Some(current.as_str()))
+    Ok(staleness(conn, brain_root, native_root, rules)?.0)
 }
 
 pub struct ScanReport {

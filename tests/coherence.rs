@@ -158,6 +158,19 @@ fn start_daemon(brain: &Path, state: &Path, serve_extra: Value) -> Daemon {
 
 /// `start_daemon` with extra top-level config keys (e.g. `code_roots`).
 fn start_daemon_cfg(brain: &Path, state: &Path, serve_extra: Value, cfg_extra: Value) -> Daemon {
+    start_daemon_env(brain, state, serve_extra, cfg_extra, &[])
+}
+
+/// `start_daemon_cfg` plus extra environment for the daemon process — how the
+/// drain barrier's mode is forced (`CFETCH_BARRIER_MODE`), so the path a
+/// platform other than this one would take is still exercised HERE.
+fn start_daemon_env(
+    brain: &Path,
+    state: &Path,
+    serve_extra: Value,
+    cfg_extra: Value,
+    env: &[(&str, &str)],
+) -> Daemon {
     std::fs::create_dir_all(state).unwrap();
     let home = tempfile::tempdir().unwrap();
     let cfg_path = state.join("config.json");
@@ -179,12 +192,16 @@ fn start_daemon_cfg(brain: &Path, state: &Path, serve_extra: Value, cfg_extra: V
         }
     }
     std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
-    let child = Command::new(BIN)
-        .args(["daemon", "run"])
+    let mut cmd = Command::new(BIN);
+    cmd.args(["daemon", "run"])
         .env("CFETCH_STATE_DIR", state)
         .env("CFETCH_CONFIG", &cfg_path)
         .env("HOME", home.path())
-        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_RUNTIME_DIR");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -252,28 +269,60 @@ fn write_token_file(dir: &Path, token: &str) -> PathBuf {
 
 #[test]
 fn read_your_writes_under_concurrent_writers() {
-    const WRITERS: usize = 4;
-    const ITERS: usize = 75; // 300 barrier round-trips total
+    // The platform's own barrier mode: `ordered (sentinel)` on Linux CI,
+    // `unordered (fingerprint)` on the macOS runner.
+    concurrent_writer_torture(4, 75, &[]); // 300 barrier round-trips
+}
 
+/// The SAME zero-tolerance torture with the barrier forced onto the unordered
+/// path — the one macOS takes, and the one that has to be provable on a host
+/// that can actually be debugged. Fewer round-trips because each query on this
+/// path stats the tree and may force a rebuild pass; the invariant is
+/// identical, and the failure it guards against is intermittent, so the
+/// iteration count is a budget, not a threshold.
+#[test]
+fn read_your_writes_with_the_unordered_barrier() {
+    concurrent_writer_torture(3, 25, &[("CFETCH_BARRIER_MODE", "unordered")]);
+}
+
+/// N writers, each appending a uniquely tokenized line and then querying: a
+/// fresh-labeled answer must contain EVERY statement whose write has already
+/// completed — its own and every other writer's. Zero tolerance.
+fn concurrent_writer_torture(writers: usize, iters: usize, env: &[(&str, &str)]) {
     let brain = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
-    for w in 0..WRITERS {
+    for w in 0..writers {
         std::fs::write(brain.path().join(format!("knowledge/w{w}.md")), "").unwrap();
     }
     let state = tempfile::tempdir().unwrap();
-    let daemon = start_daemon(brain.path(), state.path(), json!({"origin": "torture-origin"}));
+    let daemon = start_daemon_env(
+        brain.path(),
+        state.path(),
+        json!({"origin": "torture-origin"}),
+        json!({}),
+        env,
+    );
     let local = daemon.local();
+
+    // The mode must be VISIBLE to an operator, and must be the one asked for.
+    let status = local.req(&json!({"op": "serve-status"}));
+    let mode = status["serve"]["barrier_mode"].as_str().unwrap_or_default().to_string();
+    assert!(!mode.is_empty(), "serve-status must name the barrier mode: {status}");
+    if let Some((_, want)) = env.iter().find(|(k, _)| *k == "CFETCH_BARRIER_MODE") {
+        assert!(mode.starts_with(want), "forced {want}, daemon reports {mode}");
+    }
 
     // Every (writer, seq) whose append has COMPLETED. A query snapshotting
     // this set must see every member — that is the whole guarantee.
     let committed: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
-    let handles: Vec<_> = (0..WRITERS)
+    let handles: Vec<_> = (0..writers)
         .map(|w| {
             let committed = committed.clone();
             let local = local.clone();
+            let mode = mode.clone();
             let file = brain.path().join(format!("knowledge/w{w}.md"));
             std::thread::spawn(move || {
-                for n in 1..=ITERS {
+                for n in 1..=iters {
                     append_line(&file, &format!("- torture writer{w} seq{n} tk{w}x{n}\n"));
                     committed.lock().unwrap().push((w, n));
                     let snapshot = committed.lock().unwrap().clone();
@@ -282,15 +331,16 @@ fn read_your_writes_under_concurrent_writers() {
                     assert_eq!(resp["ok"], true, "query failed: {resp}");
                     assert_eq!(
                         resp["fresh"], true,
-                        "barrier must serve fresh under this load (writer {w} seq {n}): {resp}"
+                        "barrier must serve fresh under this load (writer {w} seq {n}, \
+                         {mode}): {resp}"
                     );
                     assert_eq!(resp["origin"], "torture-origin");
                     let blob = snippet_blob(&resp);
                     for (cw, cn) in &snapshot {
                         assert!(
                             blob.contains(&format!("tk{cw}x{cn}")),
-                            "writer {w} seq {n}: committed statement tk{cw}x{cn} missing from a \
-                             fresh-labeled answer (zero tolerance)"
+                            "writer {w} seq {n} ({mode}): committed statement tk{cw}x{cn} \
+                             missing from a fresh-labeled answer (zero tolerance)"
                         );
                     }
                 }

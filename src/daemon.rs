@@ -121,6 +121,13 @@ pub struct ServeInfo {
     pub last_barrier_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
+    /// Which drain-barrier coverage proof this host's watcher backend can
+    /// support — `ordered (sentinel)` or `unordered (fingerprint)`. An
+    /// operator must be able to see whether their platform is on the fast or
+    /// the sound-and-slower path (see `serve::BarrierMode`). Defaulted for
+    /// wire compatibility with a serving host older than the split.
+    #[serde(default)]
+    pub barrier_mode: String,
 }
 
 /// Counts from the most recent SUCCESSFUL code scan.
@@ -289,6 +296,12 @@ fn first_scan_ready(state: &serve::ServeState, deadline: Instant) -> bool {
 /// The one line `cfetch status` leads with: which side of the serving topology
 /// this host is on. Burying it is how a none-tier host reads as "empty" when
 /// it is merely remote.
+/// What a serving host reports as its barrier mode. A serving host older
+/// than the mode split sends nothing; say so rather than imply the fast path.
+fn barrier_mode_of(i: &ServeInfo) -> &str {
+    if i.barrier_mode.is_empty() { "mode not reported" } else { &i.barrier_mode }
+}
+
 pub fn mode_line(cfg: &Config, info: Option<&ServeInfo>) -> String {
     if let Some(cs) = &cfg.client.serving {
         return format!(
@@ -299,10 +312,11 @@ pub fn mode_line(cfg: &Config, info: Option<&ServeInfo>) -> String {
     if cfg.serve.enabled {
         return match info.filter(|i| i.enabled) {
             Some(i) => format!(
-                "mode: serving host {} (generation {}, {})",
+                "mode: serving host {} (generation {}, {}, barrier {})",
                 i.origin,
                 i.generation,
-                i.bind.clone().map_or_else(|| "unix socket only".to_string(), |b| format!("tcp {b}"))
+                i.bind.clone().map_or_else(|| "unix socket only".to_string(), |b| format!("tcp {b}")),
+                barrier_mode_of(i),
             ),
             None => format!(
                 "mode: serving host {} (daemon down — generation unknown, nothing is being served)",
@@ -467,6 +481,7 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
                     generation: s.generation.load(Ordering::Relaxed),
                     last_barrier_ms: s.last_barrier_ms.load(Ordering::Relaxed),
                     bind: s.bind_addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+                    barrier_mode: s.mode().label().to_string(),
                 },
                 None => ServeInfo {
                     enabled: false,
@@ -474,6 +489,7 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
                     generation: 0,
                     last_barrier_ms: 0,
                     bind: None,
+                    barrier_mode: String::new(),
                 },
             };
             (Response { ok: true, serve: Some(info), ..Response::default() }, false)
@@ -748,11 +764,14 @@ pub fn status() -> anyhow::Result<()> {
             println!("daemon: running (v{})", r.version.unwrap_or_default());
             if let Some(info) = info.filter(|i| i.enabled) {
                 println!(
-                    "serving: origin {}, generation {}, last barrier {} ms, {}",
+                    "serving: origin {}, generation {}, drain barrier {}, last barrier {} ms, {}",
                     info.origin,
                     info.generation,
+                    barrier_mode_of(&info),
                     info.last_barrier_ms,
-                    info.bind.map_or_else(|| "local channel only".to_string(), |b| format!("tcp {b}"))
+                    info.bind
+                        .clone()
+                        .map_or_else(|| "local channel only".to_string(), |b| format!("tcp {b}"))
                 );
             }
             if let Some(s) = call("scan-status", Duration::from_millis(300)).and_then(|r| r.scan) {
@@ -927,11 +946,20 @@ mod tests {
             generation: 42,
             last_barrier_ms: 3,
             bind: Some("198.51.100.7:9737".to_string()),
+            barrier_mode: serve::BarrierMode::Unordered.label().to_string(),
         };
         let line = mode_line(&cfg, Some(&info));
         assert!(line.starts_with("mode: serving host storage-1"), "{line}");
         assert!(line.contains("generation 42"), "{line}");
         assert!(line.contains("198.51.100.7:9737"), "{line}");
+        // The operator must be able to READ which coherence path is in force.
+        assert!(line.contains("barrier unordered (fingerprint)"), "{line}");
+        // A serving host too old to report one must not read as the fast path.
+        let unreported = ServeInfo { barrier_mode: String::new(), ..info.clone() };
+        assert!(
+            mode_line(&cfg, Some(&unreported)).contains("barrier mode not reported"),
+            "an unreported mode must never imply a guarantee"
+        );
         assert_eq!(line.lines().count(), 1, "the mode must be ONE line: {line}");
         // Daemon down: still obviously a serving host, generation unknown.
         let down = mode_line(&cfg, None);
