@@ -331,10 +331,15 @@ impl VectorWriter<'_> {
 /// This is what lets a second host answer semantically without ever holding
 /// an embeddings key.
 pub fn hydrate(conn: &Connection, store: &VectorStore) -> anyhow::Result<usize> {
+    let spec = store.spec();
+    // The cache and the meta rows that describe it move together: a cache
+    // left over from another model/width/precision is unusable ballast, and
+    // leaving meta disagreeing with the rows is how the NEXT run decides to
+    // drop work it did not need to.
+    index::ensure_vector_spec(conn, spec)?;
     if store.is_empty() {
         return Ok(0);
     }
-    let spec = store.spec();
     let missing = index::hashes_without_vectors(conn, spec, usize::MAX)?;
     let wanted: HashSet<String> = missing
         .into_iter()
@@ -497,6 +502,29 @@ mod tests {
             vec![0.0, 1.0, 0.0, 0.0],
             "the orphan was truncated, so bb's line names bb's bytes"
         );
+    }
+
+    #[test]
+    fn hydrate_drops_a_cache_left_over_from_another_spec() {
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
+        std::fs::write(brain.path().join("knowledge/a.md"), "- one\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = index::open(state.path()).unwrap();
+        index::scan(&mut conn, brain.path(), None, &crate::config::RingRules::default()).unwrap();
+
+        let old = VectorSpec { model: "old-model".into(), dim: 2, precision: Precision::F16 };
+        index::ensure_vector_spec(&conn, &old).unwrap();
+        let hash = index::content_hash("- one");
+        index::insert_vector(&conn, &hash, &old, &[1.0, 0.0]).unwrap();
+
+        let s = spec(2, Precision::F16);
+        let mut store = VectorStore::open(brain.path(), &s).unwrap();
+        store.begin_write().unwrap().put(&hash, &[0.0, 1.0]).unwrap();
+        assert_eq!(hydrate(&conn, &store).unwrap(), 1);
+        assert_eq!(index::stored_vector_spec(&conn).as_ref(), Some(&s), "meta follows the cache");
+        assert_eq!(index::vector_coverage(&conn, &s).unwrap(), (1, 1));
+        assert_eq!(index::vector_coverage(&conn, &old).unwrap(), (0, 1), "the old spec is gone");
     }
 
     #[test]
