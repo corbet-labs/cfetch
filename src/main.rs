@@ -1137,16 +1137,18 @@ fn join(ticket: &str, json: bool) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Err(e) => {
-            // Two very different causes, and the operator cannot tell them
-            // apart from the outside — so name both rather than guess.
-            anyhow::bail!(
-                "{e}. Either this invite is for an origin that does NOT share this tree — \
-                 redeeming across storage groups needs the iroh transport, which is not \
-                 wired yet — or the ticket does not belong to slice {:?}.",
-                t.slice
-            )
-        }
+        // Only ONE failure is ambiguous from the outside: a secret this tree
+        // has never seen might belong to an origin that does not share the
+        // tree. Every other refusal — already redeemed, expired — is known
+        // precisely, and dressing it up with a maybe would mislead.
+        Err(e) if e.to_string().contains("not known to this host") => anyhow::bail!(
+            "this tree has no invite matching that ticket for slice {:?}. Either the invite \
+             is from an origin that does NOT share this tree — redeeming across storage \
+             groups needs the iroh transport, which is not wired yet — or the ticket is \
+             not genuine.",
+            t.slice
+        ),
+        Err(e) => Err(e),
     }
 }
 
