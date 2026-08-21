@@ -21,9 +21,12 @@
 //! line-JSON protocol) and opens NO local index at all. Unreachable serving
 //! host = explicit error naming the host — never a fallback to local data.
 //!
-//! Perf note: an "update" is currently a full `index::scan` (~1s on the real
-//! corpus; correctness first). Incremental single-file updates are the
-//! designated follow-up; the barrier/generation contract will not change.
+//! Perf note: an update tries `index::rescan_changed` first — a stat-diff
+//! that re-reads ONLY the changed files — and falls back to the full
+//! `index::scan` for large diffs, a changed basis (different brain root,
+//! never scanned), or any incremental failure. Both paths commit the same
+//! catalog bytes and advance the generation identically; the barrier/
+//! generation contract is unchanged.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -442,7 +445,14 @@ fn apply(
         dirty
     };
     if need_scan {
-        match index::scan(c, &cfg.brain_root, Some(native)) {
+        // Incremental first: re-scan only the changed files. `None` (diff too
+        // large, basis changed) and errors alike fall back to the full scan —
+        // the correctness floor either way.
+        let result = match index::rescan_changed(c, &cfg.brain_root, Some(native)) {
+            Ok(Some(r)) => Ok(r),
+            Ok(None) | Err(_) => index::scan(c, &cfg.brain_root, Some(native)),
+        };
+        match result {
             Ok(r) => state.mark_applied(target, r.generation),
             Err(e) => state.mark_error(e.to_string()),
         }

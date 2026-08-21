@@ -157,17 +157,21 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
            path TEXT UNIQUE NOT NULL,
            mtime INTEGER NOT NULL,
            size INTEGER NOT NULL,
-           rank_pct REAL
+           rank_pct REAL,
+           norm_stem TEXT NOT NULL DEFAULT '',
+           norm_path TEXT NOT NULL DEFAULT ''
          );
          CREATE TABLE IF NOT EXISTS symbols(
            id INTEGER PRIMARY KEY,
            file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
            name TEXT NOT NULL,
            kind TEXT NOT NULL,
+           norm TEXT NOT NULL DEFAULT '',
            start_line INTEGER NOT NULL,
            end_line INTEGER NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);",
+         CREATE INDEX IF NOT EXISTS symbols_norm ON symbols(norm);
+         CREATE INDEX IF NOT EXISTS code_files_norm_stem ON code_files(norm_stem);",
     )?;
     crate::graph::ensure_schema(conn)?;
     Ok(())
@@ -180,74 +184,147 @@ pub fn file_count(conn: &Connection) -> anyhow::Result<i64> {
     Ok(conn.query_row("SELECT count(*) FROM code_files", [], |r| r.get(0))?)
 }
 
+/// One parallel walker's verdict on one file, sent to the writer thread.
+enum WalkMsg {
+    /// (mtime, size) unchanged: rows kept, no parse.
+    Unchanged(String),
+    /// Parsed (or unparseable — empty symbols) content to (re)insert.
+    Parsed {
+        path: String,
+        mtime: i64,
+        size: i64,
+        symbols: Vec<Symbol>,
+        edges: Vec<PathBuf>,
+    },
+}
+
+/// The normalized file-name stem and full path of a code file — the
+/// SQL-side match keys `find` filters on.
+fn norm_keys(path: &str) -> (String, String) {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    (norm_ident(stem), norm_ident(path))
+}
+
 /// Incremental per-file sync: unchanged (mtime, size) files keep their rows —
 /// code corpora are much larger than the markdown brain, so the full-rebuild
 /// shortcut does not carry over.
+///
+/// Parallel by construction: the ignore crate's parallel walker stats, reads
+/// and tree-sitter-parses on one worker per core, feeding a channel; this
+/// thread drains it into the ONE write transaction (SQLite has a single
+/// writer anyway — parsing, not inserting, is the expensive part).
 pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<CodeScanReport> {
     ensure_schema(conn)?;
     let mut report = CodeScanReport { files: 0, symbols: 0, edges: 0 };
+    // Known (mtime, size) per path, read once — the walker threads make the
+    // skip decision without touching the DB.
+    let known: std::collections::HashMap<String, (i64, i64)> = {
+        let mut stmt = conn.prepare("SELECT path, mtime, size FROM code_files")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+        })?;
+        rows.filter_map(Result::ok).collect()
+    };
     let tx = conn.transaction()?;
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for root in roots {
-        let walker = ignore::WalkBuilder::new(root)
-            .hidden(true)
-            .git_ignore(true)
-            .follow_links(false)
-            .filter_entry(|e| {
-                e.file_name().to_str().map(|n| !skip_dir(n)).unwrap_or(true)
-            })
-            .build();
-        for entry in walker.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            if !meta.is_file() || lang_of(entry.path()).is_none() {
-                continue;
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel::<WalkMsg>();
+        let known = &known;
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            s.spawn(move || {
+                ignore::WalkBuilder::new(root)
+                    .hidden(true)
+                    .git_ignore(true)
+                    .follow_links(false)
+                    .filter_entry(|e| {
+                        e.file_name().to_str().map(|n| !skip_dir(n)).unwrap_or(true)
+                    })
+                    .build_parallel()
+                    .run(|| {
+                        let msg_tx = msg_tx.clone();
+                        Box::new(move |entry| {
+                            let Ok(entry) = entry else { return ignore::WalkState::Continue };
+                            let Ok(meta) = entry.metadata() else {
+                                return ignore::WalkState::Continue;
+                            };
+                            if !meta.is_file() || lang_of(entry.path()).is_none() {
+                                return ignore::WalkState::Continue;
+                            }
+                            let path = entry.path().to_string_lossy().to_string();
+                            let mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0) as i64;
+                            let size = meta.len() as i64;
+                            if known.get(&path) == Some(&(mtime, size)) {
+                                let _ = msg_tx.send(WalkMsg::Unchanged(path));
+                                return ignore::WalkState::Continue;
+                            }
+                            let Ok(source) = std::fs::read_to_string(entry.path()) else {
+                                return ignore::WalkState::Continue;
+                            };
+                            let symbols = extract(entry.path(), &source).unwrap_or_default();
+                            // Import edges refresh with the file that declares
+                            // them; targets added later self-heal on the
+                            // importer's next change.
+                            let edges = crate::graph::extract_edges(entry.path(), &source, root);
+                            let _ = msg_tx
+                                .send(WalkMsg::Parsed { path, mtime, size, symbols, edges });
+                            ignore::WalkState::Continue
+                        })
+                    });
+                // The factory's original sender drops here; the drain loop
+                // below ends when the last walker clone is gone.
+            });
+            for msg in msg_rx {
+                match msg {
+                    WalkMsg::Unchanged(path) => {
+                        seen.insert(path);
+                        report.files += 1;
+                    }
+                    WalkMsg::Parsed { path, mtime, size, symbols, edges } => {
+                        crate::graph::replace_file_edges(&tx, &path, &edges)?;
+                        // prepare_cached: these two run once per changed file
+                        // and once per symbol — re-preparing them would make
+                        // the single writer the bottleneck under the parallel
+                        // parse workers.
+                        tx.prepare_cached("DELETE FROM code_files WHERE path=?1")?
+                            .execute([&path])?;
+                        let (norm_stem, norm_path) = norm_keys(&path);
+                        tx.prepare_cached(
+                            "INSERT INTO code_files(path, mtime, size, norm_stem, norm_path)
+                             VALUES(?1, ?2, ?3, ?4, ?5)",
+                        )?
+                        .execute(rusqlite::params![path, mtime, size, norm_stem, norm_path])?;
+                        let file_id = tx.last_insert_rowid();
+                        let mut ins = tx.prepare_cached(
+                            "INSERT INTO symbols(file_id, name, kind, norm, start_line, end_line)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                        )?;
+                        for s in &symbols {
+                            ins.execute(rusqlite::params![
+                                file_id,
+                                s.name,
+                                s.kind,
+                                norm_ident(&s.name),
+                                s.start_line as i64,
+                                s.end_line as i64
+                            ])?;
+                        }
+                        drop(ins);
+                        seen.insert(path);
+                        report.files += 1;
+                        report.symbols += symbols.len();
+                    }
+                }
             }
-            let path_str = entry.path().to_string_lossy().to_string();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0) as i64;
-            let size = meta.len() as i64;
-            seen.push(path_str.clone());
-            let unchanged: bool = tx
-                .query_row(
-                    "SELECT 1 FROM code_files WHERE path=?1 AND mtime=?2 AND size=?3",
-                    rusqlite::params![path_str, mtime, size],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            if unchanged {
-                report.files += 1;
-                continue;
-            }
-            let Ok(source) = std::fs::read_to_string(entry.path()) else { continue };
-            let symbols = extract(entry.path(), &source).unwrap_or_default();
-            // Import edges refresh with the file that declares them; targets
-            // added later self-heal on the importer's next change.
-            let edges = crate::graph::extract_edges(entry.path(), &source, root);
-            crate::graph::replace_file_edges(&tx, &path_str, &edges)?;
-            tx.execute("DELETE FROM code_files WHERE path=?1", [&path_str])?;
-            tx.execute(
-                "INSERT INTO code_files(path, mtime, size) VALUES(?1, ?2, ?3)",
-                rusqlite::params![path_str, mtime, size],
-            )?;
-            let file_id = tx.last_insert_rowid();
-            for s in &symbols {
-                tx.execute(
-                    "INSERT INTO symbols(file_id, name, kind, start_line, end_line)
-                     VALUES(?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![file_id, s.name, s.kind, s.start_line as i64, s.end_line as i64],
-                )?;
-            }
-            report.files += 1;
-            report.symbols += symbols.len();
-        }
+            Ok(())
+        })?;
     }
     // Files gone from disk leave the index (ON DELETE CASCADE covers symbols).
-    let placeholders: Vec<String> = Vec::new();
-    drop(placeholders);
     {
         let mut del = tx.prepare("SELECT id, path FROM code_files")?;
         let stale_ids: Vec<i64> = del
@@ -258,7 +335,6 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
             .collect();
         drop(del);
         for id in stale_ids {
-            tx.execute("DELETE FROM symbols WHERE file_id=?1", [id])?;
             tx.execute("DELETE FROM code_files WHERE id=?1", [id])?;
         }
     }
@@ -288,15 +364,36 @@ fn effective_score(h: &FindHit) -> f64 {
 /// Ranked symbol/file lookup. Match quality always beats everything else:
 /// exact symbol > symbol prefix > symbol substring > file-name matches;
 /// within one match kind, the more-imported file wins.
+///
+/// Filtering happens IN SQL against the precomputed `norm` columns (exact
+/// `=`, prefix `GLOB`, substring `LIKE`) so only candidates cross into Rust —
+/// never the whole symbol table. `norm_ident` output is ASCII-alphanumeric
+/// only, so the query can carry no GLOB/LIKE metacharacters; the ESCAPE
+/// clause is belt-and-braces. Each SQL ORDER BY replicates
+/// [`effective_score`] exactly, which makes the per-query LIMIT lossless:
+/// the global top `limit` is contained in the union of the two per-table
+/// top-`limit` lists.
 pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<FindHit>> {
     ensure_schema(conn)?;
     let q = norm_ident(query);
+    if q.is_empty() {
+        // A query with no alphanumeric content matches nothing meaningful.
+        return Ok(Vec::new());
+    }
+    let prefix = format!("{q}*");
+    let substring = format!("%{q}%");
     let mut hits: Vec<FindHit> = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT s.name, s.kind, s.start_line, s.end_line, f.path, f.rank_pct
-         FROM symbols s JOIN code_files f ON f.id = s.file_id",
+        "SELECT s.name, s.kind, s.start_line, s.end_line, f.path, f.rank_pct,
+                CASE WHEN s.norm = ?1 THEN 100
+                     WHEN s.norm GLOB ?2 THEN 60
+                     ELSE 30 END AS score
+         FROM symbols s JOIN code_files f ON f.id = s.file_id
+         WHERE s.norm = ?1 OR s.norm GLOB ?2 OR s.norm LIKE ?3 ESCAPE '\\'
+         ORDER BY score + COALESCE(f.rank_pct, 0.0) / 25.0 DESC, f.path ASC
+         LIMIT ?4",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(rusqlite::params![q, prefix, substring, limit as i64], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -304,60 +401,46 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
             r.get::<_, i64>(3)? as usize,
             r.get::<_, String>(4)?,
             r.get::<_, Option<f64>>(5)?,
+            r.get::<_, i64>(6)?,
         ))
     })?;
-    for row in rows.filter_map(Result::ok) {
-        let (name, kind, start, end, path, rank_pct) = row;
-        let lname = norm_ident(&name);
-        let score = if lname == q {
-            100
-        } else if lname.starts_with(&q) {
-            60
-        } else if lname.contains(&q) {
-            30
-        } else {
-            0
-        };
-        if score > 0 {
-            let lines = end.saturating_sub(start) + 1;
-            hits.push(FindHit {
-                path,
-                name: Some(name),
-                kind: Some(kind),
-                start_line: start,
-                end_line: end,
-                score,
-                token_estimate: (lines as u64) * 12, // ~12 tokens/line heuristic
-                rank_pct,
-            });
-        }
+    for (name, kind, start, end, path, rank_pct, score) in rows.filter_map(Result::ok) {
+        let lines = end.saturating_sub(start) + 1;
+        hits.push(FindHit {
+            path,
+            name: Some(name),
+            kind: Some(kind),
+            start_line: start,
+            end_line: end,
+            score,
+            token_estimate: (lines as u64) * 12, // ~12 tokens/line heuristic
+            rank_pct,
+        });
     }
-    let mut fstmt = conn.prepare("SELECT path, rank_pct FROM code_files")?;
-    let frows = fstmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?)))?;
-    for (path, rank_pct) in frows.filter_map(Result::ok) {
-        let base = path.rsplit('/').next().unwrap_or(&path);
-        let stem = norm_ident(base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base));
-        let score = if stem == q {
-            50
-        } else if stem.starts_with(&q) {
-            25
-        } else if norm_ident(&path).contains(&q) {
-            10
-        } else {
-            0
-        };
-        if score > 0 {
-            hits.push(FindHit {
-                path,
-                name: None,
-                kind: None,
-                start_line: 1,
-                end_line: 1,
-                score,
-                token_estimate: 0,
-                rank_pct,
-            });
-        }
+    let mut fstmt = conn.prepare(
+        "SELECT path, rank_pct,
+                CASE WHEN norm_stem = ?1 THEN 50
+                     WHEN norm_stem GLOB ?2 THEN 25
+                     ELSE 10 END AS score
+         FROM code_files
+         WHERE norm_stem = ?1 OR norm_stem GLOB ?2 OR norm_path LIKE ?3 ESCAPE '\\'
+         ORDER BY score + COALESCE(rank_pct, 0.0) / 25.0 DESC, path ASC
+         LIMIT ?4",
+    )?;
+    let frows = fstmt.query_map(rusqlite::params![q, prefix, substring, limit as i64], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, i64>(2)?))
+    })?;
+    for (path, rank_pct, score) in frows.filter_map(Result::ok) {
+        hits.push(FindHit {
+            path,
+            name: None,
+            kind: None,
+            start_line: 1,
+            end_line: 1,
+            score,
+            token_estimate: 0,
+            rank_pct,
+        });
     }
     hits.sort_by(|a, b| {
         effective_score(b).total_cmp(&effective_score(a)).then_with(|| a.path.cmp(&b.path))
@@ -470,6 +553,63 @@ mod tests {
         assert!(hits[1].path.ends_with("zebra.rs"));
         assert_eq!(hits[2].name.as_deref(), Some("cascade_two"));
         assert!(hits[1].rank_pct.unwrap() > hits[2].rank_pct.unwrap());
+    }
+
+    #[test]
+    fn find_substring_and_path_matches_survive_the_sql_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("velmurano")).unwrap();
+        std::fs::write(dir.path().join("m.rs"), "fn pre_olvecas_post() {}\n").unwrap();
+        std::fs::write(dir.path().join("velmurano/inner.rs"), "fn unrelated() {}\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        // Symbol substring: 30.
+        let hits = find(&conn, "olvecas", 10).unwrap();
+        assert_eq!(hits[0].name.as_deref(), Some("pre_olvecas_post"));
+        assert_eq!(hits[0].score, 30);
+        // Path substring (directory name, not the stem): 10.
+        let hits = find(&conn, "velmurano", 10).unwrap();
+        let file_hit = hits.iter().find(|h| h.name.is_none()).expect("file hit listed");
+        assert!(file_hit.path.ends_with("velmurano/inner.rs"));
+        assert_eq!(file_hit.score, 10);
+        // No match at all returns nothing (SQL-side filtering).
+        assert!(find(&conn, "zzznothing", 10).unwrap().is_empty());
+        assert!(find(&conn, "---", 10).unwrap().is_empty(), "no-alphanumeric query matches nothing");
+    }
+
+    #[test]
+    fn parallel_scan_indexes_a_wide_tree_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in 0..6 {
+            let sub = dir.path().join(format!("mod{d}/nested"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..10 {
+                std::fs::write(
+                    sub.join(format!("file{f}.rs")),
+                    format!("fn sym_{d}_{f}() {{}}\nfn helper_{d}_{f}() {{}}\n"),
+                )
+                .unwrap();
+            }
+        }
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        let r1 = scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!((r1.files, r1.symbols), (60, 120));
+        let hits = find(&conn, "sym_3_7", 5).unwrap();
+        assert_eq!(hits[0].score, 100);
+        assert!(hits[0].path.ends_with("mod3/nested/file7.rs"));
+        // Unchanged rescan parses nothing; counts stay stable.
+        let r2 = scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!((r2.files, r2.symbols), (60, 0));
+        // Deletions prune rows for exactly the vanished files.
+        for f in 0..5 {
+            std::fs::remove_file(dir.path().join(format!("mod0/nested/file{f}.rs"))).unwrap();
+        }
+        let r3 = scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(r3.files, 55);
+        assert!(find(&conn, "sym_0_2", 5).unwrap().iter().all(|h| h.name.is_none()));
+        assert_eq!(file_count(&conn).unwrap(), 55);
     }
 
     #[test]

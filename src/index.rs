@@ -41,10 +41,14 @@ pub struct Hit {
     pub end_line: usize,
     pub snippet: String,
     /// Paths of suppressed duplicate copies of this logical block: same
-    /// content hash on a higher (or equal) ring — e.g. the native
-    /// auto-memory mirror of a brain file. Empty for a block that exists in
-    /// exactly one place.
+    /// content hash AND same heading chain on a higher (or equal) ring —
+    /// e.g. the native auto-memory mirror of a brain file. Identical short
+    /// blocks under DIFFERENT sections are different statements, never
+    /// mirrors. Empty for a block that exists in exactly one place.
     pub mirrors: Vec<String>,
+    /// Enclosing heading chain ("H1 > H2"), the second half of the mirror
+    /// dedup key. Internal — the snippet already displays it.
+    pub(crate) chain: String,
 }
 
 /// Location defaults for a brain-root-relative path; frontmatter `ring: N`
@@ -119,21 +123,41 @@ fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
 
-/// Extracts `[[wikilink]]` target stems: alias (`|…`) and heading (`#…`)
-/// parts dropped, lowercased. The brain is an Obsidian vault — these are
-/// human-curated edges, the graph we trust most.
+/// Extracts `[[wikilink]]` targets: alias (`|…`) and heading (`#…`) parts
+/// dropped, lowercased; slash-qualified targets (`[[hosts/zfs]]`) survive
+/// whole. Fenced code blocks are skipped first (brain-lint parity): a
+/// `[[link]]` inside a ``` or ~~~ fence is an example, not an edge. The brain
+/// is an Obsidian vault — these are human-curated edges, the graph we trust
+/// most.
 pub fn wikilinks(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("[[") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("]]") else { break };
-        let inner = &after[..end];
-        let target = inner.split(['|', '#']).next().unwrap_or("").trim();
-        if !target.is_empty() && !target.contains('\n') {
-            out.push(target.to_ascii_lowercase());
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        match fence {
+            Some(open) => {
+                if fence_closes(t, open) {
+                    fence = None;
+                }
+                continue;
+            }
+            None => {
+                if let Some(open) = fence_open(t) {
+                    fence = Some(open);
+                    continue;
+                }
+            }
         }
-        rest = &after[end + 2..];
+        let mut rest = line;
+        while let Some(start) = rest.find("[[") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("]]") else { break };
+            let target = after[..end].split(['|', '#']).next().unwrap_or("").trim();
+            if !target.is_empty() {
+                out.push(target.to_ascii_lowercase());
+            }
+            rest = &after[end + 2..];
+        }
     }
     out
 }
@@ -148,10 +172,71 @@ pub fn cite_id(ring: u8, text: &str) -> String {
     )
 }
 
-/// Splits markdown into logical blocks: heading, list item (with indented
-/// continuation), table row, fenced code block, or paragraph. Line numbers are
-/// 1-indexed into the ORIGINAL file (the caller passes blanked text of equal
-/// line structure).
+/// A fence opener: a run of at least three backticks or tildes (CommonMark
+/// treats both characters as code fences). Returns (fence char, run length).
+fn fence_open(t: &str) -> Option<(char, usize)> {
+    let c = t.chars().next()?;
+    if c != '`' && c != '~' {
+        return None;
+    }
+    let run = t.chars().take_while(|&x| x == c).count();
+    (run >= 3).then_some((c, run))
+}
+
+/// CommonMark closing rule: only a run of the SAME character at least as long
+/// as the opener closes a fence — a ```` fence containing ``` examples (or a
+/// ~~~ fence containing ```) must not close early.
+fn fence_closes(t: &str, (ch, len): (char, usize)) -> bool {
+    t.chars().take_while(|&x| x == ch).count() >= len
+}
+
+/// Setext heading underline: a line of only `=` (level 1) or only `-`
+/// (level 2). Two characters minimum — a lone `-` in running text is far more
+/// often a stray bullet than an underline.
+fn setext_level(t: &str) -> Option<u8> {
+    let t = t.trim();
+    if t.len() >= 2 && t.chars().all(|c| c == '=') {
+        Some(1)
+    } else if t.len() >= 2 && t.chars().all(|c| c == '-') {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Continuation indentation: spaces or tabs both indent.
+fn indented(line: &str) -> bool {
+    line.starts_with(' ') || line.starts_with('\t')
+}
+
+/// Heading level and text of a block when the block IS a heading: ATX
+/// (`## title`, closing hashes tolerated) or setext (text + `===`/`---`
+/// underline as produced by [`segment`]).
+fn heading_of(body: &str) -> Option<(u8, String)> {
+    let mut it = body.lines();
+    let first = it.next()?.trim_start();
+    if first.starts_with('#') {
+        let level = first.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&level) && it.next().is_none() {
+            let text = first[level..].trim().trim_end_matches('#').trim();
+            return Some((level as u8, text.to_string()));
+        }
+        return None;
+    }
+    let second = it.next()?;
+    if it.next().is_none()
+        && let Some(level) = setext_level(second)
+    {
+        return Some((level, first.trim().to_string()));
+    }
+    None
+}
+
+/// Splits markdown into logical blocks: heading (ATX or setext underline),
+/// list item (with indented continuation, including blank-separated indented
+/// continuation paragraphs), table row, fenced code block (``` or ~~~), or
+/// paragraph. Line numbers are 1-indexed into the ORIGINAL file (the caller
+/// passes blanked text of equal line structure).
 pub fn segment(text: &str, skip_lines: usize) -> Vec<(usize, usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut blocks = Vec::new();
@@ -164,19 +249,9 @@ pub fn segment(text: &str, skip_lines: usize) -> Vec<(usize, usize, String)> {
             continue;
         }
         let start = i;
-        if trimmed.starts_with("```") {
-            // CommonMark closing rule: only a run of AT LEAST the opening
-            // length closes the fence — a ```` fence containing ``` examples
-            // must not close early.
-            let open_run = trimmed.chars().take_while(|&c| c == '`').count();
+        if let Some(open) = fence_open(trimmed) {
             i += 1;
-            while i < lines.len() {
-                let t = lines[i].trim_start();
-                if t.chars().take_while(|&c| c == '`').count() >= open_run
-                    && t.starts_with("```")
-                {
-                    break;
-                }
+            while i < lines.len() && !fence_closes(lines[i].trim_start(), open) {
                 i += 1;
             }
             i = (i + 1).min(lines.len());
@@ -186,17 +261,50 @@ pub fn segment(text: &str, skip_lines: usize) -> Vec<(usize, usize, String)> {
             i += 1; // one table row per block: rows are independent statements
         } else if is_list_item(trimmed) {
             i += 1;
-            while i < lines.len()
-                && !lines[i].trim_start().is_empty()
-                && lines[i].starts_with(' ')
-                && !is_list_item(lines[i].trim_start())
-            {
-                i += 1;
+            loop {
+                // Tight continuation: indented, non-blank, not itself an item.
+                while i < lines.len()
+                    && !lines[i].trim_start().is_empty()
+                    && indented(lines[i])
+                    && !is_list_item(lines[i].trim_start())
+                {
+                    i += 1;
+                }
+                // Loose continuation: blank line(s) followed by an indented
+                // non-item line — an indented continuation paragraph still
+                // belongs to the item (numbered items especially are written
+                // this way).
+                let mut j = i;
+                while j < lines.len() && lines[j].trim().is_empty() {
+                    j += 1;
+                }
+                if j > i
+                    && j < lines.len()
+                    && indented(lines[j])
+                    && !is_list_item(lines[j].trim_start())
+                {
+                    i = j + 1;
+                } else {
+                    break;
+                }
             }
+        } else if i + 1 < lines.len() && setext_level(lines[i + 1]).is_some() {
+            i += 2; // setext heading: the text line plus its underline
         } else {
+            i += 1;
             while i < lines.len() {
                 let t = lines[i].trim_start();
-                if t.is_empty() || t.starts_with('#') || t.starts_with('|') || is_list_item(t) || t.starts_with("```") {
+                if t.is_empty()
+                    || t.starts_with('#')
+                    || t.starts_with('|')
+                    || is_list_item(t)
+                    || fence_open(t).is_some()
+                {
+                    break;
+                }
+                // The upcoming line underlines THIS line into a setext
+                // heading: the heading starts its own block.
+                if i + 1 < lines.len() && setext_level(lines[i + 1]).is_some() {
                     break;
                 }
                 i += 1;
@@ -211,11 +319,16 @@ pub fn segment(text: &str, skip_lines: usize) -> Vec<(usize, usize, String)> {
 }
 
 fn is_list_item(t: &str) -> bool {
+    let numbered = |sep: char| {
+        t.split_once(sep).is_some_and(|(n, rest)| {
+            !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' ')
+        })
+    };
     t.starts_with("- ")
         || t.starts_with("* ")
         || t.starts_with("+ ")
-        || t.split_once('.')
-            .is_some_and(|(n, rest)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' '))
+        || numbered('.')
+        || numbered(')')
 }
 
 fn db_path(state_dir: &Path) -> PathBuf {
@@ -225,7 +338,7 @@ fn db_path(state_dir: &Path) -> PathBuf {
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
 /// disposable — mismatches are handled by delete-and-rebuild in `open()`.
-const SCHEMA_VERSION: i64 = 5; // 5: rank_pct + import_edges + vectors (merged)
+const SCHEMA_VERSION: i64 = 6; // 6: heading-chain ctx, doc_links/skipped_docs, code norm columns
 
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -234,6 +347,10 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_millis(1000))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // The ON DELETE CASCADE clauses below (and in code.rs) are load-bearing:
+    // enforce them explicitly instead of relying on the bundled build's
+    // compile-time default.
+    conn.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != SCHEMA_VERSION {
         let tables: i64 =
@@ -258,16 +375,29 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
            doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
            start_line INTEGER NOT NULL,
            end_line INTEGER NOT NULL,
-           text TEXT NOT NULL
+           text TEXT NOT NULL,
+           ctx TEXT NOT NULL DEFAULT '',
+           chain TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS blocks_cite ON blocks(cite);
+         CREATE INDEX IF NOT EXISTS blocks_doc ON blocks(doc_id);
          CREATE TABLE IF NOT EXISTS links(
            from_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
            to_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE
          );
          CREATE INDEX IF NOT EXISTS links_from ON links(from_doc);
          CREATE INDEX IF NOT EXISTS links_to ON links(to_doc);
-         CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(text, content='blocks', content_rowid='id');
+         CREATE TABLE IF NOT EXISTS doc_links(
+           doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+           target TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS doc_links_doc ON doc_links(doc_id);
+         CREATE TABLE IF NOT EXISTS skipped_docs(
+           path TEXT PRIMARY KEY,
+           mtime INTEGER NOT NULL,
+           size INTEGER NOT NULL
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(text, ctx, content='blocks', content_rowid='id');
          CREATE TABLE IF NOT EXISTS vectors(
            block_id INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
            embedding BLOB NOT NULL
@@ -412,9 +542,190 @@ pub struct ScanReport {
     pub generation: u64,
 }
 
+/// Joined heading texts of a chain, empty texts (blanked private headings)
+/// skipped.
+fn chain_text(chain: &[(u8, String)]) -> String {
+    chain
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" > ")
+}
+
+/// Inserts one source file's rows — doc, blocks (with heading-chain context),
+/// FTS rows, wikilink targets — or records it in `skipped_docs` when its ring
+/// is 5+. Shared by the full scan and the incremental rescan so both derive
+/// byte-identical catalogs from the same tree.
+fn insert_doc(
+    tx: &rusqlite::Transaction<'_>,
+    src: &SourceFile,
+    raw: &str,
+    report: &mut ScanReport,
+) -> anyhow::Result<()> {
+    let (fm_ring, fm_lines) = frontmatter_ring(raw);
+    let mut ring = fm_ring.unwrap_or(src.default_ring);
+    // The native store's contract ring is 2: honor demotion to 5+ (skip),
+    // never self-promotion into the resident/policy rings.
+    if src.doc_path.starts_with("native:") {
+        ring = ring.max(2);
+    }
+    if ring > MAX_INDEXED_RING {
+        report.skipped_high_ring += 1;
+        report.skipped.push(src.doc_path.clone());
+        tx.execute(
+            "INSERT INTO skipped_docs(path, mtime, size) VALUES(?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size",
+            rusqlite::params![src.doc_path, src.mtime as i64, src.size as i64],
+        )?;
+        return Ok(());
+    }
+    // Blank (not strip) private regions so line numbers stay accurate.
+    let blanked = blank_private(raw);
+    tx.execute(
+        "INSERT INTO docs(path, ring, mtime, size) VALUES(?1, ?2, ?3, ?4)",
+        rusqlite::params![src.doc_path, ring, src.mtime as i64, src.size as i64],
+    )?;
+    let doc_id = tx.last_insert_rowid();
+    for target in wikilinks(&blanked) {
+        tx.execute(
+            "INSERT INTO doc_links(doc_id, target) VALUES(?1, ?2)",
+            rusqlite::params![doc_id, target],
+        )?;
+    }
+    // Citation context: every block carries its enclosing heading chain
+    // (H1 > H2 > …); a heading block carries its ANCESTOR chain (a bare
+    // heading has no other context); a table row additionally carries its
+    // table's header row. `chain` is the dedup key part, `ctx` the searchable
+    // and displayed form.
+    let mut chain: Vec<(u8, String)> = Vec::new();
+    let mut table_header: Option<String> = None;
+    let mut last_row_end = 0usize;
+    for (start, end, body) in segment(&blanked, fm_lines) {
+        let chain_key;
+        let ctx;
+        if let Some((level, text)) = heading_of(&body) {
+            chain.retain(|(l, _)| *l < level);
+            chain_key = chain_text(&chain);
+            ctx = chain_key.clone();
+            chain.push((level, text));
+            table_header = None;
+        } else if body.trim_start().starts_with('|') {
+            chain_key = chain_text(&chain);
+            // A gap in line numbers separates two adjacent tables.
+            if start > last_row_end + 1 {
+                table_header = None;
+            }
+            last_row_end = end;
+            match &table_header {
+                Some(header) => {
+                    ctx = if chain_key.is_empty() {
+                        header.clone()
+                    } else {
+                        format!("{chain_key} > {header}")
+                    };
+                }
+                None => {
+                    // This row IS the table's header.
+                    table_header = Some(snippet_of(&body));
+                    ctx = chain_key.clone();
+                }
+            }
+        } else {
+            table_header = None;
+            chain_key = chain_text(&chain);
+            ctx = chain_key.clone();
+        }
+        let cite = cite_id(ring, &body);
+        tx.prepare_cached(
+            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?
+        .execute(rusqlite::params![cite, doc_id, start as i64, end as i64, body, ctx, chain_key])?;
+        let block_id = tx.last_insert_rowid();
+        tx.prepare_cached("INSERT INTO blocks_fts(rowid, text, ctx) VALUES(?1, ?2, ?3)")?
+            .execute(rusqlite::params![block_id, body, ctx])?;
+        report.blocks += 1;
+    }
+    report.docs += 1;
+    Ok(())
+}
+
+/// Rebuilds the `links` table from `doc_links` + the doc registry. Every doc
+/// is registered under ALL its path suffixes (stem, parent/stem, …, full
+/// path; `.md` stripped, lowercased) and a target resolves only when its key
+/// is unambiguous — a slash-qualified target resolves a stem collision
+/// (brain-lint parity). A pure function of (docs, doc_links): full and
+/// incremental scans converge on identical edges.
+fn resolve_links(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM links", [])?;
+    let mut by_suffix: std::collections::HashMap<String, Option<i64>> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT id, path FROM docs")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for (id, path) in rows.filter_map(Result::ok) {
+            let stemless =
+                path.strip_suffix(".md").unwrap_or(&path).to_ascii_lowercase();
+            let parts: Vec<&str> = stemless.split('/').collect();
+            for k in 1..=parts.len() {
+                let key = parts[parts.len() - k..].join("/");
+                by_suffix
+                    .entry(key)
+                    .and_modify(|e| *e = None) // ambiguous
+                    .or_insert(Some(id));
+            }
+        }
+    }
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT doc_id, target FROM doc_links")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        rows.filter_map(Result::ok).collect()
+    };
+    for (from_doc, target) in pending {
+        let key = target.strip_suffix(".md").unwrap_or(&target);
+        if let Some(Some(to_doc)) = by_suffix.get(key)
+            && *to_doc != from_doc
+        {
+            tx.execute(
+                "INSERT INTO links(from_doc, to_doc) VALUES(?1, ?2)",
+                rusqlite::params![from_doc, to_doc],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Bumps the persisted catalog generation INSIDE the given transaction: a
+/// reader can never observe a new catalog under an old generation or vice
+/// versa.
+fn bump_generation(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<u64> {
+    let generation: u64 = tx
+        .query_row("SELECT value FROM meta WHERE key='generation'", [], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+        + 1;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES('generation', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [generation.to_string()],
+    )?;
+    Ok(generation)
+}
+
+fn set_fingerprint(tx: &rusqlite::Transaction<'_>, fingerprint: &str) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES('source_fingerprint', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [fingerprint],
+    )?;
+    Ok(())
+}
+
 /// Full rebuild inside one transaction. The corpus is small markdown; a
-/// rebuild is cheaper and simpler than incremental sync, and matches the
-/// disposable-cache design.
+/// rebuild is cheap, and the incremental path ([`rescan_changed`]) exists for
+/// the serving daemon's event batches.
 pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<ScanReport> {
     let files = collect_files(brain_root, native_root);
     let fingerprint = source_fingerprint(&files);
@@ -431,7 +742,8 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
     // silently attach to an unrelated new block. Embeddings are derived data;
     // `embed-index` rebuilds them resumably.
     tx.execute_batch(
-        "DELETE FROM vectors; DELETE FROM blocks; DELETE FROM docs;
+        "DELETE FROM vectors; DELETE FROM doc_links; DELETE FROM links;
+         DELETE FROM blocks; DELETE FROM docs; DELETE FROM skipped_docs;
          INSERT INTO blocks_fts(blocks_fts) VALUES('delete-all');",
     )?;
     tx.execute(
@@ -439,101 +751,137 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [brain_root.to_string_lossy().as_ref()],
     )?;
-    tx.execute(
-        "INSERT INTO meta(key, value) VALUES('source_fingerprint', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [fingerprint],
-    )?;
-    // Generation advances in the SAME transaction as the catalog it labels:
-    // a reader can never observe a new catalog under an old generation or
-    // vice versa.
-    let generation: u64 = tx
-        .query_row("SELECT value FROM meta WHERE key='generation'", [], |r| r.get::<_, String>(0))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-        + 1;
-    tx.execute(
-        "INSERT INTO meta(key, value) VALUES('generation', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [generation.to_string()],
-    )?;
+    set_fingerprint(&tx, &fingerprint)?;
+    let generation = bump_generation(&tx)?;
     let mut report =
         ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new(), generation };
-    // (doc_id, link stems) collected during insertion, resolved afterwards
-    // when every doc is known.
-    let mut pending_links: Vec<(i64, Vec<String>)> = Vec::new();
     for (src, raw) in bodies {
-        let (fm_ring, fm_lines) = frontmatter_ring(&raw);
-        let mut ring = fm_ring.unwrap_or(src.default_ring);
-        // The native store's contract ring is 2: honor demotion to 5+ (skip),
-        // never self-promotion into the resident/policy rings.
-        if src.doc_path.starts_with("native:") {
-            ring = ring.max(2);
-        }
-        if ring > MAX_INDEXED_RING {
-            report.skipped_high_ring += 1;
-            report.skipped.push(src.doc_path);
-            continue;
-        }
-        // Blank (not strip) private regions so line numbers stay accurate.
-        let blanked = blank_private(&raw);
-        tx.execute(
-            "INSERT INTO docs(path, ring, mtime, size) VALUES(?1, ?2, ?3, ?4)",
-            rusqlite::params![src.doc_path, ring, src.mtime as i64, src.size as i64],
-        )?;
-        let doc_id = tx.last_insert_rowid();
-        let links = wikilinks(&blanked);
-        if !links.is_empty() {
-            pending_links.push((doc_id, links));
-        }
-        for (start, end, body) in segment(&blanked, fm_lines) {
-            let cite = cite_id(ring, &body);
-            tx.execute(
-                "INSERT INTO blocks(cite, doc_id, start_line, end_line, text)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![cite, doc_id, start as i64, end as i64, body],
-            )?;
-            let block_id = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO blocks_fts(rowid, text) VALUES(?1, ?2)",
-                rusqlite::params![block_id, body],
-            )?;
-            report.blocks += 1;
-        }
-        report.docs += 1;
+        insert_doc(&tx, &src, &raw, &mut report)?;
     }
-    // Resolve link stems to doc ids: filename stem, unambiguous only —
-    // ambiguous stems are skipped (mirrors brain-lint's path-qualify rule).
-    {
-        let mut by_stem: std::collections::HashMap<String, Option<i64>> = std::collections::HashMap::new();
-        let mut stmt = tx.prepare("SELECT id, path FROM docs")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows.filter_map(Result::ok) {
-            let (id, path) = row;
-            let base = path.rsplit('/').next().unwrap_or(&path);
-            let stem = base.strip_suffix(".md").unwrap_or(base).to_ascii_lowercase();
-            by_stem
-                .entry(stem)
-                .and_modify(|e| *e = None) // ambiguous
-                .or_insert(Some(id));
-        }
-        drop(stmt);
-        for (from_doc, stems) in pending_links {
-            for stem in stems {
-                if let Some(Some(to_doc)) = by_stem.get(&stem)
-                    && *to_doc != from_doc
-                {
-                    tx.execute(
-                        "INSERT INTO links(from_doc, to_doc) VALUES(?1, ?2)",
-                        rusqlite::params![from_doc, to_doc],
-                    )?;
-                }
-            }
-        }
-    }
+    resolve_links(&tx)?;
     tx.commit()?;
     Ok(report)
+}
+
+/// Removes one doc's rows everywhere: FTS rows (external-content FTS5 must be
+/// told each removed row's old values), blocks (vectors cascade), the doc row
+/// (links and doc_links cascade), and any `skipped_docs` entry.
+fn delete_doc(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM skipped_docs WHERE path=?1", [path])?;
+    let doc_id: Option<i64> =
+        tx.query_row("SELECT id FROM docs WHERE path=?1", [path], |r| r.get(0)).ok();
+    let Some(doc_id) = doc_id else { return Ok(()) };
+    {
+        let mut stmt = tx.prepare("SELECT id, text, ctx FROM blocks WHERE doc_id=?1")?;
+        let rows = stmt.query_map([doc_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let blocks: Vec<(i64, String, String)> = rows.filter_map(Result::ok).collect();
+        for (id, text, ctx) in blocks {
+            tx.execute(
+                "INSERT INTO blocks_fts(blocks_fts, rowid, text, ctx) VALUES('delete', ?1, ?2, ?3)",
+                rusqlite::params![id, text, ctx],
+            )?;
+        }
+    }
+    tx.execute("DELETE FROM blocks WHERE doc_id=?1", [doc_id])?;
+    tx.execute("DELETE FROM docs WHERE id=?1", [doc_id])?;
+    Ok(())
+}
+
+/// Changed+vanished files an incremental rescan will handle; larger diffs
+/// fall back to the full scan, whose bulk delete-all path is faster there.
+const INCREMENTAL_MAX_CHANGES: usize = 32;
+
+/// Incremental catalog update: re-reads ONLY the files whose (mtime, size)
+/// changed — each changed doc's rows are deleted and reinserted, vanished
+/// docs are pruned, links re-resolved — inside one transaction that also
+/// advances the generation, exactly like [`scan`]. Returns `None` when the
+/// incremental step has no valid basis (never scanned, different brain root)
+/// or the diff exceeds [`INCREMENTAL_MAX_CHANGES`]; the caller then runs the
+/// full scan. A no-op diff (fingerprint already current) commits nothing and
+/// reports the existing generation.
+pub fn rescan_changed(
+    conn: &mut Connection,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+) -> anyhow::Result<Option<ScanReport>> {
+    let root_meta: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
+        .ok();
+    if root_meta.as_deref() != Some(brain_root.to_string_lossy().as_ref())
+        || generation(conn) == 0
+    {
+        return Ok(None);
+    }
+    let files = collect_files(brain_root, native_root);
+    let fingerprint = source_fingerprint(&files);
+    let stored: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0))
+        .ok();
+    if stored.as_deref() == Some(fingerprint.as_str()) {
+        // The committed catalog already describes this tree.
+        return Ok(Some(ScanReport {
+            docs: 0,
+            blocks: 0,
+            skipped_high_ring: 0,
+            skipped: Vec::new(),
+            generation: generation(conn),
+        }));
+    }
+    // Stat diff against the stored per-file stats (indexed docs + skipped
+    // ring-5+ files) — the same (mtime, size) basis the fingerprint uses.
+    let mut stored_stats: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for table in ["docs", "skipped_docs"] {
+        let mut stmt = conn.prepare(&format!("SELECT path, mtime, size FROM {table}"))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+        })?;
+        for (path, stat) in rows.filter_map(Result::ok) {
+            stored_stats.insert(path, stat);
+        }
+    }
+    let changed: Vec<&SourceFile> = files
+        .iter()
+        .filter(|f| stored_stats.get(&f.doc_path) != Some(&(f.mtime as i64, f.size as i64)))
+        .collect();
+    let current: std::collections::HashSet<&str> =
+        files.iter().map(|f| f.doc_path.as_str()).collect();
+    let vanished: Vec<String> = stored_stats
+        .keys()
+        .filter(|p| !current.contains(p.as_str()))
+        .cloned()
+        .collect();
+    if changed.len() + vanished.len() > INCREMENTAL_MAX_CHANGES {
+        return Ok(None);
+    }
+    // Changed bodies read BEFORE the write transaction (same NFS rationale
+    // as scan). A file that vanished between stat and read is treated as
+    // deleted; the fingerprint diff surfaces it again on the next pass.
+    let bodies: Vec<(&SourceFile, Option<String>)> = changed
+        .iter()
+        .map(|f| (*f, std::fs::read_to_string(&f.abs).ok()))
+        .collect();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for path in &vanished {
+        delete_doc(&tx, path)?;
+    }
+    for (src, _) in &bodies {
+        delete_doc(&tx, &src.doc_path)?;
+    }
+    set_fingerprint(&tx, &fingerprint)?;
+    let generation = bump_generation(&tx)?;
+    let mut report =
+        ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new(), generation };
+    for (src, raw) in &bodies {
+        if let Some(raw) = raw {
+            insert_doc(&tx, src, raw, &mut report)?;
+        }
+    }
+    resolve_links(&tx)?;
+    tx.commit()?;
+    Ok(Some(report))
 }
 
 /// Current catalog generation: the count of committed scans of this index.
@@ -628,22 +976,34 @@ fn snippet_of(text: &str) -> String {
     one.chars().take(160).collect()
 }
 
+/// Snippet with the citation context prepended: `[H1 > H2] text` (and, for
+/// table rows, the table's header row inside the context). A bare heading or
+/// a lone table row is unreadable without it.
+fn snippet_with_ctx(ctx: &str, text: &str) -> String {
+    let s = snippet_of(text);
+    if ctx.is_empty() { s } else { format!("[{ctx}] {s}") }
+}
+
 /// The content-hash part of a citation id (after the `r<ring>-` prefix): the
 /// key every copy of one logical block shares across stores and rings.
 fn cite_hash(cite: &str) -> &str {
     cite.split_once('-').map_or(cite, |(_, hash)| hash)
 }
 
-/// Collapses hits carrying the same content hash: the native auto-memory
-/// store mirrors brain files, so one logical block would otherwise surface
-/// once per store. The lowest-ring copy survives, at the first occurrence's
-/// rank; the suppressed copies' paths land on the keeper's `mirrors`.
-fn dedup_by_content(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
+/// Collapses hits carrying the same content hash UNDER THE SAME heading
+/// chain: the native auto-memory store mirrors brain files, so one logical
+/// block would otherwise surface once per store. Identical short blocks in
+/// DIFFERENT sections (a bare "yes", a repeated table row) are different
+/// statements and are NOT collapsed. The lowest-ring copy survives, at the
+/// first occurrence's rank; the suppressed copies' paths land on the keeper's
+/// `mirrors`.
+fn dedup_by_content(hits: Vec<Hit>) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::new();
-    let mut slot_by_hash: std::collections::HashMap<String, usize> =
+    let mut slot_by_key: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     for hit in hits {
-        match slot_by_hash.get(cite_hash(&hit.cite)) {
+        let key = (cite_hash(&hit.cite).to_string(), hit.chain.clone());
+        match slot_by_key.get(&key) {
             Some(&slot) => {
                 let kept = &mut out[slot];
                 if hit.ring < kept.ring {
@@ -655,13 +1015,33 @@ fn dedup_by_content(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
                 }
             }
             None => {
-                slot_by_hash.insert(cite_hash(&hit.cite).to_string(), out.len());
+                slot_by_key.insert(key, out.len());
                 out.push(hit);
             }
         }
     }
-    out.truncate(limit);
     out
+}
+
+/// Ring folded into the BM25 order as a SMALL additive prior (bm25 is
+/// negative-better): enough to break near-ties toward the more trusted ring,
+/// far below the gaps between genuinely different lexical matches.
+const RING_PRIOR: f64 = 0.05;
+/// Weight of the heading-chain context column in BM25: context terms help
+/// find a block but must never outrank the same terms in the block itself.
+const CTX_WEIGHT: f64 = 0.3;
+
+/// The ranked SELECT shared by [`recall`] and [`bm25_block_ids`].
+fn ranked_match_sql(select: &str) -> String {
+    format!(
+        "SELECT {select}
+         FROM blocks_fts f
+         JOIN blocks b ON b.id = f.rowid
+         JOIN docs d ON d.id = b.doc_id
+         WHERE blocks_fts MATCH ?1
+         ORDER BY bm25(blocks_fts, 1.0, {CTX_WEIGHT}) + {RING_PRIOR} * d.ring, d.ring ASC
+         LIMIT ?2"
+    )
 }
 
 pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<Hit>> {
@@ -669,15 +1049,9 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
     if fts.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT b.cite, d.path, d.ring, b.start_line, b.end_line, b.text
-         FROM blocks_fts f
-         JOIN blocks b ON b.id = f.rowid
-         JOIN docs d ON d.id = b.doc_id
-         WHERE blocks_fts MATCH ?1
-         ORDER BY bm25(blocks_fts), d.ring ASC
-         LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare(&ranked_match_sql(
+        "b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain",
+    ))?;
     // Twice the candidate pool: duplicate suppression must refill freed
     // slots with the next-ranked hits, never shrink the result count.
     let rows = stmt.query_map(rusqlite::params![fts, (limit * 2) as i64], |r| {
@@ -687,11 +1061,23 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
             ring: r.get::<_, i64>(2)? as u8,
             start_line: r.get::<_, i64>(3)? as usize,
             end_line: r.get::<_, i64>(4)? as usize,
-            snippet: snippet_of(&r.get::<_, String>(5)?),
+            snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &r.get::<_, String>(5)?),
             mirrors: Vec::new(),
+            chain: r.get(7)?,
         })
     })?;
-    Ok(dedup_by_content(rows.filter_map(Result::ok).collect(), limit))
+    let mut hits = dedup_by_content(rows.filter_map(Result::ok).collect());
+    // Ring-band slot reservation: rings 0-1 are the top-trust band — when
+    // any of them matches at all, the top slot carries the best of them.
+    // Everything else stays in BM25(+prior) order.
+    if let Some(pos) = hits.iter().position(|h| h.ring <= 1)
+        && pos > 0
+    {
+        let reserved = hits.remove(pos);
+        hits.insert(0, reserved);
+    }
+    hits.truncate(limit);
+    Ok(hits)
 }
 
 /// Expands a citation id to its full block(s) — the second disclosure layer.
@@ -844,7 +1230,7 @@ pub fn insert_vector(conn: &Connection, block_id: i64, embedding: &[f32]) -> any
 /// longer exist (index moved on) are silently skipped.
 fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>> {
     let mut stmt = conn.prepare(
-        "SELECT b.cite, d.path, d.ring, b.start_line, b.end_line, b.text
+        "SELECT b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain
          FROM blocks b JOIN docs d ON d.id = b.doc_id WHERE b.id = ?1",
     )?;
     let mut out = Vec::with_capacity(ids.len());
@@ -856,8 +1242,9 @@ fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>
                 ring: r.get::<_, i64>(2)? as u8,
                 start_line: r.get::<_, i64>(3)? as usize,
                 end_line: r.get::<_, i64>(4)? as usize,
-                snippet: snippet_of(&r.get::<_, String>(5)?),
+                snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &r.get::<_, String>(5)?),
                 mirrors: Vec::new(),
+                chain: r.get(7)?,
             })
         });
         if let Ok(hit) = hit {
@@ -892,20 +1279,13 @@ pub fn semantic_recall(conn: &Connection, query_vec: &[f32], limit: usize) -> an
     hits_for_block_ids(conn, &ids)
 }
 
-/// BM25-ranked block ids for the same query shape [`recall`] uses.
+/// BM25-ranked block ids for the same query shape and order [`recall`] uses.
 fn bm25_block_ids(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<i64>> {
     let fts = fts_query(query);
     if fts.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT b.id FROM blocks_fts f
-         JOIN blocks b ON b.id = f.rowid
-         JOIN docs d ON d.id = b.doc_id
-         WHERE blocks_fts MATCH ?1
-         ORDER BY bm25(blocks_fts), d.ring ASC
-         LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare(&ranked_match_sql("b.id"))?;
     let rows = stmt.query_map(rusqlite::params![fts, limit as i64], |r| r.get(0))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
@@ -1493,7 +1873,7 @@ mod tests {
 
     #[test]
     fn dedup_keeps_lowest_ring_regardless_of_rank_order() {
-        let h = |cite: &str, path: &str, ring: u8| Hit {
+        let h = |cite: &str, path: &str, ring: u8, chain: &str| Hit {
             cite: cite.into(),
             path: path.into(),
             ring,
@@ -1501,18 +1881,40 @@ mod tests {
             end_line: 1,
             snippet: String::new(),
             mirrors: Vec::new(),
+            chain: chain.into(),
         };
         let hits = vec![
-            h("r2-aabbccddee", "native:p/MEMORY.md", 2),
-            h("r1-aabbccddee", "mind/memories/MEMORY.md", 1),
-            h("r3-0123456789", "knowledge/x.md", 3),
+            h("r2-aabbccddee", "native:p/MEMORY.md", 2, "Memory"),
+            h("r1-aabbccddee", "mind/memories/MEMORY.md", 1, "Memory"),
+            h("r3-0123456789", "knowledge/x.md", 3, ""),
         ];
-        let out = dedup_by_content(hits, 8);
+        let out = dedup_by_content(hits);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].cite, "r1-aabbccddee", "lowest ring wins even when ranked second");
         assert_eq!(out[0].mirrors, vec!["native:p/MEMORY.md".to_string()]);
         assert_eq!(out[1].cite, "r3-0123456789");
         assert!(out[1].mirrors.is_empty(), "a hit without duplicates is untouched");
+    }
+
+    #[test]
+    fn identical_blocks_in_different_sections_are_not_mirrors() {
+        let h = |cite: &str, path: &str, ring: u8, chain: &str| Hit {
+            cite: cite.into(),
+            path: path.into(),
+            ring,
+            start_line: 1,
+            end_line: 1,
+            snippet: String::new(),
+            mirrors: Vec::new(),
+            chain: chain.into(),
+        };
+        let hits = vec![
+            h("r3-aabbccddee", "knowledge/a.md", 3, "Hosts > Server"),
+            h("r3-aabbccddee", "knowledge/b.md", 3, "Backups"),
+        ];
+        let out = dedup_by_content(hits);
+        assert_eq!(out.len(), 2, "same hash under different heading chains = two statements");
+        assert!(out.iter().all(|h| h.mirrors.is_empty()));
     }
 
     #[test]
@@ -1577,6 +1979,326 @@ mod tests {
             vec!["knowledge/broken.md".to_string(), "knowledge/staged.md".to_string()],
             "skipped paths listed in doc-path order"
         );
+    }
+
+    #[test]
+    fn tilde_fences_segment_like_backticks() {
+        let text = "~~~\ncode line\nstill code\n~~~\n\nafter\n";
+        let blocks = segment(text, 0);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].2, "~~~\ncode line\nstill code\n~~~");
+        assert_eq!((blocks[0].0, blocks[0].1), (1, 4));
+        assert_eq!(blocks[1].2, "after");
+        // A tilde fence containing backtick runs must not close early, and
+        // vice versa.
+        let text = "~~~\n```\ninner\n```\n~~~\nafter\n";
+        let blocks = segment(text, 0);
+        assert_eq!(blocks.len(), 2, "backtick runs inside a tilde fence do not close it");
+        assert_eq!((blocks[0].0, blocks[0].1), (1, 5));
+        let text = "```\n~~~\ninner\n~~~\n```\n";
+        let blocks = segment(text, 0);
+        assert_eq!(blocks.len(), 1, "tilde runs inside a backtick fence do not close it");
+        assert_eq!((blocks[0].0, blocks[0].1), (1, 5));
+    }
+
+    #[test]
+    fn setext_headings_are_heading_blocks() {
+        let text = "Title\n=====\n\nintro paragraph\n\nSection\n-------\n\nbody text\n";
+        let blocks = segment(text, 0);
+        let bodies: Vec<&str> = blocks.iter().map(|(_, _, b)| b.as_str()).collect();
+        assert_eq!(bodies, vec!["Title\n=====", "intro paragraph", "Section\n-------", "body text"]);
+        assert_eq!((blocks[0].0, blocks[0].1), (1, 2), "H1 spans text + underline");
+        assert_eq!((blocks[2].0, blocks[2].1), (6, 7), "H2 spans text + underline");
+        assert_eq!(heading_of(blocks[0].2.as_str()), Some((1, "Title".to_string())));
+        assert_eq!(heading_of(blocks[2].2.as_str()), Some((2, "Section".to_string())));
+        // A multi-line paragraph before an underline: only the LAST line is
+        // underlined into the heading; earlier lines stay a paragraph.
+        let text = "para line\nTitle\n====\n";
+        let blocks = segment(text, 0);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].2, "para line");
+        assert_eq!((blocks[0].0, blocks[0].1), (1, 1));
+        assert_eq!(blocks[1].2, "Title\n====");
+        assert_eq!((blocks[1].0, blocks[1].1), (2, 3));
+    }
+
+    #[test]
+    fn numbered_items_keep_blank_separated_indented_continuation() {
+        let text = "1. item one\n\n   continuation para of item one\n\n2. item two\n";
+        let blocks = segment(text, 0);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].2, "1. item one\n\n   continuation para of item one");
+        assert_eq!((blocks[0].0, blocks[0].1), (1, 3), "exact line span including the blank");
+        assert_eq!(blocks[1].2, "2. item two");
+        assert_eq!((blocks[1].0, blocks[1].1), (5, 5));
+    }
+
+    #[test]
+    fn paren_numbered_items_split_like_dotted_ones() {
+        let blocks = segment("1) item one\n2) item two\n", 0);
+        assert_eq!(blocks.len(), 2, "CommonMark `1)` ordered markers are list items");
+        assert_eq!(blocks[0].2, "1) item one");
+        assert_eq!(blocks[1].2, "2) item two");
+    }
+
+    #[test]
+    fn tab_indented_continuation_stays_with_the_item() {
+        let blocks = segment("1. item one\n\tcontinued with a tab\n", 0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!((blocks[0].0, blocks[0].1), (1, 2));
+    }
+
+    #[test]
+    fn heading_chain_prepended_to_snippets() {
+        let dir = brain(&[(
+            "knowledge/h.md",
+            "# ProjectX\n\n## Setup\n\nInstall the flurbium package.\n",
+        )]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "flurbium", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "[ProjectX > Setup] Install the flurbium package.");
+        // A bare heading block carries its ANCESTOR chain.
+        let hits = recall(&conn, "setup", 5).unwrap();
+        let heading = hits.iter().find(|h| h.snippet.contains("## Setup")).unwrap();
+        assert_eq!(heading.snippet, "[ProjectX] ## Setup");
+    }
+
+    #[test]
+    fn table_rows_carry_header_and_chain() {
+        let dir = brain(&[(
+            "knowledge/t.md",
+            "# Hosts\n\n| Name | IP |\n|---|---|\n| serverx | 192.0.2.1 |\n",
+        )]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "serverx", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "[Hosts > | Name | IP |] | serverx | 192.0.2.1 |");
+        // The header row itself gets only the heading chain.
+        let hits = recall(&conn, "name", 5).unwrap();
+        let header = hits.iter().find(|h| h.snippet.contains("| Name | IP |")).unwrap();
+        assert_eq!(header.snippet, "[Hosts] | Name | IP |");
+    }
+
+    #[test]
+    fn chain_matches_recall_but_rank_below_text_matches() {
+        // Filler blocks keep the term's IDF positive (BM25 inverts its
+        // ranking when a term appears in most blocks of a tiny corpus).
+        let dir = brain(&[
+            ("knowledge/a.md", "glorpnik\n"),
+            ("knowledge/b.md", "# glorpnik\n\nunrelated words here\n"),
+            ("knowledge/fill.md", "- one\n- two\n- three\n- four\n- five\n- six\n- seven\n- eight\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "glorpnik", 10).unwrap();
+        let ctx_only = hits
+            .iter()
+            .position(|h| h.snippet.contains("unrelated words"))
+            .expect("a block whose HEADING CHAIN matches must still be recalled");
+        assert!(
+            hits[0].snippet.contains("glorpnik"),
+            "a text match leads: {:?}",
+            hits.iter().map(|h| &h.snippet).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ctx_only,
+            hits.len() - 1,
+            "the chain-only match ranks below every text match (lower column weight)"
+        );
+    }
+
+    #[test]
+    fn same_text_under_different_headings_is_two_hits_not_mirrors() {
+        let dir = brain(&[
+            ("knowledge/a.md", "# Server\n\n- restart the service\n"),
+            ("knowledge/b.md", "# Laptop\n\n- restart the service\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "restart", 5).unwrap();
+        assert_eq!(hits.len(), 2, "different sections = different statements");
+        assert!(hits.iter().all(|h| h.mirrors.is_empty()));
+    }
+
+    #[test]
+    fn wikilinks_inside_code_fences_are_ignored() {
+        let text = "```\n[[nope]]\n```\nsee [[yes]]\n~~~\n[[also-nope]]\n~~~\n";
+        assert_eq!(wikilinks(text), vec!["yes"]);
+    }
+
+    #[test]
+    fn slash_qualified_wikilink_resolves_an_ambiguous_stem() {
+        let dir = brain(&[
+            ("knowledge/a/readme2.md", "x\n"),
+            ("knowledge/b/readme2.md", "y\n"),
+            ("knowledge/linker.md", "see [[a/readme2]] and [[knowledge/b/readme2]]\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let linked = linked_docs(&conn, &["knowledge/linker.md".to_string()], 8).unwrap();
+        let paths: Vec<&str> = linked.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"knowledge/a/readme2.md"), "parent/stem suffix resolves: {paths:?}");
+        assert!(paths.contains(&"knowledge/b/readme2.md"), "full-path suffix resolves: {paths:?}");
+    }
+
+    #[test]
+    fn ring0_1_match_takes_the_top_slot() {
+        // The ring-3 block is the stronger lexical match (shortest); the
+        // ring-1 statement must still hold the top slot.
+        let dir = brain(&[
+            ("AGENT.md", "- the fenwick rule with several more words around it\n"),
+            ("knowledge/deep.md", "fenwick\n"),
+            // Fillers keep the IDF positive so BM25 genuinely prefers the
+            // shorter ring-3 block before the reservation kicks in.
+            ("knowledge/fill.md", "- one\n- two\n- three\n- four\n- five\n- six\n- seven\n- eight\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "fenwick", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].ring, 1, "top slot reserved for the ring 0-1 band");
+        assert_eq!(hits[1].ring, 3, "the rest stays in BM25 order");
+    }
+
+    #[test]
+    fn ring_prior_breaks_ties_but_never_strong_lexical_wins() {
+        // Equal lexical evidence: the lower ring wins the near-tie.
+        let dir = brain(&[
+            ("knowledge/a.md", "zelkova pattern alpha\n"),
+            ("todo/x/b.md", "zelkova pattern bravo\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "zelkova", 5).unwrap();
+        assert_eq!(hits[0].ring, 3, "prior breaks the tie toward the lower ring");
+        assert_eq!(hits[1].ring, 4);
+        // Strong lexical win: the much better match stays first even from a
+        // higher ring (no ring 0-1 hit involved, so no reservation either).
+        let dir = brain(&[
+            ("knowledge/a.md", "korvat is mentioned once amid many other words in this long statement about something else\n"),
+            ("todo/x/b.md", "korvat\n"),
+            ("knowledge/fill.md", "- one\n- two\n- three\n- four\n- five\n- six\n- seven\n- eight\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let hits = recall(&conn, "korvat", 5).unwrap();
+        assert_eq!(hits[0].ring, 4, "a strong lexical win is never overridden by the prior");
+    }
+
+    #[test]
+    fn rescan_changed_matches_a_fresh_scan_exactly() {
+        let dir = brain(&[
+            ("knowledge/a.md", "# Hosts\n\n| Name | IP |\n| serverx | 192.0.2.1 |\n"),
+            ("knowledge/b.md", "- keep this\n"),
+            ("knowledge/c.md", "doomed content\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let r1 = scan(&mut conn, dir.path(), None).unwrap();
+        assert_eq!(r1.generation, 1);
+        // Vectors on every block: unchanged docs must keep theirs.
+        for (id, _) in blocks_without_vectors(&conn, 100).unwrap() {
+            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
+        }
+        let vectors_before = vector_counts(&conn).unwrap().0;
+
+        // Change one file, add one (with a wikilink), delete one.
+        std::fs::write(dir.path().join("knowledge/b.md"), "- keep this\n- brand new fact\n").unwrap();
+        std::fs::write(dir.path().join("knowledge/d.md"), "arrived later, see [[a]]\n").unwrap();
+        std::fs::remove_file(dir.path().join("knowledge/c.md")).unwrap();
+
+        let r2 = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("small diff → incremental");
+        assert_eq!(r2.generation, 2, "incremental commit advances the generation");
+        assert!(!stale(&conn, dir.path(), None).unwrap());
+
+        // Byte-identical catalog vs an independent fresh derivation.
+        let state2 = tempfile::tempdir().unwrap();
+        let mut fresh = open(state2.path()).unwrap();
+        scan(&mut fresh, dir.path(), None).unwrap();
+        assert_eq!(
+            catalog_checksum(&conn).unwrap(),
+            catalog_checksum(&fresh).unwrap(),
+            "incremental and fresh derivations must agree byte-for-byte"
+        );
+
+        // Content moved correctly.
+        assert_eq!(recall(&conn, "brand", 5).unwrap().len(), 1);
+        assert_eq!(recall(&conn, "arrived", 5).unwrap().len(), 1);
+        assert!(recall(&conn, "doomed", 5).unwrap().is_empty());
+        // The changed doc's snippet still carries its rebuilt table context.
+        let hits = recall(&conn, "serverx", 5).unwrap();
+        assert_eq!(hits[0].snippet, "[Hosts > | Name | IP |] | serverx | 192.0.2.1 |");
+        // Links of the NEW doc resolved (full re-resolution each rescan).
+        let linked = linked_docs(&conn, &["knowledge/d.md".to_string()], 8).unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].0, "knowledge/a.md");
+        // Unchanged docs kept their vectors; changed/removed lost theirs.
+        let (vectors_after, _) = vector_counts(&conn).unwrap();
+        let a_blocks = 3; // heading + 2 table rows
+        assert_eq!(vectors_after, a_blocks, "only the untouched doc's vectors survive");
+        assert!(vectors_before > vectors_after);
+
+        // A no-op rescan commits nothing and keeps the generation.
+        let r3 = rescan_changed(&mut conn, dir.path(), None).unwrap().unwrap();
+        assert_eq!(r3.generation, 2, "fingerprint already current → no new commit");
+        assert_eq!(generation(&conn), 2);
+    }
+
+    #[test]
+    fn rescan_falls_back_without_basis_or_on_large_diffs() {
+        let dir = brain(&[("knowledge/a.md", "alpha\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        // Never scanned: no basis.
+        assert!(rescan_changed(&mut conn, dir.path(), None).unwrap().is_none());
+        scan(&mut conn, dir.path(), None).unwrap();
+        // Different brain root: no basis.
+        let other = brain(&[("knowledge/a.md", "alpha\n")]);
+        assert!(rescan_changed(&mut conn, other.path(), None).unwrap().is_none());
+        // A diff beyond the incremental cap falls back to the full scan.
+        for i in 0..40 {
+            std::fs::write(dir.path().join(format!("knowledge/bulk{i}.md")), "bulk\n").unwrap();
+        }
+        assert!(rescan_changed(&mut conn, dir.path(), None).unwrap().is_none());
+        assert!(stale(&conn, dir.path(), None).unwrap(), "fallback leaves the full scan to do it");
+    }
+
+    #[test]
+    fn rescan_handles_ring5_transitions_both_ways() {
+        let dir = brain(&[
+            ("knowledge/staged.md", "---\nring: 5\n---\nquarantined zulqar\n"),
+            ("knowledge/normal.md", "public wembly fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        assert!(recall(&conn, "zulqar", 5).unwrap().is_empty());
+
+        // Promotion: the ring-5 marker is removed.
+        std::fs::write(dir.path().join("knowledge/staged.md"), "promoted zulqar\n").unwrap();
+        // Demotion: a public file becomes staged.
+        std::fs::write(dir.path().join("knowledge/normal.md"), "---\nring: 5\n---\npublic wembly fact\n").unwrap();
+        let r = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("incremental");
+        assert_eq!(r.skipped_high_ring, 1);
+        assert_eq!(recall(&conn, "zulqar", 5).unwrap().len(), 1, "promoted file is indexed");
+        assert!(recall(&conn, "wembly", 5).unwrap().is_empty(), "demoted file left the index");
+        assert!(!stale(&conn, dir.path(), None).unwrap(), "skipped-file stats are tracked too");
+        // The tracked skipped file changing again is still an incremental step.
+        std::fs::write(dir.path().join("knowledge/normal.md"), "---\nring: 5\n---\nstill hidden, edited\n").unwrap();
+        let r = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("incremental");
+        assert_eq!(r.skipped_high_ring, 1);
+        assert!(!stale(&conn, dir.path(), None).unwrap());
     }
 
     #[test]
