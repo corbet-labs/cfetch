@@ -57,6 +57,15 @@ target, which is precisely the case lexical retrieval is best at. This is the
 argument for `--hybrid` and for reranking, and against ever making semantic
 the silent default.
 
+**Reranking earns its cost.** For "why must I never force a virtual machine
+off", lexical returned a guest-agent note about Windows shutdown times, a bare
+"## Virtual Machines" heading, and a page about the box never suspending. The
+same candidates through the cross-encoder returned the server README's
+`NEVER FORCE OFF VMs` hard rule first and AGENT.md's ring-1 statement of the
+same rule second — neither of which lexical had in its top three. The
+authoritative, highest-privilege statement of the rule was in the candidate
+set all along; only the reranker could see that it was the answer.
+
 ## Operational finding
 
 One llama-swap broker cannot serve the embedding model and the reranker
