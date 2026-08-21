@@ -437,7 +437,7 @@ fn write_payload(path: &str, brain_root: &Path, rules: &RingRules) -> serde_json
 /// brain — code files carry no ring and are churn by contract.
 fn brain_ring(brain_root: &Path, path: &str, rules: &RingRules) -> Option<u8> {
     let rel = Path::new(path).strip_prefix(brain_root).ok()?;
-    let by_location = crate::index::default_ring(&rel.to_string_lossy(), rules);
+    let by_location = crate::index::default_ring(&crate::index::rel_doc_path(rel), rules);
     Some(frontmatter_ring_bounded(Path::new(path)).unwrap_or(by_location))
 }
 

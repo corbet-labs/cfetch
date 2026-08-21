@@ -327,10 +327,17 @@ pub fn origin_of(cfg: &Config) -> String {
 }
 
 pub(crate) fn hostname() -> String {
-    // uname(2) is portable (Linux + macOS + BSD); /proc is Linux-only and
-    // left `origin` as "unknown-host" on every non-Linux serving host.
-    let node = rustix::system::uname();
-    let node = node.nodename().to_string_lossy().trim().to_string();
+    // uname(2) is portable across the unixes (Linux + macOS + BSD); /proc is
+    // Linux-only and left `origin` as "unknown-host" on every other unix.
+    // Windows has neither: `COMPUTERNAME` is the equivalent the session
+    // manager always sets.
+    #[cfg(unix)]
+    let node = {
+        let uname = rustix::system::uname();
+        uname.nodename().to_string_lossy().trim().to_string()
+    };
+    #[cfg(windows)]
+    let node = std::env::var("COMPUTERNAME").unwrap_or_default().trim().to_string();
     if !node.is_empty() {
         return node;
     }
@@ -375,7 +382,10 @@ fn watchable_dirs(brain_root: &Path, rules: &crate::config::RingRules) -> Vec<Pa
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
-        let rel = rel.to_string_lossy();
+        // Same canonical `/`-separated form the indexer derives, so the watch
+        // set stays EXACTLY the index set on every platform — a
+        // backslash-separated `mind\secrets` would match no exclusion.
+        let rel = crate::index::rel_doc_path(rel);
         if rel.is_empty() || crate::index::excluded_dir(&rel, rules) {
             continue;
         }
@@ -415,18 +425,24 @@ mod watch_scope_tests {
     #[test]
     fn watchable_dirs_skips_symlinks_and_excluded_subtrees() {
         let brain = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(outside.path().join("deep/deeper")).unwrap();
         for d in ["knowledge/hosts", "mind/memories", "mind/secrets", "logs/x", "projects/repo/src", "knowledge/archive/old"] {
             std::fs::create_dir_all(brain.path().join(d)).unwrap();
         }
         // The wineprefix-style escape hatch that walked the whole rootfs.
-        std::os::unix::fs::symlink(outside.path(), brain.path().join("knowledge/z")).unwrap();
+        // Creating a directory symlink is unprivileged on unix only; the
+        // exclusion half of this test runs on every platform.
+        #[cfg(unix)]
+        let outside = {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(outside.path().join("deep/deeper")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), brain.path().join("knowledge/z")).unwrap();
+            outside
+        };
 
         let dirs = watchable_dirs(brain.path(), &crate::config::RingRules::default());
         let rel: Vec<String> = dirs
             .iter()
-            .map(|d| d.strip_prefix(brain.path()).unwrap().to_string_lossy().to_string())
+            .map(|d| crate::index::rel_doc_path(d.strip_prefix(brain.path()).unwrap()))
             .collect();
 
         assert!(rel.iter().any(|r| r == "knowledge/hosts"));
@@ -435,6 +451,7 @@ mod watch_scope_tests {
         assert!(!rel.iter().any(|r| r.starts_with("logs")), "logs excluded: {rel:?}");
         assert!(!rel.iter().any(|r| r.starts_with("projects")), "projects excluded: {rel:?}");
         assert!(!rel.iter().any(|r| r.starts_with("knowledge/archive")), "archive excluded: {rel:?}");
+        #[cfg(unix)]
         assert!(
             !dirs.iter().any(|d| d.starts_with(outside.path())),
             "a symlinked directory must never drag its target in: {dirs:?}"
@@ -675,6 +692,11 @@ fn apply(
 /// Reads a bearer token file, trimmed. `require_0600` additionally refuses
 /// group/other-accessible files — the serving daemon must not accept a
 /// world-readable credential as its gate.
+///
+/// KNOWN GAP on Windows: there are no mode bits, and reading an ACL needs a
+/// Win32 call this binary does not link. `require_0600` is therefore a no-op
+/// there; the token file inherits the default per-user ACL of the profile
+/// directory it lives in, which is private but NOT verified by cfetch.
 pub fn read_token(path: &Path, require_0600: bool) -> anyhow::Result<String> {
     if require_0600 {
         #[cfg(unix)]
@@ -780,7 +802,21 @@ mod tests {
     }
 
     #[test]
-    fn read_token_enforces_0600_and_trims() {
+    fn read_token_trims_and_refuses_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("token");
+        std::fs::write(&p, "  secret-token\n").unwrap();
+        assert_eq!(read_token(&p, false).unwrap(), "secret-token");
+        std::fs::write(&p, "\n").unwrap();
+        assert!(read_token(&p, false).is_err(), "empty token file is an error");
+        assert!(read_token(&dir.path().join("absent"), false).is_err());
+    }
+
+    /// The mode gate is a unix file-permission check; Windows has no mode
+    /// bits and `read_token` documents that gap explicitly.
+    #[cfg(unix)]
+    #[test]
+    fn read_token_enforces_0600() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("token");
@@ -790,8 +826,14 @@ mod tests {
         assert_eq!(read_token(&p, false).unwrap(), "secret-token");
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_token(&p, true).unwrap(), "secret-token");
-        std::fs::write(&p, "\n").unwrap();
-        assert!(read_token(&p, false).is_err(), "empty token file is an error");
+    }
+
+    #[test]
+    fn the_serving_origin_is_never_empty() {
+        // "unknown-host" was the macOS symptom of reading /proc; an empty
+        // origin would be a worse one — every coherence label carries it.
+        assert!(!hostname().is_empty());
+        assert!(!origin_of(&Config::default()).is_empty());
     }
 
     #[test]

@@ -52,6 +52,25 @@ pub struct Hit {
     pub(crate) chain: String,
 }
 
+/// Rewrites `sep` to `/` — the canonical separator of every brain-relative
+/// doc path.
+///
+/// Doc paths are matched by PREFIX against `mind/secrets/`, `logs/`,
+/// `projects/`, `knowledge/archive/` and `.git/`, are stored in the catalog
+/// and are printed in citations. A platform whose separator is `\` produces
+/// `mind\secrets\age.key` from the same file, which matches none of those
+/// prefixes — the secrets boundary would open by pure string accident. On a
+/// platform whose separator is already `/`, a backslash is an ordinary
+/// filename character and is left untouched.
+pub(crate) fn normalize_separators(rel: &str, sep: char) -> String {
+    if sep == '/' { rel.to_string() } else { rel.replace(sep, "/") }
+}
+
+/// Canonical doc path for a brain-root-relative path, on any platform.
+pub(crate) fn rel_doc_path(rel: &Path) -> String {
+    normalize_separators(&rel.to_string_lossy(), std::path::MAIN_SEPARATOR)
+}
+
 /// THE taxonomy entry point: the configured location default for a
 /// brain-root-relative path. Frontmatter `ring: N` still overrides it at
 /// scan time. Everything that needs a path's ring — the scan, the watcher,
@@ -460,7 +479,7 @@ fn collect_files(
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
-        let rel = rel.to_string_lossy().to_string();
+        let rel = rel_doc_path(rel);
         if !rel.ends_with(".md") || excluded(&rel, rules) || secret_shaped(&rel) {
             continue;
         }
@@ -1354,6 +1373,46 @@ pub fn ensure_fresh(
         }
     }
     Ok(conn)
+}
+
+#[cfg(test)]
+mod path_shape_tests {
+    use super::*;
+
+    #[test]
+    fn doc_paths_are_slash_separated_whatever_the_platform_uses() {
+        assert_eq!(normalize_separators(r"mind\secrets\age.key", '\\'), "mind/secrets/age.key");
+        assert_eq!(normalize_separators("mind/secrets/age.key", '/'), "mind/secrets/age.key");
+        // A backslash is a legal filename character on unix and must survive.
+        assert_eq!(normalize_separators(r"odd\name.md", '/'), r"odd\name.md");
+    }
+
+    #[test]
+    fn the_exclusion_boundary_holds_for_backslash_separated_paths() {
+        // Without normalization every one of these slips past the prefix
+        // match and lands in the catalog — secrets first.
+        for raw in [r"mind\secrets\age.key.md", r"logs\session.md", r"projects\repo\a.md", r"knowledge\archive\old.md", r".git\COMMIT_EDITMSG.md"] {
+            let rel = normalize_separators(raw, '\\');
+            assert!(excluded(&rel, &RingRules::default()), "{raw} normalized to {rel} must be excluded");
+        }
+        for raw in [r"mind\secrets", r"logs", r"projects", r"knowledge\archive"] {
+            assert!(excluded_dir(&normalize_separators(raw, '\\'), &RingRules::default()), "{raw}");
+        }
+    }
+
+    #[test]
+    fn ring_defaults_survive_the_separator() {
+        let rules = RingRules::default();
+        assert_eq!(default_ring(&normalize_separators(r"mind\memories\MEMORY.md", '\\'), &rules), 1);
+        assert_eq!(default_ring(&normalize_separators(r"mind\memories\topic.md", '\\'), &rules), 2);
+        assert_eq!(default_ring(&normalize_separators(r"todo\active\x\STATUS.md", '\\'), &rules), 4);
+    }
+
+    #[test]
+    fn secret_shaped_names_are_caught_after_normalization() {
+        assert!(secret_shaped(&normalize_separators(r"knowledge\hosts\my.pem", '\\')));
+        assert!(secret_shaped(&normalize_separators(r"knowledge\hosts\password-notes.md", '\\')));
+    }
 }
 
 #[cfg(test)]

@@ -14,9 +14,6 @@ ignore = "0.4"
 notify = "8"
 ratatui = "0.30.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
-# flock(2) for the advisory lockfile (src/lockfile.rs): permanent lock file,
-# kernel-released on holder death — no stale-steal heuristics.
-rustix = { version = "1", features = ["fs", "system"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -34,6 +31,14 @@ tree-sitter-typescript = "0.23.2"
 # https endpoints, no gzip/charset/cookies; redirects are disabled per request
 # policy (SSRF hardening), which ureq supports natively.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# flock(2) for the advisory lockfile (src/lockfile.rs) and uname(2) for the
+# serving host's origin (src/serve.rs). UNIX ONLY: rustix compiles on Windows
+# but exposes neither module there, and both have a std-only Windows
+# counterpart (FILE_SHARE_NONE opens, %COMPUTERNAME%), so the dependency
+# simply does not exist in a Windows build.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "system"] }
 
 [dev-dependencies]
 tempfile = "3"

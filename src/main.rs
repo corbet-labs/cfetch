@@ -12,6 +12,7 @@ mod hook_io;
 mod hooks;
 mod index;
 mod install;
+mod ipc;
 mod ledger;
 mod lockfile;
 mod markers;
@@ -225,7 +226,7 @@ fn selfcheck() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                println!("ok    serving on the unix socket only (no serve.bind)");
+                println!("ok    serving on the local control channel only (no serve.bind)");
             }
         }
         if let Some(cs) = &cfg.client.serving {

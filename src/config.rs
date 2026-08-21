@@ -323,7 +323,8 @@ fn default_rrf_k() -> f64 {
 pub struct ServeConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// TCP listen address (e.g. "0.0.0.0:9737"). Absent = unix socket only.
+    /// TCP listen address (e.g. "0.0.0.0:9737"). Absent = the local control
+    /// channel only (see `crate::ipc`).
     #[serde(default)]
     pub bind: Option<String>,
     /// Host id stamped on every response. Defaults to the machine hostname.

@@ -3,11 +3,14 @@
 #
 # Platform tiers:
 #   - ubuntu-latest / macos-latest: supported. Test + clippy must pass.
-#   - windows-latest: EXPERIMENTAL, expected to fail — the daemon uses Unix
-#     sockets, which do not compile on Windows. The job exists to keep a
-#     named, visible list of what breaks there (continue-on-error keeps the
-#     workflow green while the job itself still shows its real outcome).
-#     Do not "fix" Windows here; surface only.
+#   - windows-latest: PORTED, not yet promoted. The Windows port has landed
+#     (loopback control channel, dirs-mapped paths, cmd.exe hook quoting,
+#     FILE_SHARE_NONE lockfile), but it was written on a Linux builder with
+#     no Windows target available, so this job is the FIRST place it is
+#     actually compiled and run. continue-on-error stays until the job has
+#     been observed green; the moment it is, move windows-latest into the
+#     matrix above and delete this job — the PRD makes a failing platform a
+#     release blocker once its port lands.
 name: CI
 
 on:
@@ -34,45 +37,56 @@ jobs:
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
 
-  windows-experimental:
-    name: "Windows (EXPERIMENTAL — expected to fail: Unix-socket daemon)"
+  windows-ported:
+    name: "Windows (ported — promotion gate, not yet blocking)"
     runs-on: windows-latest
-    # A Windows failure must never block the workflow: the point of this job
-    # is a visible list of what breaks, not a green lie and not a red wall.
+    # Until this job has been seen green once, a Windows failure must not
+    # block the workflow: the point is a visible list of what still breaks,
+    # not a green lie and not a red wall.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build (experimental)
+        with:
+          components: clippy
+      - name: Build
         id: build
         shell: bash
         run: cargo build --locked 2>&1 | tee build.log
-      - name: Test (experimental)
+      - name: Test
         id: test
         # Run even after a failed build so both commands' outcomes are
         # individually visible in the job.
         if: always()
         shell: bash
         run: cargo test --locked 2>&1 | tee test.log
+      - name: Clippy (zero warnings)
+        id: clippy
+        # Windows-only cfg blocks are linted nowhere else — a warning here is
+        # a real finding, not noise.
+        if: always()
+        shell: bash
+        run: cargo clippy --all-targets --locked -- -D warnings 2>&1 | tee clippy.log
       - name: Summarize Windows breakage
         if: always()
         shell: bash
         run: |
           {
-            echo "## Windows (experimental) result"
+            echo "## Windows (ported) result"
             echo ""
             echo "| Command | Outcome |"
             echo "|---------|---------|"
             echo "| cargo build --locked | ${{ steps.build.outcome }} |"
             echo "| cargo test --locked | ${{ steps.test.outcome }} |"
+            echo "| cargo clippy -D warnings | ${{ steps.clippy.outcome }} |"
             echo ""
-            if [ "${{ steps.build.outcome }}" = "success" ] && [ "${{ steps.test.outcome }}" = "success" ]; then
-              echo "Both commands passed on Windows. Consider promoting Windows out of the experimental tier."
+            if [ "${{ steps.build.outcome }}" = "success" ] && [ "${{ steps.test.outcome }}" = "success" ] && [ "${{ steps.clippy.outcome }}" = "success" ]; then
+              echo "Both commands passed on Windows. PROMOTE: move windows-latest into the \`test\` matrix and delete this job."
             else
-              echo "Expected-failure tier: the Unix-socket daemon is not expected to compile on Windows."
+              echo "The Windows port is incomplete or regressed — this list is the work."
               echo ""
               echo "### Compiler errors (deduplicated headers; full logs in the windows-build-logs artifact)"
-              errors=$(cat build.log test.log 2>/dev/null | grep -E '^error(\[|:)' | sort -u | head -n 100 || true)
+              errors=$(cat build.log test.log clippy.log 2>/dev/null | grep -E '^(error|warning)(\[|:)' | sort -u | head -n 100 || true)
               if [ -n "$errors" ]; then
                 echo '```'
                 echo "$errors"
@@ -90,4 +104,5 @@ jobs:
           path: |
             build.log
             test.log
+            clippy.log
           if-no-files-found: ignore

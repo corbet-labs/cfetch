@@ -98,6 +98,23 @@ git clone https://github.com/julian-corbet/cfetch
 cd cfetch/packaging/arch && makepkg -si
 ```
 
+### Platforms
+
+Linux, macOS and Windows are all first-class. One binary, one behaviour; the
+platform differences are confined to three places:
+
+| | Linux / macOS | Windows |
+|---|---|---|
+| Daemon control channel | unix socket (`$XDG_RUNTIME_DIR/cfetch.sock`, else the state dir) | loopback TCP on an ephemeral port, gated by a per-daemon token, both published in `daemon.endpoint` in the state dir |
+| State dir | `~/.local/state/cfetch` | `%LOCALAPPDATA%\cfetch` |
+| Config | `~/.config/cfetch/config.json` | `%APPDATA%\cfetch\config.json` |
+
+`CFETCH_STATE_DIR`, `CFETCH_CONFIG`, `CFETCH_BRAIN` and `HOME` override the
+defaults identically on every platform. A unix socket file is access-
+controlled by its mode; a loopback TCP port is not, which is why the Windows
+control channel carries a bearer token — the same gate the optional serving
+listener (`serve.bind`) uses.
+
 ## Quick start
 
 ```console

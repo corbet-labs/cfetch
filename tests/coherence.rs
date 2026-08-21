@@ -9,8 +9,13 @@
 //!       yield EQUAL checksums;
 //!   (d) crash-restart: the stat-fingerprint backstop catches up on writes
 //!       made while the daemon was dead;
-//!   (e) the same guarantees over TCP (bearer-token gated) as over the local
-//!       unix socket.
+//!   (e) the same guarantees over the serving TCP listener (bearer-token
+//!       gated) as over the LOCAL control channel.
+//!
+//! The local channel is the platform's: a unix socket on unix, token-gated
+//! loopback TCP on Windows (see `src/ipc.rs`). [`Local`] is the one place
+//! that difference exists in this harness — every test below speaks to it
+//! identically.
 //!
 //! The same harness runs against a LIVE deployment: set CFETCH_TORTURE_ADDR
 //! and CFETCH_TORTURE_TOKEN (optionally CFETCH_TORTURE_QUERY) and the
@@ -19,6 +24,7 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -36,9 +42,86 @@ struct Daemon {
     _home: tempfile::TempDir,
 }
 
+/// A handle on one daemon's LOCAL control channel. Cloneable and `Send` so
+/// the concurrency tests can hand it to their writer threads, exactly as they
+/// handed a socket path before.
+#[cfg(unix)]
+#[derive(Clone)]
+struct Local(PathBuf);
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct Local {
+    addr: String,
+    token: String,
+}
+
+impl Local {
+    /// Reads the endpoint a daemon publishes into its state dir. `None` until
+    /// it has been published.
+    #[cfg(unix)]
+    fn published(state: &Path) -> Option<Local> {
+        let p = state.join("daemon.sock");
+        if p.exists() { Some(Local(p)) } else { None }
+    }
+
+    #[cfg(windows)]
+    fn published(state: &Path) -> Option<Local> {
+        let raw = std::fs::read_to_string(state.join("daemon.endpoint")).ok()?;
+        let mut lines = raw.lines();
+        let addr = lines.next()?.trim().to_string();
+        let token = lines.next()?.trim().to_string();
+        if addr.is_empty() || token.is_empty() {
+            return None;
+        }
+        Some(Local { addr, token })
+    }
+
+    #[cfg(unix)]
+    fn describe(&self) -> String {
+        self.0.display().to_string()
+    }
+
+    #[cfg(windows)]
+    fn describe(&self) -> String {
+        format!("tcp {}", self.addr)
+    }
+
+    /// One request over the local channel; `None` when it does not answer.
+    #[cfg(unix)]
+    fn req_opt(&self, body: &Value) -> Option<Value> {
+        let mut s = UnixStream::connect(&self.0).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+        s.set_write_timeout(Some(Duration::from_secs(15))).ok()?;
+        writeln!(s, "{body}").ok()?;
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).ok()?;
+        serde_json::from_str(&line).ok()
+    }
+
+    #[cfg(windows)]
+    fn req_opt(&self, body: &Value) -> Option<Value> {
+        let mut body = body.clone();
+        body["token"] = Value::String(self.token.clone());
+        let mut s = TcpStream::connect(&self.addr).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+        s.set_write_timeout(Some(Duration::from_secs(15))).ok()?;
+        writeln!(s, "{body}").ok()?;
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).ok()?;
+        serde_json::from_str(&line).ok()
+    }
+
+    fn req(&self, body: &Value) -> Value {
+        self.req_opt(body)
+            .unwrap_or_else(|| panic!("daemon did not answer on {}", self.describe()))
+    }
+}
+
 impl Daemon {
-    fn sock(&self) -> PathBuf {
-        self.state.join("daemon.sock")
+    /// The daemon's local control channel.
+    fn local(&self) -> Local {
+        Local::published(&self.state).expect("daemon published its local endpoint")
     }
 
     /// Actual TCP address once bound (written by the daemon; resolves ":0").
@@ -68,7 +151,7 @@ impl Drop for Daemon {
 }
 
 /// Spawns `cfetch daemon run` against its own state dir + config, waits until
-/// the unix socket answers ping.
+/// the local control channel answers ping.
 fn start_daemon(brain: &Path, state: &Path, serve_extra: Value) -> Daemon {
     std::fs::create_dir_all(state).unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -99,26 +182,15 @@ fn start_daemon(brain: &Path, state: &Path, serve_extra: Value) -> Daemon {
         .expect("spawn daemon");
     let d = Daemon { child, state: state.to_path_buf(), _home: home };
     for _ in 0..200 {
-        if sock_req_opt(&d.sock(), &json!({"op": "ping"})).is_some_and(|r| r["ok"] == true) {
+        if Local::published(&d.state)
+            .and_then(|l| l.req_opt(&json!({"op": "ping"})))
+            .is_some_and(|r| r["ok"] == true)
+        {
             return d;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("daemon did not become ready on {}", d.sock().display());
-}
-
-fn sock_req_opt(sock: &Path, body: &Value) -> Option<Value> {
-    let mut s = UnixStream::connect(sock).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
-    s.set_write_timeout(Some(Duration::from_secs(15))).ok()?;
-    writeln!(s, "{body}").ok()?;
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
-}
-
-fn sock_req(sock: &Path, body: &Value) -> Value {
-    sock_req_opt(sock, body).expect("daemon answered")
+    panic!("daemon did not become ready in {}", d.state.display());
 }
 
 fn tcp_req(addr: &str, token: &str, body: &Value) -> Value {
@@ -154,10 +226,15 @@ fn append_line(path: &Path, line: &str) {
 }
 
 fn write_token_file(dir: &Path, token: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
     let p = dir.join("token");
     std::fs::write(&p, format!("{token}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The serving daemon refuses a group/other-readable token file. Windows
+    // has no mode bits and `serve::read_token` documents that gap.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     p
 }
 
@@ -175,7 +252,7 @@ fn read_your_writes_under_concurrent_writers() {
     }
     let state = tempfile::tempdir().unwrap();
     let daemon = start_daemon(brain.path(), state.path(), json!({"origin": "torture-origin"}));
-    let sock = daemon.sock();
+    let local = daemon.local();
 
     // Every (writer, seq) whose append has COMPLETED. A query snapshotting
     // this set must see every member — that is the whole guarantee.
@@ -183,7 +260,7 @@ fn read_your_writes_under_concurrent_writers() {
     let handles: Vec<_> = (0..WRITERS)
         .map(|w| {
             let committed = committed.clone();
-            let sock = sock.clone();
+            let local = local.clone();
             let file = brain.path().join(format!("knowledge/w{w}.md"));
             std::thread::spawn(move || {
                 for n in 1..=ITERS {
@@ -191,7 +268,7 @@ fn read_your_writes_under_concurrent_writers() {
                     committed.lock().unwrap().push((w, n));
                     let snapshot = committed.lock().unwrap().clone();
                     let resp =
-                        sock_req(&sock, &json!({"op": "recall", "query": "torture", "limit": 100000}));
+                        local.req(&json!({"op": "recall", "query": "torture", "limit": 100000}));
                     assert_eq!(resp["ok"], true, "query failed: {resp}");
                     assert_eq!(
                         resp["fresh"], true,
@@ -230,7 +307,7 @@ fn monotonic_prefix_across_concurrent_writers() {
     }
     let state = tempfile::tempdir().unwrap();
     let daemon = start_daemon(brain.path(), state.path(), json!({}));
-    let sock = daemon.sock();
+    let local = daemon.local();
 
     let writers: Vec<_> = (0..WRITERS)
         .map(|w| {
@@ -245,7 +322,7 @@ fn monotonic_prefix_across_concurrent_writers() {
         .collect();
 
     for _ in 0..READS {
-        let resp = sock_req(&sock, &json!({"op": "recall", "query": "torture", "limit": 100000}));
+        let resp = local.req(&json!({"op": "recall", "query": "torture", "limit": 100000}));
         assert_eq!(resp["ok"], true, "{resp}");
         assert_eq!(resp["fresh"], true, "{resp}");
         let blob = snippet_blob(&resp);
@@ -287,7 +364,7 @@ fn checksum_deterministic_fresh_vs_incremental() {
         std::thread::sleep(Duration::from_millis(20));
     }
     append_line(&brain.path().join("knowledge/base.md"), "- appended after start\n");
-    let a = sock_req(&daemon_a.sock(), &json!({"op": "checksum"}));
+    let a = daemon_a.local().req(&json!({"op": "checksum"}));
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(a["fresh"], true, "{a}");
     let checksum_a = a["checksum"].as_str().unwrap().to_string();
@@ -296,7 +373,7 @@ fn checksum_deterministic_fresh_vs_incremental() {
     // Daemon B derives FRESH from the finished tree in its own state dir.
     let state_b = tempfile::tempdir().unwrap();
     let daemon_b = start_daemon(brain.path(), state_b.path(), json!({}));
-    let b = sock_req(&daemon_b.sock(), &json!({"op": "checksum"}));
+    let b = daemon_b.local().req(&json!({"op": "checksum"}));
     assert_eq!(b["ok"], true, "{b}");
     assert_eq!(
         b["checksum"].as_str().unwrap(),
@@ -318,7 +395,7 @@ fn crash_restart_backstop_catches_up() {
 
     let state = tempfile::tempdir().unwrap();
     let mut daemon = start_daemon(brain.path(), state.path(), json!({}));
-    let before = sock_req(&daemon.sock(), &json!({"op": "checksum"}));
+    let before = daemon.local().req(&json!({"op": "checksum"}));
     assert_eq!(before["ok"], true);
     let checksum_before = before["checksum"].as_str().unwrap().to_string();
 
@@ -330,7 +407,7 @@ fn crash_restart_backstop_catches_up() {
     // Restart on the SAME state dir: the startup fingerprint backstop must
     // reconcile before the first barrier releases.
     let daemon2 = start_daemon(brain.path(), state.path(), json!({}));
-    let after = sock_req(&daemon2.sock(), &json!({"op": "checksum"}));
+    let after = daemon2.local().req(&json!({"op": "checksum"}));
     assert_eq!(after["ok"], true, "{after}");
     assert_eq!(after["fresh"], true, "{after}");
     let checksum_after = after["checksum"].as_str().unwrap().to_string();
@@ -339,11 +416,11 @@ fn crash_restart_backstop_catches_up() {
     // Ground truth: a fresh derivation over the final tree.
     let state_c = tempfile::tempdir().unwrap();
     let daemon_c = start_daemon(brain.path(), state_c.path(), json!({}));
-    let fresh = sock_req(&daemon_c.sock(), &json!({"op": "checksum"}));
+    let fresh = daemon_c.local().req(&json!({"op": "checksum"}));
     assert_eq!(fresh["checksum"].as_str().unwrap(), checksum_after);
 
     // And recall actually surfaces the outage write.
-    let resp = sock_req(&daemon2.sock(), &json!({"op": "recall", "query": "outage", "limit": 10}));
+    let resp = daemon2.local().req(&json!({"op": "recall", "query": "outage", "limit": 10}));
     assert_eq!(resp["ok"], true);
     assert!(snippet_blob(&resp).contains("born during the outage"));
 }
@@ -393,13 +470,14 @@ fn tcp_client_gets_the_same_guarantees() {
         }
     }
 
-    // Generation + checksum ops over TCP; TCP and unix agree on the catalog.
+    // Generation + checksum ops over TCP; the serving listener and the local
+    // control channel agree on the catalog.
     let g = tcp_req(&addr, token, &json!({"op": "generation"}));
     assert_eq!(g["ok"], true);
     assert!(g["generation"].as_u64().unwrap() >= 1);
     let tcp_sum = tcp_req(&addr, token, &json!({"op": "checksum"}));
-    let unix_sum = sock_req(&daemon.sock(), &json!({"op": "checksum"}));
-    assert_eq!(tcp_sum["checksum"], unix_sum["checksum"]);
+    let local_sum = daemon.local().req(&json!({"op": "checksum"}));
+    assert_eq!(tcp_sum["checksum"], local_sum["checksum"]);
 
     // find + slices answer over TCP too (empty here — no code scan ran —
     // but shaped and labeled).

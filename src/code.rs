@@ -201,7 +201,11 @@ enum WalkMsg {
 /// The normalized file-name stem and full path of a code file — the
 /// SQL-side match keys `find` filters on.
 fn norm_keys(path: &str) -> (String, String) {
-    let base = path.rsplit('/').next().unwrap_or(path);
+    // The argument is an ABSOLUTE operating-system path, so the basename must
+    // be taken with the platform's separator rules: `rsplit('/')` hands back
+    // the whole of `C:\repo\src\main.rs`, which would make every file-name
+    // key on Windows a full path and `find <name>` match nothing.
+    let base = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path);
     let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
     (norm_ident(stem), norm_ident(path))
 }
@@ -452,6 +456,23 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_name_keys_are_taken_with_the_platform_separator() {
+        // A code root is walked as absolute OS paths. On unix the two forms
+        // agree; on Windows only `Path::file_name` finds the basename.
+        let (stem, full) = norm_keys("/repo/src/main.rs");
+        assert_eq!(stem, "main");
+        assert_eq!(full, norm_ident("/repo/src/main.rs"));
+        assert_eq!(
+            Path::new(r"C:\repo\src\main.rs")
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|b| b.rsplit_once('.').map_or(b, |(s, _)| s)),
+            if cfg!(windows) { Some("main") } else { Some(r"C:\repo\src\main") },
+            "the platform decides what a backslash means"
+        );
+    }
 
     #[test]
     fn rust_symbols_have_exact_tree_ranges() {

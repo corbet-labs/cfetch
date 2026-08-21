@@ -26,14 +26,42 @@ pub fn default_settings_path() -> PathBuf {
     paths::home().join(".claude/settings.json")
 }
 
+/// POSIX shell quoting: single-quote the whole word, and close/escape/reopen
+/// around any embedded single quote.
+fn posix_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// Windows command-processor quoting: double-quote the whole word.
+///
+/// `cmd.exe` treats an apostrophe as an ordinary character, so the POSIX form
+/// would make the harness look for a program literally named `'C:\...` and
+/// every hook would silently never run. A double quote cannot appear in a
+/// Windows path (it is an illegal filename character), so there is nothing
+/// left to escape. `%` is legal in a path and would still be read as an
+/// environment reference by `cmd.exe`; that is inherent to the command
+/// processor and out of reach of quoting.
+fn windows_quote(word: &str) -> String {
+    format!("\"{word}\"")
+}
+
+/// Quoting for THIS platform's command processor.
+//
+// The branch is a runtime `cfg!`, not a `#[cfg]`: both quoters stay compiled
+// on every platform, so the tests below prove both on any runner.
+fn shell_quote(word: &str) -> String {
+    if cfg!(windows) { windows_quote(word) } else { posix_quote(word) }
+}
+
 /// The command embeds the absolute binary path: hooks run outside a login
-/// shell, so PATH is not a contract. POSIX-single-quoted against spaces.
+/// shell, so PATH is not a contract. Quoted for the platform's command
+/// processor, against spaces in the path.
 fn hook_command(subcommand: &str) -> String {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "cfetch".to_string());
-    format!("'{}' hook {subcommand}", exe.replace('\'', r"'\''"))
+    format!("{} hook {subcommand}", shell_quote(&exe))
 }
 
 fn managed_entry(subcommand: &str) -> Value {
@@ -505,6 +533,48 @@ mod tests {
         assert_eq!(out["theme"], "dark");
         assert!(gemini_settings_without_mcp(out).is_none(), "second removal is a no-op");
         assert!(gemini_settings_without_mcp(json!({"theme": "dark"})).is_none());
+    }
+
+    #[test]
+    fn posix_quoting_wraps_and_escapes_apostrophes() {
+        assert_eq!(posix_quote("/usr/bin/cfetch"), "'/usr/bin/cfetch'");
+        assert_eq!(posix_quote("/opt/a b/cfetch"), "'/opt/a b/cfetch'");
+        assert_eq!(posix_quote("/o'brien/cfetch"), r"'/o'\''brien/cfetch'");
+    }
+
+    #[test]
+    fn windows_quoting_double_quotes_the_path() {
+        // The POSIX form is not merely ugly on cmd.exe, it is broken: the
+        // apostrophes become part of the program name.
+        assert_eq!(
+            windows_quote(r"C:\Program Files\cfetch\cfetch.exe"),
+            "\"C:\\Program Files\\cfetch\\cfetch.exe\""
+        );
+        assert!(!windows_quote(r"C:\x\cfetch.exe").contains('\''), "no POSIX quoting on Windows");
+    }
+
+    #[test]
+    fn hook_command_uses_this_platforms_quoting() {
+        let cmd = hook_command("session-start");
+        let quoted = cmd
+            .strip_suffix(" hook session-start")
+            .unwrap_or_else(|| panic!("unexpected command shape: {cmd}"));
+        let (open, close) = if cfg!(windows) { ('"', '"') } else { ('\'', '\'') };
+        assert!(quoted.starts_with(open), "{cmd}");
+        assert!(quoted.ends_with(close), "{cmd}");
+    }
+
+    #[test]
+    fn registered_commands_are_quoted_for_this_platform() {
+        let out = merge(Value::Null).unwrap();
+        for (event, _) in EVENTS {
+            let cmd = out["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
+            if cfg!(windows) {
+                assert!(cmd.starts_with('"'), "{event}: {cmd}");
+            } else {
+                assert!(cmd.starts_with('\''), "{event}: {cmd}");
+            }
+        }
     }
 
     #[test]

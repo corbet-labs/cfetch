@@ -1,6 +1,7 @@
 //! The warm per-host daemon. Hooks are thin clients: they must never open
 //! databases or scan trees themselves (they sit on the interactive path), so
-//! anything heavier than a file read lives behind this Unix socket.
+//! anything heavier than a file read lives behind the LOCAL control channel
+//! ([`crate::ipc`]: a unix socket on unix, loopback TCP on Windows).
 //!
 //! Protocol: one JSON object per line in, one per line out, then the server
 //! closes the connection. Ops: ping, resident, health, scan-code,
@@ -10,10 +11,16 @@
 //!
 //! With `serve.bind` set, the SAME protocol is additionally served over TCP,
 //! gated by a bearer token (`token` field in every request; token sourced
-//! from `serve.token_file`, 0600). Shutdown stays unix-only.
+//! from `serve.token_file`, 0600). Shutdown is refused on that listener.
+//!
+//! Three channels, one gate. [`Channel`] is the whole policy surface: whether
+//! a connection must present a token, and whether it may shut the daemon
+//! down. A unix socket is access-controlled by its file mode and needs no
+//! token; loopback TCP is not, so the Windows LOCAL channel presents the
+//! daemon's own token — checked by the same `serve::token_eq` comparison the
+//! serving listener uses, never a second implementation.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::{heartbeat, hooks, index, paths, resident, serve};
+use crate::{heartbeat, hooks, index, ipc, paths, resident, serve};
 
 #[derive(Debug, Default, Deserialize)]
 struct Request {
@@ -202,12 +209,12 @@ pub fn call(op: &str, timeout: Duration) -> Option<Response> {
     call_req(&serde_json::json!({ "op": op }), timeout)
 }
 
-/// Structured client call over the local unix socket.
+/// Structured client call over the local control channel.
 pub fn call_req(body: &serde_json::Value, timeout: Duration) -> Option<Response> {
-    let stream = UnixStream::connect(paths::socket_path()).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
-    let mut stream = stream;
+    let mut stream = ipc::connect(timeout)?;
+    // A no-op where the transport is access-controlled by the operating
+    // system: on unix the request goes out byte-for-byte as built here.
+    let body = ipc::authenticate(body);
     writeln!(stream, "{body}").ok()?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;
@@ -217,9 +224,57 @@ pub fn call_req(body: &serde_json::Value, timeout: Duration) -> Option<Response>
 /// Shared state of one daemon process across its connection threads.
 struct Ctx {
     serve: Option<Arc<serve::ServeState>>,
-    /// Bearer token required on the TCP listener (None = no TCP serving).
+    /// Bearer token required on the serving TCP listener (None = no TCP
+    /// serving).
     tcp_token: Option<String>,
+    /// Bearer token required on the LOCAL channel — `Some` only where the
+    /// local transport is not access-controlled by the operating system.
+    local_token: Option<String>,
     shutdown: AtomicBool,
+}
+
+/// Which connection a request arrived on, and therefore what it may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    /// Local channel the operating system already gates (unix socket file
+    /// mode). No credential; every op, shutdown included.
+    LocalTrusted,
+    /// Local channel any process on this machine can reach (loopback TCP).
+    /// Token required; still local, so shutdown stays allowed.
+    LocalToken,
+    /// The serving listener: token required, shutdown refused.
+    Remote,
+}
+
+/// The policy this platform's LOCAL channel runs under.
+const LOCAL_CHANNEL: Channel =
+    if ipc::LOCAL_REQUIRES_TOKEN { Channel::LocalToken } else { Channel::LocalTrusted };
+
+impl Channel {
+    /// The credential this channel demands, if any.
+    fn expected_token(self, ctx: &Ctx) -> Option<Option<&String>> {
+        match self {
+            Channel::LocalTrusted => None,
+            Channel::LocalToken => Some(ctx.local_token.as_ref()),
+            Channel::Remote => Some(ctx.tcp_token.as_ref()),
+        }
+    }
+
+    /// Shutdown is a LOCAL op: a serving peer must never be able to stop the
+    /// daemon that answers it.
+    fn allows_shutdown(self) -> bool {
+        !matches!(self, Channel::Remote)
+    }
+}
+
+/// Bearer check for a channel that demands one. A missing expectation and a
+/// missing presentation both refuse — an unconfigured token is never an open
+/// door.
+fn authorized(expected: Option<&String>, presented: Option<&String>) -> bool {
+    match (expected, presented) {
+        (Some(expected), Some(got)) => serve::token_eq(expected, got),
+        _ => false,
+    }
 }
 
 /// Runs a barrier-gated query op against the committed index snapshot and
@@ -390,8 +445,8 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
 }
 
 /// Serves one connection: one request line, one response line. Returns true
-/// when this connection requested shutdown (unix only).
-fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, remote: bool) -> bool {
+/// when this connection requested shutdown (local channels only).
+fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, chan: Channel) -> bool {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
@@ -399,23 +454,17 @@ fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, remote: bool) -> bool {
     }
     let (resp, shutdown) = match serde_json::from_str::<Request>(&line) {
         Ok(req) => {
-            if remote {
-                // Bearer gate for TCP: every op requires the token; shutdown
-                // is refused outright (local-only op).
-                let authorized = match (&ctx.tcp_token, &req.token) {
-                    (Some(expected), Some(got)) => serve::token_eq(expected, got),
-                    _ => false,
-                };
-                if !authorized {
-                    (Response::err("unauthorized"), false)
-                } else if req.op == "shutdown" {
-                    (Response::err("shutdown is local-only"), false)
-                } else {
-                    let (r, _) = handle(&req, ctx);
-                    (r, false)
-                }
+            // Bearer gate wherever the transport is not access-controlled by
+            // the operating system: every op requires the token.
+            if let Some(expected) = chan.expected_token(ctx)
+                && !authorized(expected, req.token.as_ref())
+            {
+                (Response::err("unauthorized"), false)
+            } else if req.op == "shutdown" && !chan.allows_shutdown() {
+                (Response::err("shutdown is local-only"), false)
             } else {
-                handle(&req, ctx)
+                let (r, shutdown) = handle(&req, ctx);
+                (r, shutdown && chan.allows_shutdown())
             }
         }
         Err(e) => (Response::err(format!("bad request: {e}")), false),
@@ -438,9 +487,13 @@ pub fn run() -> anyhow::Result<()> {
         (Some(_), Some(tf)) => Some(serve::read_token(tf, true)?),
         _ => None,
     };
+    // Minted before anything binds so the request context can carry it
+    // without reordering the boot sequence; `None` on unix.
+    let local_token = ipc::new_local_token();
     let ctx = Arc::new(Ctx {
         serve: serve_handle.as_ref().map(|h| h.state.clone()),
         tcp_token: tcp_token.clone(),
+        local_token: local_token.clone(),
         shutdown: AtomicBool::new(false),
     });
 
@@ -461,25 +514,15 @@ pub fn run() -> anyhow::Result<()> {
                 let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
                 let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
                 let ctx = ctx.clone();
-                std::thread::spawn(move || serve_conn(conn, &ctx, true));
+                std::thread::spawn(move || serve_conn(conn, &ctx, Channel::Remote));
             }
         });
     }
 
-    let sock = paths::socket_path();
-    if let Some(dir) = sock.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // A stale socket file from a dead daemon must be cleared; a live one must
-    // not be stolen.
-    if sock.exists() {
-        if UnixStream::connect(&sock).is_ok() {
-            anyhow::bail!("daemon already running on {}", sock.display());
-        }
-        std::fs::remove_file(&sock)?;
-    }
-    let listener = UnixListener::bind(&sock)?;
-    eprintln!("cfetch daemon listening on {}", sock.display());
+    // A stale endpoint from a dead daemon is cleared; a live one is never
+    // stolen (see `ipc::listen`).
+    let listener = ipc::listen(local_token)?;
+    eprintln!("cfetch daemon listening on {}", listener.describe());
     for conn in listener.incoming() {
         if ctx.shutdown.load(Ordering::SeqCst) {
             break;
@@ -488,19 +531,18 @@ pub fn run() -> anyhow::Result<()> {
         let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
         // Thread per connection: a query blocked in the drain barrier (up to
-        // 5s) must not starve other clients — hooks poll this socket on the
+        // 5s) must not starve other clients — hooks poll this channel on the
         // interactive path.
         let ctx = ctx.clone();
-        let sock = sock.clone();
         std::thread::spawn(move || {
-            if serve_conn(conn, &ctx, false) {
+            if serve_conn(conn, &ctx, LOCAL_CHANNEL) {
                 ctx.shutdown.store(true, Ordering::SeqCst);
                 // Wake the accept loop so it observes the flag.
-                let _ = UnixStream::connect(&sock);
+                ipc::wake();
             }
         });
     }
-    let _ = std::fs::remove_file(&sock);
+    listener.cleanup();
     Ok(())
 }
 
@@ -511,16 +553,27 @@ pub fn start() -> anyhow::Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .args(["daemon", "run"])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the daemon outlives
+        // the console that started it and never receives its Ctrl-C. Closing
+        // stdio is enough on unix; on Windows the console is inherited
+        // separately from the handles.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn()?;
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(50));
         if call("ping", Duration::from_millis(200)).is_some() {
-            println!("daemon started on {}", paths::socket_path().display());
+            println!("daemon started on {}", ipc::describe());
             return Ok(());
         }
     }
@@ -552,7 +605,7 @@ pub fn status() -> anyhow::Result<()> {
                     info.origin,
                     info.generation,
                     info.last_barrier_ms,
-                    info.bind.map_or_else(|| "unix socket only".to_string(), |b| format!("tcp {b}"))
+                    info.bind.map_or_else(|| "local channel only".to_string(), |b| format!("tcp {b}"))
                 );
             }
             if let Some(s) = call("scan-status", Duration::from_millis(300)).and_then(|r| r.scan) {
@@ -573,7 +626,7 @@ pub fn status() -> anyhow::Result<()> {
                 }
             }
         }
-        None => println!("daemon: not running ({})", paths::socket_path().display()),
+        None => println!("daemon: not running ({})", ipc::describe()),
     }
     if let Ok(cfg) = Config::load()
         && let Some(cs) = &cfg.client.serving
@@ -649,7 +702,7 @@ mod tests {
     }
 
     fn no_serve_ctx() -> Ctx {
-        Ctx { serve: None, tcp_token: None, shutdown: AtomicBool::new(false) }
+        Ctx { serve: None, tcp_token: None, local_token: None, shutdown: AtomicBool::new(false) }
     }
 
     #[test]
@@ -692,10 +745,16 @@ mod tests {
         }
     }
 
-    fn roundtrip(ctx: &Ctx, remote: bool, body: serde_json::Value) -> Response {
+    fn roundtrip(ctx: &Ctx, chan: Channel, body: serde_json::Value) -> Response {
         let mut stream = Duplex { input: std::io::Cursor::new(format!("{body}\n").into_bytes()), output: Vec::new() };
-        serve_conn(&mut stream, ctx, remote);
+        serve_conn(&mut stream, ctx, chan);
         serde_json::from_slice(&stream.output).unwrap()
+    }
+
+    /// Did this connection ask for shutdown, and was it granted?
+    fn roundtrip_shutdown(ctx: &Ctx, chan: Channel, body: serde_json::Value) -> bool {
+        let mut stream = Duplex { input: std::io::Cursor::new(format!("{body}\n").into_bytes()), output: Vec::new() };
+        serve_conn(&mut stream, ctx, chan)
     }
 
     #[test]
@@ -703,14 +762,15 @@ mod tests {
         let ctx = Ctx {
             serve: None,
             tcp_token: Some("right-token".to_string()),
+            local_token: None,
             shutdown: AtomicBool::new(false),
         };
-        let r = roundtrip(&ctx, true, serde_json::json!({"op": "ping"}));
+        let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "ping"}));
         assert!(!r.ok, "missing token must be refused");
         assert_eq!(r.error.as_deref(), Some("unauthorized"));
-        let r = roundtrip(&ctx, true, serde_json::json!({"op": "ping", "token": "wrong-token"}));
+        let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "ping", "token": "wrong-token"}));
         assert_eq!(r.error.as_deref(), Some("unauthorized"));
-        let r = roundtrip(&ctx, true, serde_json::json!({"op": "ping", "token": "right-token"}));
+        let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "ping", "token": "right-token"}));
         assert!(r.ok);
     }
 
@@ -719,10 +779,74 @@ mod tests {
         let ctx = Ctx {
             serve: None,
             tcp_token: Some("t".to_string()),
+            local_token: None,
             shutdown: AtomicBool::new(false),
         };
-        let r = roundtrip(&ctx, true, serde_json::json!({"op": "shutdown", "token": "t"}));
+        let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "shutdown", "token": "t"}));
         assert!(!r.ok);
         assert!(r.error.unwrap().contains("local-only"));
+        assert!(
+            !roundtrip_shutdown(&ctx, Channel::Remote, serde_json::json!({"op": "shutdown", "token": "t"})),
+            "a refused shutdown must not stop the daemon either"
+        );
+    }
+
+    // ---- local channel policy, per transport ----
+    //
+    // Both local policies are exercised on every platform: the Windows local
+    // channel is loopback TCP, and its gate must be provable on the runner
+    // that can actually run these tests.
+
+    #[test]
+    fn an_os_gated_local_channel_needs_no_token_and_may_shut_down() {
+        // The unix socket: its file mode IS the access control.
+        let ctx = no_serve_ctx();
+        let r = roundtrip(&ctx, Channel::LocalTrusted, serde_json::json!({"op": "ping"}));
+        assert!(r.ok, "a unix-socket client presents no credential: {r:?}");
+        assert!(roundtrip_shutdown(&ctx, Channel::LocalTrusted, serde_json::json!({"op": "shutdown"})));
+    }
+
+    #[test]
+    fn a_loopback_local_channel_needs_the_token_and_may_still_shut_down() {
+        // Loopback TCP (Windows): any local process can connect, so the
+        // daemon's own token gates it — but it is still a LOCAL channel, so
+        // `daemon stop` must keep working.
+        let ctx = Ctx {
+            serve: None,
+            tcp_token: None,
+            local_token: Some("local-token".to_string()),
+            shutdown: AtomicBool::new(false),
+        };
+        let r = roundtrip(&ctx, Channel::LocalToken, serde_json::json!({"op": "ping"}));
+        assert_eq!(r.error.as_deref(), Some("unauthorized"), "no token: refused");
+        let r = roundtrip(&ctx, Channel::LocalToken, serde_json::json!({"op": "ping", "token": "guess"}));
+        assert_eq!(r.error.as_deref(), Some("unauthorized"), "wrong token: refused");
+        let r = roundtrip(&ctx, Channel::LocalToken, serde_json::json!({"op": "ping", "token": "local-token"}));
+        assert!(r.ok, "the published token opens the local channel: {r:?}");
+        assert!(
+            roundtrip_shutdown(&ctx, Channel::LocalToken, serde_json::json!({"op": "shutdown", "token": "local-token"})),
+            "shutdown is a local op on every transport"
+        );
+    }
+
+    #[test]
+    fn a_token_gated_channel_without_a_configured_token_refuses_everything() {
+        // An unconfigured credential is never an open door.
+        let ctx = no_serve_ctx();
+        for chan in [Channel::LocalToken, Channel::Remote] {
+            let r = roundtrip(&ctx, chan, serde_json::json!({"op": "ping", "token": "anything"}));
+            assert_eq!(r.error.as_deref(), Some("unauthorized"), "{chan:?}");
+            let r = roundtrip(&ctx, chan, serde_json::json!({"op": "ping"}));
+            assert_eq!(r.error.as_deref(), Some("unauthorized"), "{chan:?}");
+        }
+    }
+
+    #[test]
+    fn this_platforms_local_channel_matches_its_transport() {
+        assert_eq!(
+            LOCAL_CHANNEL,
+            if cfg!(windows) { Channel::LocalToken } else { Channel::LocalTrusted }
+        );
+        assert!(LOCAL_CHANNEL.allows_shutdown(), "the local channel always accepts shutdown");
     }
 }
