@@ -6,6 +6,7 @@ mod dashboard;
 mod embed;
 mod exhaust;
 mod govern;
+mod grant;
 mod graph;
 mod heartbeat;
 mod hook_io;
@@ -108,6 +109,31 @@ enum Command {
         slice: Option<String>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mint a one-time invite to a slice, to paste to another host
+    Invite {
+        /// Slice to grant (must be configured on this host)
+        slice: String,
+        /// Access to grant: ro or rw
+        #[arg(long, default_value = "ro")]
+        mode: String,
+        /// Expire the invite after this many hours
+        #[arg(long)]
+        expires_in_hours: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Redeem an invite minted by another host
+    Join {
+        /// The ticket text from `cfetch invite`
+        ticket: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show who has been granted which slice, and which invites are unused
+    Grants {
         #[arg(long)]
         json: bool,
     },
@@ -981,6 +1007,149 @@ fn status() -> anyhow::Result<()> {
 /// Coverage of the configured embeddings spec, local cache and shared store
 /// side by side. A none-tier host reports the shared store alone — it holds
 /// no index to cover.
+/// Mints an invite to a slice and records it as pending on this host.
+///
+/// The ticket printed here is the only readable copy of its secret: the
+/// origin keeps a hash, so an invite that is lost is re-minted rather than
+/// recovered.
+fn invite(
+    slice: &str,
+    mode: &str,
+    expires_in_hours: Option<u64>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let model = cfg.slice_model()?;
+    // Granting access to a slice this host does not define would hand out a
+    // name that resolves to nothing.
+    anyhow::ensure!(
+        model.names().any(|n| n == slice),
+        "no slice named {slice:?} on this host (configured: {})",
+        if model.is_empty() { "none".into() } else { model.names().collect::<Vec<_>>().join(", ") }
+    );
+    let mode: grant::Mode = mode.parse()?;
+    let origin = net::endpoint_id(&paths::state_dir())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = expires_in_hours.map(|h| now + h * 3600);
+    let ticket =
+        grant::invite(&cfg.brain_root, &origin.to_string(), slice, mode, now, expires_at)?;
+    let text = ticket.encode();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ticket": text, "slice": slice, "mode": mode.as_str(),
+                "origin": origin.to_string(), "expires_at": expires_at,
+            })
+        );
+    } else {
+        println!("{text}");
+        eprintln!(
+            "cfetch invite: one-time {} invite to slice {slice:?}{}. \
+             The secret is not stored — re-mint if it is lost.",
+            mode.as_str(),
+            match expires_in_hours {
+                Some(h) => format!(", expiring in {h}h"),
+                None => String::new(),
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Shows the grants this host has made, per slice.
+///
+/// Pending invites are listed too: an unused invite is a key someone still
+/// holds, and it should be as visible as a redeemed one.
+fn grants(json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let model = cfg.slice_model()?;
+    let mut rows = Vec::new();
+    for slice in model.names() {
+        for g in grant::read(&cfg.brain_root, slice)? {
+            rows.push(serde_json::json!({
+                "slice": g.slice,
+                "mode": g.mode.as_str(),
+                "peer": g.peer,
+                "state": if g.pending() { "pending" } else { "redeemed" },
+                "expires_at": g.expires_at,
+            }));
+        }
+    }
+    if json {
+        println!("{}", serde_json::json!({"grants": rows}));
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no slice has been granted to anyone from this host");
+        return Ok(());
+    }
+    for r in &rows {
+        let peer = r["peer"].as_str().unwrap_or("(unused invite)");
+        println!(
+            "{}: {} -> {} [{}]",
+            r["slice"].as_str().unwrap_or("?"),
+            r["mode"].as_str().unwrap_or("?"),
+            peer,
+            r["state"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+/// Redeems an invite.
+///
+/// When the origin shares this host's tree — the ordinary case inside one
+/// storage group — redemption is a local operation on the grants file and no
+/// network is involved at all. The secret is what proves the invite came from
+/// this tree; the origin id in the ticket is only needed for dialling one
+/// that does not.
+fn join(ticket: &str, json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let t = grant::Ticket::decode(ticket)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    anyhow::ensure!(!t.expired(now), "this invite has expired — ask the origin for a new one");
+
+    let me = net::endpoint_id(&paths::state_dir())?.to_string();
+    match grant::redeem(&cfg.brain_root, &t.slice, &t.secret, &me, now) {
+        Ok(g) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "slice": g.slice, "mode": g.mode.as_str(),
+                        "origin": t.origin, "peer": me, "shared_tree": true,
+                    })
+                );
+            } else {
+                println!(
+                    "joined slice {:?} as {} (origin {}, redeemed on the shared tree)",
+                    g.slice,
+                    g.mode.as_str(),
+                    &t.origin[..t.origin.len().min(12)]
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Two very different causes, and the operator cannot tell them
+            // apart from the outside — so name both rather than guess.
+            anyhow::bail!(
+                "{e}. Either this invite is for an origin that does NOT share this tree — \
+                 redeeming across storage groups needs the iroh transport, which is not \
+                 wired yet — or the ticket does not belong to slice {:?}.",
+                t.slice
+            )
+        }
+    }
+}
+
 /// Lists the slices and what each one holds.
 ///
 /// Counts are derived from the indexed paths at call time, so what this
@@ -1083,6 +1252,24 @@ fn main() {
             let agents = if remove { install::uninstall_agents() } else { install::install_agents() };
             if let Err(e) = agents {
                 eprintln!("cfetch install (other agents): {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Invite { slice, mode, expires_in_hours, json } => {
+            if let Err(e) = invite(&slice, &mode, expires_in_hours, json) {
+                eprintln!("cfetch invite: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Join { ticket, json } => {
+            if let Err(e) = join(&ticket, json) {
+                eprintln!("cfetch join: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Grants { json } => {
+            if let Err(e) = grants(json) {
+                eprintln!("cfetch grants: {e:#}");
                 std::process::exit(1);
             }
         }

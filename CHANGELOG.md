@@ -5,6 +5,14 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Invites and grants.** `cfetch invite <slice>` mints a one-time ticket,
+  `cfetch join <ticket>` redeems it, `cfetch grants` shows who holds what.
+  A ticket is an address plus a secret, NOT an authorization: the origin looks
+  the secret up in its own records, so a forged ticket buys nothing and a real
+  one can be pasted through any channel. The origin stores only the secret's
+  hash. An invite binds to the first host that redeems it, a retry from that
+  same host is not an error, and a second host is refused. Inside one storage
+  group — hosts sharing the tree — redemption needs no network at all.
 - **Host identity.** Each host now has a persistent iroh keypair, created on
   first use, whose public half is the endpoint id peers will grant slices to.
   `cfetch identity` prints it and `cfetch status` names it. The key lives in
