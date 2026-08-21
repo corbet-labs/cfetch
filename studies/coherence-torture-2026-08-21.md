@@ -58,3 +58,24 @@ Measured after the fix, against the real brain tree:
 
 Lesson worth keeping: the deployment attempt was the test. Three defects,
 zero of them reachable from a temp-dir fixture.
+
+## v2 architecture live on real hardware (2026-08-21, evening)
+
+The serving cutover converged: the storage host runs the serving daemon over
+the shared tree, and a none-tier client on another machine holds no index at
+all and answers every query over the overlay network.
+
+Measured on the live fleet:
+
+- serving host: unit active, TCP listener up, **90 inotify watches** for the
+  whole brain (the pre-fix recursive watcher demanded ~524k and escaped
+  through a symlink), bind < 0.5 s after start.
+- none-tier client: `status` reports "recall/find/expand route to <host>
+  (none-tier; no local index)"; a cross-host `recall` returned in **34 ms**
+  with the footer `served by <origin> (generation 1, fresh)`.
+- Every answer carries {origin, generation, fresh} — freshness is a claim the
+  client can see, and staleness would be labeled rather than silent.
+
+This is the PRD's three-tier holding model working as specified: storage +
+metadata + serving on one host, nothing at all on the other, and the drain
+barrier making the remote answer as fresh as a local one.
