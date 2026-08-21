@@ -19,6 +19,7 @@ use crate::{embed, index, rerank};
 /// Ranked hits plus the single note describing every degradation that
 /// happened on the way — joined rather than nested, because the caller has
 /// exactly one line to show a human and one JSON field to fill.
+#[derive(Debug)]
 pub struct Ranked {
     pub hits: Vec<Hit>,
     pub note: Option<String>,
@@ -37,7 +38,26 @@ pub fn ranked(
     limit: usize,
     semantic: bool,
     hybrid: bool,
+    slice: Option<&str>,
 ) -> anyhow::Result<Ranked> {
+    // Resolve the slice ONCE, before any retrieval: an unknown name must fail
+    // loudly here rather than silently answer from the whole tree.
+    let model = cfg.slice_model()?;
+    let prefixes: Vec<String> = match slice {
+        None => Vec::new(),
+        Some(name) => match model.prefixes_of(name) {
+            None => Vec::new(), // the root slice restricts nothing
+            Some([]) => anyhow::bail!(
+                "no slice named {name:?} (configured: {})",
+                if model.is_empty() {
+                    "none".to_string()
+                } else {
+                    model.names().collect::<Vec<_>>().join(", ")
+                }
+            ),
+            Some(p) => p.to_vec(),
+        },
+    };
     let mut notes: Vec<String> = Vec::new();
 
     // A misconfigured reranker can only be fixed by a human, so it is named
@@ -59,13 +79,13 @@ pub fn ranked(
     let retrieve = reranker.as_ref().map_or(limit, |c| c.candidates().max(limit));
 
     let hits = if semantic || hybrid {
-        let out = embed::semantic_hits(cfg, conn, query, retrieve, hybrid)?;
+        let out = embed::semantic_hits(cfg, conn, query, retrieve, hybrid, &prefixes)?;
         if let Some(n) = out.note {
             notes.push(n);
         }
         out.hits
     } else {
-        index::recall(conn, query, retrieve)?
+        index::recall_in(conn, query, retrieve, &prefixes)?
     };
 
     let mut hits = match &reranker {
@@ -138,7 +158,7 @@ mod tests {
 
         // limit 2, candidates 5: the reranker must SEE all five, or it could
         // never promote the fifth — which is the entire point of the window.
-        let out = ranked(&cfg, &conn, "item", 2, false, false).unwrap();
+        let out = ranked(&cfg, &conn, "item", 2, false, false, None).unwrap();
         assert!(out.note.is_none(), "{:?}", out.note);
         let sent: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
         assert_eq!(sent["documents"].as_array().unwrap().len(), 5, "the window is what gets sent");
@@ -150,7 +170,7 @@ mod tests {
     fn without_a_reranker_retrieval_never_widens() {
         let (brain, _state, conn) = five_block_index();
         let cfg = Config { brain_root: brain.path().to_path_buf(), ..Config::default() };
-        let out = ranked(&cfg, &conn, "item", 2, false, false).unwrap();
+        let out = ranked(&cfg, &conn, "item", 2, false, false, None).unwrap();
         assert_eq!(out.hits.len(), 2);
         assert!(out.note.is_none());
         assert!(out.hits[0].snippet.contains("one"), "plain retrieval order: {:?}", out.hits[0]);
@@ -160,7 +180,7 @@ mod tests {
     fn an_unreachable_reranker_still_answers_and_says_so() {
         let (brain, _state, conn) = five_block_index();
         let cfg = cfg_with_rerank(brain.path(), "http://127.0.0.1:1/v1", 5);
-        let out = ranked(&cfg, &conn, "item", 3, false, false).unwrap();
+        let out = ranked(&cfg, &conn, "item", 3, false, false, None).unwrap();
         assert_eq!(out.hits.len(), 3, "the answer survives the second stage failing");
         let note = out.note.expect("degradation is never silent");
         assert!(note.contains("rerank unavailable"), "{note}");
@@ -173,10 +193,107 @@ mod tests {
         // reported rather than retried per query.
         let mut cfg = cfg_with_rerank(brain.path(), "http://127.0.0.1:1/v1", 5);
         cfg.rerank.model = String::new();
-        let out = ranked(&cfg, &conn, "item", 3, false, false).unwrap();
+        let out = ranked(&cfg, &conn, "item", 3, false, false, None).unwrap();
         assert_eq!(out.hits.len(), 3);
         let note = out.note.expect("a misconfiguration must reach the operator");
         assert!(note.contains("rerank misconfigured"), "{note}");
         assert!(!note.contains('\n'), "one line: {note}");
+    }
+
+    // ---- slices (S1 acceptance)
+
+    /// Two slices over one tree, each holding a block that matches the query.
+    fn two_slice_index() -> (tempfile::TempDir, tempfile::TempDir, rusqlite::Connection) {
+        let brain = tempfile::tempdir().unwrap();
+        for (rel, body) in [
+            ("knowledge/hosts/server.md", "- item about the server\n"),
+            ("knowledge/world/vendor.md", "- item about a vendor\n"),
+            ("mind/memories/pref.md", "- item about a preference\n"),
+        ] {
+            let p = brain.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = index::open(state.path()).unwrap();
+        index::scan(&mut conn, brain.path(), None, &crate::config::RingRules::default()).unwrap();
+        (brain, state, conn)
+    }
+
+    fn sliced_cfg(brain: &std::path::Path) -> Config {
+        Config {
+            brain_root: brain.to_path_buf(),
+            slices: vec![
+                crate::config::SliceRule {
+                    name: "work".into(),
+                    prefixes: vec!["knowledge".into()],
+                },
+                crate::config::SliceRule {
+                    name: "hosts".into(),
+                    prefixes: vec!["knowledge/hosts".into()],
+                },
+            ],
+            ..Config::default()
+        }
+    }
+
+    fn paths_of(r: &Ranked) -> Vec<String> {
+        r.hits.iter().map(|h| h.path.clone()).collect()
+    }
+
+    #[test]
+    fn a_slice_query_returns_only_that_slice_and_what_nests_inside_it() {
+        let (brain, _state, conn) = two_slice_index();
+        let cfg = sliced_cfg(brain.path());
+
+        let inner = ranked(&cfg, &conn, "item", 10, false, false, Some("hosts")).unwrap();
+        assert_eq!(paths_of(&inner), vec!["knowledge/hosts/server.md"]);
+
+        // `hosts` is nested inside `work`, so restricting to `work` reaches
+        // both — and still never leaves it.
+        let outer = ranked(&cfg, &conn, "item", 10, false, false, Some("work")).unwrap();
+        let mut got = paths_of(&outer);
+        got.sort();
+        assert_eq!(got, vec!["knowledge/hosts/server.md", "knowledge/world/vendor.md"]);
+        assert!(!got.iter().any(|p| p.starts_with("mind/")), "the slice is a boundary");
+    }
+
+    #[test]
+    fn the_root_slice_is_the_whole_tree_and_matches_no_filter_at_all() {
+        let (brain, _state, conn) = two_slice_index();
+        let cfg = sliced_cfg(brain.path());
+        let root = ranked(&cfg, &conn, "item", 10, false, false, Some(crate::config::ROOT_SLICE))
+            .unwrap();
+        let unfiltered = ranked(&cfg, &conn, "item", 10, false, false, None).unwrap();
+        assert_eq!(paths_of(&root), paths_of(&unfiltered));
+        assert_eq!(root.hits.len(), 3);
+    }
+
+    #[test]
+    fn a_slice_that_does_not_exist_is_an_error_not_the_whole_tree() {
+        // Silently widening a typo to the entire brain is how a private slice
+        // leaks; refuse instead.
+        let (brain, _state, conn) = two_slice_index();
+        let cfg = sliced_cfg(brain.path());
+        let e = ranked(&cfg, &conn, "item", 10, false, false, Some("hsots")).unwrap_err().to_string();
+        assert!(e.contains("no slice named"), "{e}");
+        assert!(e.contains("work") && e.contains("hosts"), "the real names are offered: {e}");
+    }
+
+    #[test]
+    fn a_brain_with_no_slices_answers_exactly_as_it_did_before() {
+        // The S1 acceptance test: a single-slice brain is byte-identical.
+        let (brain, _state, conn) = two_slice_index();
+        let plain = Config { brain_root: brain.path().to_path_buf(), ..Config::default() };
+        let before = index::recall(&conn, "item", 10).unwrap();
+        let after = ranked(&plain, &conn, "item", 10, false, false, None).unwrap();
+        assert_eq!(
+            paths_of(&after),
+            before.iter().map(|h| h.path.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after.hits.iter().map(|h| h.cite.clone()).collect::<Vec<_>>(),
+            before.iter().map(|h| h.cite.clone()).collect::<Vec<_>>()
+        );
     }
 }

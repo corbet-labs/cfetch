@@ -501,6 +501,7 @@ pub fn semantic_hits(
     query: &str,
     limit: usize,
     hybrid: bool,
+    prefixes: &[String],
 ) -> anyhow::Result<SemanticRecall> {
     let client = EmbedClient::new(&cfg.embeddings)
         .map_err(|e| anyhow::anyhow!("semantic recall unavailable: {e}"))?;
@@ -514,7 +515,7 @@ pub fn semantic_hits(
     if embedded == 0 {
         // Nothing to rank against. Answer lexically — but say so; a silently
         // lexical "hybrid" is the degradation this project bans.
-        return Ok(SemanticRecall { hits: index::recall(conn, query, limit)?, note });
+        return Ok(SemanticRecall { hits: index::recall_in(conn, query, limit, prefixes)?, note });
     }
     let embedded_query = client.embed_query(query);
     let mut qv = match embedded_query {
@@ -528,7 +529,7 @@ pub fn semantic_hits(
             let reason = format!("semantic: query embedding failed ({e:#}) — answering lexically");
             let reason = reason.replace('\n', " ");
             return Ok(SemanticRecall {
-                hits: index::recall(conn, query, limit)?,
+                hits: index::recall_in(conn, query, limit, prefixes)?,
                 note: Some(match note {
                     Some(coverage) => format!("{coverage}; {reason}"),
                     None => reason,
@@ -538,9 +539,9 @@ pub fn semantic_hits(
     };
     index::l2_normalize(&mut qv);
     let hits = if hybrid {
-        index::hybrid_recall(conn, &spec, query, &qv, limit, cfg.recall.rrf_k)?
+        index::hybrid_recall(conn, &spec, query, &qv, limit, cfg.recall.rrf_k, prefixes)?
     } else {
-        index::semantic_recall(conn, &spec, &qv, limit)?
+        index::semantic_recall(conn, &spec, &qv, limit, prefixes)?
     };
     Ok(SemanticRecall { hits, note })
 }
@@ -675,11 +676,11 @@ mod tests {
     fn semantic_recall_unavailable_without_config_is_one_line() {
         let state = tempfile::tempdir().unwrap();
         let conn = index::open(state.path()).unwrap();
-        let err = semantic_hits(&Config::default(), &conn, "query", 5, false).unwrap_err();
+        let err = semantic_hits(&Config::default(), &conn, "query", 5, false, &[]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("semantic recall unavailable"), "got: {msg}");
         assert!(!msg.contains('\n'));
-        let err = semantic_hits(&Config::default(), &conn, "query", 5, true).unwrap_err();
+        let err = semantic_hits(&Config::default(), &conn, "query", 5, true, &[]).unwrap_err();
         assert!(err.to_string().contains("semantic recall unavailable"), "--hybrid gated too");
     }
 
@@ -1120,7 +1121,7 @@ mod tests {
         let (brain, _state, conn) = five_block_index();
         let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
         let cfg = semantic_config(brain.path(), &url);
-        let out = semantic_hits(&cfg, &conn, "three", 5, true).unwrap();
+        let out = semantic_hits(&cfg, &conn, "three", 5, true, &[]).unwrap();
         let note = out.note.expect("zero coverage must be reported, never hidden");
         assert!(note.contains("0/5"), "the numbers are in the warning: {note}");
         assert!(note.contains("cfetch embed-index"), "the fix is named: {note}");
@@ -1128,7 +1129,7 @@ mod tests {
         assert!(out.hits[0].snippet.contains("three"));
         assert!(bodies.lock().unwrap().is_empty(), "no point embedding a query nothing can match");
         // --semantic degrades the same way: an answer plus the truth about it.
-        let out = semantic_hits(&cfg, &conn, "three", 5, false).unwrap();
+        let out = semantic_hits(&cfg, &conn, "three", 5, false, &[]).unwrap();
         assert!(out.note.is_some());
         assert_eq!(out.hits.len(), 1);
     }
@@ -1143,7 +1144,7 @@ mod tests {
         }
         let (url, _, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
         let cfg = semantic_config(brain.path(), &url);
-        let out = semantic_hits(&cfg, &conn, "one", 5, true).unwrap();
+        let out = semantic_hits(&cfg, &conn, "one", 5, true, &[]).unwrap();
         let note = out.note.expect("partial coverage is degradation, and must be said");
         assert!(note.contains("2/5"), "got: {note}");
         assert!(!out.hits.is_empty());
@@ -1165,7 +1166,7 @@ mod tests {
             embeddings: EmbeddingsConfig { endpoint: "http://127.0.0.1:1".into(), ..cfg.embeddings },
             ..cfg
         };
-        let out = semantic_hits(&dead, &conn, "three", 5, true).unwrap();
+        let out = semantic_hits(&dead, &conn, "three", 5, true, &[]).unwrap();
         let note = out.note.expect("a degraded answer must be labeled");
         assert!(note.contains("query embedding failed"), "got: {note}");
         assert!(note.contains("lexical"), "got: {note}");
@@ -1180,7 +1181,7 @@ mod tests {
         let cfg = semantic_config(brain.path(), &url);
         let mut store = store_for(brain.path());
         run(&mut conn, &EmbedClient::new(&cfg.embeddings).unwrap(), 8, &mut store).unwrap();
-        let out = semantic_hits(&cfg, &conn, "one", 5, true).unwrap();
+        let out = semantic_hits(&cfg, &conn, "one", 5, true, &[]).unwrap();
         assert!(out.note.is_none(), "no warning when nothing is degraded: {:?}", out.note);
         assert!(!out.hits.is_empty());
     }
@@ -1199,7 +1200,7 @@ mod tests {
         let mut conn_b = index::open(state_b.path()).unwrap();
         index::scan(&mut conn_b, brain.path(), None, &crate::config::RingRules::default()).unwrap();
         assert_eq!(index::vector_coverage(&conn_b, &spec_for(2)).unwrap(), (0, 5));
-        let out = semantic_hits(&cfg, &conn_b, "one", 5, false).unwrap();
+        let out = semantic_hits(&cfg, &conn_b, "one", 5, false, &[]).unwrap();
         assert!(out.note.is_none(), "the tree covered it: {:?}", out.note);
         assert!(!out.hits.is_empty());
         assert_eq!(index::vector_coverage(&conn_b, &spec_for(2)).unwrap(), (5, 5));

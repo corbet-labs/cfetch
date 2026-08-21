@@ -61,6 +61,10 @@ struct Request {
     semantic: Option<bool>,
     #[serde(default)]
     hybrid: Option<bool>,
+    /// recall op: restrict to one slice. Resolved on the SERVING host, which
+    /// is where the slice model lives.
+    #[serde(default)]
+    slice: Option<String>,
     /// SessionStart's working directory, for the resident op: the daemon
     /// shares the host with its caller but not the cwd, so the repo half of
     /// the injection scope has to travel with the request.
@@ -515,10 +519,19 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
             let limit = req.limit.unwrap_or(8);
             let semantic = req.semantic.unwrap_or(false);
             let hybrid = req.hybrid.unwrap_or(false);
+            let slice = req.slice.clone();
             let cfg = ctx.cfg.clone();
             (
                 serve_query(ctx, |conn| {
-                    let r = crate::pipeline::ranked(&cfg, conn, &query, limit, semantic, hybrid)?;
+                    let r = crate::pipeline::ranked(
+                        &cfg,
+                        conn,
+                        &query,
+                        limit,
+                        semantic,
+                        hybrid,
+                        slice.as_deref(),
+                    )?;
                     Ok(Response {
                         hits: Some(r.hits.into_iter().map(Into::into).collect()),
                         note: r.note,

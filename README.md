@@ -389,6 +389,47 @@ r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
 
 `cfetch status` prints the same coverage before you need it.
 
+### Slices (`slices`)
+
+A slice is a named set of brain-relative prefixes — the unit of composition
+and sharing, nestable down to a single file. Nesting is implicit: a slice
+whose prefixes sit under another's is inside it, so there is no parent field
+to keep in step with the paths.
+
+```json
+{
+  "slices": [
+    { "name": "knowledge", "prefixes": ["knowledge"] },
+    { "name": "hosts",     "prefixes": ["knowledge/hosts"] },
+    { "name": "memories",  "prefixes": ["mind/memories"] }
+  ]
+}
+```
+
+```console
+$ cfetch slices
+knowledge: 64 doc(s), 3266 block(s) — knowledge
+hosts: 134 doc(s), 8350 block(s) — knowledge/hosts
+memories: 200 doc(s), 1931 block(s) — mind/memories
+root: 308 doc(s), 5994 block(s) — the whole tree, minus anything a slice claims
+
+$ cfetch recall --slice hosts backup
+```
+
+- Every document belongs to its INNERMOST slice — the longest matching prefix
+  wins, and configuration order breaks a tie. Documents no slice claims are in
+  the reserved `root` slice, which no configured slice may be named.
+- `--slice NAME` reaches everything nested inside NAME, because a nested
+  slice's prefixes sit under its parent's by construction.
+- A name that does not exist is an error, not a silent widening to the whole
+  tree — that is how a private slice would leak.
+- Prefixes match path COMPONENTS, so `drafts` never claims `draftsman`.
+- Membership is derived from the path at query time, never stored: a stored
+  slice would disagree with the configuration the moment one was edited
+  without a rescan.
+- With no slices configured, nothing changes — the whole tree is one implicit
+  slice.
+
 ### Reranking (`rerank`)
 
 Off by default, and independent of how the candidates were found — it improves

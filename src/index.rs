@@ -1120,29 +1120,75 @@ const RING_PRIOR: f64 = 0.05;
 const CTX_WEIGHT: f64 = 0.3;
 
 /// The ranked SELECT shared by [`recall`] and [`bm25_block_ids`].
-fn ranked_match_sql(select: &str) -> String {
+/// The slice filter, as SQL over `prefix_count` bound prefixes starting at
+/// `?3`.
+///
+/// Compared by component rather than with LIKE or GLOB: a path is under a
+/// prefix when it IS the prefix or continues with `/`. That is the same rule
+/// `config::under_prefix` applies — so `drafts` never claims `draftsman` —
+/// and it cannot be confused by a `%`, `_` or `[` living in a filename.
+fn slice_filter_sql(prefix_count: usize) -> String {
+    if prefix_count == 0 {
+        return String::new();
+    }
+    let terms: Vec<String> = (0..prefix_count)
+        .map(|i| {
+            let p = i + 3;
+            format!(
+                "(substr(d.path,1,length(?{p})) = ?{p} \
+                  AND (length(d.path) = length(?{p}) OR substr(d.path,length(?{p})+1,1) = '/'))"
+            )
+        })
+        .collect();
+    format!(" AND ({})", terms.join(" OR "))
+}
+
+fn ranked_match_sql(select: &str, prefix_count: usize) -> String {
+    let slice = slice_filter_sql(prefix_count);
     format!(
         "SELECT {select}
          FROM blocks_fts f
          JOIN blocks b ON b.id = f.rowid
          JOIN docs d ON d.id = b.doc_id
-         WHERE blocks_fts MATCH ?1
+         WHERE blocks_fts MATCH ?1{slice}
          ORDER BY bm25(blocks_fts, 1.0, {CTX_WEIGHT}) + {RING_PRIOR} * d.ring, d.ring ASC
          LIMIT ?2"
     )
 }
 
+/// Binds `(fts, limit, prefixes…)` in the order [`ranked_match_sql`] numbers
+/// them. Prefixes lose a trailing slash here so the SQL's length arithmetic
+/// matches `config::under_prefix` exactly.
+fn ranked_params(fts: &str, limit: usize, prefixes: &[String]) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value;
+    let mut p = vec![Value::Text(fts.to_string()), Value::Integer(limit as i64)];
+    p.extend(prefixes.iter().map(|s| Value::Text(s.trim_end_matches('/').to_string())));
+    p
+}
+
 pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<Hit>> {
+    recall_in(conn, query, limit, &[])
+}
+
+/// Recall restricted to documents under `prefixes` — the slice filter. An
+/// empty slice restricts nothing, which is what the root slice is.
+pub fn recall_in(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<Hit>> {
     let fts = fts_query(query);
     if fts.is_empty() {
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(&ranked_match_sql(
         "b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain",
+        prefixes.len(),
     ))?;
     // Twice the candidate pool: duplicate suppression must refill freed
     // slots with the next-ranked hits, never shrink the result count.
-    let rows = stmt.query_map(rusqlite::params![fts, (limit * 2) as i64], |r| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(ranked_params(&fts, limit * 2, prefixes)), |r| {
         Ok(Hit {
             cite: r.get(0)?,
             path: r.get(1)?,
@@ -1166,6 +1212,21 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
     }
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Every indexed document with its block count, for classification in Rust.
+///
+/// Slice membership is a pure function of (path, config), so it is derived
+/// here rather than stored: a stored slice would silently disagree with the
+/// configuration the moment someone edited it and had not rescanned.
+pub fn doc_block_counts(conn: &Connection) -> anyhow::Result<Vec<(String, usize)>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.path, COUNT(b.id) FROM docs d
+         LEFT JOIN blocks b ON b.doc_id = d.id
+         GROUP BY d.id ORDER BY d.path",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))?;
+    Ok(rows.filter_map(Result::ok).collect())
 }
 
 /// Expands a citation id to its full block(s) — the second disclosure layer.
@@ -1456,12 +1517,27 @@ fn semantic_block_ids(
     spec: &VectorSpec,
     query_vec: &[f32],
     limit: usize,
+    prefixes: &[String],
 ) -> anyhow::Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT b.id, v.embedding FROM vectors v JOIN blocks b ON b.hash = v.content_hash
-         WHERE v.model = ?1 AND v.dim = ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![spec.model, spec.dim as i64], |r| {
+    // The slice filter belongs HERE and not after ranking: a hybrid answer
+    // fuses this list with the lexical one, so a vector hit from outside the
+    // slice would leak in through the fusion no matter what the lexical half
+    // was restricted to.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT b.id, v.embedding FROM vectors v
+         JOIN blocks b ON b.hash = v.content_hash
+         JOIN docs d ON d.id = b.doc_id
+         WHERE v.model = ?1 AND v.dim = ?2{}",
+        slice_filter_sql(prefixes.len())
+    ))?;
+    let mut params: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(spec.model.clone()),
+        rusqlite::types::Value::Integer(spec.dim as i64),
+    ];
+    params.extend(
+        prefixes.iter().map(|p| rusqlite::types::Value::Text(p.trim_end_matches('/').to_string())),
+    );
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
     })?;
     let mut scored: Vec<(i64, f32)> = rows
@@ -1483,19 +1559,26 @@ pub fn semantic_recall(
     spec: &VectorSpec,
     query_vec: &[f32],
     limit: usize,
+    prefixes: &[String],
 ) -> anyhow::Result<Vec<Hit>> {
-    let ids = semantic_block_ids(conn, spec, query_vec, limit)?;
+    let ids = semantic_block_ids(conn, spec, query_vec, limit, prefixes)?;
     hits_for_block_ids(conn, &ids)
 }
 
 /// BM25-ranked block ids for the same query shape and order [`recall`] uses.
-fn bm25_block_ids(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<i64>> {
+fn bm25_block_ids(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<i64>> {
     let fts = fts_query(query);
     if fts.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(&ranked_match_sql("b.id"))?;
-    let rows = stmt.query_map(rusqlite::params![fts, limit as i64], |r| r.get(0))?;
+    let mut stmt = conn.prepare(&ranked_match_sql("b.id", prefixes.len()))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(ranked_params(&fts, limit, prefixes)), |r| r.get(0))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
 
@@ -1522,10 +1605,11 @@ pub fn hybrid_recall(
     query_vec: &[f32],
     limit: usize,
     rrf_k: f64,
+    prefixes: &[String],
 ) -> anyhow::Result<Vec<Hit>> {
     let pool = (limit * 4).max(20);
-    let lexical = bm25_block_ids(conn, query, pool)?;
-    let semantic = semantic_block_ids(conn, spec, query_vec, pool)?;
+    let lexical = bm25_block_ids(conn, query, pool, prefixes)?;
+    let semantic = semantic_block_ids(conn, spec, query_vec, pool, prefixes)?;
     let mut fused = rrf_fuse(&[lexical, semantic], rrf_k);
     fused.truncate(limit);
     hits_for_block_ids(conn, &fused)
@@ -2338,13 +2422,13 @@ mod tests {
         assign("stalwart", &[0.0, 1.0]);
         let mut q = vec![0.9f32, 0.1];
         l2_normalize(&mut q);
-        let hits = semantic_recall(&conn, &spec, &q, 10).unwrap();
+        let hits = semantic_recall(&conn, &spec, &q, 10, &[]).unwrap();
         assert_eq!(hits.len(), 2, "unembedded block cannot appear");
         assert!(hits[0].path.ends_with("zfs.md"), "closest vector first");
         assert!(hits[1].path.ends_with("mail.md"));
         assert!(hits[0].cite.starts_with("r3-"), "hits carry the normal citation shape");
         // limit applies
-        assert_eq!(semantic_recall(&conn, &spec, &q, 1).unwrap().len(), 1);
+        assert_eq!(semantic_recall(&conn, &spec, &q, 1, &[]).unwrap().len(), 1);
     }
 
     #[test]
@@ -2366,7 +2450,7 @@ mod tests {
         insert_vector(&conn, &hashes[0], &spec, &[1.0, 0.0]).unwrap(); // a.md: far from query
         insert_vector(&conn, &hashes[1], &spec, &[0.0, 1.0]).unwrap(); // b.md: close to query
         let q = vec![0.0f32, 1.0];
-        let hits = hybrid_recall(&conn, &spec, "zfs", &q, 10, 2.0).unwrap();
+        let hits = hybrid_recall(&conn, &spec, "zfs", &q, 10, 2.0, &[]).unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert!(paths.contains(&"knowledge/a.md"), "lexical-only hit present");
         assert!(paths.contains(&"knowledge/b.md"), "semantic-only hit present");

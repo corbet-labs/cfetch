@@ -3,6 +3,15 @@
 Notable changes per release. cfetch is young and moving fast; anything not
 listed here is a fix or an internal change with no effect on behavior.
 
+## Unreleased
+
+- **Slices.** Named prefix sets over the tree, nestable, with `cfetch slices`
+  and `cfetch recall --slice`. A document belongs to its innermost slice; a
+  query for a slice reaches everything inside it; an unknown name is refused
+  rather than widened to the whole tree. Membership is derived from the path
+  rather than stored, so it cannot fall out of step with the configuration.
+  A brain with no slices behaves exactly as before.
+
 ## 0.8.0
 
 - **The drain barrier is sound on every platform, and says which path it is

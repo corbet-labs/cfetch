@@ -102,8 +102,16 @@ enum Command {
         /// Fuse BM25 and semantic rankings via reciprocal rank fusion
         #[arg(long)]
         hybrid: bool,
+        /// Restrict to one slice and everything nested inside it
+        #[arg(long)]
+        slice: Option<String>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the configured slices with what each one holds
+    Slices {
         #[arg(long)]
         json: bool,
     },
@@ -590,6 +598,7 @@ fn recall_remote(
     expand: bool,
     semantic: bool,
     hybrid: bool,
+    slice: Option<&str>,
     limit: usize,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -607,7 +616,7 @@ fn recall_remote(
             // holds nothing is exactly who this is for.
             serde_json::json!({
                 "op": "recall", "query": query, "limit": limit,
-                "semantic": semantic, "hybrid": hybrid,
+                "semantic": semantic, "hybrid": hybrid, "slice": slice,
             })
         }
     };
@@ -622,12 +631,13 @@ fn recall(
     expand: bool,
     semantic: bool,
     hybrid: bool,
+    slice: Option<&str>,
     limit: usize,
     json: bool,
 ) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     if let Some(cs) = &cfg.client.serving {
-        return recall_remote(cs, query, id, expand, semantic, hybrid, limit, json);
+        return recall_remote(cs, query, id, expand, semantic, hybrid, slice, limit, json);
     }
     // On a serving host, plain recall/expand go through the local daemon's
     // drain barrier when it answers. The direct path below is an equally
@@ -682,7 +692,7 @@ fn recall(
     // silently fell back to lexical ranking.
     // One ranking pipeline, shared with the serving daemon: the same query
     // against the same tree must rank the same way whoever answers it.
-    let ranked = pipeline::ranked(&cfg, &conn, query, limit, semantic, hybrid)?;
+    let ranked = pipeline::ranked(&cfg, &conn, query, limit, semantic, hybrid, slice)?;
     let (hits, note) = (ranked.hits, ranked.note);
     if let Some(note) = &note {
         eprintln!("cfetch recall: {note}");
@@ -959,6 +969,55 @@ fn status() -> anyhow::Result<()> {
 /// Coverage of the configured embeddings spec, local cache and shared store
 /// side by side. A none-tier host reports the shared store alone — it holds
 /// no index to cover.
+/// Lists the slices and what each one holds.
+///
+/// Counts are derived from the indexed paths at call time, so what this
+/// prints is what a `--slice` query would actually match — a stored count
+/// could disagree with the configuration.
+fn slices(json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let model = cfg.slice_model()?;
+    let conn = index::open_ro(&paths::state_dir())?;
+    let docs = index::doc_block_counts(&conn)?;
+
+    // Every configured slice appears even when empty: a slice that claims
+    // nothing is a configuration mistake worth seeing, not an absence.
+    let mut order: Vec<String> = model.names().map(str::to_string).collect();
+    order.push(config::ROOT_SLICE.to_string());
+    let mut counts: std::collections::HashMap<&str, (usize, usize)> =
+        order.iter().map(|n| (n.as_str(), (0, 0))).collect();
+    for (path, blocks) in &docs {
+        let name = model.slice_for(path);
+        let e = counts.entry(name).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += blocks;
+    }
+
+    if json {
+        let arr: Vec<_> = order
+            .iter()
+            .map(|n| {
+                let (d, b) = counts.get(n.as_str()).copied().unwrap_or((0, 0));
+                serde_json::json!({"slice": n, "docs": d, "blocks": b})
+            })
+            .collect();
+        println!("{}", serde_json::json!({"slices": arr}));
+        return Ok(());
+    }
+    if model.is_empty() {
+        println!("no slices configured — the whole tree is one implicit slice");
+    }
+    for n in &order {
+        let (d, b) = counts.get(n.as_str()).copied().unwrap_or((0, 0));
+        let prefixes = match model.prefixes_of(n) {
+            None => "the whole tree, minus anything a slice claims".to_string(),
+            Some(p) => p.join(", "),
+        };
+        println!("{n}: {d} doc(s), {b} block(s) — {prefixes}");
+    }
+    Ok(())
+}
+
 fn semantic_status(cfg: &config::Config) -> anyhow::Result<String> {
     let spec = cfg.embeddings.spec();
     let shared = vectors::VectorStore::open(&cfg.brain_root, &spec)?.len();
@@ -1015,6 +1074,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Slices { json } => {
+            if let Err(e) = slices(json) {
+                eprintln!("cfetch slices: {e:#}");
+                std::process::exit(1);
+            }
+        }
         Command::Staging { action } => {
             if let Err(e) = staging_cmd(action) {
                 eprintln!("cfetch staging: {e}");
@@ -1053,8 +1118,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Recall { query, id, expand, semantic, hybrid, limit, json } => {
-            if let Err(e) = recall(&query.join(" "), id.as_deref(), expand, semantic, hybrid, limit, json) {
+        Command::Recall { query, id, expand, semantic, hybrid, slice, limit, json } => {
+            if let Err(e) = recall(
+                &query.join(" "),
+                id.as_deref(),
+                expand,
+                semantic,
+                hybrid,
+                slice.as_deref(),
+                limit,
+                json,
+            ) {
                 eprintln!("cfetch recall: {e}");
                 std::process::exit(1);
             }

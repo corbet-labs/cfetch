@@ -71,6 +71,111 @@ impl Default for RingRules {
     }
 }
 
+/// The name of the slice every document falls into when no configured slice
+/// claims it. Reserved: a configured slice may not take it, because then a
+/// path would have two truthful answers to "which slice is this?".
+pub const ROOT_SLICE: &str = "root";
+
+/// A named set of brain-relative prefixes.
+///
+/// Slices are the unit of composition and sharing: any set of markdown files,
+/// nestable, down to a single file. Nesting is IMPLICIT — a slice whose
+/// prefixes all sit under another's is inside it — so there is no parent
+/// field to keep in step with the paths.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SliceRule {
+    pub name: String,
+    pub prefixes: Vec<String>,
+}
+
+impl SliceRule {
+    /// The longest prefix of this slice that claims `rel`, if any. Length is
+    /// how "innermost" is decided, so it is returned rather than a bool.
+    fn claim(&self, rel: &str) -> Option<usize> {
+        self.prefixes
+            .iter()
+            .filter(|p| under_prefix(rel, p))
+            .map(|p| p.trim_end_matches('/').len())
+            .max()
+    }
+
+}
+
+/// The configured slices, validated once so every later lookup is total.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Slices {
+    rules: Vec<SliceRule>,
+}
+
+impl Slices {
+    /// Rejects the shapes that would make a later answer ambiguous rather
+    /// than carrying them into the index.
+    pub fn new(rules: Vec<SliceRule>) -> anyhow::Result<Slices> {
+        let mut seen = std::collections::HashSet::new();
+        for r in &rules {
+            let name = r.name.trim();
+            anyhow::ensure!(!name.is_empty(), "a slice must have a name");
+            anyhow::ensure!(
+                name != ROOT_SLICE,
+                "slice name {ROOT_SLICE:?} is reserved for documents no slice claims"
+            );
+            anyhow::ensure!(seen.insert(name.to_string()), "two slices are both named {name:?}");
+            anyhow::ensure!(!r.prefixes.is_empty(), "slice {name:?} claims no prefixes");
+            for p in &r.prefixes {
+                anyhow::ensure!(
+                    !p.trim().trim_end_matches('/').is_empty(),
+                    "slice {name:?} has an empty prefix, which would claim the whole tree"
+                );
+            }
+        }
+        Ok(Slices { rules })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.rules.iter().map(|r| r.name.as_str())
+    }
+
+    /// The INNERMOST slice claiming `rel`: the longest matching prefix wins,
+    /// and configuration order breaks a tie so the answer never depends on
+    /// iteration luck.
+    pub fn slice_for(&self, rel: &str) -> &str {
+        self.rules
+            .iter()
+            .filter_map(|r| r.claim(rel).map(|len| (len, r)))
+            // `reduce` keeping the incumbent on a tie, NOT `max_by_key`:
+            // max_by_key returns the LAST maximum, which would hand an
+            // equal-depth tie to the last declaration instead of the first
+            // and make the answer depend on where a slice was appended.
+            .reduce(|best, next| if next.0 > best.0 { next } else { best })
+            .map(|(_, r)| r.name.as_str())
+            .unwrap_or(ROOT_SLICE)
+    }
+
+    /// The path prefixes a query for `name` should match.
+    ///
+    /// `None` means "no filter": the root slice is the whole tree. A nested
+    /// slice's prefixes sit under its parent's by construction, so filtering
+    /// on the named slice's own prefixes already includes everything nested
+    /// inside it — there is no ancestry to walk. An unknown name yields an
+    /// empty set, so a typo returns nothing rather than everything.
+    pub fn prefixes_of(&self, name: &str) -> Option<&[String]> {
+        if name == ROOT_SLICE {
+            return None;
+        }
+        Some(
+            self.rules
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.prefixes.as_slice())
+                .unwrap_or(&[]),
+        )
+    }
+}
+
 /// True when `rel` is `prefix` itself or anything beneath it. Written against
 /// path components, not raw strings, so `drafts` never swallows `draftsman`;
 /// a trailing slash on the prefix is accepted and meaningless.
@@ -534,6 +639,11 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub rerank: RerankConfig,
+    /// Named prefix sets, the unit of composition and sharing. Empty (the
+    /// default) means one implicit slice covering everything, which is
+    /// exactly today's behavior.
+    #[serde(default)]
+    pub slices: Vec<SliceRule>,
     #[serde(default)]
     pub recall: RecallConfig,
     /// Governance loop (reminder queue + cadence rule refresh).
@@ -587,6 +697,7 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             rerank: RerankConfig::default(),
+            slices: Vec::new(),
             recall: RecallConfig::default(),
             governance: GovernanceConfig::default(),
             serve: ServeConfig::default(),
@@ -664,6 +775,12 @@ impl Config {
             rules: self.ring_rules.clone(),
             exclude_prefixes: self.exclude_prefixes.clone(),
         }
+    }
+
+    /// The validated slice model. An invalid one is an error at the point of
+    /// use rather than a silently ignored config block.
+    pub fn slice_model(&self) -> anyhow::Result<Slices> {
+        Slices::new(self.slices.clone())
     }
 
     pub fn resolve(&self, p: &std::path::Path) -> PathBuf {
@@ -1113,5 +1230,78 @@ mod tests {
         let p = dir.path().join("config.json");
         std::fs::write(&p, "{ nope").unwrap();
         assert!(Config::load_from(&p).is_err());
+    }
+
+    // ---- slices
+
+    fn slice(name: &str, prefixes: &[&str]) -> SliceRule {
+        SliceRule {
+            name: name.into(),
+            prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_document_resolves_to_its_innermost_slice() {
+        let m = Slices::new(vec![
+            slice("work", &["knowledge"]),
+            slice("hosts", &["knowledge/hosts"]),
+        ])
+        .unwrap();
+        // Longest matching prefix wins, whatever order they are declared in.
+        assert_eq!(m.slice_for("knowledge/hosts/server/zfs.md"), "hosts");
+        assert_eq!(m.slice_for("knowledge/world/cloudflare.md"), "work");
+        assert_eq!(m.slice_for("mind/memories/x.md"), ROOT_SLICE);
+    }
+
+    #[test]
+    fn a_prefix_matches_path_components_never_substrings() {
+        let m = Slices::new(vec![slice("d", &["drafts"])]).unwrap();
+        assert_eq!(m.slice_for("drafts/a.md"), "d");
+        assert_eq!(m.slice_for("drafts"), "d");
+        assert_eq!(m.slice_for("draftsman/a.md"), ROOT_SLICE, "no substring claims");
+    }
+
+    #[test]
+    fn equal_length_claims_are_broken_by_configuration_order() {
+        // Two slices claiming the same depth must not depend on iteration
+        // luck: the earlier declaration wins, every time.
+        let m = Slices::new(vec![slice("first", &["a/b"]), slice("second", &["a/b"])]).unwrap();
+        assert_eq!(m.slice_for("a/b/c.md"), "first");
+    }
+
+    #[test]
+    fn a_query_for_a_slice_matches_everything_nested_inside_it() {
+        // `hosts` sits under `work`, so restricting to `work` must still
+        // reach it — that is the whole matryoshka.
+        let m = Slices::new(vec![
+            slice("work", &["knowledge"]),
+            slice("hosts", &["knowledge/hosts"]),
+        ])
+        .unwrap();
+        assert_eq!(m.prefixes_of("work"), Some(["knowledge".to_string()].as_slice()));
+        assert_eq!(m.prefixes_of(ROOT_SLICE), None, "the root slice restricts nothing");
+        assert_eq!(m.prefixes_of("typo"), Some([].as_slice()), "an unknown name matches nothing");
+    }
+
+    #[test]
+    fn ambiguous_or_world_claiming_slice_configurations_are_refused() {
+        assert!(Slices::new(vec![slice("", &["a"])]).is_err(), "unnamed");
+        assert!(Slices::new(vec![slice(ROOT_SLICE, &["a"])]).is_err(), "reserved name");
+        assert!(
+            Slices::new(vec![slice("x", &["a"]), slice("x", &["b"])]).is_err(),
+            "two slices with one name have no innermost answer"
+        );
+        assert!(Slices::new(vec![slice("x", &[])]).is_err(), "claims nothing");
+        assert!(Slices::new(vec![slice("x", &[""])]).is_err(), "an empty prefix claims the tree");
+        assert!(Slices::new(vec![slice("x", &["/"])]).is_err());
+    }
+
+    #[test]
+    fn no_slices_configured_is_one_implicit_slice() {
+        let m = Slices::new(Vec::new()).unwrap();
+        assert!(m.is_empty());
+        assert_eq!(m.slice_for("anything/at/all.md"), ROOT_SLICE);
+        assert_eq!(m.prefixes_of(ROOT_SLICE), None);
     }
 }
