@@ -41,6 +41,14 @@ listed here is a fix or an internal change with no effect on behavior.
   versioned append-only JSONL streams per host; staging candidates are
   markdown files with content-addressed ids, so a candidate flagged on one
   machine is visible — and drainable — from any of them.
+- **A host that holds nothing can still rank semantically.** `--semantic` and
+  `--hybrid` used to refuse over remote serving, because the querying host had
+  no vectors and no endpoint to embed its own query against. The serving host
+  now ranks on the client's behalf — it is the one holding both — so the
+  none-tier hosts the whole design is for are no longer second-class. Ranking
+  itself moved into one shared pipeline, so the same query against the same
+  tree ranks identically whether it was answered locally or over the wire, and
+  any degradation travels back with the answer.
 - **Cross-encoder reranking.** An optional second stage reorders a retrieved
   shortlist by reading query and document together, which no retrieval scorer
   does. Recall widens to `rerank.candidates` and the answer is cut back

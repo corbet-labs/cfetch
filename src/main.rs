@@ -20,6 +20,7 @@ mod markers;
 mod mcp;
 mod migrate;
 mod paths;
+mod pipeline;
 mod rerank;
 mod resident;
 mod serve;
@@ -543,6 +544,12 @@ fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyho
         return Ok(());
     }
     let hits = resp.hits.clone().unwrap_or_default();
+    // The serving host's degradation is the caller's to see: it ranked on our
+    // behalf against endpoints we cannot reach, so if it fell back we would
+    // otherwise never know.
+    if let Some(note) = &resp.note {
+        eprintln!("cfetch recall: {note}");
+    }
     if json {
         let arr: Vec<_> = hits
             .iter()
@@ -558,7 +565,7 @@ fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyho
             "{}",
             serde_json::json!({
                 "hits": arr, "origin": resp.origin, "generation": resp.generation,
-                "fresh": resp.fresh, "stale_note": resp.stale_note,
+                "fresh": resp.fresh, "stale_note": resp.stale_note, "note": resp.note,
             })
         );
     } else if hits.is_empty() {
@@ -586,12 +593,6 @@ fn recall_remote(
     limit: usize,
     json: bool,
 ) -> anyhow::Result<()> {
-    if semantic || hybrid {
-        anyhow::bail!(
-            "--semantic/--hybrid are not yet available over remote serving (host {})",
-            cs.addr
-        );
-    }
     if expand {
         eprintln!("note: --expand (linked docs) is not yet available over remote serving — showing hits only");
     }
@@ -601,7 +602,13 @@ fn recall_remote(
             if query.trim().is_empty() {
                 anyhow::bail!("empty query (pass search terms or --id <citation>)");
             }
-            serde_json::json!({"op": "recall", "query": query, "limit": limit})
+            // The serving host ranks: it holds the vectors and it is the one
+            // with an endpoint to embed the query against. A client that
+            // holds nothing is exactly who this is for.
+            serde_json::json!({
+                "op": "recall", "query": query, "limit": limit,
+                "semantic": semantic, "hybrid": hybrid,
+            })
         }
     };
     let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
@@ -673,48 +680,13 @@ fn recall(
     // Semantic/hybrid answers carry their own degradation note: partial or
     // absent vector coverage is reported, never hidden behind a result that
     // silently fell back to lexical ranking.
-    // Reranking reads a WIDER list than it shows: a cross-encoder can only
-    // promote a statement that retrieval actually proposed, so retrieval runs
-    // to `candidates` and the answer is cut back to `limit` afterwards. When
-    // reranking is off, over-retrieving would be pure cost.
-    let reranker = if cfg.rerank.enabled {
-        match rerank::RerankClient::new(&cfg.rerank) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                // Misconfigured is not the same as unavailable: it can only be
-                // fixed by a human, so it is said once, plainly, and the
-                // lexical answer still comes back.
-                eprintln!("cfetch recall: rerank misconfigured ({e:#}) — answering in retrieval order");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let retrieve = reranker.as_ref().map_or(limit, |c| c.candidates().max(limit));
-
-    let (hits, note) = if semantic || hybrid {
-        let out = embed::semantic_hits(&cfg, &conn, query, retrieve, hybrid)?;
-        (out.hits, out.note)
-    } else {
-        (index::recall(&conn, query, retrieve)?, None)
-    };
+    // One ranking pipeline, shared with the serving daemon: the same query
+    // against the same tree must rank the same way whoever answers it.
+    let ranked = pipeline::ranked(&cfg, &conn, query, limit, semantic, hybrid)?;
+    let (hits, note) = (ranked.hits, ranked.note);
     if let Some(note) = &note {
         eprintln!("cfetch recall: {note}");
     }
-    let (hits, rerank_note) = match &reranker {
-        Some(client) => {
-            let out = rerank::apply(client, query, hits, |h: &index::Hit| h.snippet.clone());
-            (out.hits, out.note)
-        }
-        None => (hits, None),
-    };
-    if let Some(note) = &rerank_note {
-        eprintln!("cfetch recall: {note}");
-    }
-    // Back to what the caller asked for, after the reordering that needed more.
-    let mut hits = hits;
-    hits.truncate(limit);
     let linked = if expand && !hits.is_empty() {
         let top: Vec<String> = hits.iter().take(3).map(|h| h.path.clone()).collect();
         index::linked_docs(&conn, &top, 8)?
@@ -740,10 +712,7 @@ fn recall(
         // the degradation its human would have read on stderr.
         println!(
             "{}",
-            serde_json::json!({
-                "hits": arr, "linked": links,
-                "semantic_note": note, "rerank_note": rerank_note,
-            })
+            serde_json::json!({"hits": arr, "linked": links, "note": note})
         );
     } else if hits.is_empty() {
         println!("no hits for \"{query}\"");

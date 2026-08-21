@@ -54,6 +54,13 @@ struct Request {
     /// map op: token budget the rendered map must fit.
     #[serde(default)]
     budget_tokens: Option<u64>,
+    /// recall op: rank by vectors (`semantic`) or fuse with BM25 (`hybrid`).
+    /// A none-tier host cannot embed its own query — the host holding the
+    /// index does it, which is the whole point of serving.
+    #[serde(default)]
+    semantic: Option<bool>,
+    #[serde(default)]
+    hybrid: Option<bool>,
     /// SessionStart's working directory, for the resident op: the daemon
     /// shares the host with its caller but not the cwd, so the repo half of
     /// the injection scope has to travel with the request.
@@ -93,6 +100,11 @@ pub struct Response {
     pub barrier_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    /// How the ranking degraded, if it did — absent vector coverage, an
+    /// unreachable reranker. It travels with the answer because the client
+    /// that asked cannot see the endpoint the serving host talked to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hits: Option<Vec<serve::WireHit>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,6 +359,10 @@ pub fn call_req(body: &serde_json::Value, timeout: Duration) -> Option<Response>
 
 /// Shared state of one daemon process across its connection threads.
 struct Ctx {
+    /// The daemon's own configuration. A serving host ranks ON BEHALF OF
+    /// clients that hold nothing, so the endpoints it may reach — embeddings,
+    /// reranking — are its own, never the caller's.
+    cfg: Arc<crate::config::Config>,
     serve: Option<Arc<serve::ServeState>>,
     /// Bearer token required on the serving TCP listener (None = no TCP
     /// serving).
@@ -497,11 +513,15 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
         "recall" => {
             let query = req.query.clone().unwrap_or_default();
             let limit = req.limit.unwrap_or(8);
+            let semantic = req.semantic.unwrap_or(false);
+            let hybrid = req.hybrid.unwrap_or(false);
+            let cfg = ctx.cfg.clone();
             (
                 serve_query(ctx, |conn| {
-                    let hits = index::recall(conn, &query, limit)?;
+                    let r = crate::pipeline::ranked(&cfg, conn, &query, limit, semantic, hybrid)?;
                     Ok(Response {
-                        hits: Some(hits.into_iter().map(Into::into).collect()),
+                        hits: Some(r.hits.into_iter().map(Into::into).collect()),
+                        note: r.note,
                         ..Response::default()
                     })
                 }),
@@ -632,6 +652,7 @@ pub fn run() -> anyhow::Result<()> {
     // without reordering the boot sequence; `None` on unix.
     let local_token = ipc::new_local_token();
     let ctx = Arc::new(Ctx {
+        cfg: Arc::new(cfg.clone()),
         serve: serve_handle.as_ref().map(|h| h.state.clone()),
         tcp_token: tcp_token.clone(),
         local_token: local_token.clone(),
@@ -863,7 +884,13 @@ mod tests {
     }
 
     fn no_serve_ctx() -> Ctx {
-        Ctx { serve: None, tcp_token: None, local_token: None, shutdown: AtomicBool::new(false) }
+        Ctx {
+            cfg: Arc::new(crate::config::Config::default()),
+            serve: None,
+            tcp_token: None,
+            local_token: None,
+            shutdown: AtomicBool::new(false),
+        }
     }
 
     #[test]
@@ -1038,6 +1065,7 @@ mod tests {
     #[test]
     fn tcp_requires_the_bearer_token_for_every_op() {
         let ctx = Ctx {
+            cfg: Arc::new(crate::config::Config::default()),
             serve: None,
             tcp_token: Some("right-token".to_string()),
             local_token: None,
@@ -1053,8 +1081,27 @@ mod tests {
     }
 
     #[test]
+    fn the_ranking_mode_and_its_note_cross_the_wire_in_both_directions() {
+        // A client asks the SERVING host to rank semantically, because a
+        // none-tier host has no vectors and no endpoint of its own.
+        let r: Request =
+            serde_json::from_str(r#"{"op":"recall","query":"q","limit":3,"semantic":true}"#).unwrap();
+        assert_eq!(r.semantic, Some(true));
+        assert_eq!(r.hybrid, None);
+        // An older client that never learned the flags still parses, and asks
+        // for exactly what it always asked for.
+        let r: Request = serde_json::from_str(r#"{"op":"recall","query":"q"}"#).unwrap();
+        assert_eq!((r.semantic, r.hybrid), (None, None));
+        // And an older SERVING host's answer, which carries no note, is not a
+        // parse failure on a newer client.
+        let resp: Response = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(resp.note.is_none());
+    }
+
+    #[test]
     fn shutdown_is_local_only() {
         let ctx = Ctx {
+            cfg: Arc::new(crate::config::Config::default()),
             serve: None,
             tcp_token: Some("t".to_string()),
             local_token: None,
@@ -1090,6 +1137,7 @@ mod tests {
         // daemon's own token gates it — but it is still a LOCAL channel, so
         // `daemon stop` must keep working.
         let ctx = Ctx {
+            cfg: Arc::new(crate::config::Config::default()),
             serve: None,
             tcp_token: None,
             local_token: Some("local-token".to_string()),
