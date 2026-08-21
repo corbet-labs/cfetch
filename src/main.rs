@@ -18,6 +18,7 @@ mod markers;
 mod mcp;
 mod paths;
 mod resident;
+mod serve;
 mod session_state;
 mod transcript;
 
@@ -199,6 +200,39 @@ fn selfcheck() -> anyhow::Result<()> {
         None => println!("warn  daemon not running — hooks fall back to direct reads"),
     }
 
+    if let Some(cfg) = &cfg {
+        if cfg.serve.enabled {
+            println!("ok    serving mode: origin {}", serve::origin_of(cfg));
+            if let (Some(bind), Some(tf)) = (&cfg.serve.bind, &cfg.serve.token_file) {
+                match serve::read_token(tf, true) {
+                    Ok(_) => println!("ok    tcp serving configured on {bind} (token file is 0600)"),
+                    Err(e) => {
+                        println!("FAIL  tcp serving: {e}");
+                        hard_failures += 1;
+                    }
+                }
+            } else {
+                println!("ok    serving on the unix socket only (no serve.bind)");
+            }
+        }
+        if let Some(cs) = &cfg.client.serving {
+            // A none-tier host without its serving host has NO memory at all
+            // — that is a hard failure, not a warning.
+            match serve::client_call(cs, serde_json::json!({"op": "generation"}), serve::QUERY_TIMEOUT) {
+                Ok(r) => println!(
+                    "ok    client mode (none-tier): serving host {} answers (origin {}, generation {})",
+                    cs.addr,
+                    r.origin.unwrap_or_default(),
+                    r.generation.unwrap_or(0)
+                ),
+                Err(e) => {
+                    println!("FAIL  client mode (none-tier): {e}");
+                    hard_failures += 1;
+                }
+            }
+        }
+    }
+
     let degraded = heartbeat::degraded();
     if degraded.is_empty() {
         println!("ok    no degraded hooks");
@@ -214,15 +248,29 @@ fn selfcheck() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Commands that need a local index refuse on a none-tier host instead of
+/// quietly building a parallel truth next to the remote routing.
+fn none_tier_guard(cfg: &config::Config, what: &str) -> anyhow::Result<()> {
+    if let Some(cs) = &cfg.client.serving {
+        anyhow::bail!(
+            "{what} needs a local index, but this host is none-tier by config \
+             (client.serving = {}): queries are served remotely and no local index exists",
+            cs.addr
+        );
+    }
+    Ok(())
+}
+
 fn scan(background: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
+    none_tier_guard(&cfg, "scan")?;
     {
         let mut conn = index::open(&paths::state_dir())?;
         let native = paths::native_projects_root();
         let report = index::scan(&mut conn, &cfg.brain_root, Some(&native))?;
         println!(
-            "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
-            report.docs, report.blocks, report.skipped_high_ring
+            "indexed {} docs, {} blocks (generation {}, {} file(s) skipped as ring 5+)",
+            report.docs, report.blocks, report.generation, report.skipped_high_ring
         );
         // Name the skipped files (a malformed ring declaration also lands
         // here, fail-closed) so a quarantined-by-accident file is visible.
@@ -260,6 +308,46 @@ fn scan(background: bool) -> anyhow::Result<()> {
 }
 
 fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
+    // None-tier: the serving host's code index answers; no local index opens.
+    if let Some(cs) = config::Config::load()?.client.serving {
+        let body = serde_json::json!({"op": "find", "query": query, "limit": limit});
+        let resp = serve::client_call(&cs, body, serve::QUERY_TIMEOUT)?;
+        let hits = resp.code_hits.clone().unwrap_or_default();
+        if json {
+            let arr: Vec<_> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "path": h.path, "name": h.name, "kind": h.kind,
+                        "lines": [h.start_line, h.end_line], "tokens_estimated": h.token_estimate,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "hits": arr, "origin": resp.origin, "generation": resp.generation,
+                    "fresh": resp.fresh, "stale_note": resp.stale_note,
+                })
+            );
+            return Ok(());
+        }
+        if hits.is_empty() {
+            println!("no hits for \"{query}\" (served by {})", resp.origin.unwrap_or_default());
+            return Ok(());
+        }
+        for h in &hits {
+            match (&h.name, &h.kind) {
+                (Some(name), Some(kind)) => println!(
+                    "{}:{}-{}  {} {}  (~{} tok)",
+                    h.path, h.start_line, h.end_line, kind, name, h.token_estimate
+                ),
+                _ => println!("{}  (file match)", h.path),
+            }
+        }
+        print_served_by(&resp);
+        return Ok(());
+    }
     // Serves the existing snapshot ONLY: a full code scan over NFS roots
     // takes minutes and must never ride on an interactive lookup. `cfetch
     // scan` (or the daemon's background scan) owns index freshness.
@@ -308,6 +396,7 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
 
 fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
+    none_tier_guard(&cfg, "map")?;
     let conn = index::open(&paths::state_dir())?;
     let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
     if m.lines.is_empty() {
@@ -326,6 +415,126 @@ fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Coherence footer for answers that went through a serving daemon.
+fn print_served_by(resp: &daemon::Response) {
+    let origin = resp.origin.clone().unwrap_or_default();
+    let generation = resp.generation.unwrap_or(0);
+    if resp.fresh == Some(false) {
+        println!(
+            "\nserved by {origin} (generation {generation}) — STALE: {}",
+            resp.stale_note.clone().unwrap_or_else(|| "barrier expired".to_string())
+        );
+    } else {
+        println!("\nserved by {origin} (generation {generation}, fresh)");
+    }
+}
+
+fn print_wire_hits(hits: &[serve::WireHit]) {
+    for h in hits {
+        println!("{} {}:{}-{} (ring {})", h.cite, h.path, h.start_line, h.end_line, h.ring);
+        println!("    {}", h.snippet);
+        if !h.mirrors.is_empty() {
+            println!("    (also at: {})", h.mirrors.join(", "));
+        }
+    }
+}
+
+/// recall/expand answered by a serving daemon (remote TCP or the local unix
+/// socket) — shared rendering for both.
+fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyhow::Result<()> {
+    if let Some(cite) = id {
+        let blocks = resp.blocks.clone().unwrap_or_default();
+        if blocks.is_empty() {
+            println!(
+                "no block with citation {cite} (index may have moved on — content-addressed ids change when the entry changes)"
+            );
+            return Ok(());
+        }
+        for b in &blocks {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "cite": b.cite, "path": b.path, "ring": b.ring,
+                        "lines": [b.start_line, b.end_line], "text": b.text,
+                        "origin": resp.origin, "generation": resp.generation, "fresh": resp.fresh,
+                    })
+                );
+            } else {
+                println!("{} {}:{}-{} (ring {})\n{}\n", b.cite, b.path, b.start_line, b.end_line, b.ring, b.text);
+            }
+        }
+        if !json {
+            print_served_by(resp);
+        }
+        return Ok(());
+    }
+    let hits = resp.hits.clone().unwrap_or_default();
+    if json {
+        let arr: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "cite": h.cite, "path": h.path, "ring": h.ring,
+                    "lines": [h.start_line, h.end_line], "snippet": h.snippet,
+                    "mirrors": h.mirrors,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "hits": arr, "origin": resp.origin, "generation": resp.generation,
+                "fresh": resp.fresh, "stale_note": resp.stale_note,
+            })
+        );
+    } else if hits.is_empty() {
+        println!("no hits");
+        print_served_by(resp);
+    } else {
+        print_wire_hits(&hits);
+        print_served_by(resp);
+        println!("expand a hit: cfetch recall --id <citation>");
+    }
+    Ok(())
+}
+
+/// none-tier: recall/expand answered by the remote serving host. Unreachable
+/// is an explicit error naming the host — this host has no local index to
+/// fall back to, and must never pretend otherwise.
+#[allow(clippy::too_many_arguments)] // thin CLI adapter, mirrors the flag set
+fn recall_remote(
+    cs: &config::ClientServingConfig,
+    query: &str,
+    id: Option<&str>,
+    expand: bool,
+    semantic: bool,
+    hybrid: bool,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    if semantic || hybrid {
+        anyhow::bail!(
+            "--semantic/--hybrid are not yet available over remote serving (host {})",
+            cs.addr
+        );
+    }
+    if expand {
+        eprintln!("note: --expand (linked docs) is not yet available over remote serving — showing hits only");
+    }
+    let body = match id {
+        Some(cite) => serde_json::json!({"op": "expand", "cite": cite}),
+        None => {
+            if query.trim().is_empty() {
+                anyhow::bail!("empty query (pass search terms or --id <citation>)");
+            }
+            serde_json::json!({"op": "recall", "query": query, "limit": limit})
+        }
+    };
+    let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
+    recall_served(&resp, id, json)
+}
+
 #[allow(clippy::too_many_arguments)] // thin CLI adapter, mirrors the flag set
 fn recall(
     query: &str,
@@ -337,6 +546,29 @@ fn recall(
     json: bool,
 ) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
+    if let Some(cs) = &cfg.client.serving {
+        return recall_remote(cs, query, id, expand, semantic, hybrid, limit, json);
+    }
+    // On a serving host, plain recall/expand go through the local daemon's
+    // drain barrier when it answers. The direct path below is an equally
+    // coherent fallback: `ensure_fresh` stat-fingerprints the tree on every
+    // query — it just lacks the generation label and daemon batching.
+    if id.is_none() && query.trim().is_empty() {
+        anyhow::bail!("empty query (pass search terms or --id <citation>)");
+    }
+    if cfg.serve.enabled
+        && !(semantic || hybrid || expand)
+        && let Some(resp) = daemon::call_req(
+            &match id {
+                Some(cite) => serde_json::json!({"op": "expand", "cite": cite}),
+                None => serde_json::json!({"op": "recall", "query": query, "limit": limit}),
+            },
+            std::time::Duration::from_secs(8),
+        )
+        && resp.ok
+    {
+        return recall_served(&resp, id, json);
+    }
     let native = paths::native_projects_root();
     let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
 
@@ -592,7 +824,8 @@ fn main() {
             }
         }
         Command::Dashboard => {
-            if let Err(e) = dashboard::run() {
+            let guard = config::Config::load().and_then(|c| none_tier_guard(&c, "dashboard"));
+            if let Err(e) = guard.and_then(|()| dashboard::run()) {
                 eprintln!("cfetch dashboard: {e}");
                 std::process::exit(1);
             }
@@ -628,7 +861,8 @@ fn main() {
             }
         }
         Command::EmbedIndex { batch } => {
-            if let Err(e) = embed::embed_index_cmd(batch) {
+            let guard = config::Config::load().and_then(|c| none_tier_guard(&c, "embed-index"));
+            if let Err(e) = guard.and_then(|()| embed::embed_index_cmd(batch)) {
                 eprintln!("cfetch embed-index: {e}");
                 std::process::exit(1);
             }

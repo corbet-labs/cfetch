@@ -4,21 +4,38 @@
 //!
 //! Protocol: one JSON object per line in, one per line out, then the server
 //! closes the connection. Ops: ping, resident, health, scan-code,
-//! scan-status, shutdown.
+//! scan-status, serve-status, shutdown — plus, when serving mode is enabled
+//! (config `serve.enabled`), the barrier-gated query ops recall, expand,
+//! find, slices, generation and checksum.
+//!
+//! With `serve.bind` set, the SAME protocol is additionally served over TCP,
+//! gated by a bearer token (`token` field in every request; token sourced
+//! from `serve.token_file`, 0600). Shutdown stays unix-only.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::{heartbeat, paths, resident};
+use crate::{heartbeat, hooks, index, paths, resident, serve};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Request {
     op: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    cite: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -34,6 +51,51 @@ pub struct Response {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan: Option<ScanStatus>,
+    // ---- serving-mode fields ----
+    /// Host id of the answering serving host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Catalog generation the answer was served from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// True when the drain barrier fully applied before answering; false =
+    /// bounded-barrier expiry, see `stale_note`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh: Option<bool>,
+    /// Why the answer may be stale (only when `fresh` is false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_note: Option<String>,
+    /// Time this query spent in the drain barrier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub barrier_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits: Option<Vec<serve::WireHit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<serve::WireBlock>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_hits: Option<Vec<serve::WireFindHit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slices: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serve: Option<ServeInfo>,
+}
+
+impl Response {
+    fn err(msg: impl Into<String>) -> Response {
+        Response { ok: false, error: Some(msg.into()), ..Response::default() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeInfo {
+    pub enabled: bool,
+    pub origin: String,
+    pub generation: u64,
+    pub last_barrier_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
 }
 
 /// Counts from the most recent SUCCESSFUL code scan.
@@ -132,18 +194,59 @@ fn run_code_scan() -> Result<ScanCounts, String> {
 /// Client call with a hard deadline. The hook path budget is ~250ms total; on
 /// any failure the caller falls back or stays silent.
 pub fn call(op: &str, timeout: Duration) -> Option<Response> {
+    call_req(&serde_json::json!({ "op": op }), timeout)
+}
+
+/// Structured client call over the local unix socket.
+pub fn call_req(body: &serde_json::Value, timeout: Duration) -> Option<Response> {
     let stream = UnixStream::connect(paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
     let mut stream = stream;
-    let req = serde_json::json!({ "op": op });
-    writeln!(stream, "{req}").ok()?;
+    writeln!(stream, "{body}").ok()?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;
     serde_json::from_str(&line).ok()
 }
 
-fn handle(req: &Request) -> (Response, bool) {
+/// Shared state of one daemon process across its connection threads.
+struct Ctx {
+    serve: Option<Arc<serve::ServeState>>,
+    /// Bearer token required on the TCP listener (None = no TCP serving).
+    tcp_token: Option<String>,
+    shutdown: AtomicBool,
+}
+
+/// Runs a barrier-gated query op against the committed index snapshot and
+/// stamps the coherence labels (origin, generation, fresh) on the response.
+/// The generation is read from the SAME connection that answers, so the
+/// label always matches the snapshot.
+fn serve_query(
+    ctx: &Ctx,
+    f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<Response>,
+) -> Response {
+    let Some(state) = &ctx.serve else {
+        return Response::err("serving is not enabled on this daemon (config serve.enabled)");
+    };
+    let outcome = state.barrier(serve::BARRIER_TIMEOUT);
+    let conn = match index::open_ro(state.state_dir()) {
+        Ok(c) => c,
+        Err(e) => return Response::err(format!("open index: {e}")),
+    };
+    let mut resp = match f(&conn) {
+        Ok(r) => r,
+        Err(e) => return Response::err(e.to_string()),
+    };
+    resp.ok = true;
+    resp.origin = Some(state.origin.clone());
+    resp.generation = Some(index::generation(&conn));
+    resp.fresh = Some(outcome.fresh);
+    resp.stale_note = outcome.note;
+    resp.barrier_ms = Some(outcome.waited_ms);
+    resp
+}
+
+fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
     match req.op.as_str() {
         "ping" => (
             Response {
@@ -162,10 +265,7 @@ fn handle(req: &Request) -> (Response, bool) {
                     let d = resident::build(&cfg);
                     (Response { ok: true, digest: Some(d.text), ..Response::default() }, false)
                 }
-                Err(e) => (
-                    Response { ok: false, error: Some(e.to_string()), ..Response::default() },
-                    false,
-                ),
+                Err(e) => (Response::err(e.to_string()), false),
             }
         }
         "health" => {
@@ -195,16 +295,171 @@ fn handle(req: &Request) -> (Response, bool) {
             }
         }
         "scan-status" => (Response { ok: true, scan: Some(SCAN.status()), ..Response::default() }, false),
-        "shutdown" => (Response { ok: true, ..Response::default() }, true),
-        other => (
-            Response { ok: false, error: Some(format!("unknown op: {other}")), ..Response::default() },
+        "serve-status" => {
+            let info = match &ctx.serve {
+                Some(s) => ServeInfo {
+                    enabled: true,
+                    origin: s.origin.clone(),
+                    generation: s.generation.load(Ordering::Relaxed),
+                    last_barrier_ms: s.last_barrier_ms.load(Ordering::Relaxed),
+                    bind: s.bind_addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+                },
+                None => ServeInfo {
+                    enabled: false,
+                    origin: String::new(),
+                    generation: 0,
+                    last_barrier_ms: 0,
+                    bind: None,
+                },
+            };
+            (Response { ok: true, serve: Some(info), ..Response::default() }, false)
+        }
+        "recall" => {
+            let query = req.query.clone().unwrap_or_default();
+            let limit = req.limit.unwrap_or(8);
+            (
+                serve_query(ctx, |conn| {
+                    let hits = index::recall(conn, &query, limit)?;
+                    Ok(Response {
+                        hits: Some(hits.into_iter().map(Into::into).collect()),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
+        "expand" => {
+            let cite = req.cite.clone().unwrap_or_default();
+            (
+                serve_query(ctx, |conn| {
+                    let blocks = index::expand(conn, &cite)?;
+                    Ok(Response {
+                        blocks: Some(blocks.into_iter().map(Into::into).collect()),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
+        "find" => {
+            let query = req.query.clone().unwrap_or_default();
+            let limit = req.limit.unwrap_or(10);
+            (
+                serve_query(ctx, |conn| {
+                    let hits = crate::code::find(conn, &query, limit)?;
+                    Ok(Response {
+                        code_hits: Some(hits.into_iter().map(Into::into).collect()),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
+        "slices" => {
+            // Hook advisory path: read-only, deliberately WITHOUT the
+            // barrier — a hint must never cost seconds on the interactive
+            // path, and a slightly stale line range is a missed optimization,
+            // not wrong knowledge.
+            if ctx.serve.is_none() {
+                return (
+                    Response::err("serving is not enabled on this daemon (config serve.enabled)"),
+                    false,
+                );
+            }
+            let path = req.path.clone().unwrap_or_default();
+            let limit = req.limit.unwrap_or(5);
+            let slices = hooks::symbol_slices(&paths::state_dir().join("index.db"), &path, limit);
+            (Response { ok: true, slices: Some(slices), ..Response::default() }, false)
+        }
+        "generation" => (serve_query(ctx, |_conn| Ok(Response::default())), false),
+        "checksum" => (
+            serve_query(ctx, |conn| {
+                Ok(Response { checksum: Some(index::catalog_checksum(conn)?), ..Response::default() })
+            }),
             false,
         ),
+        "shutdown" => (Response { ok: true, ..Response::default() }, true),
+        other => (Response::err(format!("unknown op: {other}")), false),
     }
+}
+
+/// Serves one connection: one request line, one response line. Returns true
+/// when this connection requested shutdown (unix only).
+fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, remote: bool) -> bool {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    let (resp, shutdown) = match serde_json::from_str::<Request>(&line) {
+        Ok(req) => {
+            if remote {
+                // Bearer gate for TCP: every op requires the token; shutdown
+                // is refused outright (local-only op).
+                let authorized = match (&ctx.tcp_token, &req.token) {
+                    (Some(expected), Some(got)) => serve::token_eq(expected, got),
+                    _ => false,
+                };
+                if !authorized {
+                    (Response::err("unauthorized"), false)
+                } else if req.op == "shutdown" {
+                    (Response::err("shutdown is local-only"), false)
+                } else {
+                    let (r, _) = handle(&req, ctx);
+                    (r, false)
+                }
+            } else {
+                handle(&req, ctx)
+            }
+        }
+        Err(e) => (Response::err(format!("bad request: {e}")), false),
+    };
+    let mut stream = reader.into_inner();
+    if let Ok(s) = serde_json::to_string(&resp) {
+        let _ = writeln!(stream, "{s}");
+    }
+    shutdown
 }
 
 /// Foreground run loop (systemd/`daemon start` both end up here).
 pub fn run() -> anyhow::Result<()> {
+    // Serving mode needs the config at boot; a corrupt config fails LOUDLY
+    // here (hooks then use their daemon-less fallbacks) instead of silently
+    // starting a daemon that cannot serve.
+    let cfg = Config::load()?;
+    let serve_handle = if cfg.serve.enabled { Some(serve::start(&cfg)?) } else { None };
+    let tcp_token = match (&cfg.serve.bind, &cfg.serve.token_file) {
+        (Some(_), Some(tf)) => Some(serve::read_token(tf, true)?),
+        _ => None,
+    };
+    let ctx = Arc::new(Ctx {
+        serve: serve_handle.as_ref().map(|h| h.state.clone()),
+        tcp_token: tcp_token.clone(),
+        shutdown: AtomicBool::new(false),
+    });
+
+    if let (Some(bind), Some(_)) = (&cfg.serve.bind, &tcp_token) {
+        let listener = std::net::TcpListener::bind(bind)?;
+        let local = listener.local_addr()?;
+        // Record the actual bound address (resolves ":0" configs) for
+        // status/selfcheck and the torture harness.
+        std::fs::write(paths::state_dir().join("serve.addr"), local.to_string())?;
+        if let Some(h) = &serve_handle {
+            *h.state.bind_addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(local.to_string());
+        }
+        eprintln!("cfetch daemon serving TCP on {local}");
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+                let ctx = ctx.clone();
+                std::thread::spawn(move || serve_conn(conn, &ctx, true));
+            }
+        });
+    }
+
     let sock = paths::socket_path();
     if let Some(dir) = sock.parent() {
         std::fs::create_dir_all(dir)?;
@@ -220,27 +475,24 @@ pub fn run() -> anyhow::Result<()> {
     let listener = UnixListener::bind(&sock)?;
     eprintln!("cfetch daemon listening on {}", sock.display());
     for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
-        let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut reader = BufReader::new(conn);
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
-            continue;
-        }
-        let (resp, shutdown) = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(&req),
-            Err(e) => (
-                Response { ok: false, error: Some(format!("bad request: {e}")), ..Response::default() },
-                false,
-            ),
-        };
-        let mut conn = reader.into_inner();
-        if let Ok(s) = serde_json::to_string(&resp) {
-            let _ = writeln!(conn, "{s}");
-        }
-        if shutdown {
+        if ctx.shutdown.load(Ordering::SeqCst) {
             break;
         }
+        let Ok(conn) = conn else { continue };
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+        // Thread per connection: a query blocked in the drain barrier (up to
+        // 5s) must not starve other clients — hooks poll this socket on the
+        // interactive path.
+        let ctx = ctx.clone();
+        let sock = sock.clone();
+        std::thread::spawn(move || {
+            if serve_conn(conn, &ctx, false) {
+                ctx.shutdown.store(true, Ordering::SeqCst);
+                // Wake the accept loop so it observes the flag.
+                let _ = UnixStream::connect(&sock);
+            }
+        });
     }
     let _ = std::fs::remove_file(&sock);
     Ok(())
@@ -286,6 +538,17 @@ pub fn status() -> anyhow::Result<()> {
     match call("ping", Duration::from_millis(300)) {
         Some(r) => {
             println!("daemon: running (v{})", r.version.unwrap_or_default());
+            if let Some(info) = call("serve-status", Duration::from_millis(300)).and_then(|r| r.serve)
+                && info.enabled
+            {
+                println!(
+                    "serving: origin {}, generation {}, last barrier {} ms, {}",
+                    info.origin,
+                    info.generation,
+                    info.last_barrier_ms,
+                    info.bind.map_or_else(|| "unix socket only".to_string(), |b| format!("tcp {b}"))
+                );
+            }
             if let Some(s) = call("scan-status", Duration::from_millis(300)).and_then(|r| r.scan) {
                 if s.running {
                     println!("code scan: running in the background");
@@ -305,6 +568,11 @@ pub fn status() -> anyhow::Result<()> {
             }
         }
         None => println!("daemon: not running ({})", paths::socket_path().display()),
+    }
+    if let Ok(cfg) = Config::load()
+        && let Some(cs) = &cfg.client.serving
+    {
+        println!("client: recall/find/expand route to {} (none-tier; no local index)", cs.addr);
     }
     let degraded = heartbeat::degraded();
     if degraded.is_empty() {
@@ -354,5 +622,83 @@ mod tests {
         assert!(c.try_begin());
         c.complete(Ok(ScanCounts { files: 8, symbols: 9, edges: 1 }));
         assert!(c.status().last_error.is_none(), "success clears the error");
+    }
+
+    fn no_serve_ctx() -> Ctx {
+        Ctx { serve: None, tcp_token: None, shutdown: AtomicBool::new(false) }
+    }
+
+    #[test]
+    fn query_ops_refuse_when_serving_disabled() {
+        let ctx = no_serve_ctx();
+        for op in ["recall", "expand", "find", "slices", "generation", "checksum"] {
+            let (resp, shutdown) =
+                handle(&Request { op: op.to_string(), ..Request::default() }, &ctx);
+            assert!(!resp.ok, "{op} must refuse without serve.enabled");
+            assert!(resp.error.unwrap().contains("serve.enabled"), "{op} error must name the fix");
+            assert!(!shutdown);
+        }
+    }
+
+    #[test]
+    fn serve_status_reports_disabled_without_serving() {
+        let ctx = no_serve_ctx();
+        let (resp, _) = handle(&Request { op: "serve-status".into(), ..Request::default() }, &ctx);
+        assert!(resp.ok);
+        assert!(!resp.serve.unwrap().enabled);
+    }
+
+    /// In-memory duplex "stream" for serve_conn tests.
+    struct Duplex {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn roundtrip(ctx: &Ctx, remote: bool, body: serde_json::Value) -> Response {
+        let mut stream = Duplex { input: std::io::Cursor::new(format!("{body}\n").into_bytes()), output: Vec::new() };
+        serve_conn(&mut stream, ctx, remote);
+        serde_json::from_slice(&stream.output).unwrap()
+    }
+
+    #[test]
+    fn tcp_requires_the_bearer_token_for_every_op() {
+        let ctx = Ctx {
+            serve: None,
+            tcp_token: Some("right-token".to_string()),
+            shutdown: AtomicBool::new(false),
+        };
+        let r = roundtrip(&ctx, true, serde_json::json!({"op": "ping"}));
+        assert!(!r.ok, "missing token must be refused");
+        assert_eq!(r.error.as_deref(), Some("unauthorized"));
+        let r = roundtrip(&ctx, true, serde_json::json!({"op": "ping", "token": "wrong-token"}));
+        assert_eq!(r.error.as_deref(), Some("unauthorized"));
+        let r = roundtrip(&ctx, true, serde_json::json!({"op": "ping", "token": "right-token"}));
+        assert!(r.ok);
+    }
+
+    #[test]
+    fn shutdown_is_local_only() {
+        let ctx = Ctx {
+            serve: None,
+            tcp_token: Some("t".to_string()),
+            shutdown: AtomicBool::new(false),
+        };
+        let r = roundtrip(&ctx, true, serde_json::json!({"op": "shutdown", "token": "t"}));
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("local-only"));
     }
 }

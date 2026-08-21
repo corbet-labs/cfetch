@@ -103,6 +103,43 @@ fn default_rrf_k() -> f64 {
     2.0
 }
 
+/// Serving mode: this daemon owns its index lifecycle (watcher, generations,
+/// drain barrier) and answers recall/find/expand for local clients — and for
+/// remote ones when `bind` is set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP listen address (e.g. "0.0.0.0:9737"). Absent = unix socket only.
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// Host id stamped on every response. Defaults to the machine hostname.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Bearer token file gating the TCP listener; must be mode 0600.
+    /// Required when `bind` is set.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+}
+
+/// Remote serving host a none-tier client queries instead of any local index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientServingConfig {
+    /// "host:port" of the serving daemon's TCP listener.
+    pub addr: String,
+    /// File holding the bearer token for that listener.
+    pub token_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientConfig {
+    /// When set, recall/find/expand route to this serving host and the host
+    /// opens NO local index at all (none-tier by config). Unreachable is an
+    /// explicit error — never a silent fallback to stale local data.
+    #[serde(default)]
+    pub serving: Option<ClientServingConfig>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "paths::default_brain_root")]
@@ -131,6 +168,12 @@ pub struct Config {
     /// Governance loop (reminder queue + cadence rule refresh).
     #[serde(default)]
     pub governance: GovernanceConfig,
+    /// Serving mode (storage host answering queries).
+    #[serde(default)]
+    pub serve: ServeConfig,
+    /// Client routing (none-tier host querying a serving host).
+    #[serde(default)]
+    pub client: ClientConfig,
 }
 
 fn default_budget_chars() -> usize {
@@ -153,6 +196,8 @@ impl Default for Config {
             embeddings: EmbeddingsConfig::default(),
             recall: RecallConfig::default(),
             governance: GovernanceConfig::default(),
+            serve: ServeConfig::default(),
+            client: ClientConfig::default(),
         }
     }
 }
@@ -186,6 +231,18 @@ impl Config {
                     r.ring
                 );
             }
+        }
+        if cfg.serve.enabled && cfg.client.serving.is_some() {
+            anyhow::bail!(
+                "serve.enabled and client.serving are mutually exclusive: serving needs a local \
+                 index, a none-tier client must open none"
+            );
+        }
+        if cfg.serve.bind.is_some() && cfg.serve.token_file.is_none() {
+            anyhow::bail!(
+                "serve.bind requires serve.token_file: the TCP listener is bearer-token gated, \
+                 an open listener is unconfigurable"
+            );
         }
         Ok(cfg)
     }
@@ -295,6 +352,66 @@ mod tests {
         let cfg = Config::load_from(&p).unwrap();
         assert!(cfg.governance.enabled);
         assert_eq!(cfg.governance.reinject_every, 7);
+    }
+
+    #[test]
+    fn serve_and_client_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert!(!cfg.serve.enabled);
+        assert!(cfg.serve.bind.is_none());
+        assert!(cfg.serve.origin.is_none());
+        assert!(cfg.serve.token_file.is_none());
+        assert!(cfg.client.serving.is_none());
+    }
+
+    #[test]
+    fn serve_and_client_blocks_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"serve": {"enabled": true, "bind": "0.0.0.0:9737",
+                          "origin": "storage-1", "token_file": "/tmp/t"}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.serve.enabled);
+        assert_eq!(cfg.serve.bind.as_deref(), Some("0.0.0.0:9737"));
+        assert_eq!(cfg.serve.origin.as_deref(), Some("storage-1"));
+        assert_eq!(cfg.serve.token_file, Some(PathBuf::from("/tmp/t")));
+
+        std::fs::write(
+            &p,
+            r#"{"client": {"serving": {"addr": "storage-1.example:9737", "token_file": "/tmp/t"}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        let cs = cfg.client.serving.as_ref().unwrap();
+        assert_eq!(cs.addr, "storage-1.example:9737");
+        assert_eq!(cs.token_file, PathBuf::from("/tmp/t"));
+    }
+
+    #[test]
+    fn serving_host_and_none_tier_client_are_mutually_exclusive() {
+        // serve.enabled needs a local index; client.serving forbids one.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"serve": {"enabled": true},
+                "client": {"serving": {"addr": "h:1", "token_file": "/tmp/t"}}}"#,
+        )
+        .unwrap();
+        assert!(Config::load_from(&p).is_err());
+    }
+
+    #[test]
+    fn serve_bind_requires_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"serve": {"enabled": true, "bind": "127.0.0.1:0"}}"#).unwrap();
+        assert!(Config::load_from(&p).is_err(), "an open unauthenticated TCP listener must be unconfigurable");
     }
 
     #[test]

@@ -408,6 +408,8 @@ pub struct ScanReport {
     /// unparseable ring frontmatter — surfaced so a file quarantined by
     /// accident is visible instead of silently absent from recall.
     pub skipped: Vec<String>,
+    /// Catalog generation this scan committed (see [`generation`]).
+    pub generation: u64,
 }
 
 /// Full rebuild inside one transaction. The corpus is small markdown; a
@@ -442,7 +444,22 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [fingerprint],
     )?;
-    let mut report = ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new() };
+    // Generation advances in the SAME transaction as the catalog it labels:
+    // a reader can never observe a new catalog under an old generation or
+    // vice versa.
+    let generation: u64 = tx
+        .query_row("SELECT value FROM meta WHERE key='generation'", [], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+        + 1;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES('generation', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [generation.to_string()],
+    )?;
+    let mut report =
+        ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new(), generation };
     // (doc_id, link stems) collected during insertion, resolved afterwards
     // when every doc is known.
     let mut pending_links: Vec<(i64, Vec<String>)> = Vec::new();
@@ -517,6 +534,54 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
     }
     tx.commit()?;
     Ok(report)
+}
+
+/// Current catalog generation: the count of committed scans of this index.
+/// Monotonic and persisted in meta; incremented INSIDE each scan's
+/// transaction, so any reader always sees a (catalog, generation) pair from
+/// one commit. 0 = never scanned.
+pub fn generation(conn: &Connection) -> u64 {
+    conn.query_row("SELECT value FROM meta WHERE key='generation'", [], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Deterministic digest of the catalog: sha256 over the sorted
+/// (cite, path, ring) rows. Two catalogs built from the same tree — by ANY
+/// derivation path (fresh scan, event-driven rebuild, post-crash backstop) —
+/// must produce the same checksum: the coherence invariant's cross-holder
+/// verification value. Generation is deliberately NOT part of the digest.
+pub fn catalog_checksum(conn: &Connection) -> anyhow::Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT b.cite, d.path, d.ring FROM blocks b JOIN docs d ON d.id = b.doc_id
+         ORDER BY b.cite, d.path, d.ring",
+    )?;
+    let rows =
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+    let mut hasher = sha2::Sha256::new();
+    for (cite, path, ring) in rows.filter_map(Result::ok) {
+        hasher.update(cite.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(ring.to_le_bytes());
+        hasher.update([0xffu8]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Read-only open for serving-side query threads: never contends for the
+/// write lock, never creates or migrates schema. Fails when no index exists
+/// yet — the caller reports that instead of racing the builder.
+pub fn open_ro(state_dir: &Path) -> anyhow::Result<Connection> {
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        db_path(state_dir),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_millis(1000))?;
+    Ok(conn)
 }
 
 /// Docs linked (either direction, human-curated wikilinks) to the docs of the
@@ -1122,6 +1187,61 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].2.contains("still code"));
         assert_eq!(blocks[1].2, "after");
+    }
+
+    #[test]
+    fn generation_advances_with_every_scan_and_persists() {
+        let dir = brain(&[("knowledge/a.md", "alpha\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        assert_eq!(generation(&conn), 0, "unscanned index has generation 0");
+        let r1 = scan(&mut conn, dir.path(), None).unwrap();
+        assert_eq!(r1.generation, 1);
+        assert_eq!(generation(&conn), 1);
+        let r2 = scan(&mut conn, dir.path(), None).unwrap();
+        assert_eq!(r2.generation, 2, "generation is monotonic per committed scan");
+        drop(conn);
+        let conn = open(state.path()).unwrap();
+        assert_eq!(generation(&conn), 2, "generation is persisted in index meta");
+    }
+
+    #[test]
+    fn catalog_checksum_is_a_pure_function_of_the_tree() {
+        let dir = brain(&[
+            ("knowledge/a.md", "alpha fact\n\nbeta fact\n"),
+            ("knowledge/b.md", "- gamma\n- delta\n"),
+        ]);
+        // Two independent derivations (separate state dirs) over the same tree.
+        let s1 = tempfile::tempdir().unwrap();
+        let s2 = tempfile::tempdir().unwrap();
+        let mut c1 = open(s1.path()).unwrap();
+        let mut c2 = open(s2.path()).unwrap();
+        scan(&mut c1, dir.path(), None).unwrap();
+        scan(&mut c2, dir.path(), None).unwrap();
+        // Different generations must not leak into the digest.
+        scan(&mut c2, dir.path(), None).unwrap();
+        let k1 = catalog_checksum(&c1).unwrap();
+        let k2 = catalog_checksum(&c2).unwrap();
+        assert!(!k1.is_empty());
+        assert_eq!(k1, k2, "same tree must yield the same catalog checksum");
+        // A content change must change the digest.
+        std::fs::write(dir.path().join("knowledge/b.md"), "- gamma\n- delta prime\n").unwrap();
+        scan(&mut c1, dir.path(), None).unwrap();
+        assert_ne!(catalog_checksum(&c1).unwrap(), k2);
+    }
+
+    #[test]
+    fn open_ro_serves_the_committed_snapshot() {
+        let dir = brain(&[("knowledge/a.md", "royw fact\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let ro = open_ro(state.path()).unwrap();
+        assert_eq!(recall(&ro, "royw", 5).unwrap().len(), 1);
+        assert!(
+            ro.execute("INSERT INTO meta(key,value) VALUES('x','y')", []).is_err(),
+            "read-only handle must not be able to write"
+        );
     }
 
     #[test]

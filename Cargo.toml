@@ -11,6 +11,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 ignore = "0.4"
+notify = "8"
 ratatui = "0.30.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

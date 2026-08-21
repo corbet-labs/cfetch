@@ -226,8 +226,8 @@ fn line_count(path: &Path) -> Option<usize> {
 /// formatted `name start-end`. ANY failure (no DB yet, WAL sidecars
 /// unreadable, schema drift) yields no hints — a missed optimization, never a
 /// broken hook. The read-only open also guarantees the hook cannot contend
-/// with the indexer for the write lock.
-fn symbol_slices(db: &Path, file_path: &str, limit: usize) -> Vec<String> {
+/// with the indexer for the write lock. Also serves the daemon's `slices` op.
+pub(crate) fn symbol_slices(db: &Path, file_path: &str, limit: usize) -> Vec<String> {
     use rusqlite::OpenFlags;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let Ok(conn) = rusqlite::Connection::open_with_flags(db, flags) else {
@@ -247,6 +247,20 @@ fn symbol_slices(db: &Path, file_path: &str, limit: usize) -> Vec<String> {
     })
     .map(|rows| rows.filter_map(Result::ok).collect())
     .unwrap_or_default()
+}
+
+/// Serving-host probe for slice hints: shorter read budget than a full
+/// query — an advisory must not stall the interactive path.
+fn remote_slices(
+    cs: &crate::config::ClientServingConfig,
+    path: &str,
+    limit: usize,
+) -> Vec<String> {
+    let body = serde_json::json!({"op": "slices", "path": path, "limit": limit});
+    crate::serve::client_call(cs, body, Duration::from_secs(2))
+        .ok()
+        .and_then(|r| r.slices)
+        .unwrap_or_default()
 }
 
 /// PreToolUse: read hygiene advice at the moment of spend. Repeat-read
@@ -279,7 +293,15 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
     }
 
     if line_count(Path::new(path)).is_some_and(|n| n > LARGE_FILE_LINES) {
-        let hints = symbol_slices(&state_dir.join("index.db"), path, MAX_SLICE_HINTS);
+        // None-tier hosts (client.serving) hold NO local index: the probe
+        // goes to the serving host instead. Failures yield no hints — the
+        // hook contract (silence over errors) outranks the client routing
+        // contract's explicit-error rule here; the CLI/MCP surfaces do the
+        // loud reporting for a dead serving host.
+        let hints = match Config::load().ok().and_then(|c| c.client.serving) {
+            Some(cs) => remote_slices(&cs, path, MAX_SLICE_HINTS),
+            None => symbol_slices(&state_dir.join("index.db"), path, MAX_SLICE_HINTS),
+        };
         if !hints.is_empty() && st.should_hint_slices(path) {
             emit.add_context(format!(
                 "[cfetch: {path} is >{LARGE_FILE_LINES} lines; known symbol slices: {}]",

@@ -10,7 +10,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{Value, json};
 
-use crate::{code, config::Config, index, paths};
+use crate::{code, config::Config, index, paths, serve};
 
 const PROTOCOL_FALLBACK: &str = "2025-06-18";
 
@@ -56,9 +56,108 @@ fn text_result(text: String) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": false})
 }
 
+/// Coherence footer appended to every remotely-served MCP answer.
+fn served_footer(resp: &crate::daemon::Response) -> String {
+    let origin = resp.origin.clone().unwrap_or_default();
+    let generation = resp.generation.unwrap_or(0);
+    if resp.fresh == Some(false) {
+        format!(
+            "\n[served by {origin}, generation {generation} — STALE: {}]",
+            resp.stale_note.clone().unwrap_or_else(|| "barrier expired".to_string())
+        )
+    } else {
+        format!("\n[served by {origin}, generation {generation}, fresh]")
+    }
+}
+
+/// none-tier routing: every tool answered by the remote serving host; no
+/// local index is opened. Unreachable = explicit error naming the host.
+fn run_tool_remote(
+    cs: &crate::config::ClientServingConfig,
+    name: &str,
+    args: &Value,
+    limit: usize,
+) -> anyhow::Result<String> {
+    let body = match name {
+        "cfetch_recall" => json!({
+            "op": "recall",
+            "query": args.get("query").and_then(Value::as_str).unwrap_or(""),
+            "limit": if limit == 0 { 8 } else { limit },
+        }),
+        "cfetch_expand" => json!({
+            "op": "expand",
+            "cite": args.get("cite").and_then(Value::as_str).unwrap_or(""),
+        }),
+        "cfetch_find" => json!({
+            "op": "find",
+            "query": args.get("query").and_then(Value::as_str).unwrap_or(""),
+            "limit": if limit == 0 { 10 } else { limit },
+        }),
+        other => anyhow::bail!("unknown tool: {other}"),
+    };
+    let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
+    let text = match name {
+        "cfetch_recall" => {
+            let hits = resp.hits.clone().unwrap_or_default();
+            if hits.is_empty() {
+                "no hits".to_string()
+            } else {
+                hits.iter()
+                    .map(|h| {
+                        let mut line = format!(
+                            "{} {}:{}-{} (ring {})\n    {}",
+                            h.cite, h.path, h.start_line, h.end_line, h.ring, h.snippet
+                        );
+                        if !h.mirrors.is_empty() {
+                            line.push_str(&format!("\n    (also at: {})", h.mirrors.join(", ")));
+                        }
+                        line
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        "cfetch_expand" => {
+            let blocks = resp.blocks.clone().unwrap_or_default();
+            if blocks.is_empty() {
+                "no block with that citation".to_string()
+            } else {
+                blocks
+                    .iter()
+                    .map(|b| {
+                        format!("{} {}:{}-{} (ring {})\n{}", b.cite, b.path, b.start_line, b.end_line, b.ring, b.text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            }
+        }
+        _ => {
+            let hits = resp.code_hits.clone().unwrap_or_default();
+            if hits.is_empty() {
+                "no hits".to_string()
+            } else {
+                hits.iter()
+                    .map(|h| match (&h.name, &h.kind) {
+                        (Some(n), Some(k)) => format!(
+                            "{}:{}-{}  {} {}  (~{} tok)",
+                            h.path, h.start_line, h.end_line, k, n, h.token_estimate
+                        ),
+                        _ => format!("{}  (file match)", h.path),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    };
+    Ok(format!("{text}{}", served_footer(&resp)))
+}
+
 fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
     let cfg = Config::load()?;
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if let Some(cs) = &cfg.client.serving {
+        return run_tool_remote(cs, name, args, limit);
+    }
     match name {
         "cfetch_recall" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
