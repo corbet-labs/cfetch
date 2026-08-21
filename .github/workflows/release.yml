@@ -33,9 +33,15 @@ jobs:
           - os: macos-latest
             artifact: mac-cfetch-arm64
             bin: cfetch
-          - os: macos-13
+          # Intel macOS is CROSS-BUILT on the arm64 runner rather than taken
+          # from a macos-13 runner: those are being wound down and a queued
+          # leg would block the whole release behind hardware we do not
+          # control. The Apple SDK ships both slices, so this needs no
+          # emulation and no second machine.
+          - os: macos-latest
             artifact: mac-cfetch-x86_64
             bin: cfetch
+            target: x86_64-apple-darwin
           - os: windows-latest
             artifact: win-cfetch-x86_64.exe
             bin: cfetch.exe
@@ -43,13 +49,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked
+          fi
       - name: Stage artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          if [ -n "${{ matrix.target }}" ]; then
+            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          else
+            cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
