@@ -14,6 +14,8 @@ mod markers;
 mod mcp;
 mod paths;
 mod resident;
+mod session_state;
+mod transcript;
 
 use clap::{Parser, Subcommand};
 
@@ -356,7 +358,30 @@ fn status() -> anyhow::Result<()> {
         .flat_map(|s| s.by_source.values())
         .map(|t| t.tokens_estimated)
         .sum();
-    println!("ledger: {sessions} session(s), ~{injected} tokens injected (estimated)");
+    println!("ledger: {sessions} session(s)");
+    println!("  estimated: ~{injected} tokens injected by cfetch (chars/3.5 heuristic)");
+    // Measured truth from transcripts, side by side with the estimate — and
+    // clearly labeled absent when the transcript could not be parsed.
+    let mut measured = ledger::MeasuredUsage::default();
+    let mut measured_sessions = 0usize;
+    for s in ledger.sessions.values() {
+        if !s.measured.is_zero() {
+            measured_sessions += 1;
+            measured.accumulate(&s.measured);
+        }
+    }
+    if measured_sessions > 0 {
+        println!(
+            "  measured:  {} api call(s) over {measured_sessions} session(s): {} input / {} output / {} cache-read / {} cache-created tokens (transcript ground truth)",
+            measured.api_calls,
+            measured.input_tokens,
+            measured.output_tokens,
+            measured.cache_read_input_tokens,
+            measured.cache_creation_input_tokens
+        );
+    } else {
+        println!("  measured:  none — no transcript usage booked yet, numbers above are estimates");
+    }
     let state = paths::state_dir();
     let bytes: u64 = std::fs::read_dir(&state)
         .map(|rd| {
