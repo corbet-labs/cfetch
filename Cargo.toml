@@ -22,6 +22,10 @@ tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
+# Embeddings HTTP client only (src/embed.rs). Minimal feature set: rustls for
+# https endpoints, no gzip/charset/cookies; redirects are disabled per request
+# policy (SSRF hardening), which ureq supports natively.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tempfile = "3"

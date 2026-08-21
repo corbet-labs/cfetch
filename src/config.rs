@@ -15,6 +15,41 @@ pub struct ResidentEntry {
     pub ring: u8,
 }
 
+/// Embeddings backend: an OpenAI-compatible `/embeddings` endpoint (in this
+/// house: llama-broker on the GPU platform). Disabled by default — semantic
+/// recall is opt-in, and the client is NEVER called from hook entrypoints
+/// (hooks must not spend network time on the interactive path).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL; `/embeddings` is appended. Must be https or loopback —
+    /// config is a file agents write, so the URL is SSRF-guarded at use.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecallConfig {
+    /// Reciprocal-rank-fusion constant for `recall --hybrid`. Small K weights
+    /// top ranks heavily; K=2 measurably beat the textbook K=60 on a 22k-unit
+    /// corpus (MRR 0.845 vs 0.627), so 2 is the default.
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f64,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        RecallConfig { rrf_k: default_rrf_k() }
+    }
+}
+
+fn default_rrf_k() -> f64 {
+    2.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "paths::default_brain_root")]
@@ -33,6 +68,10 @@ pub struct Config {
     /// Sessions kept in the injection ledger (writer-side retention).
     #[serde(default = "default_ledger_max_sessions")]
     pub ledger_max_sessions: usize,
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub recall: RecallConfig,
 }
 
 fn default_budget_chars() -> usize {
@@ -51,6 +90,8 @@ impl Default for Config {
             code_roots: Vec::new(),
             budget_chars: default_budget_chars(),
             ledger_max_sessions: default_ledger_max_sessions(),
+            embeddings: EmbeddingsConfig::default(),
+            recall: RecallConfig::default(),
         }
     }
 }
@@ -128,6 +169,33 @@ mod tests {
         let p = dir.path().join("config.json");
         std::fs::write(&p, r#"{"resident": [{"path": "x.md", "ring": 3}]}"#).unwrap();
         assert!(Config::load_from(&p).is_err());
+    }
+
+    #[test]
+    fn embeddings_default_disabled_and_rrf_k_default_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert!(!cfg.embeddings.enabled);
+        assert!(cfg.embeddings.endpoint.is_empty());
+        assert!(cfg.embeddings.model.is_empty());
+        assert_eq!(cfg.recall.rrf_k, 2.0);
+    }
+
+    #[test]
+    fn embeddings_and_recall_blocks_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"embeddings": {"enabled": true, "endpoint": "https://llm.example/v1", "model": "nomic"},
+                "recall": {"rrf_k": 60}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.embeddings.enabled);
+        assert_eq!(cfg.embeddings.endpoint, "https://llm.example/v1");
+        assert_eq!(cfg.embeddings.model, "nomic");
+        assert_eq!(cfg.recall.rrf_k, 60.0);
     }
 
     #[test]

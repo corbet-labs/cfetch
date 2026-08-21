@@ -199,6 +199,7 @@ mod tests {
             code_roots: Vec::new(),
             budget_chars: 2000,
             ledger_max_sessions: 10,
+            ..Config::default()
         };
         let d = build(&cfg);
         assert!(d.text.len() <= 2000, "digest was {} chars for a 2000 budget", d.text.len());
@@ -238,6 +239,7 @@ mod tests {
             code_roots: Vec::new(),
             budget_chars: 1000,
             ledger_max_sessions: 10,
+            ..Config::default()
         };
         let d = build(&cfg);
         assert!(d.text.len() < 1400, "digest was {} chars", d.text.len());
@@ -253,6 +255,7 @@ mod tests {
             code_roots: Vec::new(),
             budget_chars: 1000,
             ledger_max_sessions: 10,
+            ..Config::default()
         };
         let d = build(&cfg);
         assert!(d.text.contains("resident file missing"));
