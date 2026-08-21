@@ -7,63 +7,78 @@ use std::fmt::Write as _;
 
 use crate::config::Config;
 
+const OPEN: &str = "<private>";
+const CLOSE: &str = "</private>";
+
+/// Byte ranges (tags inclusive) of private regions, DEPTH-AWARE: a nested
+/// `<private>` does not let the first `</private>` end the region — trailing
+/// private content must never leak. Unbalanced opens fail closed to end of
+/// input; a stray close outside any region is plain text.
+fn private_regions(s: &str) -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut depth = 0usize;
+    let mut region_start = 0usize;
+    let mut pos = 0usize;
+    while pos < s.len() {
+        let next_open = s[pos..].find(OPEN).map(|i| pos + i);
+        let next_close = s[pos..].find(CLOSE).map(|i| pos + i);
+        let open_first = match (next_open, next_close) {
+            (None, None) => break,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(o), Some(c)) => o < c,
+        };
+        if open_first {
+            let o = next_open.unwrap();
+            if depth == 0 {
+                region_start = o;
+            }
+            depth += 1;
+            pos = o + OPEN.len();
+        } else {
+            let c = next_close.unwrap();
+            if depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    regions.push((region_start, c + CLOSE.len()));
+                }
+            }
+            pos = c + CLOSE.len();
+        }
+    }
+    if depth > 0 {
+        regions.push((region_start, s.len())); // fail closed
+    }
+    regions
+}
+
 /// Like `strip_private`, but replaces private content with spaces instead of
 /// removing it, preserving newlines — so line numbers in citations computed
 /// from the blanked text still match the file on disk.
 pub fn blank_private(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        match rest.find("<private>") {
-            None => {
-                out.push_str(rest);
-                return out;
-            }
-            Some(start) => {
-                out.push_str(&rest[..start]);
-                let after = &rest[start + "<private>".len()..];
-                let (private_part, next) = match after.find("</private>") {
-                    None => (after, ""), // fail closed: blank to end of input
-                    Some(end) => (&after[..end], &after[end + "</private>".len()..]),
-                };
-                // Tags themselves also blank to spaces.
-                out.extend("<private>".chars().map(|_| ' '));
-                for c in private_part.chars() {
-                    out.push(if c == '\n' { '\n' } else { ' ' });
-                }
-                if !next.is_empty() {
-                    out.extend("</private>".chars().map(|_| ' '));
-                }
-                rest = next;
-                if rest.is_empty() {
-                    return out;
-                }
-            }
+    let mut cursor = 0usize;
+    for (start, end) in private_regions(s) {
+        out.push_str(&s[cursor..start]);
+        for c in s[start..end].chars() {
+            out.push(if c == '\n' { '\n' } else { ' ' });
         }
+        cursor = end;
     }
+    out.push_str(&s[cursor..]);
+    out
 }
 
-/// Removes `<private>...</private>` regions. Fail-closed: an opening tag with
-/// no closing tag removes everything from the tag to the end.
+/// Removes `<private>...</private>` regions (nesting-aware, fail-closed).
 pub fn strip_private(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        match rest.find("<private>") {
-            None => {
-                out.push_str(rest);
-                return out;
-            }
-            Some(start) => {
-                out.push_str(&rest[..start]);
-                let after = &rest[start + "<private>".len()..];
-                match after.find("</private>") {
-                    None => return out, // fail closed
-                    Some(end) => rest = &after[end + "</private>".len()..],
-                }
-            }
-        }
+    let mut cursor = 0usize;
+    for (start, end) in private_regions(s) {
+        out.push_str(&s[cursor..start]);
+        cursor = end;
     }
+    out.push_str(&s[cursor..]);
+    out
 }
 
 pub struct ResidentDigest {
@@ -100,23 +115,29 @@ pub fn build(cfg: &Config) -> ResidentDigest {
         return ResidentDigest { text: String::new(), sources: Vec::new() };
     }
 
+    // The budget is a HARD cap on the whole digest: headers and clip markers
+    // are charged against it, not added on top.
     let budget = cfg.budget_chars.max(200);
-    let share = budget / sections.len();
+    let overhead: usize = sections.iter().map(|(label, _)| label.len() + 8).sum();
+    let share = budget.saturating_sub(overhead).max(sections.len() * 60) / sections.len();
     let mut text = String::new();
     let mut sources = Vec::new();
     for (label, body) in sections {
         let clipped = if body.len() > share {
-            let mut cut = share.saturating_sub(80).max(80);
+            let marker_reserve = 60 + label.len();
+            let mut cut = share.saturating_sub(marker_reserve).max(40).min(body.len());
             while cut < body.len() && !body.is_char_boundary(cut) {
                 cut += 1;
             }
-            format!(
-                "{}\n[clipped at {} of {} chars — full content: {}]",
-                &body[..cut.min(body.len())],
-                cut.min(body.len()),
-                body.len(),
-                label
-            )
+            if cut < body.len() {
+                format!(
+                    "{}\n[clipped at {cut} of {} chars — full content: {label}]",
+                    &body[..cut],
+                    body.len(),
+                )
+            } else {
+                body
+            }
         } else {
             body
         };
@@ -149,6 +170,42 @@ mod tests {
     }
 
     #[test]
+    fn nested_private_blocks_do_not_leak_the_tail() {
+        // The first </private> must NOT close the outer region.
+        let s = "a<private>x<private>y</private>STILL-PRIVATE</private>b";
+        assert_eq!(strip_private(s), "ab");
+        let b = blank_private(s);
+        assert!(!b.contains("STILL-PRIVATE"));
+        assert_eq!(b.len(), s.len());
+    }
+
+    #[test]
+    fn stray_close_tag_is_plain_text() {
+        assert_eq!(strip_private("a</private>b"), "a</private>b");
+    }
+
+    #[test]
+    fn digest_budget_is_a_hard_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(dir.path().join(name), "word ".repeat(3000)).unwrap();
+        }
+        let cfg = Config {
+            brain_root: dir.path().to_path_buf(),
+            resident: ["a.md", "b.md", "c.md"]
+                .iter()
+                .map(|n| ResidentEntry { path: PathBuf::from(n), ring: 1 })
+                .collect(),
+            code_roots: Vec::new(),
+            budget_chars: 2000,
+            ledger_max_sessions: 10,
+        };
+        let d = build(&cfg);
+        assert!(d.text.len() <= 2000, "digest was {} chars for a 2000 budget", d.text.len());
+        assert_eq!(d.text.matches("[clipped at ").count(), 3);
+    }
+
+    #[test]
     fn blanking_preserves_length_and_newlines() {
         let s = "keep\n<private>zqx\nwvy</private>\ntail";
         let b = blank_private(s);
@@ -178,6 +235,7 @@ mod tests {
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
             resident: vec![ResidentEntry { path: PathBuf::from("big.md"), ring: 0 }],
+            code_roots: Vec::new(),
             budget_chars: 1000,
             ledger_max_sessions: 10,
         };
@@ -192,6 +250,7 @@ mod tests {
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
             resident: vec![ResidentEntry { path: PathBuf::from("absent.md"), ring: 1 }],
+            code_roots: Vec::new(),
             budget_chars: 1000,
             ledger_max_sessions: 10,
         };

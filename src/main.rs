@@ -1,3 +1,4 @@
+mod code;
 mod config;
 mod daemon;
 mod heartbeat;
@@ -6,6 +7,7 @@ mod hooks;
 mod index;
 mod install;
 mod ledger;
+mod lockfile;
 mod paths;
 mod resident;
 
@@ -39,8 +41,16 @@ enum Command {
         #[arg(long)]
         remove: bool,
     },
-    /// Rebuild the recall index from the brain tree
+    /// Rebuild the recall index and sync the code index
     Scan,
+    /// Locate a symbol or file in the code index, with exact line ranges
+    Find {
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
     Recall {
         /// Search terms (word-prefix matched, OR-combined)
@@ -146,6 +156,42 @@ fn scan() -> anyhow::Result<()> {
         "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
         report.docs, report.blocks, report.skipped_high_ring
     );
+    let code = code::scan_code(&mut conn, &cfg.effective_code_roots())?;
+    println!("code: {} files, {} symbols (re)parsed", code.files, code.symbols);
+    Ok(())
+}
+
+fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let mut conn = index::open(&paths::state_dir())?;
+    code::scan_code(&mut conn, &cfg.effective_code_roots())?;
+    let hits = code::find(&conn, query, limit)?;
+    if json {
+        let arr: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "path": h.path, "name": h.name, "kind": h.kind,
+                    "lines": [h.start_line, h.end_line], "tokens_estimated": h.token_estimate,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(arr));
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("no hits for \"{query}\"");
+        return Ok(());
+    }
+    for h in &hits {
+        match (&h.name, &h.kind) {
+            (Some(name), Some(kind)) => println!(
+                "{}:{}-{}  {} {}  (~{} tok)",
+                h.path, h.start_line, h.end_line, kind, name, h.token_estimate
+            ),
+            _ => println!("{}  (file match)", h.path),
+        }
+    }
     Ok(())
 }
 
@@ -205,6 +251,10 @@ fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Re
 
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
+    let quarantines = ledger::quarantine_count(&paths::state_dir());
+    if quarantines > 0 {
+        println!("ledger: {quarantines} quarantined corrupt file(s) — torn writes occurred (ledger.json.corrupt-*)");
+    }
     let ledger = ledger::load();
     let sessions = ledger.sessions.len();
     let injected: u64 = ledger
@@ -229,10 +279,19 @@ fn status() -> anyhow::Result<()> {
 }
 
 fn main() {
+    // Hook invocations bypass clap entirely: a parse failure would exit 2,
+    // which is the harness's BLOCKING code (a Stop hook exiting 2 traps the
+    // session in a loop). Hooks must reach hooks::run no matter what.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("hook") {
+        let event = argv.get(2).cloned().unwrap_or_default();
+        hooks::run(&event);
+        return;
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Hook { event } => {
-            // Never propagate errors to the harness; hooks::run records them.
+            // Unreachable in practice (pre-dispatch above), kept for --help.
             hooks::run(&event);
         }
         Command::Daemon { action } => {
@@ -257,6 +316,12 @@ fn main() {
         Command::Scan => {
             if let Err(e) = scan() {
                 eprintln!("cfetch scan: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Find { query, limit, json } => {
+            if let Err(e) = find(&query, limit, json) {
+                eprintln!("cfetch find: {e}");
                 std::process::exit(1);
             }
         }

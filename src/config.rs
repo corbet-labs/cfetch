@@ -23,6 +23,10 @@ pub struct Config {
     /// Paths are relative to brain_root unless absolute.
     #[serde(default)]
     pub resident: Vec<ResidentEntry>,
+    /// Roots for the code index (`cfetch find`). Empty means the default:
+    /// `<brain_root>/projects/github` — where the house repos live.
+    #[serde(default)]
+    pub code_roots: Vec<PathBuf>,
     /// Hard cap on the injected digest, in characters.
     #[serde(default = "default_budget_chars")]
     pub budget_chars: usize,
@@ -44,6 +48,7 @@ impl Default for Config {
         Config {
             brain_root: paths::default_brain_root(),
             resident: vec![ResidentEntry { path: PathBuf::from("AGENT.md"), ring: 1 }],
+            code_roots: Vec::new(),
             budget_chars: default_budget_chars(),
             ledger_max_sessions: default_ledger_max_sessions(),
         }
@@ -85,6 +90,14 @@ impl Config {
 
     pub fn resolve(&self, p: &std::path::Path) -> PathBuf {
         if p.is_absolute() { p.to_path_buf() } else { self.brain_root.join(p) }
+    }
+
+    pub fn effective_code_roots(&self) -> Vec<PathBuf> {
+        if self.code_roots.is_empty() {
+            vec![self.brain_root.join("projects/github")]
+        } else {
+            self.code_roots.iter().map(|p| self.resolve(p)).collect()
+        }
     }
 }
 

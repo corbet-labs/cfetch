@@ -1,6 +1,6 @@
 [package]
 name = "cfetch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 description = "A second brain for coding agents: privilege-ring memory, hook injection, retrieval, and a code index in one binary"
@@ -14,6 +14,12 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tree-sitter = "0.26.12"
+tree-sitter-go = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -46,7 +46,7 @@ pub fn call(op: &str, timeout: Duration) -> Option<Response> {
     serde_json::from_str(&line).ok()
 }
 
-fn handle(req: &Request, cfg: &Config) -> (Response, bool) {
+fn handle(req: &Request) -> (Response, bool) {
     match req.op.as_str() {
         "ping" => (
             Response {
@@ -57,8 +57,19 @@ fn handle(req: &Request, cfg: &Config) -> (Response, bool) {
             false,
         ),
         "resident" => {
-            let d = resident::build(cfg);
-            (Response { ok: true, digest: Some(d.text), ..Response::default() }, false)
+            // Config is reloaded per request: a startup snapshot would make
+            // the warm path silently diverge from the daemon-less fallback
+            // after a config edit.
+            match Config::load() {
+                Ok(cfg) => {
+                    let d = resident::build(&cfg);
+                    (Response { ok: true, digest: Some(d.text), ..Response::default() }, false)
+                }
+                Err(e) => (
+                    Response { ok: false, error: Some(e.to_string()), ..Response::default() },
+                    false,
+                ),
+            }
         }
         "health" => {
             let degraded = heartbeat::degraded().into_iter().map(|(n, _)| n).collect();
@@ -74,7 +85,6 @@ fn handle(req: &Request, cfg: &Config) -> (Response, bool) {
 
 /// Foreground run loop (systemd/`daemon start` both end up here).
 pub fn run() -> anyhow::Result<()> {
-    let cfg = Config::load()?;
     let sock = paths::socket_path();
     if let Some(dir) = sock.parent() {
         std::fs::create_dir_all(dir)?;
@@ -98,7 +108,7 @@ pub fn run() -> anyhow::Result<()> {
             continue;
         }
         let (resp, shutdown) = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(&req, &cfg),
+            Ok(req) => handle(&req),
             Err(e) => (
                 Response { ok: false, error: Some(format!("bad request: {e}")), ..Response::default() },
                 false,

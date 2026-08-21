@@ -37,6 +37,52 @@ fn file_in(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("ledger.json")
 }
 
+/// Ledger lock: ~500ms max wait, 5s stale-steal. `None` means proceed
+/// UNLOCKED — a clobbered counter beats a stalled hook.
+fn acquire_lock(state_dir: &std::path::Path) -> Option<crate::lockfile::Lock> {
+    crate::lockfile::acquire(&state_dir.join("ledger.lock"), 500, 5)
+}
+
+/// A corrupt ledger is moved aside (bytes preserved for forensics), never
+/// overwritten in place and never allowed to permanently wedge booking. At
+/// most 3 quarantine files are kept.
+fn quarantine(state_dir: &std::path::Path) {
+    let path = file_in(state_dir);
+    let ts = now();
+    let _ = std::fs::rename(&path, state_dir.join(format!("ledger.json.corrupt-{ts}")));
+    if let Ok(rd) = std::fs::read_dir(state_dir) {
+        let mut quarantined: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("ledger.json.corrupt-"))
+            })
+            .collect();
+        quarantined.sort();
+        while quarantined.len() > 3 {
+            let _ = std::fs::remove_file(quarantined.remove(0));
+        }
+    }
+}
+
+/// Number of quarantined corrupt ledgers — surfaced by status/selfcheck so a
+/// torn write is visible instead of silent.
+pub fn quarantine_count(state_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(state_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("ledger.json.corrupt-"))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -73,8 +119,13 @@ pub fn book_in(
     chars: usize,
     max_sessions: usize,
 ) {
-    if chars == 0 || corrupt(state_dir) {
+    if chars == 0 {
         return;
+    }
+    let _ = std::fs::create_dir_all(state_dir);
+    let _lock = acquire_lock(state_dir);
+    if corrupt(state_dir) {
+        quarantine(state_dir);
     }
     let mut ledger = load_from(state_dir);
     let s = ledger
@@ -98,11 +149,10 @@ pub fn book_in(
     }
 
     let path = file_in(state_dir);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(s) = serde_json::to_string_pretty(&ledger) {
-        let tmp = path.with_extension("json.tmp");
+        // Unique tmp per writer: a shared tmp name lets two processes
+        // interleave open/truncate/write and rename a torn file into place.
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         if std::fs::write(&tmp, s).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
@@ -138,13 +188,38 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_ledger_is_never_overwritten() {
+    fn corrupt_ledger_is_quarantined_and_booking_recovers() {
         let dir = tempfile::tempdir().unwrap();
         let path = file_in(dir.path());
         std::fs::write(&path, "{ not json").unwrap();
         book_in(dir.path(), "s1", "resident", 100, 10);
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(raw, "{ not json");
+        // The corrupt bytes are preserved aside, not overwritten in place…
+        assert_eq!(quarantine_count(dir.path()), 1);
+        let q: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_str().unwrap().starts_with("ledger.json.corrupt-"))
+            .collect();
+        assert_eq!(std::fs::read_to_string(q[0].path()).unwrap(), "{ not json");
+        // …and booking works again instead of wedging forever.
+        let l = load_from(dir.path());
+        assert_eq!(l.sessions["s1"].by_source["resident"].chars, 100);
+    }
+
+    #[test]
+    fn lock_is_released_and_stale_locks_are_stolen() {
+        let dir = tempfile::tempdir().unwrap();
+        book_in(dir.path(), "s1", "resident", 10, 10);
+        assert!(!dir.path().join("ledger.lock").exists(), "lock must be released");
+        // A stale lock (old mtime) must not block booking.
+        let lock = dir.path().join("ledger.lock");
+        std::fs::write(&lock, "999999").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let f = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        book_in(dir.path(), "s2", "resident", 10, 10);
+        assert_eq!(load_from(dir.path()).sessions.len(), 2);
     }
 
     #[test]

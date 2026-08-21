@@ -11,7 +11,6 @@
 //! becomes a new citation by construction. The ring prefix makes the trust
 //! level of a hit visible in the id itself.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -48,7 +47,9 @@ pub fn default_ring(rel: &str) -> u8 {
     if rel == "AGENT.md" || rel == "README.md" {
         1
     } else if rel.starts_with("mind/memories/") {
-        if rel.ends_with("MEMORY.md") { 1 } else { 2 }
+        // Exactly the index file — a topic file named e.g. OLD-MEMORY.md must
+        // not inherit ring 1 by suffix accident.
+        if rel == "mind/memories/MEMORY.md" { 1 } else { 2 }
     } else if rel.starts_with("todo/") {
         4
     } else {
@@ -83,6 +84,10 @@ fn secret_shaped(rel: &str) -> bool {
 
 /// Parses a leading `---` frontmatter for `ring: N`. Returns (ring override,
 /// line count of the frontmatter block including fences).
+///
+/// FAIL CLOSED: a `ring:` key whose value does not parse cleanly yields 255
+/// (= skip the file). A malformed declaration on quarantined content must
+/// never fall back to an indexable default.
 fn frontmatter_ring(text: &str) -> (Option<u8>, usize) {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
@@ -94,8 +99,10 @@ fn frontmatter_ring(text: &str) -> (Option<u8>, usize) {
         if t == "---" {
             return (ring, i + 2);
         }
-        if let Some(v) = t.strip_prefix("ring:") {
-            ring = v.trim().parse::<u8>().ok();
+        let lower = t.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("ring:") {
+            let token = v.split_whitespace().next().unwrap_or("");
+            ring = Some(token.parse::<u8>().unwrap_or(255));
         }
     }
     // Unterminated frontmatter: treat as content.
@@ -106,9 +113,14 @@ fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
 
+/// 40 hash bits: at ~20k blocks the birthday collision expectation is ~0.0002
+/// — the 24-bit version measurably collided in the real corpus.
 pub fn cite_id(ring: u8, text: &str) -> String {
     let digest = sha2::Sha256::digest(normalize(text).as_bytes());
-    format!("r{ring}-{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2])
+    format!(
+        "r{ring}-{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4]
+    )
 }
 
 /// Splits markdown into logical blocks: heading, list item (with indented
@@ -128,8 +140,18 @@ pub fn segment(text: &str, skip_lines: usize) -> Vec<(usize, usize, String)> {
         }
         let start = i;
         if trimmed.starts_with("```") {
+            // CommonMark closing rule: only a run of AT LEAST the opening
+            // length closes the fence — a ```` fence containing ``` examples
+            // must not close early.
+            let open_run = trimmed.chars().take_while(|&c| c == '`').count();
             i += 1;
-            while i < lines.len() && !lines[i].trim_start().starts_with("```") {
+            while i < lines.len() {
+                let t = lines[i].trim_start();
+                if t.chars().take_while(|&c| c == '`').count() >= open_run
+                    && t.starts_with("```")
+                {
+                    break;
+                }
                 i += 1;
             }
             i = (i + 1).min(lines.len());
@@ -175,6 +197,11 @@ fn db_path(state_dir: &Path) -> PathBuf {
     state_dir.join("index.db")
 }
 
+/// Bump whenever tables/columns/id formats change: an old DB with a new
+/// binary is silently wrong (e.g. stale cite widths), and the cache is
+/// disposable — mismatches are handled by delete-and-rebuild in `open()`.
+const SCHEMA_VERSION: i64 = 2;
+
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -182,6 +209,15 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_millis(1000))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != SCHEMA_VERSION {
+        let tables: i64 =
+            conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))?;
+        if tables > 0 {
+            anyhow::bail!("index schema v{version} != v{SCHEMA_VERSION}; rebuild required");
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS docs(
@@ -231,11 +267,12 @@ struct SourceFile {
 }
 
 fn stat_of(meta: &std::fs::Metadata) -> (u64, u64) {
+    // Nanosecond precision: same-second same-size edits must flip staleness.
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     (mtime, meta.len())
 }
@@ -296,8 +333,24 @@ fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFil
     out
 }
 
-/// Cheap staleness decision: compare the sources' (path, mtime, size) set with
-/// the docs table. Stat-only — no file bodies are read.
+/// One value answering "does this index describe these sources": sha256 over
+/// the sorted (doc_path, mtime, size) list — INCLUDING files the scan later
+/// skips by ring, so a ring-frontmatter edit or a skipped file's change flips
+/// staleness like any other.
+fn source_fingerprint(files: &[SourceFile]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for f in files {
+        hasher.update(f.doc_path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(f.mtime.to_le_bytes());
+        hasher.update(f.size.to_le_bytes());
+        hasher.update([0xffu8]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Cheap staleness decision: stat-only fingerprint comparison — no file
+/// bodies are read.
 pub fn stale(conn: &Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<bool> {
     let root_meta: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
@@ -305,36 +358,11 @@ pub fn stale(conn: &Connection, brain_root: &Path, native_root: Option<&Path>) -
     if root_meta.as_deref() != Some(brain_root.to_string_lossy().as_ref()) {
         return Ok(true);
     }
-    let mut indexed: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    let mut stmt = conn.prepare("SELECT path, mtime, size FROM docs")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)))
-    })?;
-    for row in rows {
-        let (p, ms) = row?;
-        indexed.insert(p, ms);
-    }
-    // Skipped ring-5+ files never land in docs; carry them as absent by
-    // comparing only what WOULD be indexed. A ring-5 file edit still flips
-    // staleness via mtime, which is acceptable over-rebuilding, not a miss.
-    let current: BTreeMap<String, (u64, u64)> = collect_files(brain_root, native_root)
-        .into_iter()
-        .map(|f| (f.doc_path, (f.mtime, f.size)))
-        .collect();
-    // Everything indexed must still exist unchanged; new files show up as
-    // current-not-indexed. Ring-skipped files are current-not-indexed too —
-    // tolerated below by only requiring indexed ⊆ current with equal stats,
-    // plus no brand-new indexable file that we have never seen.
-    for (p, ms) in &indexed {
-        match current.get(p) {
-            Some(c) if c == ms => {}
-            _ => return Ok(true),
-        }
-    }
-    let seen: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key='source_count'", [], |r| r.get(0))
+    let stored: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0))
         .ok();
-    Ok(seen.as_deref() != Some(current.len().to_string().as_str()))
+    let current = source_fingerprint(&collect_files(brain_root, native_root));
+    Ok(stored.as_deref() != Some(current.as_str()))
 }
 
 pub struct ScanReport {
@@ -348,8 +376,15 @@ pub struct ScanReport {
 /// disposable-cache design.
 pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<ScanReport> {
     let files = collect_files(brain_root, native_root);
-    let source_count = files.len();
-    let tx = conn.transaction()?;
+    let fingerprint = source_fingerprint(&files);
+    // Read every body BEFORE the write transaction: the tree may be NFS, and
+    // holding SQLite's writer lock across slow I/O starves concurrent readers
+    // into SQLITE_BUSY failures.
+    let bodies: Vec<(SourceFile, String)> = files
+        .into_iter()
+        .filter_map(|src| std::fs::read_to_string(&src.abs).ok().map(|raw| (src, raw)))
+        .collect();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute_batch(
         "DELETE FROM blocks; DELETE FROM docs;
          INSERT INTO blocks_fts(blocks_fts) VALUES('delete-all');",
@@ -360,18 +395,19 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
         [brain_root.to_string_lossy().as_ref()],
     )?;
     tx.execute(
-        "INSERT INTO meta(key, value) VALUES('source_count', ?1)
+        "INSERT INTO meta(key, value) VALUES('source_fingerprint', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [source_count.to_string()],
+        [fingerprint],
     )?;
     let mut report = ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0 };
-    for src in files {
-        let raw = match std::fs::read_to_string(&src.abs) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    for (src, raw) in bodies {
         let (fm_ring, fm_lines) = frontmatter_ring(&raw);
-        let ring = fm_ring.unwrap_or(src.default_ring);
+        let mut ring = fm_ring.unwrap_or(src.default_ring);
+        // The native store's contract ring is 2: honor demotion to 5+ (skip),
+        // never self-promotion into the resident/policy rings.
+        if src.doc_path.starts_with("native:") {
+            ring = ring.max(2);
+        }
         if ring > MAX_INDEXED_RING {
             report.skipped_high_ring += 1;
             continue;
@@ -465,7 +501,10 @@ pub fn expand(conn: &Connection, cite: &str) -> anyhow::Result<Vec<Block>> {
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-/// Ensures the index exists and is fresh, rebuilding when stale.
+/// Ensures the index exists and is fresh, rebuilding when stale. Rebuilds are
+/// serialized by a lockfile: when another process is already rebuilding, this
+/// one serves the still-valid committed snapshot instead of failing with
+/// SQLITE_BUSY or duplicating the work.
 pub fn ensure_fresh(
     state_dir: &Path,
     brain_root: &Path,
@@ -473,7 +512,13 @@ pub fn ensure_fresh(
 ) -> anyhow::Result<Connection> {
     let mut conn = open(state_dir).context("open index")?;
     if stale(&conn, brain_root, native_root)? {
-        scan(&mut conn, brain_root, native_root)?;
+        // `None` = another rebuilder is active; serve the committed snapshot.
+        let lock = crate::lockfile::acquire(&state_dir.join("scan.lock"), 500, 120);
+        // Re-check under the lock: the previous holder may have rebuilt
+        // exactly what we were about to.
+        if lock.is_some() && stale(&conn, brain_root, native_root)? {
+            scan(&mut conn, brain_root, native_root)?;
+        }
     }
     Ok(conn)
 }
@@ -646,6 +691,79 @@ mod tests {
         let report = scan(&mut conn, brain.path(), Some(&absent)).unwrap();
         assert_eq!(report.docs, 1);
         assert!(!stale(&conn, brain.path(), Some(&absent)).unwrap());
+    }
+
+    #[test]
+    fn malformed_ring_frontmatter_fails_closed() {
+        let dir = brain(&[
+            ("knowledge/bad.md", "---\nring: banana\n---\nzweptahl must stay hidden\n"),
+            ("knowledge/spaced.md", "---\nRing: 1 # promoted\n---\nquorvex is promoted\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None).unwrap();
+        assert_eq!(report.skipped_high_ring, 1);
+        assert!(recall(&conn, "zweptahl", 5).unwrap().is_empty());
+        let hits = recall(&conn, "quorvex", 5).unwrap();
+        assert_eq!(hits[0].ring, 1, "case-insensitive key + trailing token tolerated");
+    }
+
+    #[test]
+    fn native_files_cannot_promote_above_ring2() {
+        let brain_dir = brain(&[("knowledge/a.md", "x\n")]);
+        let native = tempfile::tempdir().unwrap();
+        let mem = native.path().join("p/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("sneaky.md"), "---\nring: 0\n---\ni claim to be an invariant\n").unwrap();
+        std::fs::write(mem.join("quarantined.md"), "---\nring: 5\n---\nhidden\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, brain_dir.path(), Some(native.path())).unwrap();
+        let hits = recall(&conn, "invariant", 5).unwrap();
+        assert_eq!(hits[0].ring, 2, "promotion clamped to the store's contract ring");
+        assert_eq!(report.skipped_high_ring, 1, "demotion to 5+ is honored");
+    }
+
+    #[test]
+    fn skipped_file_changes_still_flip_staleness() {
+        let dir = brain(&[
+            ("knowledge/a.md", "visible\n"),
+            ("knowledge/staged.md", "---\nring: 5\n---\nv1\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        assert!(!stale(&conn, dir.path(), None).unwrap());
+        // Editing the SKIPPED file (e.g. removing its ring-5 marker = promotion)
+        // must be noticed — the old subset comparison was blind to this.
+        std::fs::write(dir.path().join("knowledge/staged.md"), "now public\n").unwrap();
+        assert!(stale(&conn, dir.path(), None).unwrap());
+    }
+
+    #[test]
+    fn long_fence_containing_short_fence_does_not_close_early() {
+        let text = "````\ncode\n```\nstill code\n````\n\nafter\n";
+        let blocks = segment(text, 0);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].2.contains("still code"));
+        assert_eq!(blocks[1].2, "after");
+    }
+
+    #[test]
+    fn old_schema_version_triggers_rebuild_not_silent_reuse() {
+        let state = tempfile::tempdir().unwrap();
+        {
+            let conn = open(state.path()).unwrap();
+            conn.execute("INSERT INTO meta(key,value) VALUES('marker','old')", []).unwrap();
+            conn.pragma_update(None, "user_version", 1i64).unwrap();
+        }
+        let conn = open(state.path()).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let marker: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key='marker'", [], |r| r.get(0))
+            .ok();
+        assert!(marker.is_none(), "old-schema DB must be discarded, not reused");
     }
 
     #[test]

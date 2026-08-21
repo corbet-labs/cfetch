@@ -46,15 +46,17 @@ fn managed_entry(subcommand: &str) -> Value {
     })
 }
 
-fn is_managed(entry: &Value) -> bool {
-    entry
-        .get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|hooks| {
-            hooks
-                .iter()
-                .any(|h| h.get("_managedBy").and_then(Value::as_str) == Some(MANAGED_BY))
-        })
+/// Removes OUR tagged hook objects from an entry's inner `hooks` array —
+/// never the whole entry, which may co-locate user hooks. Returns whether the
+/// entry still does anything and should be kept.
+fn strip_managed(entry: &mut Value) -> bool {
+    match entry.get_mut("hooks").and_then(Value::as_array_mut) {
+        Some(hooks) => {
+            hooks.retain(|h| h.get("_managedBy").and_then(Value::as_str) != Some(MANAGED_BY));
+            !hooks.is_empty()
+        }
+        None => true, // not a shape we own; leave it alone
+    }
 }
 
 /// Pure merge so it is testable: returns the new settings document.
@@ -78,7 +80,7 @@ pub fn merge(settings: Value) -> anyhow::Result<Value> {
         let list = list
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("settings.json hooks.{event_key} is not an array"))?;
-        list.retain(|entry| !is_managed(entry));
+        list.retain_mut(strip_managed);
         list.push(managed_entry(subcommand));
     }
     Ok(Value::Object(root))
@@ -94,7 +96,7 @@ pub fn unmerge(settings: Value) -> anyhow::Result<Value> {
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for (_, list) in hooks.iter_mut() {
             if let Some(arr) = list.as_array_mut() {
-                arr.retain(|entry| !is_managed(entry));
+                arr.retain_mut(strip_managed);
             }
         }
     }
@@ -173,6 +175,24 @@ mod tests {
     }
 
     #[test]
+    fn user_hook_colocated_in_managed_entry_survives() {
+        // A user may append their own hook object INTO our managed entry's
+        // hooks array; merge/unmerge must remove only the tagged object.
+        let mut merged = merge(Value::Null).unwrap();
+        merged["hooks"]["Stop"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "command", "command": "user-added-inside"}));
+        let remerged = merge(merged.clone()).unwrap();
+        let all: String = serde_json::to_string(&remerged).unwrap();
+        assert!(all.contains("user-added-inside"), "co-located user hook was deleted");
+        let unmerged = unmerge(remerged).unwrap();
+        let s = serde_json::to_string(&unmerged).unwrap();
+        assert!(s.contains("user-added-inside"));
+        assert!(!s.contains(MANAGED_BY));
+    }
+
+    #[test]
     fn unmerge_removes_only_ours() {
         let merged = merge(json!({
             "hooks": {"Stop": [
@@ -184,9 +204,6 @@ mod tests {
         let stop = clean["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1);
         assert_eq!(stop[0]["hooks"][0]["command"], "keep-me");
-        for (event, _) in EVENTS {
-            let arr = clean["hooks"][event].as_array().unwrap();
-            assert!(arr.iter().all(|e| !is_managed(e)));
-        }
+        assert!(!serde_json::to_string(&clean).unwrap().contains(MANAGED_BY));
     }
 }
