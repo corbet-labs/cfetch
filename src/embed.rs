@@ -160,6 +160,9 @@ pub struct EmbedClient {
     /// an endpoint that ignores the parameter still yields exactly this
     /// width. 0 = take whatever the model returns.
     dimensions: usize,
+    /// Instruction prepended to a query, never to a document (see
+    /// [`crate::config::EmbeddingsConfig::query_prefix`]).
+    query_prefix: String,
 }
 
 impl std::fmt::Debug for EmbedClient {
@@ -199,6 +202,7 @@ impl EmbedClient {
             auth,
             base_timeout,
             dimensions: cfg.dimensions,
+            query_prefix: cfg.query_prefix.clone(),
         })
     }
 
@@ -247,6 +251,23 @@ impl EmbedClient {
     /// large batch on a slow backend is busy, not down.
     pub fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         self.embed_with_timeout(texts, batch_timeout(self.base_timeout, texts.len()))
+    }
+
+    /// Embeds ONE query, with the configured instruction prefix applied.
+    ///
+    /// This is the only path that prefixes anything. `embed`/`embed_batch`
+    /// stay raw, because what they produce is stored and shared, and a
+    /// document embedded with an instruction is not the same artifact.
+    pub fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
+        let text = if self.query_prefix.is_empty() {
+            query.to_string()
+        } else {
+            format!("{}{query}", self.query_prefix)
+        };
+        self.embed(&[text.as_str()])?
+            .into_iter()
+            .next()
+            .context("endpoint returned no vector for the query")
     }
 
     /// Embeds a batch of texts; returns one vector per input, in input order
@@ -495,9 +516,7 @@ pub fn semantic_hits(
         // lexical "hybrid" is the degradation this project bans.
         return Ok(SemanticRecall { hits: index::recall(conn, query, limit)?, note });
     }
-    let embedded_query = client
-        .embed(&[query])
-        .and_then(|vs| vs.into_iter().next().context("endpoint returned no vector for the query"));
+    let embedded_query = client.embed_query(query);
     let mut qv = match embedded_query {
         Ok(qv) => qv,
         Err(e) => {
@@ -665,6 +684,40 @@ mod tests {
     }
 
     // ---- client wire behavior ----
+
+    #[test]
+    fn the_instruction_prefixes_queries_and_never_documents() {
+        // Asymmetric retrieval: the instruction belongs on the query side.
+        // A document embedded with it would not be the same artifact as the
+        // one every other host derived, so `embed`/`embed_batch` stay raw.
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let mut cfg = EmbeddingsConfig {
+            enabled: true,
+            endpoint: url.clone(),
+            model: "test-model".into(),
+            dimensions: 2,
+            ..EmbeddingsConfig::default()
+        };
+        cfg.query_prefix = "Instruct: find it\nQuery: ".into();
+        let client = EmbedClient::new(&cfg).unwrap();
+
+        client.embed_query("what is it").unwrap();
+        client.embed_batch(&["a stored block"]).unwrap();
+        let sent = bodies.lock().unwrap();
+        let q: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(q["input"], serde_json::json!(["Instruct: find it\nQuery: what is it"]));
+        let d: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        assert_eq!(d["input"], serde_json::json!(["a stored block"]), "documents stay raw");
+    }
+
+    #[test]
+    fn an_empty_prefix_leaves_the_query_untouched() {
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let client = client_for(&url);
+        client.embed_query("plain").unwrap();
+        let q: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(q["input"], serde_json::json!(["plain"]));
+    }
 
     #[test]
     fn embed_posts_openai_shape_and_orders_by_index() {

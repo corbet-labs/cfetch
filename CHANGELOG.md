@@ -41,6 +41,11 @@ listed here is a fix or an internal change with no effect on behavior.
   versioned append-only JSONL streams per host; staging candidates are
   markdown files with content-addressed ids, so a candidate flagged on one
   machine is visible — and drainable — from any of them.
+- **Queries are embedded the way retrieval models expect.** `embeddings.query_prefix`
+  carries the instruction modern embedders are trained to see on the query
+  side, and only there — documents stay raw, so stored vectors are unchanged.
+  Without it cfetch was embedding queries and documents identically, which
+  these models are explicitly not trained for.
 - **A host that holds nothing can still rank semantically.** `--semantic` and
   `--hybrid` used to refuse over remote serving, because the querying host had
   no vectors and no endpoint to embed its own query against. The serving host

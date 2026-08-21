@@ -334,6 +334,17 @@ local llama.cpp server, LM Studio, vLLM, or a hosted API:
   and re-normalized client-side. A model that cannot reach the width is an
   error, never a silently narrower vector. Full native width is usually 8–16x
   more than a documentation corpus can use, and it dominates the index file.
+- `query_prefix` — the instruction this model expects on a QUERY, and on
+  nothing else. Retrieval embedders are asymmetric: they are trained with an
+  instruction on the query side and raw text on the document side, and they
+  lose accuracy when both are embedded identically. E5 wants `"query: "`;
+  Qwen3 wants an `Instruct:`/`Query:` pair. Measured here against
+  qwen3-embed-8b over a 17,610-block tree, the documented wording widened the
+  cosine margin between a relevant block and a distractor from +0.082 to
+  +0.128, and visibly fixed the ranking. There is deliberately no
+  document-side prefix: a query prefix changes one query, while a document
+  prefix would change every stored vector and so would have to become part of
+  the artifact identity.
 - `precision` — `f16` (default) or `f32`. Half floats halve the artifact at a
   cosine error far below the ranking's resolution.
 - `api_key_env` — the NAME of an environment variable holding the key, never
