@@ -59,6 +59,16 @@ Two properties make that safe to rely on:
   comes — labeled stale, with the reason. Silent staleness is the one failure
   this design refuses.
 
+How the barrier proves coverage depends on what the platform's file watcher can
+promise, and `cfetch status` says which is in force. On Linux, inotify delivers
+events in order, so a numbered sentinel riding the same queue proves it for
+free. Where events carry no usable order — macOS FSEvents, kqueue, Windows,
+polling — the barrier proves coverage by content instead, comparing a stat
+fingerprint of the tree taken at query entry against what the committed catalog
+has seen. That costs a stat walk per query (tens of milliseconds on a normal
+brain) and it is not optional: a guarantee the platform cannot give is not a
+guarantee, and an answer that cannot be proven fresh says so.
+
 A machine that holds nothing opens no database, keeps no index, and needs no
 storage: it is a network call away from the whole brain.
 

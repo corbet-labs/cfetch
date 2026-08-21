@@ -5,6 +5,19 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **The drain barrier is sound on every platform, and says which path it is
+  on.** Proving coverage with a sentinel works only where the watcher delivers
+  events in order, which is inotify and nothing else; macOS FSEvents coalesces
+  per directory and does not order across them, and a concurrent-writer run
+  there could answer `fresh: true` while missing a committed statement. The
+  watcher backend now declares its ordering capability at runtime: Linux keeps
+  the sentinel path unchanged, and every other backend proves coverage by
+  comparing a stat fingerprint of the tree, taken at query entry, against what
+  the committed catalog has seen. `serve-status` and `cfetch status` name the
+  mode in force. Where one such walk would cost more than the barrier's own
+  budget, the answer comes back immediately as stale-and-labeled rather than
+  blowing the bound.
+
 - **Rings are configuration, not code.** `ring_rules` (ordered prefix → ring)
   and `exclude_prefixes` replace a hardcoded taxonomy. The shipped defaults
   reproduce the previous behavior exactly. Secrets, logs and `.git` remain
