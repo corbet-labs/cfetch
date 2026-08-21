@@ -1223,11 +1223,14 @@ mod tests {
     #[test]
     fn barrier_times_out_stale_when_nothing_applies() {
         let dir = tempfile::tempdir().unwrap();
+        // Pinned to the sentinel path: this test simulates a watcher, so it
+        // must not depend on what the HOST's watcher backend can promise.
         let state = ServeState::new(
             "test".into(),
             dir.path().to_path_buf(),
             dir.path().join("barrier"),
-        );
+        )
+        .with_mode(BarrierMode::Ordered);
         std::fs::create_dir_all(dir.path().join("barrier")).unwrap();
         // No watcher, no worker: the sentinel is never observed.
         let out = state.barrier(Duration::from_millis(80));
@@ -1241,11 +1244,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let barrier_dir = dir.path().join("barrier");
         std::fs::create_dir_all(&barrier_dir).unwrap();
-        let state = Arc::new(ServeState::new(
-            "test".into(),
-            dir.path().to_path_buf(),
-            barrier_dir,
-        ));
+        let state = Arc::new(
+            ServeState::new("test".into(), dir.path().to_path_buf(), barrier_dir)
+                .with_mode(BarrierMode::Ordered),
+        );
         // A fully started server: watches registered (the registration
         // thread's job), pending work exists and is not yet applied.
         state.mark_watches_ready();
@@ -1272,11 +1274,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let barrier_dir = dir.path().join("barrier");
         std::fs::create_dir_all(&barrier_dir).unwrap();
-        let state = Arc::new(ServeState::new(
-            "test".into(),
-            dir.path().to_path_buf(),
-            barrier_dir,
-        ));
+        let state = Arc::new(
+            ServeState::new("test".into(), dir.path().to_path_buf(), barrier_dir)
+                .with_mode(BarrierMode::Ordered),
+        );
         // Sentinel observed immediately, zero pending — but the startup
         // backstop has not settled yet: events may have been missed while
         // the daemon was down, so freshness must not be claimed.
@@ -1323,11 +1324,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let barrier_dir = dir.path().join("barrier");
         std::fs::create_dir_all(&barrier_dir).unwrap();
-        let state = Arc::new(ServeState::new(
-            "test".into(),
-            dir.path().to_path_buf(),
-            barrier_dir,
-        ));
+        let state = Arc::new(
+            ServeState::new("test".into(), dir.path().to_path_buf(), barrier_dir)
+                .with_mode(BarrierMode::Ordered),
+        );
         state.mark_applied(0, 1); // settled
         state.note_event();
         state.mark_error("disk on fire".to_string());
