@@ -639,11 +639,18 @@ fn recall(
     if query.trim().is_empty() {
         anyhow::bail!("empty query (pass search terms or --id <citation>)");
     }
-    let hits = if semantic || hybrid {
-        embed::semantic_hits(&cfg, &conn, query, limit, hybrid)?
+    // Semantic/hybrid answers carry their own degradation note: partial or
+    // absent vector coverage is reported, never hidden behind a result that
+    // silently fell back to lexical ranking.
+    let (hits, note) = if semantic || hybrid {
+        let out = embed::semantic_hits(&cfg, &conn, query, limit, hybrid)?;
+        (out.hits, out.note)
     } else {
-        index::recall(&conn, query, limit)?
+        (index::recall(&conn, query, limit)?, None)
     };
+    if let Some(note) = &note {
+        eprintln!("cfetch recall: {note}");
+    }
     let linked = if expand && !hits.is_empty() {
         let top: Vec<String> = hits.iter().take(3).map(|h| h.path.clone()).collect();
         index::linked_docs(&conn, &top, 8)?
@@ -665,7 +672,9 @@ fn recall(
             .iter()
             .map(|(p, r)| serde_json::json!({"path": p, "ring": r}))
             .collect();
-        println!("{}", serde_json::json!({"hits": arr, "linked": links}));
+        // The note rides in the JSON too: an agent parsing stdout must see
+        // the degradation its human would have read on stderr.
+        println!("{}", serde_json::json!({"hits": arr, "linked": links, "semantic_note": note}));
     } else if hits.is_empty() {
         println!("no hits for \"{query}\"");
     } else {

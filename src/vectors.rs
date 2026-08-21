@@ -44,6 +44,10 @@ const MAGIC: &str = "cfetch-vectors v1";
 /// Header lines before the hash list: magic, model, dim, precision.
 const HEADER_LINES: usize = 4;
 
+/// Up to this many missing vectors, a hydrate seeks per record instead of
+/// streaming the whole artifact file.
+const SEEK_UNTIL: usize = 64;
+
 /// Filename-safe form of a model id. Model names carry slashes and colons
 /// (`sentence-transformers/all-MiniLM-L6-v2`), which are not filenames; the
 /// mapping is lossy on purpose (two models CAN collide here), and the exact
@@ -59,6 +63,7 @@ fn slug(spec: &VectorSpec) -> String {
 
 /// A `(model, dim, precision)` artifact set on disk, with its hash list
 /// loaded. Reading needs nothing else; writing goes through [`VectorWriter`].
+#[derive(Debug)]
 pub struct VectorStore {
     dir: PathBuf,
     spec: VectorSpec,
@@ -72,8 +77,79 @@ impl VectorStore {
     /// that does not exist yet reads as empty — a host with no artifacts is a
     /// host with zero coverage, not an error.
     pub fn open(brain_root: &Path, spec: &VectorSpec) -> anyhow::Result<VectorStore> {
-        let _ = (brain_root, spec);
-        unimplemented!()
+        anyhow::ensure!(
+            !spec.model.contains(['\n', '\r']),
+            "embeddings.model must not contain newlines"
+        );
+        anyhow::ensure!(spec.dim > 0, "embeddings.dimensions must be at least 1");
+        let dir = crate::paths::shared_vector_dir(brain_root);
+        let mut store =
+            VectorStore { dir, spec: spec.clone(), hashes: Vec::new(), present: HashSet::new() };
+        store.reload()?;
+        Ok(store)
+    }
+
+    fn idx_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.idx", slug(&self.spec)))
+    }
+
+    fn bin_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.bin", slug(&self.spec)))
+    }
+
+    /// Rereads the index file. Only records that are BOTH listed and present
+    /// in the `.bin` count — a torn tail is invisible to readers.
+    fn reload(&mut self) -> anyhow::Result<()> {
+        self.hashes.clear();
+        self.present.clear();
+        let idx = self.idx_path();
+        let raw = match std::fs::read_to_string(&idx) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(anyhow::anyhow!("read {}: {e}", idx.display())),
+        };
+        let mut lines = raw.lines();
+        anyhow::ensure!(
+            lines.next() == Some(MAGIC),
+            "{} is not a cfetch vector index",
+            idx.display()
+        );
+        let mut header = std::collections::HashMap::new();
+        for _ in 0..HEADER_LINES - 1 {
+            let line = lines.next().context("truncated vector index header")?;
+            let (k, v) = line.split_once(' ').context("malformed vector index header")?;
+            header.insert(k.to_string(), v.to_string());
+        }
+        // The slug is lossy (a slash becomes an underscore), so the exact
+        // model string is what actually decides whether these vectors are
+        // ours. A mismatch is loud: two models' vectors in one ranking are
+        // numbers that only LOOK like similarity.
+        let stored_model = header.get("model").map(String::as_str).unwrap_or_default();
+        anyhow::ensure!(
+            stored_model == self.spec.model,
+            "{} holds vectors of model {stored_model:?}, not {:?}",
+            idx.display(),
+            self.spec.model
+        );
+        anyhow::ensure!(
+            header.get("dim").map(String::as_str) == Some(self.spec.dim.to_string().as_str()),
+            "{} holds a different dimension than embeddings.dimensions={}",
+            idx.display(),
+            self.spec.dim
+        );
+        anyhow::ensure!(
+            header.get("precision").map(String::as_str) == Some(self.spec.precision.as_str()),
+            "{} holds a different precision than embeddings.precision={}",
+            idx.display(),
+            self.spec.precision.as_str()
+        );
+        let listed: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let stored_records = std::fs::metadata(self.bin_path()).map(|m| m.len()).unwrap_or(0) as usize
+            / self.stride();
+        self.hashes = listed;
+        self.hashes.truncate(stored_records);
+        self.present = self.hashes.iter().cloned().collect();
+        Ok(())
     }
 
     pub fn spec(&self) -> &VectorSpec {
@@ -99,24 +175,98 @@ impl VectorStore {
 
     /// One vector by content hash, widened to f32.
     pub fn get(&self, hash: &str) -> anyhow::Result<Option<Vec<f32>>> {
-        let _ = hash;
-        unimplemented!()
+        let Some(record) = self.hashes.iter().position(|h| h == hash) else {
+            return Ok(None);
+        };
+        let path = self.bin_path();
+        let mut file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        file.seek(std::io::SeekFrom::Start((record * self.stride()) as u64))?;
+        let mut buf = vec![0u8; self.stride()];
+        file.read_exact(&mut buf).with_context(|| format!("read record {record} of {}", path.display()))?;
+        Ok(Some(index::blob_to_vec(&buf, self.spec.precision)))
     }
 
     /// Streams the whole store in record order — one sequential read, the
     /// shape a hydrate wants.
     pub fn for_each(
         &self,
-        f: impl FnMut(&str, Vec<f32>) -> anyhow::Result<()>,
+        mut f: impl FnMut(&str, Vec<f32>) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let _ = f;
-        unimplemented!()
+        if self.hashes.is_empty() {
+            return Ok(());
+        }
+        let path = self.bin_path();
+        let file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut buf = vec![0u8; self.stride()];
+        for hash in &self.hashes {
+            reader
+                .read_exact(&mut buf)
+                .with_context(|| format!("read {} (short of its index)", path.display()))?;
+            f(hash, index::blob_to_vec(&buf, self.spec.precision))?;
+        }
+        Ok(())
     }
 
     /// Takes the store's write lock and repairs any torn tail. Only a host
     /// with the embed capability ever calls this; every other host reads.
     pub fn begin_write(&mut self) -> anyhow::Result<VectorWriter<'_>> {
-        unimplemented!()
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("create {}", self.dir.display()))?;
+        // Derived bytes belong in the tree, never in the tree's git history.
+        let ignore = self.dir.join(".gitignore");
+        if !ignore.exists() {
+            std::fs::write(&ignore, "# Derived vector artifacts: shared as files, never as commits.\n*\n!.gitignore\n")
+                .with_context(|| format!("write {}", ignore.display()))?;
+        }
+        let lock = crate::lockfile::acquire(&self.dir.join("store.lock"), 5_000, 0).context(
+            "another embed run holds the shared vector store (derive-once: one writer per group)",
+        )?;
+        // Another writer may have appended since we opened: reload UNDER the
+        // lock, then repair whatever a crash left behind.
+        self.reload()?;
+        let bin = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.bin_path())?;
+        // `reload` already dropped unlisted records from the view; make the
+        // file agree, so the next append lands where its index line says.
+        bin.set_len((self.hashes.len() * self.stride()) as u64)?;
+        let mut idx = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.idx_path())?;
+        if idx.metadata()?.len() == 0 {
+            write!(
+                idx,
+                "{MAGIC}\nmodel {}\ndim {}\nprecision {}\n",
+                self.spec.model,
+                self.spec.dim,
+                self.spec.precision.as_str()
+            )?;
+        } else {
+            // Rewrite the hash list whenever the view is shorter than the
+            // file (an index line whose record never landed).
+            let raw = std::fs::read_to_string(self.idx_path())?;
+            let listed = raw.lines().skip(HEADER_LINES).filter(|l| !l.is_empty()).count();
+            if listed != self.hashes.len() {
+                let header: String =
+                    raw.lines().take(HEADER_LINES).map(|l| format!("{l}\n")).collect();
+                let body: String = self.hashes.iter().map(|h| format!("{h}\n")).collect();
+                idx.set_len(0)?;
+                idx.seek(std::io::SeekFrom::Start(0))?;
+                idx.write_all(header.as_bytes())?;
+                idx.write_all(body.as_bytes())?;
+            }
+        }
+        idx.seek(std::io::SeekFrom::End(0))?;
+        let mut bin = bin;
+        bin.seek(std::io::SeekFrom::End(0))?;
+        Ok(VectorWriter { store: self, _lock: lock, bin, idx })
     }
 }
 
@@ -133,14 +283,37 @@ impl VectorWriter<'_> {
     /// Appends one vector. Returns false when the hash is already stored (the
     /// derive-once contract: an artifact that exists is never recomputed).
     pub fn put(&mut self, hash: &str, vector: &[f32]) -> anyhow::Result<bool> {
-        let _ = (hash, vector);
-        unimplemented!()
+        anyhow::ensure!(
+            !hash.contains(['\n', '\r']) && !hash.is_empty(),
+            "content hash {hash:?} is not a hash"
+        );
+        anyhow::ensure!(
+            vector.len() == self.store.spec.dim,
+            "vector has {} components, the store holds {}",
+            vector.len(),
+            self.store.spec.dim
+        );
+        if self.store.present.contains(hash) {
+            return Ok(false);
+        }
+        // Record FIRST, index line second: a crash between them leaves an
+        // orphan record (invisible, truncated by the next writer), never an
+        // index line pointing at bytes that are not there.
+        self.bin.write_all(&index::vec_to_blob(vector, self.store.spec.precision))?;
+        writeln!(self.idx, "{hash}")?;
+        self.store.hashes.push(hash.to_string());
+        self.store.present.insert(hash.to_string());
+        Ok(true)
     }
 
     /// Durably lands everything written so far — called per batch, so an
     /// interrupted run leaves committed work behind for the next one.
     pub fn flush(&mut self) -> anyhow::Result<()> {
-        unimplemented!()
+        self.bin.flush()?;
+        self.bin.sync_all()?;
+        self.idx.flush()?;
+        self.idx.sync_all()?;
+        Ok(())
     }
 }
 
@@ -149,8 +322,43 @@ impl VectorWriter<'_> {
 /// This is what lets a second host answer semantically without ever holding
 /// an embeddings key.
 pub fn hydrate(conn: &Connection, store: &VectorStore) -> anyhow::Result<usize> {
-    let _ = (conn, store);
-    unimplemented!()
+    if store.is_empty() {
+        return Ok(0);
+    }
+    let spec = store.spec();
+    let missing = index::hashes_without_vectors(conn, spec, usize::MAX)?;
+    let wanted: HashSet<String> = missing
+        .into_iter()
+        .map(|(hash, _)| hash)
+        .filter(|hash| store.contains(hash))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut imported = 0usize;
+    if wanted.len() <= SEEK_UNTIL {
+        // The everyday case after an edit: a handful of hashes. Seeking to
+        // each record beats streaming a 40 MB artifact file to find five.
+        for hash in &wanted {
+            if let Some(vector) = store.get(hash)? {
+                index::insert_vector(&tx, hash, spec, &vector)?;
+                imported += 1;
+            }
+        }
+    } else {
+        // A first hydrate wants everything: one sequential pass, not 20k
+        // seeks over what may be an NFS-mounted tree.
+        store.for_each(|hash, vector| {
+            if wanted.contains(hash) {
+                index::insert_vector(&tx, hash, spec, &vector)?;
+                imported += 1;
+            }
+            Ok(())
+        })?;
+    }
+    tx.commit()?;
+    Ok(imported)
 }
 
 #[cfg(test)]

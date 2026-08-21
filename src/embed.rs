@@ -23,6 +23,7 @@ use rusqlite::Connection;
 
 use crate::config::{Config, EmbeddingsConfig};
 use crate::index;
+use crate::vectors;
 
 /// (scheme, host) of a URL, lowercased, without pulling in a URL crate.
 /// Userinfo is refused outright: `https://safe.example@evil.host/` parses two
@@ -154,6 +155,11 @@ pub struct EmbedClient {
     auth: Option<String>,
     /// One interactive request's bound; the batch path scales it.
     base_timeout: std::time::Duration,
+    /// Stored/queried vector width. Sent to the endpoint as `dimensions`
+    /// (Matryoshka truncation server-side) AND enforced on the response, so
+    /// an endpoint that ignores the parameter still yields exactly this
+    /// width. 0 = take whatever the model returns.
+    dimensions: usize,
 }
 
 impl std::fmt::Debug for EmbedClient {
@@ -192,11 +198,44 @@ impl EmbedClient {
             model: cfg.model.clone(),
             auth,
             base_timeout,
+            dimensions: cfg.dimensions,
         })
     }
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    /// Brings one response vector to the configured width. A model that
+    /// returns MORE is truncated to the Matryoshka prefix and re-normalized
+    /// (the endpoint either ignored `dimensions` or does not support it); a
+    /// model that returns FEWER is an error, never a silently padded or
+    /// silently narrower vector — the operator asked for a width this model
+    /// cannot produce and has to hear it.
+    fn fit(&self, mut v: Vec<f32>) -> anyhow::Result<Vec<f32>> {
+        if self.dimensions == 0 {
+            return Ok(v);
+        }
+        anyhow::ensure!(
+            v.len() >= self.dimensions,
+            "model {} returned {}-d vectors but embeddings.dimensions asks for {} \
+             (set embeddings.dimensions to {} or fewer, or configure a wider model)",
+            self.model,
+            v.len(),
+            self.dimensions,
+            v.len()
+        );
+        if v.len() > self.dimensions {
+            // A Matryoshka prefix is no longer a unit vector: re-normalize,
+            // or every truncated vector would score short against the query.
+            v.truncate(self.dimensions);
+            index::l2_normalize(&mut v);
+        }
+        Ok(v)
     }
 
     /// Interactive path (recall): one request under the tight base bound.
@@ -226,7 +265,14 @@ impl EmbedClient {
             index: Option<usize>,
             embedding: Vec<f32>,
         }
-        let body = serde_json::json!({ "model": self.model, "input": texts }).to_string();
+        let mut request = serde_json::json!({ "model": self.model, "input": texts });
+        if self.dimensions > 0 {
+            // Modern embedders are Matryoshka-trained: asking for the width
+            // we store saves the endpoint work and the wire the bytes. An
+            // endpoint that ignores the field is handled by `fit`.
+            request["dimensions"] = serde_json::json!(self.dimensions);
+        }
+        let body = request.to_string();
         let mut req = self
             .agent
             .post(&self.url)
@@ -268,7 +314,7 @@ impl EmbedClient {
             .map(|(pos, row)| (row.index.unwrap_or(pos), row.embedding))
             .collect();
         rows.sort_by_key(|(i, _)| *i);
-        Ok(rows.into_iter().map(|(_, v)| v).collect())
+        rows.into_iter().map(|(_, v)| self.fit(v)).collect()
     }
 }
 
@@ -278,61 +324,127 @@ fn snippet(text: &str) -> String {
 }
 
 pub struct EmbedIndexReport {
+    /// Vectors derived from the endpoint in this run.
     pub embedded: usize,
+    /// Vectors taken from the shared store instead of being re-derived.
+    pub imported: usize,
     pub total_blocks: usize,
 }
 
-/// Embeds every block lacking a vector, `batch` texts per request, committing
-/// per batch — an interrupted run resumes exactly where it stopped (missing
-/// vector row = not yet embedded). A changed model or dimension drops all
-/// vectors first; the loop then naturally re-covers everything.
-pub fn run(conn: &mut Connection, client: &EmbedClient, batch: usize) -> anyhow::Result<EmbedIndexReport> {
+/// Derives the vectors this storage group is still missing.
+///
+/// COMPUTE-ONCE: the shared store in the tree is the record. The run first
+/// takes everything it already holds (`hydrate`), then embeds only content
+/// hashes no host has derived yet — writing each batch to the SHARED store
+/// before caching it locally, so an interrupted run leaves its work where the
+/// next run (on any host) will find it. A missing vector is the whole
+/// resumability contract; nothing else is remembered between runs.
+pub fn run(
+    conn: &mut Connection,
+    client: &EmbedClient,
+    batch: usize,
+    store: &mut vectors::VectorStore,
+) -> anyhow::Result<EmbedIndexReport> {
     let batch = batch.max(1);
-    if index::ensure_embed_model(conn, client.model())? {
-        println!("embedding model changed -> dropped existing vectors, re-embedding everything");
+    let spec = store.spec().clone();
+    anyhow::ensure!(
+        spec.model == client.model() && spec.dim == client.dimensions(),
+        "the shared store is {} at {} dimensions, the client is {} at {} — one artifact, one spec",
+        spec.model,
+        spec.dim,
+        client.model(),
+        client.dimensions()
+    );
+    if index::ensure_vector_spec(conn, &spec)? {
+        println!("embedding spec changed -> local vector cache dropped, re-filling for {}", spec.model);
+    }
+    let imported = vectors::hydrate(conn, store)?;
+    if imported > 0 {
+        println!("imported {imported} vector(s) from the shared store (already derived by this group)");
     }
     let mut embedded = 0usize;
-    loop {
-        let missing = index::blocks_without_vectors(conn, batch)?;
-        if missing.is_empty() {
-            break;
+    let mut pending = index::hashes_without_vectors(conn, &spec, batch)?;
+    if !pending.is_empty() {
+        // The write lock is taken only when there IS something to derive: a
+        // host that only reads never needs the store to be writable.
+        let mut writer = store.begin_write()?;
+        loop {
+            let texts: Vec<&str> = pending.iter().map(|(_, t)| t.as_str()).collect();
+            let vectors = client.embed_batch(&texts)?;
+            // Record first, cache second: the shared artifact is what the
+            // group keeps, the local row is a convenience.
+            for ((hash, _), vector) in pending.iter().zip(&vectors) {
+                writer.put(hash, vector)?;
+            }
+            writer.flush()?;
+            let tx = conn.transaction()?;
+            for ((hash, _), vector) in pending.iter().zip(&vectors) {
+                index::insert_vector(&tx, hash, &spec, vector)?;
+            }
+            tx.commit()?;
+            embedded += pending.len();
+            let (done, total) = index::vector_coverage(conn, &spec)?;
+            println!("embedded {done}/{total} blocks");
+            pending = index::hashes_without_vectors(conn, &spec, batch)?;
+            if pending.is_empty() {
+                break;
+            }
         }
-        let texts: Vec<&str> = missing.iter().map(|(_, t)| t.as_str()).collect();
-        let vectors = client.embed_batch(&texts)?;
-        if let Some(first) = vectors.first()
-            && index::ensure_embed_dim(conn, first.len())?
-        {
-            // The drop cleared other rows, not this fresh batch — the loop's
-            // next blocks_without_vectors naturally re-covers everything.
-            println!("embedding dimension changed -> dropped existing vectors, re-embedding everything");
-        }
-        // One transaction per batch: an interrupted run keeps every batch
-        // committed so far, and the missing-row query resumes from there.
-        let tx = conn.transaction()?;
-        for ((block_id, _), vector) in missing.iter().zip(&vectors) {
-            index::insert_vector(&tx, *block_id, vector)?;
-        }
-        tx.commit()?;
-        embedded += missing.len();
-        let (done, total) = index::vector_counts(conn)?;
-        println!("embedded {done}/{total} blocks");
     }
-    let (_, total_blocks) = index::vector_counts(conn)?;
-    Ok(EmbedIndexReport { embedded, total_blocks })
+    let (_, total_blocks) = index::vector_coverage(conn, &spec)?;
+    Ok(EmbedIndexReport { embedded, imported, total_blocks })
 }
 
 /// CLI entry for `cfetch embed-index`.
 pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let client = EmbedClient::new(&cfg.embeddings)?;
+    let spec = cfg.embeddings.spec();
+    let mut store = vectors::VectorStore::open(&cfg.brain_root, &spec)?;
     let native = crate::paths::native_projects_root();
     let mut conn = index::ensure_fresh(&crate::paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
-    let report = run(&mut conn, &client, batch)?;
+    let report = run(&mut conn, &client, batch, &mut store)?;
     println!(
-        "embed-index complete: {} embedded this run, {} block(s) total",
-        report.embedded, report.total_blocks
+        "embed-index complete: {} embedded this run, {} imported from the shared store, {} block(s) total",
+        report.embedded, report.imported, report.total_blocks
+    );
+    println!(
+        "shared vector store: {} ({} artifact(s), {} at {} dimensions)",
+        crate::paths::shared_vector_dir(&cfg.brain_root).display(),
+        store.len(),
+        spec.precision.as_str(),
+        spec.dim
     );
     Ok(())
+}
+
+/// A semantic/hybrid answer, plus what was WRONG with it. `note` is the
+/// project's anti-silent-degradation contract in one field: a memory system
+/// that quietly returns worse answers is the failure this exists to prevent,
+/// so partial or absent vector coverage travels with the result and every
+/// caller surfaces it.
+#[derive(Debug)]
+pub struct SemanticRecall {
+    pub hits: Vec<index::Hit>,
+    pub note: Option<String>,
+}
+
+/// The coverage line, or None when nothing is degraded.
+fn coverage_note(embedded: usize, total: usize) -> Option<String> {
+    if total == 0 || embedded >= total {
+        return None;
+    }
+    Some(if embedded == 0 {
+        format!(
+            "semantic: 0/{total} blocks embedded — answering lexically only; run cfetch embed-index"
+        )
+    } else {
+        format!(
+            "semantic: {embedded}/{total} blocks embedded — {} block(s) cannot be reached \
+             semantically; run cfetch embed-index",
+            total - embedded
+        )
+    })
 }
 
 /// Semantic (`--semantic`) or hybrid (`--hybrid`) recall: embeds the query,
@@ -343,20 +455,33 @@ pub fn semantic_hits(
     query: &str,
     limit: usize,
     hybrid: bool,
-) -> anyhow::Result<Vec<index::Hit>> {
+) -> anyhow::Result<SemanticRecall> {
     let client = EmbedClient::new(&cfg.embeddings)
         .map_err(|e| anyhow::anyhow!("semantic recall unavailable: {e}"))?;
+    let spec = cfg.embeddings.spec();
+    // The shared store is the record: take whatever this group already
+    // derived before judging our own coverage.
+    let store = vectors::VectorStore::open(&cfg.brain_root, &spec)?;
+    vectors::hydrate(conn, &store)?;
+    let (embedded, total) = index::vector_coverage(conn, &spec)?;
+    let note = coverage_note(embedded, total);
+    if embedded == 0 {
+        // Nothing to rank against. Answer lexically — but say so; a silently
+        // lexical "hybrid" is the degradation this project bans.
+        return Ok(SemanticRecall { hits: index::recall(conn, query, limit)?, note });
+    }
     let mut qv = client
         .embed(&[query])?
         .into_iter()
         .next()
         .context("embeddings endpoint returned no vector for the query")?;
     index::l2_normalize(&mut qv);
-    if hybrid {
-        index::hybrid_recall(conn, query, &qv, limit, cfg.recall.rrf_k)
+    let hits = if hybrid {
+        index::hybrid_recall(conn, &spec, query, &qv, limit, cfg.recall.rrf_k)?
     } else {
-        index::semantic_recall(conn, &qv, limit)
-    }
+        index::semantic_recall(conn, &spec, &qv, limit)?
+    };
+    Ok(SemanticRecall { hits, note })
 }
 
 #[cfg(test)]
@@ -627,6 +752,7 @@ mod tests {
             endpoint: url,
             model: "test-model".into(),
             api_key_env: "CFETCH_TEST_EMBED_KEY".into(),
+            dimensions: 2,
             ..EmbeddingsConfig::default()
         })
         .unwrap();
@@ -690,6 +816,7 @@ mod tests {
             endpoint: url,
             model: "test-model".into(),
             timeout_secs: 1,
+            dimensions: 2,
             ..EmbeddingsConfig::default()
         })
         .unwrap();
@@ -709,6 +836,7 @@ mod tests {
             endpoint: url,
             model: "test-model".into(),
             timeout_secs: 1,
+            dimensions: 2,
             ..EmbeddingsConfig::default()
         })
         .unwrap();

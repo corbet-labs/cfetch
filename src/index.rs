@@ -17,7 +17,7 @@ use anyhow::Context as _;
 use rusqlite::Connection;
 use sha2::Digest as _;
 
-use crate::config::RingRules;
+use crate::config::{Precision, RingRules, VectorSpec};
 use crate::resident::blank_private;
 
 /// Rings 5-6 are never indexed: staging and exhaust must not surface in
@@ -178,14 +178,28 @@ pub fn wikilinks(text: &str) -> Vec<String> {
     out
 }
 
+/// THE content address of a statement: the full sha256 hex of its normalized
+/// text. Every derived artifact — vectors today, rerank scores tomorrow — is
+/// keyed by this, and it is stable across hosts, rescans and reorderings
+/// because it is a function of the content alone.
+///
+/// ONE hashing site: [`cite_from_hash`] shows a truncated PREFIX of this same
+/// digest, so a citation and the vector stored under its hash can never end
+/// up describing different content.
+pub fn content_hash(text: &str) -> String {
+    format!("{:x}", sha2::Sha256::digest(normalize(text).as_bytes()))
+}
+
 /// 40 hash bits: at ~20k blocks the birthday collision expectation is ~0.0002
-/// — the 24-bit version measurably collided in the real corpus.
-pub fn cite_id(ring: u8, text: &str) -> String {
-    let digest = sha2::Sha256::digest(normalize(text).as_bytes());
-    format!(
-        "r{ring}-{:02x}{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3], digest[4]
-    )
+/// — the 24-bit version measurably collided in the real corpus. The citation
+/// TRUNCATES the content address; the full digest keys the artifacts.
+const CITE_HASH_HEX: usize = 10;
+
+/// Citation id of a block: its ring, then a prefix of its content address.
+/// Takes the hash rather than the text so no caller ever hashes twice — the
+/// citation and the block's derived artifacts come from one digest.
+pub fn cite_from_hash(ring: u8, hash: &str) -> String {
+    format!("r{ring}-{}", &hash[..CITE_HASH_HEX])
 }
 
 /// A fence opener: a run of at least three backticks or tildes (CommonMark
@@ -354,7 +368,7 @@ fn db_path(state_dir: &Path) -> PathBuf {
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
 /// disposable — mismatches are handled by delete-and-rebuild in `open()`.
-const SCHEMA_VERSION: i64 = 6; // 6: heading-chain ctx, doc_links/skipped_docs, code norm columns
+const SCHEMA_VERSION: i64 = 7; // 7: blocks.hash + content-hash-keyed vectors(model, dim)
 
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -393,9 +407,11 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
            end_line INTEGER NOT NULL,
            text TEXT NOT NULL,
            ctx TEXT NOT NULL DEFAULT '',
-           chain TEXT NOT NULL DEFAULT ''
+           chain TEXT NOT NULL DEFAULT '',
+           hash TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS blocks_cite ON blocks(cite);
+         CREATE INDEX IF NOT EXISTS blocks_hash ON blocks(hash);
          CREATE INDEX IF NOT EXISTS blocks_doc ON blocks(doc_id);
          CREATE TABLE IF NOT EXISTS links(
            from_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
@@ -415,7 +431,9 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
          );
          CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(text, ctx, content='blocks', content_rowid='id');
          CREATE TABLE IF NOT EXISTS vectors(
-           block_id INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+           content_hash TEXT PRIMARY KEY,
+           model TEXT NOT NULL,
+           dim INTEGER NOT NULL,
            embedding BLOB NOT NULL
          );",
     )?;
@@ -661,12 +679,13 @@ fn insert_doc(
             chain_key = chain_text(&chain);
             ctx = chain_key.clone();
         }
-        let cite = cite_id(ring, &body);
+        let hash = content_hash(&body);
+        let cite = cite_from_hash(ring, &hash);
         tx.prepare_cached(
-            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain, hash)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?
-        .execute(rusqlite::params![cite, doc_id, start as i64, end as i64, body, ctx, chain_key])?;
+        .execute(rusqlite::params![cite, doc_id, start as i64, end as i64, body, ctx, chain_key, hash])?;
         let block_id = tx.last_insert_rowid();
         tx.prepare_cached("INSERT INTO blocks_fts(rowid, text, ctx) VALUES(?1, ?2, ?3)")?
             .execute(rusqlite::params![block_id, body, ctx])?;
@@ -767,12 +786,13 @@ pub fn scan(
         .filter_map(|src| std::fs::read_to_string(&src.abs).ok().map(|raw| (src, raw)))
         .collect();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Vectors MUST go with the blocks they describe: after `DELETE FROM
-    // blocks` SQLite reuses rowids from 1, so a stale vectors row would
-    // silently attach to an unrelated new block. Embeddings are derived data;
-    // `embed-index` rebuilds them resumably.
+    // Vectors deliberately SURVIVE the rebuild: they are keyed by content
+    // hash, not by a block rowid, so a rebuilt catalog re-joins every vector
+    // whose text is still in the tree. They used to be dropped here because
+    // rowids are recycled — which made one markdown edit cost 100% of the
+    // embeddings. `prune_vectors` below drops exactly the hashes that left.
     tx.execute_batch(
-        "DELETE FROM vectors; DELETE FROM doc_links; DELETE FROM links;
+        "DELETE FROM doc_links; DELETE FROM links;
          DELETE FROM blocks; DELETE FROM docs; DELETE FROM skipped_docs;
          INSERT INTO blocks_fts(blocks_fts) VALUES('delete-all');",
     )?;
@@ -789,13 +809,16 @@ pub fn scan(
         insert_doc(&tx, &src, &raw, &mut report)?;
     }
     resolve_links(&tx)?;
+    prune_vectors(&tx)?;
     tx.commit()?;
     Ok(report)
 }
 
 /// Removes one doc's rows everywhere: FTS rows (external-content FTS5 must be
-/// told each removed row's old values), blocks (vectors cascade), the doc row
-/// (links and doc_links cascade), and any `skipped_docs` entry.
+/// told each removed row's old values), blocks, the doc row (links and
+/// doc_links cascade), and any `skipped_docs` entry. Vectors are NOT touched
+/// here — they belong to content, not to a doc, and the same text in another
+/// file keeps them alive; [`prune_vectors`] settles that at the end of a scan.
 fn delete_doc(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<()> {
     tx.execute("DELETE FROM skipped_docs WHERE path=?1", [path])?;
     let doc_id: Option<i64> =
@@ -911,6 +934,7 @@ pub fn rescan_changed(
         }
     }
     resolve_links(&tx)?;
+    prune_vectors(&tx)?;
     tx.commit()?;
     Ok(Some(report))
 }
@@ -1138,27 +1162,104 @@ pub fn expand(conn: &Connection, cite: &str) -> anyhow::Result<Vec<Block>> {
 
 // ---- vector store (semantic + hybrid recall) ----
 //
-// Embeddings live INSIDE index.db as little-endian f32 blobs, one row per
-// block, L2-normalized at insert so cosine similarity reduces to a dot
-// product at query time. No vector-index dependency: at ~20k blocks a linear
-// scan in Rust is milliseconds, exact, and zero-dep (the sanctioned fallback
-// in DESIGN.md). A missing row means "not yet embedded" — that single fact
-// makes `embed-index` resumable for free.
+// The RECORD for embeddings is the shared artifact store in the tree (see
+// `vectors.rs`). What lives here is a per-host CACHE of the same vectors,
+// keyed by CONTENT HASH so it survives every rebuild of the catalog, joined
+// to blocks by hash at query time. Rows are L2-normalized at insert, so
+// cosine similarity reduces to a dot product. No vector-index dependency: at
+// ~20k blocks a linear scan in Rust is milliseconds and exact.
+//
+// A missing row means "not yet embedded" — that single fact makes both the
+// hydrate from the shared store and `embed-index` resumable for free.
 
-/// Little-endian f32 encoding — the on-disk vector format.
-pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
+/// IEEE binary32 -> binary16, round-to-nearest-even, subnormals included.
+/// Written out rather than pulled in: it is thirty lines of well-specified
+/// bit work, and the crate that would supply it is a dependency in every
+/// build of a tool whose bill of materials is deliberately short.
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x007f_ffff;
+    if exponent == 0xff {
+        // Inf, or NaN (kept NaN by a non-zero payload).
+        return sign | 0x7c00 | if mantissa != 0 { 0x0200 } else { 0 };
+    }
+    let unbiased = exponent - 127 + 15;
+    if unbiased >= 0x1f {
+        return sign | 0x7c00; // overflows half range -> infinity
+    }
+    if unbiased <= 0 {
+        if unbiased < -10 {
+            return sign; // below the smallest subnormal -> signed zero
+        }
+        // Subnormal: restore the implicit leading one, then shift into place.
+        let full = mantissa | 0x0080_0000;
+        let shift = (14 - unbiased) as u32;
+        let half = full >> shift;
+        let round_bit = 1u32 << (shift - 1);
+        let round_up =
+            (full & round_bit) != 0 && ((full & (round_bit - 1)) != 0 || (half & 1) != 0);
+        return sign | (half + u32::from(round_up)) as u16;
+    }
+    let half = ((unbiased as u32) << 10) | (mantissa >> 13);
+    let round_bit = 1u32 << 12;
+    let round_up = (mantissa & round_bit) != 0 && ((mantissa & (round_bit - 1)) != 0 || (half & 1) != 0);
+    sign | (half + u32::from(round_up)) as u16
+}
+
+/// Inverse of [`f32_to_f16`] — exact, every binary16 is a binary32.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exponent = ((bits >> 10) & 0x1f) as u32;
+    let mantissa = (bits & 0x03ff) as u32;
+    let out = if exponent == 0 {
+        if mantissa == 0 {
+            sign
+        } else {
+            // Subnormal: normalize by shifting the leading one into place.
+            let mut m = mantissa;
+            let mut shifts = 0u32;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                shifts += 1;
+            }
+            sign | ((113 - shifts) << 23) | ((m & 0x03ff) << 13)
+        }
+    } else if exponent == 0x1f {
+        sign | 0x7f80_0000 | (mantissa << 13)
+    } else {
+        sign | ((exponent + 127 - 15) << 23) | (mantissa << 13)
+    };
+    f32::from_bits(out)
+}
+
+/// Little-endian encoding at the configured width — the ONE codec, used by
+/// both the local cache and the shared artifact files.
+pub fn vec_to_blob(v: &[f32], precision: Precision) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * precision.width());
     for x in v {
-        out.extend_from_slice(&x.to_le_bytes());
+        match precision {
+            Precision::F16 => out.extend_from_slice(&f32_to_f16(*x).to_le_bytes()),
+            Precision::F32 => out.extend_from_slice(&x.to_le_bytes()),
+        }
     }
     out
 }
 
-/// Inverse of [`vec_to_blob`]; a trailing partial chunk (corrupt blob) is
-/// dropped rather than misread.
-pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    let (chunks, _remainder) = b.as_chunks::<4>();
-    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
+/// Inverse of [`vec_to_blob`], widened to f32 for the dot product; a trailing
+/// partial component (corrupt blob) is dropped rather than misread.
+pub fn blob_to_vec(b: &[u8], precision: Precision) -> Vec<f32> {
+    match precision {
+        Precision::F16 => {
+            let (chunks, _remainder) = b.as_chunks::<2>();
+            chunks.iter().map(|c| f16_to_f32(u16::from_le_bytes(*c))).collect()
+        }
+        Precision::F32 => {
+            let (chunks, _remainder) = b.as_chunks::<4>();
+            chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
+        }
+    }
 }
 
 /// L2-normalizes in place; the zero vector is left untouched (it can never
@@ -1190,69 +1291,93 @@ fn meta_set(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Records the embedding model in meta; a DIFFERENT stored model drops every
-/// vector (and the stored dimension) — mixed-model similarity is meaningless,
-/// and rebuild is a first-class, resumable path. Returns true when vectors
-/// were dropped.
-pub fn ensure_embed_model(conn: &Connection, model: &str) -> anyhow::Result<bool> {
-    let stored = meta_get(conn, "embed_model");
-    if stored.as_deref() == Some(model) {
+/// The artifact spec the cached vectors were written under, if any.
+pub fn stored_vector_spec(conn: &Connection) -> Option<VectorSpec> {
+    let model = meta_get(conn, "embed_model")?;
+    let dim = meta_get(conn, "embed_dim")?.parse().ok()?;
+    let precision = match meta_get(conn, "embed_precision")?.as_str() {
+        "f16" => Precision::F16,
+        "f32" => Precision::F32,
+        _ => return None,
+    };
+    Some(VectorSpec { model, dim, precision })
+}
+
+/// Records `(model, dim, precision)` in meta; a DIFFERENT stored spec drops
+/// every cached vector — vectors of two models, widths or precisions produce
+/// numbers that look like similarity and are not. Returns true when a drop
+/// happened. Re-filling is a first-class path: the shared store still holds
+/// the artifacts, so the cost is usually a hydrate, not an embed run.
+pub fn ensure_vector_spec(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<bool> {
+    let stored = stored_vector_spec(conn);
+    if stored.as_ref() == Some(spec) {
         return Ok(false);
     }
     let dropping = stored.is_some();
     conn.execute("DELETE FROM vectors", [])?;
-    // The dimension belongs to the model: clear it so the next embed run
-    // re-learns it from the first response.
-    conn.execute("DELETE FROM meta WHERE key='embed_dim'", [])?;
-    meta_set(conn, "embed_model", model)?;
+    meta_set(conn, "embed_model", &spec.model)?;
+    meta_set(conn, "embed_dim", &spec.dim.to_string())?;
+    meta_set(conn, "embed_precision", spec.precision.as_str())?;
     Ok(dropping)
 }
 
-/// Same contract as [`ensure_embed_model`] for the vector dimension (a model
-/// NAME can silently change dimension when the endpoint is reconfigured).
-pub fn ensure_embed_dim(conn: &Connection, dim: usize) -> anyhow::Result<bool> {
-    let stored = meta_get(conn, "embed_dim");
-    let dim_str = dim.to_string();
-    if stored.as_deref() == Some(dim_str.as_str()) {
-        return Ok(false);
-    }
-    let dropping = stored.is_some();
-    conn.execute("DELETE FROM vectors", [])?;
-    meta_set(conn, "embed_dim", &dim_str)?;
-    Ok(dropping)
+/// Drops cached vectors whose content is no longer anywhere in the catalog.
+/// Called at the end of every scan: an edited block's old vector goes, every
+/// unchanged block's vector stays.
+fn prune_vectors(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM vectors WHERE content_hash NOT IN (SELECT hash FROM blocks)", [])?;
+    Ok(())
 }
 
-/// Blocks with no vector row yet, in stable id order — the embed-index work
-/// queue. Missing row = not yet embedded (resumability contract).
-pub fn blocks_without_vectors(conn: &Connection, limit: usize) -> anyhow::Result<Vec<(i64, String)>> {
+/// The embed work queue: content hashes with no cached vector, each with one
+/// representative text, in document order. DISTINCT by hash — the same
+/// statement in two files is one artifact, embedded once.
+pub fn hashes_without_vectors(
+    conn: &Connection,
+    spec: &VectorSpec,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT b.id, b.text FROM blocks b
-         LEFT JOIN vectors v ON v.block_id = b.id
-         WHERE v.block_id IS NULL
-         ORDER BY b.id LIMIT ?1",
+        "SELECT b.hash, min(b.text), min(b.id) FROM blocks b
+         LEFT JOIN vectors v ON v.content_hash = b.hash AND v.model = ?1 AND v.dim = ?2
+         WHERE v.content_hash IS NULL
+         GROUP BY b.hash ORDER BY min(b.id) LIMIT ?3",
     )?;
-    let rows = stmt.query_map([limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map(
+        rusqlite::params![spec.model, spec.dim as i64, limit as i64],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )?;
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-/// (embedded, total blocks) — progress reporting.
-pub fn vector_counts(conn: &Connection) -> anyhow::Result<(usize, usize)> {
+/// (blocks reachable by semantic recall, blocks total) FOR THIS SPEC — the
+/// coverage number every degradation warning quotes. Spec-relative on
+/// purpose: vectors of another model are not coverage, they are ballast.
+pub fn vector_coverage(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<(usize, usize)> {
     let (v, b): (i64, i64) = conn.query_row(
-        "SELECT (SELECT count(*) FROM vectors), (SELECT count(*) FROM blocks)",
-        [],
+        "SELECT (SELECT count(*) FROM blocks b JOIN vectors v
+                   ON v.content_hash = b.hash AND v.model = ?1 AND v.dim = ?2),
+                (SELECT count(*) FROM blocks)",
+        rusqlite::params![spec.model, spec.dim as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok((v as usize, b as usize))
 }
 
-/// Stores one block's embedding, L2-normalized, as a little-endian f32 blob.
-pub fn insert_vector(conn: &Connection, block_id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+/// Caches one content hash's embedding, L2-normalized, at the spec's width.
+pub fn insert_vector(
+    conn: &Connection,
+    content_hash: &str,
+    spec: &VectorSpec,
+    embedding: &[f32],
+) -> anyhow::Result<()> {
     let mut v = embedding.to_vec();
     l2_normalize(&mut v);
     conn.execute(
-        "INSERT INTO vectors(block_id, embedding) VALUES(?1, ?2)
-         ON CONFLICT(block_id) DO UPDATE SET embedding=excluded.embedding",
-        rusqlite::params![block_id, vec_to_blob(&v)],
+        "INSERT INTO vectors(content_hash, model, dim, embedding) VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(content_hash) DO UPDATE SET
+           model=excluded.model, dim=excluded.dim, embedding=excluded.embedding",
+        rusqlite::params![content_hash, spec.model, spec.dim as i64, vec_to_blob(&v, spec.precision)],
     )?;
     Ok(())
 }
@@ -1285,16 +1410,28 @@ fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>
     Ok(out)
 }
 
-/// Block ids ranked by dot product against a normalized query vector —
-/// a full linear scan, exact by construction. Rows whose dimension does not
-/// match the query are skipped (transitional state during a model change).
-fn semantic_block_ids(conn: &Connection, query_vec: &[f32], limit: usize) -> anyhow::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT block_id, embedding FROM vectors")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+/// Block ids ranked by dot product against a normalized query vector — a full
+/// linear scan, exact by construction. Vectors join blocks BY CONTENT HASH,
+/// so a rebuilt catalog re-attaches every surviving vector to its new rowid.
+/// Rows whose width does not match the query are skipped (a transitional
+/// state while a spec change is being re-embedded).
+fn semantic_block_ids(
+    conn: &Connection,
+    spec: &VectorSpec,
+    query_vec: &[f32],
+    limit: usize,
+) -> anyhow::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.id, v.embedding FROM vectors v JOIN blocks b ON b.hash = v.content_hash
+         WHERE v.model = ?1 AND v.dim = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![spec.model, spec.dim as i64], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
     let mut scored: Vec<(i64, f32)> = rows
         .filter_map(Result::ok)
         .filter_map(|(id, blob)| {
-            let v = blob_to_vec(&blob);
+            let v = blob_to_vec(&blob, spec.precision);
             (v.len() == query_vec.len()).then(|| (id, dot(&v, query_vec)))
         })
         .collect();
@@ -1305,8 +1442,13 @@ fn semantic_block_ids(conn: &Connection, query_vec: &[f32], limit: usize) -> any
 
 /// Pure cosine ranking over all stored vectors (query vector must be
 /// normalized). Blocks without vectors simply cannot appear.
-pub fn semantic_recall(conn: &Connection, query_vec: &[f32], limit: usize) -> anyhow::Result<Vec<Hit>> {
-    let ids = semantic_block_ids(conn, query_vec, limit)?;
+pub fn semantic_recall(
+    conn: &Connection,
+    spec: &VectorSpec,
+    query_vec: &[f32],
+    limit: usize,
+) -> anyhow::Result<Vec<Hit>> {
+    let ids = semantic_block_ids(conn, spec, query_vec, limit)?;
     hits_for_block_ids(conn, &ids)
 }
 
@@ -1339,6 +1481,7 @@ pub fn rrf_fuse(lists: &[Vec<i64>], k: f64) -> Vec<i64> {
 /// the final limit so fusion has something to reorder.
 pub fn hybrid_recall(
     conn: &Connection,
+    spec: &VectorSpec,
     query: &str,
     query_vec: &[f32],
     limit: usize,
@@ -1346,7 +1489,7 @@ pub fn hybrid_recall(
 ) -> anyhow::Result<Vec<Hit>> {
     let pool = (limit * 4).max(20);
     let lexical = bm25_block_ids(conn, query, pool)?;
-    let semantic = semantic_block_ids(conn, query_vec, pool)?;
+    let semantic = semantic_block_ids(conn, spec, query_vec, pool)?;
     let mut fused = rrf_fuse(&[lexical, semantic], rrf_k);
     fused.truncate(limit);
     hits_for_block_ids(conn, &fused)
@@ -1487,6 +1630,10 @@ mod tests {
         assert!(recall(&conn, "hyllvar", 5).unwrap().is_empty(), "secrets stay out, always");
         assert!(recall(&conn, "nogrant", 5).unwrap().is_empty(), "configured exclusion applies");
         assert_eq!(recall(&conn, "kavender", 5).unwrap().len(), 1);
+    }
+
+    fn cite_id(ring: u8, text: &str) -> String {
+        cite_from_hash(ring, &content_hash(text))
     }
 
     #[test]
@@ -1805,12 +1952,16 @@ mod tests {
     #[test]
     fn f32_blob_roundtrip_is_little_endian() {
         let v = vec![0.25f32, -1.5, 3.0];
-        let blob = vec_to_blob(&v);
+        let blob = vec_to_blob(&v, Precision::F32);
         assert_eq!(blob.len(), 12);
         assert_eq!(&blob[0..4], &0.25f32.to_le_bytes());
-        assert_eq!(blob_to_vec(&blob), v);
+        assert_eq!(blob_to_vec(&blob, Precision::F32), v);
         // corrupt trailing partial chunk is dropped, not misread
-        assert_eq!(blob_to_vec(&blob[..10]), vec![0.25f32, -1.5]);
+        assert_eq!(blob_to_vec(&blob[..10], Precision::F32), vec![0.25f32, -1.5]);
+        // f16 is little-endian too, and exact for these values
+        let blob = vec_to_blob(&v, Precision::F16);
+        assert_eq!(blob.len(), 6);
+        assert_eq!(blob_to_vec(&blob, Precision::F16), v);
     }
 
     #[test]
