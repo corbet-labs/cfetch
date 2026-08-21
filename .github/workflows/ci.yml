@@ -1,0 +1,21 @@
+# Test + lint gate. Push is limited to main so a pull request runs once, not
+# twice. No secrets are used anywhere in this workflow.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings

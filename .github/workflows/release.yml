@@ -1,0 +1,31 @@
+# Tag v* -> GitHub release with a Linux binary. The runner's glibc-linked
+# release build is uploaded as-is; LICENSE.md rides along because FSL requires
+# the terms to accompany every redistribution. Uses only the workflow's own
+# GITHUB_TOKEN (via the contents: write permission) — no configured secrets.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/cfetch dist/cfetch-x86_64-unknown-linux-gnu
+          cp LICENSE.md dist/LICENSE.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cfetch-x86_64-unknown-linux-gnu
+            dist/LICENSE.md
