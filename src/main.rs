@@ -1,6 +1,7 @@
 mod code;
 mod config;
 mod daemon;
+mod dashboard;
 mod heartbeat;
 mod hook_io;
 mod hooks;
@@ -60,11 +61,16 @@ enum Command {
         /// Expand a citation id instead of searching
         #[arg(long)]
         id: Option<String>,
+        /// Also list docs wikilinked to the top hits (1-hop curated graph)
+        #[arg(long)]
+        expand: bool,
         #[arg(long, default_value_t = 8)]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
+    /// Open the terminal dashboard: health, ledger, live recall
+    Dashboard,
     /// Serve recall/find/expand over MCP (stdio) for any MCP client
     Mcp,
     /// Verify the installation end to end; nonzero exit on hard failures
@@ -199,7 +205,7 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
+fn recall(query: &str, id: Option<&str>, expand: bool, limit: usize, json: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     let native = paths::native_projects_root();
     let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
@@ -230,6 +236,12 @@ fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Re
         anyhow::bail!("empty query (pass search terms or --id <citation>)");
     }
     let hits = index::recall(&conn, query, limit)?;
+    let linked = if expand && !hits.is_empty() {
+        let top: Vec<String> = hits.iter().take(3).map(|h| h.path.clone()).collect();
+        index::linked_docs(&conn, &top, 8)?
+    } else {
+        Vec::new()
+    };
     if json {
         let arr: Vec<_> = hits
             .iter()
@@ -240,13 +252,23 @@ fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Re
                 })
             })
             .collect();
-        println!("{}", serde_json::json!(arr));
+        let links: Vec<_> = linked
+            .iter()
+            .map(|(p, r)| serde_json::json!({"path": p, "ring": r}))
+            .collect();
+        println!("{}", serde_json::json!({"hits": arr, "linked": links}));
     } else if hits.is_empty() {
         println!("no hits for \"{query}\"");
     } else {
         for h in &hits {
             println!("{} {}:{}-{} (ring {})", h.cite, h.path, h.start_line, h.end_line, h.ring);
             println!("    {}", h.snippet);
+        }
+        if !linked.is_empty() {
+            println!("\nlinked (curated wikilinks, 1 hop from top hits):");
+            for (p, r) in &linked {
+                println!("    {p} (ring {r})");
+            }
         }
         println!("\nexpand a hit: cfetch recall --id <citation>");
     }
@@ -323,6 +345,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Dashboard => {
+            if let Err(e) = dashboard::run() {
+                eprintln!("cfetch dashboard: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Mcp => {
             if let Err(e) = mcp::serve() {
                 eprintln!("cfetch mcp: {e}");
@@ -341,8 +369,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Recall { query, id, limit, json } => {
-            if let Err(e) = recall(&query.join(" "), id.as_deref(), limit, json) {
+        Command::Recall { query, id, expand, limit, json } => {
+            if let Err(e) = recall(&query.join(" "), id.as_deref(), expand, limit, json) {
                 eprintln!("cfetch recall: {e}");
                 std::process::exit(1);
             }

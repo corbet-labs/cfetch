@@ -113,6 +113,25 @@ fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
 
+/// Extracts `[[wikilink]]` target stems: alias (`|…`) and heading (`#…`)
+/// parts dropped, lowercased. The brain is an Obsidian vault — these are
+/// human-curated edges, the graph we trust most.
+pub fn wikilinks(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[[") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else { break };
+        let inner = &after[..end];
+        let target = inner.split(['|', '#']).next().unwrap_or("").trim();
+        if !target.is_empty() && !target.contains('\n') {
+            out.push(target.to_ascii_lowercase());
+        }
+        rest = &after[end + 2..];
+    }
+    out
+}
+
 /// 40 hash bits: at ~20k blocks the birthday collision expectation is ~0.0002
 /// — the 24-bit version measurably collided in the real corpus.
 pub fn cite_id(ring: u8, text: &str) -> String {
@@ -200,7 +219,7 @@ fn db_path(state_dir: &Path) -> PathBuf {
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
 /// disposable — mismatches are handled by delete-and-rebuild in `open()`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -236,6 +255,12 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
            text TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS blocks_cite ON blocks(cite);
+         CREATE TABLE IF NOT EXISTS links(
+           from_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+           to_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS links_from ON links(from_doc);
+         CREATE INDEX IF NOT EXISTS links_to ON links(to_doc);
          CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(text, content='blocks', content_rowid='id');",
     )?;
     Ok(conn)
@@ -400,6 +425,9 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
         [fingerprint],
     )?;
     let mut report = ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0 };
+    // (doc_id, link stems) collected during insertion, resolved afterwards
+    // when every doc is known.
+    let mut pending_links: Vec<(i64, Vec<String>)> = Vec::new();
     for (src, raw) in bodies {
         let (fm_ring, fm_lines) = frontmatter_ring(&raw);
         let mut ring = fm_ring.unwrap_or(src.default_ring);
@@ -419,6 +447,10 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
             rusqlite::params![src.doc_path, ring, src.mtime as i64, src.size as i64],
         )?;
         let doc_id = tx.last_insert_rowid();
+        let links = wikilinks(&blanked);
+        if !links.is_empty() {
+            pending_links.push((doc_id, links));
+        }
         for (start, end, body) in segment(&blanked, fm_lines) {
             let cite = cite_id(ring, &body);
             tx.execute(
@@ -435,8 +467,64 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
         }
         report.docs += 1;
     }
+    // Resolve link stems to doc ids: filename stem, unambiguous only —
+    // ambiguous stems are skipped (mirrors brain-lint's path-qualify rule).
+    {
+        let mut by_stem: std::collections::HashMap<String, Option<i64>> = std::collections::HashMap::new();
+        let mut stmt = tx.prepare("SELECT id, path FROM docs")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows.filter_map(Result::ok) {
+            let (id, path) = row;
+            let base = path.rsplit('/').next().unwrap_or(&path);
+            let stem = base.strip_suffix(".md").unwrap_or(base).to_ascii_lowercase();
+            by_stem
+                .entry(stem)
+                .and_modify(|e| *e = None) // ambiguous
+                .or_insert(Some(id));
+        }
+        drop(stmt);
+        for (from_doc, stems) in pending_links {
+            for stem in stems {
+                if let Some(Some(to_doc)) = by_stem.get(&stem)
+                    && *to_doc != from_doc
+                {
+                    tx.execute(
+                        "INSERT INTO links(from_doc, to_doc) VALUES(?1, ?2)",
+                        rusqlite::params![from_doc, to_doc],
+                    )?;
+                }
+            }
+        }
+    }
     tx.commit()?;
     Ok(report)
+}
+
+/// Docs linked (either direction, human-curated wikilinks) to the docs of the
+/// given citation paths — the deterministic 1-hop graph expansion of a recall
+/// result. Returns (path, ring) sorted by ring then path, deduped.
+pub fn linked_docs(conn: &Connection, hit_paths: &[String], limit: usize) -> anyhow::Result<Vec<(String, u8)>> {
+    let mut out: Vec<(String, u8)> = Vec::new();
+    for path in hit_paths {
+        let mut stmt = conn.prepare(
+            "SELECT d2.path, d2.ring FROM docs d1
+             JOIN links l ON l.from_doc = d1.id JOIN docs d2 ON d2.id = l.to_doc
+             WHERE d1.path = ?1
+             UNION
+             SELECT d2.path, d2.ring FROM docs d1
+             JOIN links l ON l.to_doc = d1.id JOIN docs d2 ON d2.id = l.from_doc
+             WHERE d1.path = ?1",
+        )?;
+        let rows = stmt.query_map([path], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u8)))?;
+        for row in rows.filter_map(Result::ok) {
+            if !hit_paths.contains(&row.0) && !out.contains(&row) {
+                out.push(row);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    out.truncate(limit);
+    Ok(out)
 }
 
 /// FTS5 query string: each term becomes a quoted prefix token, OR-joined —
@@ -764,6 +852,44 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key='marker'", [], |r| r.get(0))
             .ok();
         assert!(marker.is_none(), "old-schema DB must be discarded, not reused");
+    }
+
+    #[test]
+    fn wikilink_extraction_handles_alias_and_anchor() {
+        let links = wikilinks("see [[Zfs-Dataset|the dataset doc]] and [[shares#SMB]] but not [[]]");
+        assert_eq!(links, vec!["zfs-dataset", "shares"]);
+    }
+
+    #[test]
+    fn recall_expansion_follows_curated_links_both_directions() {
+        let dir = brain(&[
+            ("knowledge/zfs.md", "pools and datasets, see [[shares]]\n"),
+            ("knowledge/hosts/shares.md", "SMB share layout\n"),
+            ("knowledge/backup.md", "backups mirror [[zfs]] snapshots\n"),
+            ("knowledge/unrelated.md", "nothing here\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let linked = linked_docs(&conn, &["knowledge/zfs.md".to_string()], 8).unwrap();
+        let paths: Vec<&str> = linked.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"knowledge/hosts/shares.md"), "outgoing link followed");
+        assert!(paths.contains(&"knowledge/backup.md"), "incoming link followed");
+        assert!(!paths.contains(&"knowledge/unrelated.md"));
+    }
+
+    #[test]
+    fn ambiguous_wikilink_stems_are_skipped() {
+        let dir = brain(&[
+            ("knowledge/a/readme2.md", "x\n"),
+            ("knowledge/b/readme2.md", "y\n"),
+            ("knowledge/linker.md", "see [[readme2]]\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None).unwrap();
+        let linked = linked_docs(&conn, &["knowledge/linker.md".to_string()], 8).unwrap();
+        assert!(linked.is_empty(), "ambiguous stem must create no edge");
     }
 
     #[test]
