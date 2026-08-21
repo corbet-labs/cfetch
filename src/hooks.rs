@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::hook_io::{Emit, HookEvent};
-use crate::{daemon, heartbeat, ledger, resident};
+use crate::{daemon, exhaust, heartbeat, ledger, paths, resident};
 
 const DAEMON_BUDGET: Duration = Duration::from_millis(250);
 
@@ -15,8 +15,10 @@ pub fn run(event_name: &str) {
     let event = HookEvent::from_stdin();
     let result = match event_name {
         "session-start" => session_start(&event),
+        "post-tool" => post_tool(&event),
+        "stop" => stop_hook(&event),
         // Milestone-1 skeletons: prove liveness, do nothing else yet.
-        "pre-tool" | "post-tool" | "stop" | "precompact" => Ok(()),
+        "pre-tool" | "precompact" => Ok(()),
         other => Err(anyhow::anyhow!("unknown hook: {other}")),
     };
     match result {
@@ -93,4 +95,83 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     ledger::book(event.session(), "resident-digest", emitted, max_sessions);
     // The config failure still counts as a hook failure for the heartbeat.
     cfg.map(|_| ())
+}
+
+/// PostToolUse: ring-6 exhaust capture. The exhaust DB lives in the LOCAL
+/// state dir (never NFS), so a direct short-timeout write stays inside the
+/// hook latency budget without involving the daemon — and capture keeps
+/// working when no daemon runs at all. Emits nothing.
+fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
+    if event.tool_name.is_none() {
+        return Ok(()); // nothing capturable in this event
+    }
+    let cfg = Config::load()?;
+    post_tool_capture(&paths::state_dir(), &cfg, event)
+}
+
+fn post_tool_capture(
+    state_dir: &std::path::Path,
+    cfg: &Config,
+    event: &HookEvent,
+) -> anyhow::Result<()> {
+    if !cfg.capture.enabled {
+        return Ok(());
+    }
+    let conn = exhaust::open(state_dir)?;
+    exhaust::capture_post_tool(&conn, event)
+}
+
+/// Stop: write the session's turn summary, then run the 6->5 flagging traps.
+/// Emits nothing — Stop-level additionalContext would force an extra model
+/// turn, and ring 5/6 content is never injected anyway.
+fn stop_hook(event: &HookEvent) -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    stop_capture(&paths::state_dir(), &cfg, event)
+}
+
+fn stop_capture(state_dir: &std::path::Path, cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
+    if !cfg.capture.enabled {
+        return Ok(());
+    }
+    let conn = exhaust::open(state_dir)?;
+    exhaust::record_stop(&conn, event.session())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CaptureConfig;
+    use serde_json::json;
+
+    fn bash_event(cmd: &str) -> HookEvent {
+        HookEvent {
+            session_id: Some("s1".into()),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(json!({"command": cmd})),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn capture_disabled_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg =
+            Config { capture: CaptureConfig { enabled: false }, ..Config::default() };
+        post_tool_capture(dir.path(), &cfg, &bash_event("ls")).unwrap();
+        stop_capture(dir.path(), &cfg, &bash_event("ls")).unwrap();
+        assert!(
+            !dir.path().join("exhaust.db").exists(),
+            "disabled capture must not even create the exhaust db"
+        );
+    }
+
+    #[test]
+    fn capture_enabled_records_the_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        post_tool_capture(dir.path(), &cfg, &bash_event("cargo build")).unwrap();
+        let conn = exhaust::open(dir.path()).unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
 }

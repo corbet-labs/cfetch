@@ -2,6 +2,7 @@ mod code;
 mod config;
 mod daemon;
 mod dashboard;
+mod exhaust;
 mod heartbeat;
 mod hook_io;
 mod hooks;
@@ -69,6 +70,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Review ring-5 staging: auto-flagged exhaust (local only, never injected)
+    Staging {
+        #[command(subcommand)]
+        action: StagingAction,
+    },
     /// Open the terminal dashboard: health, ledger, live recall
     Dashboard,
     /// Serve recall/find/expand over MCP (stdio) for any MCP client
@@ -77,6 +83,19 @@ enum Command {
     Selfcheck,
     /// Show daemon, hook health, and state footprint
     Status,
+}
+
+#[derive(Subcommand)]
+enum StagingAction {
+    /// List flagged, unconsumed candidates, newest first
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a candidate consumed (a distillation session has taken it)
+    Consume { id: i64 },
+    /// Drop a candidate from staging without consuming it
+    Dismiss { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -275,6 +294,54 @@ fn recall(query: &str, id: Option<&str>, expand: bool, limit: usize, json: bool)
     Ok(())
 }
 
+/// Ring-5 staging review. Read side only: flagging happens in the Stop hook's
+/// traps. Nothing here is ever injected into a session or synced off-host.
+fn staging(action: StagingAction) -> anyhow::Result<()> {
+    let conn = exhaust::open(&paths::state_dir())?;
+    match action {
+        StagingAction::List { json } => {
+            let rows = exhaust::staging_list(&conn)?;
+            if json {
+                let arr: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        let payload: serde_json::Value = serde_json::from_str(&r.payload)
+                            .unwrap_or_else(|_| serde_json::Value::String(r.payload.clone()));
+                        serde_json::json!({
+                            "id": r.id, "reason": r.reason, "kind": r.kind,
+                            "session_id": r.session_id, "ts": r.ts, "payload": payload,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::json!(arr));
+            } else if rows.is_empty() {
+                println!("staging is empty — no flagged exhaust awaiting review");
+            } else {
+                for r in &rows {
+                    let session = r.session_id.get(..8).unwrap_or(&r.session_id);
+                    println!("#{}  {}  {}  session {}  {}", r.id, r.reason, r.kind, session, r.payload);
+                }
+                println!("\ndistill a candidate, then: cfetch staging consume <id> | dismiss <id>");
+            }
+        }
+        StagingAction::Consume { id } => {
+            if exhaust::consume(&conn, id)? {
+                println!("consumed #{id}");
+            } else {
+                anyhow::bail!("no staged candidate #{id} (never flagged, or already consumed/dismissed)");
+            }
+        }
+        StagingAction::Dismiss { id } => {
+            if exhaust::dismiss(&conn, id)? {
+                println!("dismissed #{id}");
+            } else {
+                anyhow::bail!("no staged candidate #{id} (never flagged, or already consumed/dismissed)");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
     let quarantines = ledger::quarantine_count(&paths::state_dir());
@@ -342,6 +409,12 @@ fn main() {
                 && let Err(e) = install::install_agents()
             {
                 eprintln!("cfetch install (other agents): {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Staging { action } => {
+            if let Err(e) = staging(action) {
+                eprintln!("cfetch staging: {e}");
                 std::process::exit(1);
             }
         }
