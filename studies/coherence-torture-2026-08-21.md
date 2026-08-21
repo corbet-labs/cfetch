@@ -79,3 +79,28 @@ Measured on the live fleet:
 This is the PRD's three-tier holding model working as specified: storage +
 metadata + serving on one host, nothing at all on the other, and the drain
 barrier making the remote answer as fresh as a local one.
+
+## The barrier's ordering premise is inotify-specific (macOS, 2026-08-21)
+
+The drain barrier claims: *observing sentinel N implies every write that
+completed before the barrier began has been counted*. That holds because the
+sentinel rides the SAME event queue as the writes — under **inotify**, which
+delivers events in FIFO order.
+
+**macOS FSEvents makes no such promise.** It coalesces per directory, batches
+with latency, and does not order events across directories. The CI matrix
+caught the consequence on macos-latest: a concurrent-writer run produced an
+answer labeled `fresh: true` that was missing a committed statement —
+precisely the zero-tolerance invariant. It passed the previous macOS run, so
+the failure is intermittent, which is the signature of a violated ordering
+assumption rather than a broken mechanism.
+
+Consequence for the design: the fast sentinel path is a LINUX optimization,
+not the guarantee itself. On platforms without ordered delivery the barrier
+must establish coverage a different way (a stat-fingerprint taken at query
+start, which the daemon already computes for its 60s backstop), accepting a
+higher per-query cost where correctness demands it.
+
+The honest framing: cfetch's freshness guarantee is only as strong as the
+platform's event ordering, and the code must know which platform it is on
+rather than assuming the strongest one.
