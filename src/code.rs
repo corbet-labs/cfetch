@@ -457,6 +457,17 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
 mod tests {
     use super::*;
 
+    /// Platform-agnostic path-suffix assertion: the code index stores
+    /// OS-NATIVE absolute paths (a Windows user wants `C:\repo\src\x.rs`,
+    /// not a unixism), so a test may not compare against a `/`-joined
+    /// literal — it would pass on unix and fail on Windows for a correct
+    /// index. Compare component-wise instead.
+    fn ends_with_path(haystack: &str, suffix: &str) -> bool {
+        let h: Vec<_> = std::path::Path::new(haystack).components().collect();
+        let s: Vec<_> = std::path::Path::new(suffix).components().collect();
+        h.len() >= s.len() && h[h.len() - s.len()..] == s[..]
+    }
+
     #[test]
     fn file_name_keys_are_taken_with_the_platform_separator() {
         // A code root is walked as absolute OS paths. On unix the two forms
@@ -592,7 +603,7 @@ mod tests {
         // Path substring (directory name, not the stem): 10.
         let hits = find(&conn, "velmurano", 10).unwrap();
         let file_hit = hits.iter().find(|h| h.name.is_none()).expect("file hit listed");
-        assert!(file_hit.path.ends_with("velmurano/inner.rs"));
+        assert!(ends_with_path(&file_hit.path, "velmurano/inner.rs"));
         assert_eq!(file_hit.score, 10);
         // No match at all returns nothing (SQL-side filtering).
         assert!(find(&conn, "zzznothing", 10).unwrap().is_empty());
@@ -619,7 +630,7 @@ mod tests {
         assert_eq!((r1.files, r1.symbols), (60, 120));
         let hits = find(&conn, "sym_3_7", 5).unwrap();
         assert_eq!(hits[0].score, 100);
-        assert!(hits[0].path.ends_with("mod3/nested/file7.rs"));
+        assert!(ends_with_path(&hits[0].path, "mod3/nested/file7.rs"));
         // Unchanged rescan parses nothing; counts stay stable.
         let r2 = scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
         assert_eq!((r2.files, r2.symbols), (60, 0));

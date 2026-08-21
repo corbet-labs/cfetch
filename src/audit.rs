@@ -501,7 +501,14 @@ mod tests {
         assert_eq!(inline.tokens_estimated, Some(6), "chars/3.5, ceiled");
         let leading = &md.imports[1];
         assert_eq!(leading.spec, "extra.md");
-        assert!(leading.path.ends_with(".claude/extra.md"), "relative to CLAUDE.md's dir");
+        // Component-wise: the resolved import is an OS-native path, so a
+        // `/`-joined literal would fail on Windows for a correct result.
+        let want: Vec<_> = std::path::Path::new(".claude/extra.md").components().collect();
+        let got: Vec<_> = std::path::Path::new(&leading.path).components().collect();
+        assert!(
+            got.len() >= want.len() && got[got.len() - want.len()..] == want[..],
+            "relative to CLAUDE.md's dir, got {}", leading.path
+        );
         assert_eq!(leading.tokens_estimated, Some(3));
 
         assert_eq!(r.mcp.len(), 2);
