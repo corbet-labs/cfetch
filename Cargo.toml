@@ -1,6 +1,6 @@
 [package]
 name = "cfetch"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "FSL-1.1-ALv2"
 description = "A second brain for coding agents: privilege-ring memory, hook injection, retrieval, and a code index in one binary"
