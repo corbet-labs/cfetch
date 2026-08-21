@@ -104,19 +104,76 @@ pub fn unmerge(settings: Value) -> anyhow::Result<Value> {
     Ok(Value::Object(root))
 }
 
-/// Idempotent append of the cfetch MCP server to Codex's config.toml. Pure
-/// string transform (no TOML dependency for one table): present = unchanged.
-fn codex_toml_with_mcp(content: &str, exe: &str) -> Option<String> {
-    if content.contains("[mcp_servers.cfetch]") {
-        return None;
-    }
-    let sep = if content.is_empty() || content.ends_with('\n') { "" } else { "\n" };
-    Some(format!(
-        "{content}{sep}\n[mcp_servers.cfetch]\ncommand = \"{exe}\"\nargs = [\"mcp\"]\n"
-    ))
+/// Whether a TOML mcp-server entry already carries the CURRENT command/args.
+fn codex_entry_is_current(entry: &toml_edit::Item, exe: &str) -> bool {
+    let Some(t) = entry.as_table_like() else { return false };
+    t.get("command").and_then(|v| v.as_str()) == Some(exe)
+        && t.get("args")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.len() == 1 && a.get(0).and_then(|x| x.as_str()) == Some("mcp"))
 }
 
-/// Idempotent merge of the cfetch MCP server into Gemini's settings.json.
+/// Structured upsert of the cfetch MCP server into Codex's config.toml,
+/// via toml_edit so the user's comments and formatting survive byte-for-byte.
+/// An unparseable file is refused outright (like the Gemini JSON path) —
+/// appending to a file we cannot parse could corrupt it. Content-keyed:
+/// `Ok(None)` = entry already carries the current command/args; a stale entry
+/// (the binary moved) is repaired in place, extra user keys preserved.
+fn codex_toml_with_mcp(content: &str, exe: &str) -> anyhow::Result<Option<String>> {
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| anyhow::anyhow!("refusing to touch unparseable TOML: {e}"))?;
+    let already_current = doc
+        .get("mcp_servers")
+        .and_then(|s| s.as_table_like())
+        .and_then(|s| s.get("cfetch"))
+        .is_some_and(|entry| codex_entry_is_current(entry, exe));
+    if already_current {
+        return Ok(None);
+    }
+    if doc.get("mcp_servers").is_none() {
+        let mut t = toml_edit::Table::new();
+        // Implicit: renders only `[mcp_servers.cfetch]`, no bare header line.
+        t.set_implicit(true);
+        doc.insert("mcp_servers", toml_edit::Item::Table(t));
+    }
+    let servers = doc["mcp_servers"]
+        .as_table_like_mut()
+        .ok_or_else(|| anyhow::anyhow!("config.toml `mcp_servers` is not a table"))?;
+    if !servers.get("cfetch").is_some_and(|e| e.as_table_like().is_some()) {
+        servers.insert("cfetch", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let entry = servers
+        .get_mut("cfetch")
+        .and_then(|e| e.as_table_like_mut())
+        .expect("just ensured a table-like cfetch entry");
+    entry.insert("command", toml_edit::value(exe));
+    let mut args = toml_edit::Array::new();
+    args.push("mcp");
+    entry.insert("args", toml_edit::value(args));
+    Ok(Some(doc.to_string()))
+}
+
+/// Removes the cfetch MCP server from Codex's config.toml. `Ok(None)` =
+/// nothing of ours present. Unparseable = refuse, same as the upsert.
+fn codex_toml_without_mcp(content: &str) -> anyhow::Result<Option<String>> {
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| anyhow::anyhow!("refusing to touch unparseable TOML: {e}"))?;
+    let removed = doc
+        .get_mut("mcp_servers")
+        .and_then(|s| s.as_table_like_mut())
+        .and_then(|s| s.remove("cfetch"))
+        .is_some();
+    if !removed {
+        return Ok(None);
+    }
+    Ok(Some(doc.to_string()))
+}
+
+/// Content-keyed merge of the cfetch MCP server into Gemini's settings.json:
+/// `Ok(None)` = entry already carries the current command/args; a stale entry
+/// is repaired in place, extra user keys inside it preserved.
 fn gemini_settings_with_mcp(settings: Value, exe: &str) -> anyhow::Result<Option<Value>> {
     let mut root = match settings {
         Value::Object(m) => m,
@@ -129,11 +186,31 @@ fn gemini_settings_with_mcp(settings: Value, exe: &str) -> anyhow::Result<Option
     let servers = servers
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json 'mcpServers' is not an object"))?;
-    if servers.contains_key("cfetch") {
+    let desired_command = Value::String(exe.to_string());
+    let desired_args = json!(["mcp"]);
+    if let Some(current) = servers.get("cfetch").and_then(Value::as_object)
+        && current.get("command") == Some(&desired_command)
+        && current.get("args") == Some(&desired_args)
+    {
         return Ok(None);
     }
-    servers.insert("cfetch".into(), json!({"command": exe, "args": ["mcp"]}));
+    let entry = servers.entry("cfetch").or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    let entry = entry.as_object_mut().expect("just ensured an object");
+    entry.insert("command".into(), desired_command);
+    entry.insert("args".into(), desired_args);
     Ok(Some(Value::Object(root)))
+}
+
+/// Removes the cfetch entry from Gemini's settings.json; `None` = nothing of
+/// ours present (including a non-object document: nothing we wrote survives
+/// in a shape we did not write).
+fn gemini_settings_without_mcp(settings: Value) -> Option<Value> {
+    let Value::Object(mut root) = settings else { return None };
+    root.get_mut("mcpServers")?.as_object_mut()?.remove("cfetch")?;
+    Some(Value::Object(root))
 }
 
 fn current_exe_str() -> String {
@@ -143,9 +220,32 @@ fn current_exe_str() -> String {
         .unwrap_or_else(|| "cfetch".to_string())
 }
 
+/// Reads a file that may legitimately not exist yet. Only NotFound maps to
+/// empty — an unreadable existing file must never be treated as absent and
+/// then overwritten.
+fn read_or_empty(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    }
+}
+
+/// Atomic replace: tmp file in the same directory + rename.
+fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("cfetch-tmp.{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Registers cfetch with every other agent found on this machine —
 /// feature-detected, instruction blocks + MCP, nothing is created for agents
-/// that are not installed.
+/// that are not installed. Re-running repairs drift: a registration whose
+/// embedded binary path went stale is updated in place.
 pub fn install_agents() -> anyhow::Result<()> {
     let exe = current_exe_str();
     let codex = paths::home().join(".codex");
@@ -154,9 +254,11 @@ pub fn install_agents() -> anyhow::Result<()> {
         let verb = crate::markers::upsert_file(&agents_md)?;
         println!("codex: {verb} {}", agents_md.display());
         let toml_path = codex.join("config.toml");
-        let current = std::fs::read_to_string(&toml_path).unwrap_or_default();
-        if let Some(next) = codex_toml_with_mcp(&current, &exe) {
-            std::fs::write(&toml_path, next)?;
+        let current = read_or_empty(&toml_path)?;
+        if let Some(next) = codex_toml_with_mcp(&current, &exe)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?
+        {
+            write_atomic(&toml_path, &next)?;
             println!("codex: registered MCP server in {}", toml_path.display());
         }
     }
@@ -166,16 +268,60 @@ pub fn install_agents() -> anyhow::Result<()> {
         let verb = crate::markers::upsert_file(&gemini_md)?;
         println!("gemini: {verb} {}", gemini_md.display());
         let settings_path = gemini.join("settings.json");
-        let current: Value = match std::fs::read_to_string(&settings_path) {
-            Ok(s) => serde_json::from_str(&s)
-                .map_err(|e| anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display()))?,
-            Err(_) => Value::Object(Map::new()),
+        let raw = read_or_empty(&settings_path)?;
+        let current: Value = if raw.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(&raw).map_err(|e| {
+                anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display())
+            })?
         };
         if let Some(next) = gemini_settings_with_mcp(current, &exe)? {
-            let tmp = settings_path.with_extension("json.cfetch-tmp");
-            std::fs::write(&tmp, serde_json::to_string_pretty(&next)?)?;
-            std::fs::rename(&tmp, &settings_path)?;
+            write_atomic(&settings_path, &serde_json::to_string_pretty(&next)?)?;
             println!("gemini: registered MCP server in {}", settings_path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Symmetric uninstall: removes exactly what install_agents() creates — the
+/// AGENTS.md/GEMINI.md marker blocks, the Codex `mcp_servers.cfetch` table,
+/// and the Gemini `mcpServers.cfetch` entry. Feature-detected the same way;
+/// everything the user wrote stays.
+pub fn uninstall_agents() -> anyhow::Result<()> {
+    let codex = paths::home().join(".codex");
+    if codex.is_dir() {
+        let agents_md = codex.join("AGENTS.md");
+        if crate::markers::remove_block_file(&agents_md)? {
+            println!("codex: removed block from {}", agents_md.display());
+        }
+        let toml_path = codex.join("config.toml");
+        if toml_path.is_file() {
+            let current = read_or_empty(&toml_path)?;
+            if let Some(next) = codex_toml_without_mcp(&current)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?
+            {
+                write_atomic(&toml_path, &next)?;
+                println!("codex: removed MCP server from {}", toml_path.display());
+            }
+        }
+    }
+    let gemini = paths::home().join(".gemini");
+    if gemini.is_dir() {
+        let gemini_md = gemini.join("GEMINI.md");
+        if crate::markers::remove_block_file(&gemini_md)? {
+            println!("gemini: removed block from {}", gemini_md.display());
+        }
+        let settings_path = gemini.join("settings.json");
+        if settings_path.is_file() {
+            let raw = read_or_empty(&settings_path)?;
+            let current: Value = serde_json::from_str(&raw).map_err(|e| {
+                anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display())
+            })?;
+            if let Some(next) = gemini_settings_without_mcp(current) {
+                write_atomic(&settings_path, &serde_json::to_string_pretty(&next)?)?;
+                println!("gemini: removed MCP server from {}", settings_path.display());
+            }
         }
     }
     Ok(())
@@ -280,11 +426,49 @@ mod tests {
     }
 
     #[test]
-    fn codex_toml_append_is_idempotent() {
-        let once = codex_toml_with_mcp("model = \"o5\"\n", "/usr/bin/cfetch").unwrap();
+    fn codex_toml_upsert_preserves_comments_and_is_idempotent() {
+        let input = "# my codex config\nmodel = \"o5\" # pinned on purpose\n\n[profiles.fast]\nmodel = \"o5-mini\"\n";
+        let once = codex_toml_with_mcp(input, "/usr/bin/cfetch").unwrap().unwrap();
+        assert!(once.starts_with(input), "user bytes (comments included) preserved verbatim");
         assert!(once.contains("[mcp_servers.cfetch]"));
-        assert!(once.starts_with("model = \"o5\"\n"));
-        assert!(codex_toml_with_mcp(&once, "/usr/bin/cfetch").is_none());
+        assert!(once.contains("command = \"/usr/bin/cfetch\""));
+        assert!(once.contains("args = [\"mcp\"]"));
+        assert!(
+            codex_toml_with_mcp(&once, "/usr/bin/cfetch").unwrap().is_none(),
+            "current registration: no rewrite"
+        );
+        // empty file (fresh install): just our table
+        let fresh = codex_toml_with_mcp("", "/usr/bin/cfetch").unwrap().unwrap();
+        assert!(fresh.trim_start().starts_with("[mcp_servers.cfetch]"), "no bare [mcp_servers] header:\n{fresh}");
+    }
+
+    #[test]
+    fn codex_toml_parse_error_is_refused() {
+        assert!(codex_toml_with_mcp("model = \"unclosed", "/x").is_err());
+        assert!(codex_toml_without_mcp("model = \"unclosed").is_err());
+    }
+
+    #[test]
+    fn codex_toml_stale_path_is_repaired_preserving_user_keys() {
+        // Binary moved (e.g. package update): the registration must follow.
+        let stale = "# note\n[mcp_servers.cfetch]\ncommand = \"/old/place/cfetch\"\nargs = [\"mcp\"]\nstartup_timeout_ms = 9000\n";
+        let out = codex_toml_with_mcp(stale, "/new/place/cfetch").unwrap().unwrap();
+        assert!(out.contains("command = \"/new/place/cfetch\""));
+        assert!(!out.contains("/old/place"), "stale path gone");
+        assert!(out.contains("startup_timeout_ms = 9000"), "user-added keys survive the repair");
+        assert!(out.contains("# note"));
+        assert!(codex_toml_with_mcp(&out, "/new/place/cfetch").unwrap().is_none());
+    }
+
+    #[test]
+    fn codex_toml_removal_is_grep_proof_and_leaves_others() {
+        let input = "# keep this comment\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.cfetch]\ncommand = \"/usr/bin/cfetch\"\nargs = [\"mcp\"]\n";
+        let out = codex_toml_without_mcp(input).unwrap().unwrap();
+        assert!(!out.contains("cfetch"), "grep-proof: zero cfetch traces, got:\n{out}");
+        assert!(out.contains("[mcp_servers.other]"), "foreign server survives");
+        assert!(out.contains("# keep this comment"));
+        assert!(codex_toml_without_mcp(&out).unwrap().is_none(), "second removal is a no-op");
+        assert!(codex_toml_without_mcp("model = \"o5\"\n").unwrap().is_none(), "nothing of ours: no rewrite");
     }
 
     #[test]
@@ -295,6 +479,32 @@ mod tests {
         assert_eq!(merged["mcpServers"]["other"]["command"], "x");
         assert_eq!(merged["mcpServers"]["cfetch"]["args"][0], "mcp");
         assert!(gemini_settings_with_mcp(merged, "/usr/bin/cfetch").unwrap().is_none());
+    }
+
+    #[test]
+    fn gemini_stale_path_is_repaired_preserving_user_keys() {
+        let stale = json!({"mcpServers": {"cfetch": {
+            "command": "/old/place/cfetch", "args": ["mcp"], "timeout": 30000
+        }}});
+        let out = gemini_settings_with_mcp(stale, "/new/place/cfetch").unwrap().unwrap();
+        assert_eq!(out["mcpServers"]["cfetch"]["command"], "/new/place/cfetch");
+        assert_eq!(out["mcpServers"]["cfetch"]["timeout"], 30000, "user-added keys survive");
+        assert!(gemini_settings_with_mcp(out, "/new/place/cfetch").unwrap().is_none());
+    }
+
+    #[test]
+    fn gemini_removal_is_grep_proof_and_leaves_others() {
+        let v = json!({"theme": "dark", "mcpServers": {
+            "other": {"command": "x"},
+            "cfetch": {"command": "/usr/bin/cfetch", "args": ["mcp"]}
+        }});
+        let out = gemini_settings_without_mcp(v).unwrap();
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("cfetch"), "grep-proof: zero cfetch traces");
+        assert_eq!(out["mcpServers"]["other"]["command"], "x");
+        assert_eq!(out["theme"], "dark");
+        assert!(gemini_settings_without_mcp(out).is_none(), "second removal is a no-op");
+        assert!(gemini_settings_without_mcp(json!({"theme": "dark"})).is_none());
     }
 
     #[test]

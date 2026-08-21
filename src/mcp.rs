@@ -12,7 +12,15 @@ use serde_json::{Value, json};
 
 use crate::{code, config::Config, index, paths, serve};
 
-const PROTOCOL_FALLBACK: &str = "2025-06-18";
+/// Protocol revisions this server implements, newest first. Negotiation per
+/// the MCP spec: a version we support is echoed back; anything else (or an
+/// absent field) is answered with OUR newest supported version — the client
+/// then decides whether it can proceed. Never a blind echo.
+const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The tools we serve; a tools/call naming anything else is the caller's
+/// protocol error (-32602), not a tool-execution failure.
+const TOOL_NAMES: &[&str] = &["cfetch_recall", "cfetch_expand", "cfetch_find"];
 
 fn tool_defs() -> Value {
     json!([
@@ -229,20 +237,34 @@ pub fn handle(msg: &Value) -> Option<Value> {
     let respond = |v: Value| Some(json!({"jsonrpc": "2.0", "id": id, "result": v}));
     match method {
         "initialize" => {
-            let requested = msg
-                .pointer("/params/protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(PROTOCOL_FALLBACK);
+            let requested = msg.pointer("/params/protocolVersion").and_then(Value::as_str);
+            let negotiated = match requested {
+                Some(v) if SUPPORTED_PROTOCOLS.contains(&v) => v,
+                _ => SUPPORTED_PROTOCOLS[0],
+            };
             respond(json!({
-                "protocolVersion": requested,
+                "protocolVersion": negotiated,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "cfetch", "version": env!("CARGO_PKG_VERSION")}
+                "serverInfo": {"name": "cfetch", "version": env!("CARGO_PKG_VERSION")},
+                // One doctrine, two renderers: the same source function feeds
+                // the AGENTS.md/GEMINI.md marker block (markers::protocol_block).
+                "instructions": crate::markers::doctrine(crate::markers::Surface::Mcp),
             }))
         }
         "ping" => respond(json!({})),
         "tools/list" => respond(json!({"tools": tool_defs()})),
         "tools/call" => {
             let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
+            if !TOOL_NAMES.contains(&name) {
+                // Unknown tool = invalid params per the MCP spec, a JSON-RPC
+                // -32602 error. `isError: true` results are reserved for
+                // failures of a REAL tool's execution (those the model can
+                // see and react to).
+                return Some(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32602, "message": format!("unknown tool: {name}")}
+                }));
+            }
             let empty = json!({});
             let args = msg.pointer("/params/arguments").unwrap_or(&empty);
             match run_tool(name, args) {
@@ -260,6 +282,26 @@ pub fn handle(msg: &Value) -> Option<Value> {
     }
 }
 
+/// Handles one wire message, which JSON-RPC 2.0 allows to be a batch array:
+/// a batch gets a batch response (notifications contribute nothing, and an
+/// all-notification batch gets no response at all); the empty batch is the
+/// spec's invalid-request error.
+pub fn handle_message(msg: &Value) -> Option<Value> {
+    match msg.as_array() {
+        Some(items) => {
+            if items.is_empty() {
+                return Some(json!({
+                    "jsonrpc": "2.0", "id": Value::Null,
+                    "error": {"code": -32600, "message": "invalid request: empty batch"}
+                }));
+            }
+            let responses: Vec<Value> = items.iter().filter_map(handle).collect();
+            (!responses.is_empty()).then_some(Value::Array(responses))
+        }
+        None => handle(msg),
+    }
+}
+
 /// Stdio serve loop: one JSON-RPC message per line in, one per line out.
 pub fn serve() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
@@ -270,7 +312,7 @@ pub fn serve() -> anyhow::Result<()> {
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-        if let Some(resp) = handle(&msg) {
+        if let Some(resp) = handle_message(&msg) {
             writeln!(stdout, "{resp}")?;
             stdout.flush()?;
         }
@@ -283,7 +325,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialize_echoes_protocol_and_lists_tools() {
+    fn initialize_negotiates_protocol_and_lists_tools() {
+        // A supported (older) revision is accepted and echoed.
         let resp = handle(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-03-26"}
@@ -292,14 +335,68 @@ mod tests {
         assert_eq!(resp["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(resp["result"]["serverInfo"]["name"], "cfetch");
 
-        let tools = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+        // An unknown revision gets OUR newest supported, never a blind echo.
+        let resp = handle(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "initialize",
+            "params": {"protocolVersion": "1999-01-01"}
+        }))
+        .unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], SUPPORTED_PROTOCOLS[0]);
+
+        // Absent field: same answer as unknown.
+        let resp = handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "initialize"})).unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], SUPPORTED_PROTOCOLS[0]);
+
+        let tools = handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})).unwrap();
         let names: Vec<&str> = tools["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["cfetch_recall", "cfetch_expand", "cfetch_find"]);
+        assert_eq!(names, TOOL_NAMES, "tools/list and the -32602 gate must agree");
+    }
+
+    #[test]
+    fn initialize_carries_recall_first_instructions() {
+        let resp = handle(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        }))
+        .unwrap();
+        let instructions = resp["result"]["instructions"].as_str().unwrap();
+        // Same source function as the AGENTS.md/GEMINI.md marker block.
+        assert_eq!(instructions, crate::markers::doctrine(crate::markers::Surface::Mcp));
+        assert!(instructions.contains("cfetch_recall"), "MCP surface names the MCP tools");
+        assert!(instructions.contains("Before searching files or reading code wholesale"));
+    }
+
+    #[test]
+    fn batch_requests_get_a_batch_response() {
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        ]);
+        let resp = handle_message(&batch).unwrap();
+        let arr = resp.as_array().expect("a batch request gets a batch response");
+        assert_eq!(arr.len(), 2, "the notification contributes no response");
+        assert_eq!(arr[0]["id"], 1);
+        assert_eq!(arr[1]["id"], 2);
+        assert!(arr[1]["result"]["tools"].is_array());
+
+        // All-notification batch: no response at all.
+        let silent = json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}]);
+        assert!(handle_message(&silent).is_none());
+
+        // Empty batch: the spec's single invalid-request error.
+        let err = handle_message(&json!([])).unwrap();
+        assert_eq!(err["error"]["code"], -32600);
+
+        // A single (non-array) message passes through unchanged.
+        let single = handle_message(&json!({"jsonrpc": "2.0", "id": 9, "method": "ping"})).unwrap();
+        assert_eq!(single["id"], 9);
+        assert!(!single.is_array());
     }
 
     #[test]
@@ -314,12 +411,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_reports_is_error_not_crash() {
+    fn unknown_tool_is_a_jsonrpc_invalid_params_error() {
         let resp = handle(&json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": {"name": "cfetch_delete_everything", "arguments": {}}
         }))
         .unwrap();
-        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["error"]["code"], -32602, "protocol error, not an isError result");
+        assert!(resp.get("result").is_none());
+        assert_eq!(resp["id"], 4);
     }
 }

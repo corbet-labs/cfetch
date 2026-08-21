@@ -8,8 +8,15 @@
 //! The endpoint URL comes from the config file — a file agents write — so it
 //! is SSRF-guarded at use: https or loopback only, private/link-local/
 //! metadata ranges refused, redirects disabled (a 3xx must never be able to
-//! walk a request, and its Authorization header, somewhere else). 10 s
-//! timeout: an embeddings backend that slow is down, not busy.
+//! walk a request, and its Authorization header, somewhere else).
+//!
+//! Auth: `embeddings.api_key_env` names an environment VARIABLE holding the
+//! key (never the key itself in config) -> `Authorization: Bearer` header.
+//! Timeouts: `embeddings.timeout_secs` (default 10 s) bounds one interactive
+//! request — a backend that slow is down, not busy. The embed-index batch
+//! path scales that bound per batched item (`batch_timeout`): a 64-block
+//! batch on a CPU backend is busy, not down, and timing it out only to
+//! resend the identical batch is a livelock.
 
 use anyhow::Context as _;
 use rusqlite::Connection;
@@ -106,11 +113,47 @@ pub fn check_endpoint(url: &str, allow_hosts: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Extra timeout allowance per batched input on the embed-index path.
+/// Interactive recall (one input) keeps the tight base bound.
+const PER_ITEM: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The embed-index batch bound: base + per-item.
+fn batch_timeout(base: std::time::Duration, items: usize) -> std::time::Duration {
+    base + PER_ITEM * items as u32
+}
+
+/// Resolves `api_key_env` (an environment variable NAME) to a ready
+/// `Bearer …` header value. Empty config = no auth. A value that cannot be
+/// an env var name is refused loudly — it is almost certainly a pasted key,
+/// and a key in the config file is exactly what this indirection prevents.
+fn resolve_auth(api_key_env: &str) -> anyhow::Result<Option<String>> {
+    let name = api_key_env.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let valid = !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    anyhow::ensure!(
+        valid,
+        "embeddings.api_key_env {name:?} is not an environment variable NAME — \
+         configure the variable's name, never the key itself"
+    );
+    let key = std::env::var(name)
+        .map_err(|_| anyhow::anyhow!("embeddings.api_key_env: environment variable {name} is not set"))?;
+    anyhow::ensure!(!key.trim().is_empty(), "embeddings.api_key_env: environment variable {name} is empty");
+    Ok(Some(format!("Bearer {}", key.trim())))
+}
+
 pub struct EmbedClient {
     agent: ureq::Agent,
     /// Full `…/embeddings` URL, endpoint trailing slashes normalized away.
     url: String,
     model: String,
+    /// Ready `Bearer …` header value, resolved from `api_key_env` at
+    /// construction (a missing variable fails fast, not mid-batch).
+    auth: Option<String>,
+    /// One interactive request's bound; the batch path scales it.
+    base_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for EmbedClient {
@@ -135,9 +178,11 @@ impl EmbedClient {
             "embeddings not configured (embeddings.endpoint and embeddings.model required)"
         );
         check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
+        let auth = resolve_auth(&cfg.api_key_env)?;
+        let base_timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
-            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            .timeout_global(Some(base_timeout))
             .http_status_as_error(false) // status checked explicitly below
             .build()
             .new_agent();
@@ -145,6 +190,8 @@ impl EmbedClient {
             agent,
             url: format!("{}/embeddings", cfg.endpoint.trim_end_matches('/')),
             model: cfg.model.clone(),
+            auth,
+            base_timeout,
         })
     }
 
@@ -152,9 +199,24 @@ impl EmbedClient {
         &self.model
     }
 
+    /// Interactive path (recall): one request under the tight base bound.
+    pub fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_with_timeout(texts, self.base_timeout)
+    }
+
+    /// Batch path (embed-index): the bound scales base + per-item, because a
+    /// large batch on a slow backend is busy, not down.
+    pub fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.embed_with_timeout(texts, batch_timeout(self.base_timeout, texts.len()))
+    }
+
     /// Embeds a batch of texts; returns one vector per input, in input order
     /// (the response's `index` field is honored, not the array order).
-    pub fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn embed_with_timeout(
+        &self,
+        texts: &[&str],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         #[derive(serde::Deserialize)]
         struct Response {
             data: Vec<Row>,
@@ -165,10 +227,17 @@ impl EmbedClient {
             embedding: Vec<f32>,
         }
         let body = serde_json::json!({ "model": self.model, "input": texts }).to_string();
-        let mut resp = self
+        let mut req = self
             .agent
             .post(&self.url)
-            .header("content-type", "application/json")
+            .config()
+            .timeout_global(Some(timeout)) // per-request override of the agent bound
+            .build()
+            .header("content-type", "application/json");
+        if let Some(auth) = &self.auth {
+            req = req.header("authorization", auth);
+        }
+        let mut resp = req
             .send(body.as_bytes())
             .with_context(|| format!("POST {}", self.url))?;
         let status = resp.status();
@@ -229,7 +298,7 @@ pub fn run(conn: &mut Connection, client: &EmbedClient, batch: usize) -> anyhow:
             break;
         }
         let texts: Vec<&str> = missing.iter().map(|(_, t)| t.as_str()).collect();
-        let vectors = client.embed(&texts)?;
+        let vectors = client.embed_batch(&texts)?;
         if let Some(first) = vectors.first()
             && index::ensure_embed_dim(conn, first.len())?
         {
@@ -302,7 +371,8 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
-    fn read_request_body(s: &mut std::net::TcpStream) -> Option<String> {
+    /// Reads one HTTP request; returns (headers, body).
+    fn read_request(s: &mut std::net::TcpStream) -> Option<(String, String)> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         let header_end = loop {
@@ -330,7 +400,9 @@ mod tests {
             }
             buf.extend_from_slice(&tmp[..n]);
         }
-        Some(String::from_utf8_lossy(&buf[header_end..(header_end + content_length).min(buf.len())]).to_string())
+        let body =
+            String::from_utf8_lossy(&buf[header_end..(header_end + content_length).min(buf.len())]).to_string();
+        Some((headers, body))
     }
 
     fn http_response(status: u16, body: &str) -> String {
@@ -342,24 +414,27 @@ mod tests {
 
     /// Spawns a one-connection-at-a-time server; `responder(request_no,
     /// request_body)` produces the FULL http response. Returns (base_url,
-    /// recorded request bodies).
-    fn spawn_server<F>(responder: F) -> (String, Arc<Mutex<Vec<String>>>)
+    /// recorded request bodies, recorded request headers).
+    #[allow(clippy::type_complexity)]
+    fn spawn_server<F>(responder: F) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>)
     where
         F: Fn(usize, &str) -> String + Send + 'static,
     {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let recorded = bodies.clone();
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let (recorded_bodies, recorded_headers) = (bodies.clone(), headers.clone());
         std::thread::spawn(move || {
             for (n, stream) in listener.incoming().enumerate() {
                 let Ok(mut s) = stream else { break };
-                let Some(body) = read_request_body(&mut s) else { continue };
-                recorded.lock().unwrap().push(body.clone());
+                let Some((hdrs, body)) = read_request(&mut s) else { continue };
+                recorded_bodies.lock().unwrap().push(body.clone());
+                recorded_headers.lock().unwrap().push(hdrs);
                 let _ = s.write_all(responder(n, &body).as_bytes());
             }
         });
-        (format!("http://127.0.0.1:{port}"), bodies)
+        (format!("http://127.0.0.1:{port}"), bodies, headers)
     }
 
     /// OpenAI-shaped response with one deterministic 2-d vector per input:
@@ -385,7 +460,7 @@ mod tests {
             enabled: true,
             endpoint: url.to_string(),
             model: "test-model".to_string(),
-            allow_hosts: Vec::new(),
+            ..EmbeddingsConfig::default()
         })
         .unwrap()
     }
@@ -438,7 +513,7 @@ mod tests {
             enabled: true,
             endpoint: String::new(),
             model: "m".into(),
-            allow_hosts: Vec::new(),
+            ..EmbeddingsConfig::default()
         })
         .unwrap_err();
         assert!(!err.to_string().is_empty());
@@ -446,7 +521,7 @@ mod tests {
             enabled: true,
             endpoint: "http://127.0.0.1:1".into(),
             model: String::new(),
-            allow_hosts: Vec::new(),
+            ..EmbeddingsConfig::default()
         })
         .unwrap_err();
         assert!(!err.to_string().is_empty());
@@ -468,7 +543,7 @@ mod tests {
 
     #[test]
     fn embed_posts_openai_shape_and_orders_by_index() {
-        let (url, bodies) = spawn_server(|_, body| canned_embeddings(body, 10.0));
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 10.0));
         let client = client_for(&url);
         let out = client.embed(&["alpha", "beta"]).unwrap();
         // response rows arrive reversed; `index` must restore input order
@@ -480,7 +555,7 @@ mod tests {
 
     #[test]
     fn redirects_are_refused() {
-        let (url, _) = spawn_server(|_, _| {
+        let (url, _, _) = spawn_server(|_, _| {
             "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/elsewhere\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                 .to_string()
         });
@@ -490,7 +565,7 @@ mod tests {
 
     #[test]
     fn non_2xx_status_is_an_error() {
-        let (url, _) = spawn_server(|_, _| http_response(500, r#"{"error":"boom"}"#));
+        let (url, _, _) = spawn_server(|_, _| http_response(500, r#"{"error":"boom"}"#));
         let client = client_for(&url);
         let err = client.embed(&["x"]).unwrap_err();
         assert!(err.to_string().contains("500"), "status surfaced: {err}");
@@ -499,12 +574,115 @@ mod tests {
     #[test]
     fn short_response_is_an_error() {
         // 1 vector for 2 inputs must not silently mis-align block ids
-        let (url, _) = spawn_server(|_, body| {
+        let (url, _, _) = spawn_server(|_, body| {
             let _ = body;
             http_response(200, r#"{"object":"list","data":[{"index":0,"embedding":[1.0,0.0]}]}"#)
         });
         let client = client_for(&url);
         assert!(client.embed(&["a", "b"]).is_err());
+    }
+
+    // ---- auth header ----
+
+    #[test]
+    fn api_key_env_sets_bearer_header() {
+        // The config carries the env var's NAME; the key comes from the
+        // process environment at construction time.
+        // SAFETY: test-only unique variable name; no reader depends on it.
+        unsafe { std::env::set_var("CFETCH_TEST_EMBED_KEY", "sk-cfetch-test") };
+        let (url, _, headers) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let client = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            api_key_env: "CFETCH_TEST_EMBED_KEY".into(),
+            ..EmbeddingsConfig::default()
+        })
+        .unwrap();
+        client.embed(&["x"]).unwrap();
+        let sent = headers.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(sent.contains("authorization: bearer sk-cfetch-test"), "got headers:\n{sent}");
+    }
+
+    #[test]
+    fn no_api_key_env_means_no_auth_header() {
+        let (url, _, headers) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let client = client_for(&url);
+        client.embed(&["x"]).unwrap();
+        let sent = headers.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(!sent.contains("authorization:"), "no auth configured, none sent:\n{sent}");
+    }
+
+    #[test]
+    fn unset_or_literal_api_key_env_is_refused() {
+        let base = EmbeddingsConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            ..EmbeddingsConfig::default()
+        };
+        // configured NAME whose variable is absent from the environment
+        let err = EmbedClient::new(&EmbeddingsConfig {
+            api_key_env: "CFETCH_TEST_DEFINITELY_UNSET_VAR".into(),
+            ..base.clone()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("not set"), "got: {err}");
+        // a literal key pasted where the NAME belongs must be refused loudly
+        let err = EmbedClient::new(&EmbeddingsConfig {
+            api_key_env: "sk-abc123.secret-key".into(),
+            ..base
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("never the key itself"), "got: {err}");
+    }
+
+    // ---- timeouts ----
+
+    #[test]
+    fn batch_timeout_scales_base_plus_per_item() {
+        let base = std::time::Duration::from_secs(10);
+        assert_eq!(batch_timeout(base, 0), base);
+        assert_eq!(batch_timeout(base, 1), base + PER_ITEM);
+        assert_eq!(batch_timeout(base, 64), base + PER_ITEM * 64);
+    }
+
+    #[test]
+    fn interactive_timeout_stays_tight() {
+        // Server answers after 2 s; the interactive bound is 1 s.
+        let (url, _, _) = spawn_server(|_, body| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            canned_embeddings(body, 0.0)
+        });
+        let client = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            timeout_secs: 1,
+            ..EmbeddingsConfig::default()
+        })
+        .unwrap();
+        assert!(client.embed(&["x"]).is_err(), "recall must not wait for a slow backend");
+    }
+
+    #[test]
+    fn batch_timeout_outlives_a_backend_too_slow_for_interactive() {
+        // Same 2 s server, same 1 s base — but the batch path's bound is
+        // base + per-item (1 + 2 = 3 s for one input), so it succeeds.
+        let (url, _, _) = spawn_server(|_, body| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            canned_embeddings(body, 0.0)
+        });
+        let client = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            timeout_secs: 1,
+            ..EmbeddingsConfig::default()
+        })
+        .unwrap();
+        let out = client.embed_batch(&["x"]).unwrap();
+        assert_eq!(out.len(), 1);
     }
 
     // ---- embed-index over a real (temp) index ----
@@ -523,7 +701,7 @@ mod tests {
     #[test]
     fn embed_index_embeds_all_blocks_in_batches() {
         let (_brain, _state, mut conn) = five_block_index();
-        let (url, bodies) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
         let client = client_for(&url);
         let report = run(&mut conn, &client, 2).unwrap();
         assert_eq!(report.embedded, 5);
@@ -552,7 +730,7 @@ mod tests {
         let (_brain, _state, mut conn) = five_block_index();
         // First server: batch 1 succeeds, batch 2 fails -> run() errors, but
         // the first batch's vectors are already committed.
-        let (url_a, _) = spawn_server(|n, body| {
+        let (url_a, _, _) = spawn_server(|n, body| {
             if n == 0 { canned_embeddings(body, 0.0) } else { http_response(500, "{}") }
         });
         let client_a = client_for(&url_a);
@@ -560,7 +738,7 @@ mod tests {
         assert_eq!(index::vector_counts(&conn).unwrap().0, 2, "committed batch survives the failure");
 
         // Second server: healthy. Only the 3 missing blocks get embedded.
-        let (url_b, bodies_b) = spawn_server(|_, body| canned_embeddings(body, 100.0));
+        let (url_b, bodies_b, _) = spawn_server(|_, body| canned_embeddings(body, 100.0));
         let client_b = client_for(&url_b);
         let report = run(&mut conn, &client_b, 2).unwrap();
         assert_eq!(report.embedded, 3, "resume embeds only what is missing");
@@ -584,7 +762,7 @@ mod tests {
     #[test]
     fn embed_index_after_model_change_re_embeds_everything() {
         let (_brain, _state, mut conn) = five_block_index();
-        let (url, bodies) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
         let client = client_for(&url);
         run(&mut conn, &client, 8).unwrap();
         assert_eq!(index::vector_counts(&conn).unwrap(), (5, 5));
@@ -593,7 +771,7 @@ mod tests {
             enabled: true,
             endpoint: url.clone(),
             model: "other-model".to_string(),
-            allow_hosts: Vec::new(),
+            ..EmbeddingsConfig::default()
         })
         .unwrap();
         let report = run(&mut conn, &client2, 8).unwrap();

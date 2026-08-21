@@ -38,7 +38,7 @@ fn default_capture_enabled() -> bool {
 /// llama.cpp server, LM Studio, vLLM, or a hosted API). Disabled by default — semantic
 /// recall is opt-in, and the client is NEVER called from hook entrypoints
 /// (hooks must not spend network time on the interactive path).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -52,6 +52,33 @@ pub struct EmbeddingsConfig {
     /// refusal (mesh overlays, lab networks). Never exempts from https.
     #[serde(default)]
     pub allow_hosts: Vec<String>,
+    /// NAME of the environment variable holding the API key (e.g.
+    /// "OPENAI_API_KEY") — never the key itself: config files travel in
+    /// dotfiles and backups, keys must not. Empty = no Authorization header.
+    #[serde(default)]
+    pub api_key_env: String,
+    /// Timeout for ONE interactive embeddings request, in seconds. This is
+    /// the tight bound recall rides on; the embed-index batch path scales it
+    /// per batched item (see embed::batch_timeout).
+    #[serde(default = "default_embed_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        EmbeddingsConfig {
+            enabled: false,
+            endpoint: String::new(),
+            model: String::new(),
+            allow_hosts: Vec::new(),
+            api_key_env: String::new(),
+            timeout_secs: default_embed_timeout_secs(),
+        }
+    }
+}
+
+fn default_embed_timeout_secs() -> u64 {
+    10
 }
 
 /// The governance loop: Stop-side reminder producers plus instruction-decay
@@ -308,6 +335,27 @@ mod tests {
         assert!(cfg.embeddings.endpoint.is_empty());
         assert!(cfg.embeddings.model.is_empty());
         assert_eq!(cfg.recall.rrf_k, 2.0);
+    }
+
+    #[test]
+    fn embeddings_api_key_env_and_timeout_parse_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert!(cfg.embeddings.api_key_env.is_empty(), "default: no auth");
+        assert_eq!(cfg.embeddings.timeout_secs, 10, "default: tight interactive bound");
+        assert_eq!(EmbeddingsConfig::default().timeout_secs, 10, "Default impl must agree with serde");
+        let p = dir.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"embeddings": {"api_key_env": "MY_EMBED_KEY", "timeout_secs": 30}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.embeddings.api_key_env, "MY_EMBED_KEY");
+        assert_eq!(cfg.embeddings.timeout_secs, 30);
+        // partial block keeps the timeout default
+        std::fs::write(&p, r#"{"embeddings": {"enabled": true}}"#).unwrap();
+        assert_eq!(Config::load_from(&p).unwrap().embeddings.timeout_secs, 10);
     }
 
     #[test]

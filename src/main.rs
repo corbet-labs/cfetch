@@ -43,7 +43,8 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// Register (or remove) cfetch's hooks in Claude Code settings
+    /// Register (or remove) cfetch in Claude Code settings and every other
+    /// detected agent (Codex, Gemini): hooks, MCP servers, instruction blocks
     Install {
         /// Path to settings.json (default: ~/.claude/settings.json)
         #[arg(long)]
@@ -810,9 +811,10 @@ fn main() {
                 eprintln!("cfetch install: {e}");
                 std::process::exit(1);
             }
-            if !remove
-                && let Err(e) = install::install_agents()
-            {
+            // Other agents (Codex, Gemini) follow symmetrically: install
+            // registers, --remove strips every trace.
+            let agents = if remove { install::uninstall_agents() } else { install::install_agents() };
+            if let Err(e) = agents {
                 eprintln!("cfetch install (other agents): {e}");
                 std::process::exit(1);
             }
