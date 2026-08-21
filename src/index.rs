@@ -621,9 +621,8 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 /// Inverse of [`vec_to_blob`]; a trailing partial chunk (corrupt blob) is
 /// dropped rather than misread.
 pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    let (chunks, _remainder) = b.as_chunks::<4>();
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// L2-normalizes in place; the zero vector is left untouched (it can never
