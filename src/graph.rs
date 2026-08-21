@@ -769,10 +769,14 @@ pub fn map(
     let mut paths: Vec<(String, String, u64)> = Vec::new(); // (abs, display-relative, size)
     for root in roots {
         for (p, size) in files_under(conn, root)? {
+            // Forward slashes on every platform. Map lines are SERVED: a
+            // Windows host and a Linux host indexing the same repository must
+            // hand a client byte-identical lines, or the same file reads as
+            // two different files depending on who answered.
             let rel = Path::new(&p)
                 .strip_prefix(root)
-                .map(|r| r.display().to_string())
-                .unwrap_or_else(|_| p.clone());
+                .map(crate::index::rel_doc_path)
+                .unwrap_or_else(|_| crate::index::rel_doc_path(Path::new(&p)));
             paths.push((p, rel, size));
         }
     }
@@ -1166,6 +1170,31 @@ mod tests {
 
         let starved = map(&conn, &roots, None, 1).unwrap();
         assert_eq!(starved.lines.len(), 1, "at least one entry under any budget");
+    }
+
+    /// Map lines cross the wire. A Windows host answering `map` for the same
+    /// repository must produce the SAME bytes a Linux host does, or one file
+    /// reads as two depending on which host was asked. Caught by the Windows
+    /// CI runner, which rendered `proj\src\lib.rs`.
+    #[test]
+    fn map_paths_are_forward_slashed_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/deep/nested.rs", "pub fn only_symbol() {}\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let m = map(&conn, &[dir.path().to_path_buf()], None, 100_000).unwrap();
+        assert!(
+            m.lines.iter().any(|l| l.starts_with("src/deep/nested.rs ")),
+            "nested path must render with forward slashes: {:?}",
+            m.lines
+        );
+        assert!(
+            !m.lines.iter().any(|l| l.contains('\\')),
+            "no native separator may leak into a served line: {:?}",
+            m.lines
+        );
     }
 
     #[test]
