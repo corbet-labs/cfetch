@@ -2032,6 +2032,60 @@ mod tests {
     }
 
     #[test]
+    fn f16_conversion_matches_the_ieee_oracle_bit_for_bit() {
+        // Expected bit patterns produced by an INDEPENDENT implementation
+        // (CPython's struct "e" format, IEEE binary16, round-to-nearest-even)
+        // — this is the check that the hand-written narrowing is a real f16
+        // and not merely self-consistent. Subnormals, the rounding floor
+        // (2.98e-8 ties to zero, 5.96e-8 to the smallest subnormal), the
+        // largest finite half, and the awkward decimal fractions are all in.
+        let cases: [(f32, u16); 25] = [
+            (0.0e+00, 0x0000),
+            (-0.0e+00, 0x8000),
+            (1.0e+00, 0x3c00),
+            (-1.0e+00, 0xbc00),
+            (5.0e-01, 0x3800),
+            (-3.125e-02, 0xa800),
+            (1.0e-04, 0x068e),
+            (-1.0e-04, 0x868e),
+            (6.0e-08, 0x0001),
+            (5.9604645e-08, 0x0001),
+            (2.9802322e-08, 0x0000),
+            (9.995117e-01, 0x3bff),
+            (3.3333334e-01, 0x3555),
+            (6.5504e+04, 0x7bff),
+            (-6.5504e+04, 0xfbff),
+            (6.1e-05, 0x03ff),
+            (6.0e-05, 0x03ef),
+            (1.0e-07, 0x0002),
+            (1.0e-01, 0x2e66),
+            (2.0e-01, 0x3266),
+            (7.0710677e-01, 0x39a8),
+            (9.765625e-04, 0x1400),
+            (1.0009766e+00, 0x3c01),
+            (2.4414062e-04, 0x0c00),
+            (1.1e-05, 0x00b9),
+        ];
+        for (value, expected) in cases {
+            let got = f32_to_f16(value);
+            assert_eq!(got, expected, "f32_to_f16({value:e}) = {got:#06x}, expected {expected:#06x}");
+            // And back: widening a half is exact, so the round trip is the
+            // half's own value, sign of zero included.
+            let back = f16_to_f32(got);
+            assert_eq!(
+                back.to_bits(),
+                f16_to_f32(expected).to_bits(),
+                "widening {expected:#06x} disagreed"
+            );
+        }
+        // Values beyond the half range saturate to infinity rather than
+        // wrapping into a finite lie.
+        assert_eq!(f32_to_f16(1e30), 0x7c00);
+        assert_eq!(f32_to_f16(-1e30), 0xfc00);
+        assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+    }
+
+    #[test]
     fn f16_blobs_halve_the_bytes_and_round_trip_within_tolerance() {
         let v: Vec<f32> = (0..8).map(|i| (i as f32 - 3.5) / 16.0).collect();
         let blob = vec_to_blob(&v, Precision::F16);
