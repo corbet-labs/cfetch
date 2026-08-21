@@ -1,5 +1,13 @@
 # Test + lint gate. Push is limited to main so a pull request runs once, not
 # twice. No secrets are used anywhere in this workflow.
+#
+# Platform tiers:
+#   - ubuntu-latest / macos-latest: supported. Test + clippy must pass.
+#   - windows-latest: EXPERIMENTAL, expected to fail — the daemon uses Unix
+#     sockets, which do not compile on Windows. The job exists to keep a
+#     named, visible list of what breaks there (continue-on-error keeps the
+#     workflow green while the job itself still shows its real outcome).
+#     Do not "fix" Windows here; surface only.
 name: CI
 
 on:
@@ -9,7 +17,13 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      # Keep every platform's result visible even when one fails.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,3 +33,61 @@ jobs:
         run: cargo test --locked
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  windows-experimental:
+    name: "Windows (EXPERIMENTAL — expected to fail: Unix-socket daemon)"
+    runs-on: windows-latest
+    # A Windows failure must never block the workflow: the point of this job
+    # is a visible list of what breaks, not a green lie and not a red wall.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (experimental)
+        id: build
+        shell: bash
+        run: cargo build --locked 2>&1 | tee build.log
+      - name: Test (experimental)
+        id: test
+        # Run even after a failed build so both commands' outcomes are
+        # individually visible in the job.
+        if: always()
+        shell: bash
+        run: cargo test --locked 2>&1 | tee test.log
+      - name: Summarize Windows breakage
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Windows (experimental) result"
+            echo ""
+            echo "| Command | Outcome |"
+            echo "|---------|---------|"
+            echo "| cargo build --locked | ${{ steps.build.outcome }} |"
+            echo "| cargo test --locked | ${{ steps.test.outcome }} |"
+            echo ""
+            if [ "${{ steps.build.outcome }}" = "success" ] && [ "${{ steps.test.outcome }}" = "success" ]; then
+              echo "Both commands passed on Windows. Consider promoting Windows out of the experimental tier."
+            else
+              echo "Expected-failure tier: the Unix-socket daemon is not expected to compile on Windows."
+              echo ""
+              echo "### Compiler errors (deduplicated headers; full logs in the windows-build-logs artifact)"
+              errors=$(cat build.log test.log 2>/dev/null | grep -E '^error(\[|:)' | sort -u | head -n 100 || true)
+              if [ -n "$errors" ]; then
+                echo '```'
+                echo "$errors"
+                echo '```'
+              else
+                echo "(no compiler error lines captured — see the step logs and artifact)"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload Windows logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-logs
+          path: |
+            build.log
+            test.log
+          if-no-files-found: ignore
