@@ -54,6 +54,36 @@ pub struct EmbeddingsConfig {
     pub allow_hosts: Vec<String>,
 }
 
+/// The governance loop: Stop-side reminder producers plus instruction-decay
+/// cadence re-injection, all delivered at the next UserPromptSubmit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    #[serde(default = "default_governance_enabled")]
+    pub enabled: bool,
+    /// Every N-th post-tool event re-queues the top ring-0 rules (compliance
+    /// decays measurably with generated output; see DESIGN's instruction-decay
+    /// study). Zero switches the cadence off while keeping the Stop producers.
+    #[serde(default = "default_reinject_every")]
+    pub reinject_every: u32,
+}
+
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        GovernanceConfig {
+            enabled: default_governance_enabled(),
+            reinject_every: default_reinject_every(),
+        }
+    }
+}
+
+fn default_governance_enabled() -> bool {
+    true
+}
+
+fn default_reinject_every() -> u32 {
+    25
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallConfig {
     /// Reciprocal-rank-fusion constant for `recall --hybrid`. Small K weights
@@ -98,6 +128,9 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub recall: RecallConfig,
+    /// Governance loop (reminder queue + cadence rule refresh).
+    #[serde(default)]
+    pub governance: GovernanceConfig,
 }
 
 fn default_budget_chars() -> usize {
@@ -119,6 +152,7 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             recall: RecallConfig::default(),
+            governance: GovernanceConfig::default(),
         }
     }
 }
@@ -234,6 +268,33 @@ mod tests {
         assert_eq!(cfg.embeddings.endpoint, "https://llm.example/v1");
         assert_eq!(cfg.embeddings.model, "nomic");
         assert_eq!(cfg.recall.rrf_k, 60.0);
+    }
+
+    #[test]
+    fn governance_defaults_on_with_cadence_25() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert!(cfg.governance.enabled, "default: governance on");
+        assert_eq!(cfg.governance.reinject_every, 25);
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"resident": []}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.governance.enabled, "partial file: governance on");
+        assert_eq!(cfg.governance.reinject_every, 25);
+    }
+
+    #[test]
+    fn governance_block_parses_and_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"governance": {"enabled": false}}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(!cfg.governance.enabled);
+        assert_eq!(cfg.governance.reinject_every, 25, "partial block keeps the default cadence");
+        std::fs::write(&p, r#"{"governance": {"reinject_every": 7}}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.governance.enabled);
+        assert_eq!(cfg.governance.reinject_every, 7);
     }
 
     #[test]

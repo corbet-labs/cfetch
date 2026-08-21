@@ -47,6 +47,21 @@ pub struct SessionState {
     /// Files already given symbol-slice hints — same once-per-session cap.
     #[serde(default)]
     pub hinted: BTreeSet<String>,
+    /// Files written this session (governance: the stale-STATUS nudge needs
+    /// to know what the session touched, not just what it read).
+    #[serde(default)]
+    pub written: BTreeSet<String>,
+    /// Reminders queued at Stop (or by the cadence counter), delivered at the
+    /// next UserPromptSubmit: (key, text). A Stop-level injection forces a
+    /// whole extra model turn; a queued one rides the next prompt for free.
+    #[serde(default)]
+    pub queued_reminders: Vec<(String, String)>,
+    /// Reminder keys already delivered — at most once per session per key.
+    #[serde(default)]
+    pub shown_keys: BTreeSet<String>,
+    /// Post-tool events seen this session, for cadence re-injection.
+    #[serde(default)]
+    pub tool_events: u64,
 }
 
 impl SessionState {
@@ -55,9 +70,11 @@ impl SessionState {
     }
 
     /// A write invalidates the read record: the earlier content is stale, so
-    /// the next read is legitimate and must not warn.
+    /// the next read is legitimate and must not warn. The path also joins the
+    /// session's written set (the stale-STATUS nudge reads it at Stop).
     pub fn record_write(&mut self, path: &str) {
         self.reads.remove(path);
+        self.written.insert(path.to_string());
     }
 
     /// Decides — and books — a repeat-read advisory for `path`. Returns true
@@ -78,6 +95,38 @@ impl SessionState {
     /// Books a symbol-slice hint for `path`; true at most once per session.
     pub fn should_hint_slices(&mut self, path: &str) -> bool {
         self.hinted.insert(path.to_string())
+    }
+
+    /// Queues a reminder for the next UserPromptSubmit, deduplicated by key:
+    /// a key already queued or already delivered this session queues nothing.
+    /// Returns whether the reminder was queued.
+    pub fn queue_reminder(&mut self, key: &str, text: &str) -> bool {
+        if self.shown_keys.contains(key) || self.queued_reminders.iter().any(|(k, _)| k == key) {
+            return false;
+        }
+        self.queued_reminders.push((key.to_string(), text.to_string()));
+        true
+    }
+
+    /// Empties the queue and marks every drained key as shown, returning the
+    /// reminder texts in queue order.
+    pub fn drain_reminders(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.queued_reminders)
+            .into_iter()
+            .map(|(key, text)| {
+                self.shown_keys.insert(key);
+                text
+            })
+            .collect()
+    }
+
+    /// Counts one post-tool event; returns `Some(count)` exactly when this
+    /// event is the `every`-th one (cadence re-injection is due). `every` of
+    /// zero never fires — it is the cadence off switch.
+    pub fn count_tool_event(&mut self, every: u32) -> Option<u64> {
+        self.tool_events += 1;
+        (every > 0 && self.tool_events.is_multiple_of(u64::from(every)))
+            .then_some(self.tool_events)
     }
 }
 
@@ -207,6 +256,77 @@ mod tests {
         assert!(st.should_hint_slices("/big.rs"));
         assert!(!st.should_hint_slices("/big.rs"));
         assert!(st.should_hint_slices("/other.rs"));
+    }
+
+    #[test]
+    fn writes_are_recorded_for_the_status_nudge() {
+        let mut st = SessionState::default();
+        st.record_write("/b/agents/knowledge/topic.md");
+        st.record_write("/b/agents/knowledge/topic.md");
+        st.record_write("/elsewhere/other.md");
+        assert!(st.written.contains("/b/agents/knowledge/topic.md"));
+        assert!(st.written.contains("/elsewhere/other.md"));
+        assert_eq!(st.written.len(), 2, "written paths are a set, not a log");
+    }
+
+    #[test]
+    fn reminder_queue_dedups_by_key() {
+        let mut st = SessionState::default();
+        assert!(st.queue_reminder("status", "first"));
+        assert!(!st.queue_reminder("status", "second"), "key already queued");
+        assert!(st.queue_reminder("staging", "other"));
+        assert_eq!(st.drain_reminders(), vec!["first".to_string(), "other".to_string()]);
+        assert!(!st.queue_reminder("status", "third"), "a shown key never re-queues");
+        assert!(st.drain_reminders().is_empty());
+    }
+
+    #[test]
+    fn drain_empties_the_queue_and_marks_keys_shown() {
+        let mut st = SessionState::default();
+        assert!(st.queue_reminder("k1", "t1"));
+        assert!(st.queue_reminder("k2", "t2"));
+        assert_eq!(st.drain_reminders(), vec!["t1".to_string(), "t2".to_string()]);
+        assert!(st.queued_reminders.is_empty());
+        assert!(st.shown_keys.contains("k1") && st.shown_keys.contains("k2"));
+        assert!(st.drain_reminders().is_empty(), "draining an empty queue yields nothing");
+    }
+
+    #[test]
+    fn tool_event_cadence_fires_at_exactly_n_and_2n() {
+        let mut st = SessionState::default();
+        let mut fired = Vec::new();
+        for _ in 0..7 {
+            if let Some(n) = st.count_tool_event(3) {
+                fired.push(n);
+            }
+        }
+        assert_eq!(fired, vec![3, 6], "cadence must fire at exactly N and 2N");
+        assert_eq!(st.tool_events, 7);
+    }
+
+    #[test]
+    fn cadence_of_zero_never_fires() {
+        let mut st = SessionState::default();
+        for _ in 0..5 {
+            assert_eq!(st.count_tool_event(0), None);
+        }
+        assert_eq!(st.tool_events, 5, "the counter still advances");
+    }
+
+    #[test]
+    fn governance_state_survives_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SessionState::default();
+        st.record_write("/b/agents/x.md");
+        assert!(st.queue_reminder("status", "update the STATUS"));
+        st.shown_keys.insert("staging".into());
+        st.tool_events = 24;
+        store(dir.path(), "s1", &st);
+        let mut back = load(dir.path(), "s1");
+        assert!(back.written.contains("/b/agents/x.md"));
+        assert_eq!(back.tool_events, 24);
+        assert!(!back.queue_reminder("staging", "dup"), "shown keys survive the roundtrip");
+        assert_eq!(back.drain_reminders(), vec!["update the STATUS".to_string()]);
     }
 
     #[test]

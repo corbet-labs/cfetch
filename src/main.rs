@@ -4,6 +4,7 @@ mod daemon;
 mod dashboard;
 mod embed;
 mod exhaust;
+mod govern;
 mod graph;
 mod heartbeat;
 mod hook_io;
@@ -32,7 +33,7 @@ struct Cli {
 enum Command {
     /// Run a hook entrypoint (invoked by the agent harness, reads stdin)
     Hook {
-        /// session-start | pre-tool | post-tool | stop | precompact
+        /// session-start | user-prompt | pre-tool | post-tool | stop | precompact
         event: String,
     },
     /// Manage the per-host daemon

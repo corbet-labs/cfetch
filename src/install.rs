@@ -15,6 +15,7 @@ const MANAGED_BY: &str = "cfetch";
 /// (harness event key, cfetch hook subcommand)
 const EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "user-prompt"),
     ("PreToolUse", "pre-tool"),
     ("PostToolUse", "post-tool"),
     ("Stop", "stop"),
@@ -216,6 +217,15 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("session-start"));
+    }
+
+    #[test]
+    fn user_prompt_submit_hook_is_registered() {
+        let out = merge(Value::Null).unwrap();
+        let entry = &out["hooks"]["UserPromptSubmit"][0]["hooks"][0];
+        assert!(entry["command"].as_str().unwrap().contains("hook user-prompt"));
+        assert_eq!(entry["timeout"], 10);
+        assert_eq!(entry["_managedBy"], MANAGED_BY);
     }
 
     #[test]

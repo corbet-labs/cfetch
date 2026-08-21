@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::hook_io::{Emit, HookEvent};
-use crate::{daemon, exhaust, heartbeat, ledger, paths, resident, session_state, transcript};
+use crate::{daemon, exhaust, govern, heartbeat, ledger, paths, resident, session_state, transcript};
 
 const DAEMON_BUDGET: Duration = Duration::from_millis(250);
 
@@ -21,6 +21,7 @@ pub fn run(event_name: &str) {
     let event = HookEvent::from_stdin();
     let result = match event_name {
         "session-start" => session_start(&event),
+        "user-prompt" => user_prompt(&event),
         "pre-tool" => pre_tool(&event),
         "post-tool" => post_tool(&event),
         "stop" => stop(&event),
@@ -101,6 +102,73 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     ledger::book(event.session(), "resident-digest", emitted, max_sessions);
     // The config failure still counts as a hook failure for the heartbeat.
     cfg.map(|_| ())
+}
+
+/// UserPromptSubmit: drains the reminder queue onto the prompt — the
+/// zero-extra-turn delivery channel for everything queued at Stop and by the
+/// cadence counter.
+fn user_prompt(event: &HookEvent) -> anyhow::Result<()> {
+    user_prompt_drain(&paths::state_dir(), event, ledger_max_sessions())
+}
+
+fn user_prompt_drain(
+    state_dir: &Path,
+    event: &HookEvent,
+    max_sessions: usize,
+) -> anyhow::Result<()> {
+    // Reminders describe the primary session's own activity; a subagent
+    // prompt must never receive them — nor consume them out of the queue.
+    if event.is_subagent() {
+        return Ok(());
+    }
+    let mut st = session_state::load(state_dir, event.session());
+    let reminders = st.drain_reminders();
+    if reminders.is_empty() {
+        return Ok(());
+    }
+    session_state::store(state_dir, event.session(), &st);
+    let mut emit = Emit::new("UserPromptSubmit");
+    for r in reminders {
+        emit.add_context(r);
+    }
+    // ONE JSON object regardless of how many reminders were queued.
+    let emitted = emit.finish();
+    ledger::book_in(state_dir, event.session(), "reminders", emitted, max_sessions);
+    Ok(())
+}
+
+/// Stop-side reminder producers (wt/govern): QUEUE only, never emit — a
+/// Stop-level injection forces a whole extra model turn. Runs after the
+/// capture half so candidates the traps just flagged are already countable.
+fn stop_govern(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
+    if !cfg.governance.enabled || event.is_subagent() {
+        return Ok(());
+    }
+    let mut st = session_state::load(state_dir, event.session());
+    let mut dirty = govern::queue_status_nudge(&mut st, &cfg.brain_root);
+    dirty |= govern::queue_staging_visibility(&mut st, &state_dir.join("exhaust.db"));
+    if dirty {
+        session_state::store(state_dir, event.session(), &st);
+    }
+    Ok(())
+}
+
+/// Cadence re-injection (wt/govern): every `reinject_every`-th post-tool
+/// event queues the top ring-0 rules for the next user prompt. Queued here,
+/// delivered at UserPromptSubmit — never at Stop.
+fn post_tool_cadence(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
+    if !cfg.governance.enabled || event.is_subagent() || event.tool_name.is_none() {
+        return Ok(());
+    }
+    let mut st = session_state::load(state_dir, event.session());
+    if let Some(n) = st.count_tool_event(cfg.governance.reinject_every)
+        && let Some(rules) = govern::top_ring0_rules(cfg)
+    {
+        st.queue_reminder(&format!("rules-{n}"), &rules);
+    }
+    // The counter advanced even when nothing was queued.
+    session_state::store(state_dir, event.session(), &st);
+    Ok(())
 }
 
 /// Ring-6 exhaust capture (from wt/capture). The exhaust DB lives in the
@@ -232,16 +300,24 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// PostToolUse: BOTH halves run — ring-6 exhaust capture (wt/capture) and
-/// session read/write tracking (wt/account). A failure in one half must not
-/// starve the other; the first error is still reported to the heartbeat.
+/// PostToolUse: ALL halves run — ring-6 exhaust capture (wt/capture), cadence
+/// counting (wt/govern), and session read/write tracking (wt/account). A
+/// failure in one half must not starve the others; the first error is still
+/// reported to the heartbeat.
 fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
     let mut first_err: Option<anyhow::Error> = None;
     if event.tool_name.is_some() {
-        let capture = Config::load()
-            .and_then(|cfg| post_tool_capture(&paths::state_dir(), &cfg, event));
-        if let Err(e) = capture {
-            first_err = Some(e);
+        let state_dir = paths::state_dir();
+        match Config::load() {
+            Ok(cfg) => {
+                if let Err(e) = post_tool_capture(&state_dir, &cfg, event) {
+                    first_err = Some(e);
+                }
+                if let Err(e) = post_tool_cadence(&state_dir, &cfg, event) {
+                    first_err.get_or_insert(e);
+                }
+            }
+            Err(e) => first_err = Some(e),
         }
     }
     if let Err(e) = post_tool_track(event) {
@@ -289,14 +365,22 @@ fn post_tool_track(event: &HookEvent) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stop: BOTH halves — exhaust turn summary + traps (wt/capture) and
+/// Stop: ALL halves — exhaust turn summary + traps (wt/capture), reminder
+/// producers (wt/govern, after the traps so fresh flags count), and
 /// measured-usage booking (wt/account).
 fn stop(event: &HookEvent) -> anyhow::Result<()> {
     let mut first_err: Option<anyhow::Error> = None;
-    let capture = Config::load()
-        .and_then(|cfg| stop_capture(&paths::state_dir(), &cfg, event));
-    if let Err(e) = capture {
-        first_err = Some(e);
+    let state_dir = paths::state_dir();
+    match Config::load() {
+        Ok(cfg) => {
+            if let Err(e) = stop_capture(&state_dir, &cfg, event) {
+                first_err = Some(e);
+            }
+            if let Err(e) = stop_govern(&state_dir, &cfg, event) {
+                first_err.get_or_insert(e);
+            }
+        }
+        Err(e) => first_err = Some(e),
     }
     if let Err(e) = stop_measure(event) {
         first_err.get_or_insert(e);
@@ -375,6 +459,152 @@ mod tests {
         let conn = exhaust::open(dir.path()).unwrap();
         let n: i64 = conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn user_prompt_drains_queued_reminders_once_and_books_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = session_state::SessionState::default();
+        assert!(st.queue_reminder("status", "update the STATUS"));
+        assert!(st.queue_reminder("staging", "look at staging"));
+        session_state::store(dir.path(), "s1", &st);
+
+        let event = HookEvent { session_id: Some("s1".into()), ..Default::default() };
+        user_prompt_drain(dir.path(), &event, 10).unwrap();
+
+        let back = session_state::load(dir.path(), "s1");
+        assert!(back.queued_reminders.is_empty(), "delivery must empty the queue");
+        assert!(back.shown_keys.contains("status") && back.shown_keys.contains("staging"));
+        let ledger = ledger::load_from(dir.path());
+        let booked = &ledger.sessions["s1"].by_source["reminders"];
+        assert_eq!(booked.count, 1, "many reminders, ONE emit, one booking");
+        assert!(booked.chars > 0);
+
+        // A second prompt delivers (and books) nothing further.
+        user_prompt_drain(dir.path(), &event, 10).unwrap();
+        let ledger = ledger::load_from(dir.path());
+        assert_eq!(ledger.sessions["s1"].by_source["reminders"].count, 1);
+    }
+
+    #[test]
+    fn user_prompt_never_serves_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = session_state::SessionState::default();
+        assert!(st.queue_reminder("status", "for the primary session"));
+        session_state::store(dir.path(), "s1", &st);
+
+        let sub = HookEvent {
+            session_id: Some("s1".into()),
+            agent_id: Some("a1".into()),
+            ..Default::default()
+        };
+        user_prompt_drain(dir.path(), &sub, 10).unwrap();
+        let back = session_state::load(dir.path(), "s1");
+        assert_eq!(back.queued_reminders.len(), 1, "a subagent must not consume the queue");
+        assert!(ledger::load_from(dir.path()).sessions.is_empty(), "and books nothing");
+    }
+
+    /// Config with governance settings and a tempdir brain holding one ring-0
+    /// resident rules file.
+    fn govern_cfg(brain: &Path, enabled: bool, reinject_every: u32) -> Config {
+        std::fs::write(
+            brain.join("rules.md"),
+            "---\ndescription: never force off VMs\n---\nbody\n",
+        )
+        .unwrap();
+        Config {
+            brain_root: brain.to_path_buf(),
+            resident: vec![crate::config::ResidentEntry {
+                path: std::path::PathBuf::from("rules.md"),
+                ring: 0,
+            }],
+            governance: crate::config::GovernanceConfig { enabled, reinject_every },
+            ..Config::default()
+        }
+    }
+
+    fn brain_writes(state_dir: &Path, session: &str, brain: &Path, n: usize) {
+        let mut st = session_state::load(state_dir, session);
+        for i in 0..n {
+            st.record_write(&format!("{}/knowledge/f{i}.md", brain.display()));
+        }
+        session_state::store(state_dir, session, &st);
+    }
+
+    #[test]
+    fn stop_producers_queue_only_when_governance_is_enabled() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        brain_writes(state.path(), "s1", brain.path(), 3);
+        let event = HookEvent { session_id: Some("s1".into()), ..Default::default() };
+
+        let off = govern_cfg(brain.path(), false, 25);
+        stop_govern(state.path(), &off, &event).unwrap();
+        assert!(
+            session_state::load(state.path(), "s1").queued_reminders.is_empty(),
+            "disabled governance must queue nothing"
+        );
+
+        let on = govern_cfg(brain.path(), true, 25);
+        stop_govern(state.path(), &on, &event).unwrap();
+        let st = session_state::load(state.path(), "s1");
+        assert_eq!(st.queued_reminders.len(), 1);
+        assert_eq!(st.queued_reminders[0].0, "status");
+    }
+
+    #[test]
+    fn stop_producers_exempt_subagents() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        brain_writes(state.path(), "s1", brain.path(), 3);
+        let sub = HookEvent {
+            session_id: Some("s1".into()),
+            agent_type: Some("worker".into()),
+            ..Default::default()
+        };
+        let cfg = govern_cfg(brain.path(), true, 25);
+        stop_govern(state.path(), &cfg, &sub).unwrap();
+        assert!(session_state::load(state.path(), "s1").queued_reminders.is_empty());
+    }
+
+    #[test]
+    fn cadence_queues_rules_at_exactly_n_and_2n() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = govern_cfg(brain.path(), true, 2);
+        let event = bash_event("ls");
+
+        for _ in 0..4 {
+            post_tool_cadence(state.path(), &cfg, &event).unwrap();
+        }
+        let st = session_state::load(state.path(), "s1");
+        assert_eq!(st.tool_events, 4);
+        let keys: Vec<&str> = st.queued_reminders.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["rules-2", "rules-4"], "fires at exactly N and 2N");
+        assert!(st.queued_reminders[0].1.starts_with("[cfetch rule refresh]"));
+        assert!(st.queued_reminders[0].1.contains("never force off VMs"));
+    }
+
+    #[test]
+    fn cadence_skips_subagents_disabled_governance_and_non_tool_events() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+
+        let off = govern_cfg(brain.path(), false, 2);
+        post_tool_cadence(state.path(), &off, &bash_event("ls")).unwrap();
+
+        let on = govern_cfg(brain.path(), true, 2);
+        let mut sub = bash_event("ls");
+        sub.agent_id = Some("a1".into());
+        post_tool_cadence(state.path(), &on, &sub).unwrap();
+
+        let mut no_tool = bash_event("ls");
+        no_tool.tool_name = None;
+        post_tool_cadence(state.path(), &on, &no_tool).unwrap();
+
+        let st = session_state::load(state.path(), "s1");
+        assert_eq!(st.tool_events, 0, "none of these may advance the counter");
+        assert!(st.queued_reminders.is_empty());
     }
 
     #[test]
