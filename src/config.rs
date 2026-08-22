@@ -647,16 +647,50 @@ pub struct RecallConfig {
     /// corpus (MRR 0.845 vs 0.627), so 2 is the default.
     #[serde(default = "default_rrf_k")]
     pub rrf_k: f64,
+    /// The precision gate over a purely lexical answer.
+    #[serde(default)]
+    pub gate: GateConfig,
 }
 
 impl Default for RecallConfig {
     fn default() -> Self {
-        RecallConfig { rrf_k: default_rrf_k() }
+        RecallConfig { rrf_k: default_rrf_k(), gate: GateConfig::default() }
     }
 }
 
 fn default_rrf_k() -> f64 {
     2.0
+}
+
+/// The precision gate: an admission test for hits that no other stage judges.
+///
+/// Retrieval OR-joins the query's terms on purpose, so a six-word question
+/// still finds the block that phrased it differently. The price is that a
+/// block sharing ONE ordinary word with the query is retrieved, and with no
+/// semantic stage configured it is also returned. This is the knob that says
+/// no to it.
+///
+/// Off by default. A gate that drops a hit the operator expected is worse
+/// than the weak hit it was meant to suppress, so switching it on is a
+/// deliberate act with a corpus in front of you.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateConfig {
+    /// How many DISTINCT non-stopword query terms a hit must carry to be
+    /// admitted. Clamped to the number of such terms the query actually has,
+    /// so a one-word query is never gated against itself; 0 or 1 therefore
+    /// means no gate at all, which is the default.
+    #[serde(default = "default_gate_min_terms")]
+    pub min_terms: usize,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        GateConfig { min_terms: default_gate_min_terms() }
+    }
+}
+
+fn default_gate_min_terms() -> usize {
+    1
 }
 
 /// Serving mode: this daemon owns its index lifecycle (watcher, generations,

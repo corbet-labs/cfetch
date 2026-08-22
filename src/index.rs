@@ -55,6 +55,11 @@ pub struct Hit {
     /// Enclosing heading chain ("H1 > H2"), the second half of the mirror
     /// dedup key. Internal — the snippet already displays it.
     pub(crate) chain: String,
+    /// The block's whole body. Internal — `snippet` is the display form, and
+    /// it is capped at 160 characters. A consumer that only REORDERS hits can
+    /// live with that cap; one that DROPS them cannot, or it would suppress a
+    /// block whose evidence sat past the cut.
+    pub(crate) text: String,
 }
 
 /// Rewrites `sep` to `/` — the canonical separator of every brain-relative
@@ -1201,15 +1206,17 @@ pub fn recall_in(
     // Twice the candidate pool: duplicate suppression must refill freed
     // slots with the next-ranked hits, never shrink the result count.
     let rows = stmt.query_map(rusqlite::params_from_iter(ranked_params(&fts, limit * 2, prefixes)), |r| {
+        let text: String = r.get(5)?;
         Ok(Hit {
             cite: r.get(0)?,
             path: r.get(1)?,
             ring: r.get::<_, i64>(2)? as u8,
             start_line: r.get::<_, i64>(3)? as usize,
             end_line: r.get::<_, i64>(4)? as usize,
-            snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &r.get::<_, String>(5)?),
+            snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &text),
             mirrors: Vec::new(),
             chain: r.get(7)?,
+            text,
         })
     })?;
     let mut hits = dedup_by_content(rows.filter_map(Result::ok).collect());
@@ -1533,15 +1540,17 @@ fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         let hit = stmt.query_row([id], |r| {
+            let text: String = r.get(5)?;
             Ok(Hit {
                 cite: r.get(0)?,
                 path: r.get(1)?,
                 ring: r.get::<_, i64>(2)? as u8,
                 start_line: r.get::<_, i64>(3)? as usize,
                 end_line: r.get::<_, i64>(4)? as usize,
-                snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &r.get::<_, String>(5)?),
+                snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &text),
                 mirrors: Vec::new(),
                 chain: r.get(7)?,
+                text,
             })
         });
         if let Ok(hit) = hit {
@@ -2603,6 +2612,7 @@ mod tests {
             snippet: String::new(),
             mirrors: Vec::new(),
             chain: chain.into(),
+            text: String::new(),
         };
         let hits = vec![
             h("r2-aabbccddee", "native:p/MEMORY.md", 2, "Memory"),
@@ -2628,6 +2638,7 @@ mod tests {
             snippet: String::new(),
             mirrors: Vec::new(),
             chain: chain.into(),
+            text: String::new(),
         };
         let hits = vec![
             h("r3-aabbccddee", "knowledge/a.md", 3, "Hosts > Server"),

@@ -544,6 +544,47 @@ r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
     Native filesystem backup only — never file-level tools between ZFS datasets ...
 ```
 
+### The precision gate (`recall.gate`)
+
+Off by default. Retrieval OR-joins the query's terms on purpose, so a six-word
+question still finds the block that phrased it differently — and a block
+sharing one ordinary word with the query comes back too. This is the stage
+that refuses it.
+
+```json
+{
+  "recall": {
+    "gate": { "min_terms": 2 }
+  }
+}
+```
+
+`min_terms` is how many DISTINCT non-stopword query terms a hit must carry. It
+is clamped to the number the query actually has, so a one-word query is never
+gated against itself, and `0` or `1` means no gate at all.
+
+```console
+$ cfetch recall zfs snapshot retention policy
+cfetch recall: precision gate dropped 1 hit(s) carrying under 2 of the query's 4 term(s)
+r3-8c1a44f0d2 knowledge/hosts/server/storage.md:31-33 (ring 3)
+    [Storage > Snapshots] zfs snapshot retention runs nightly and prunes ...
+```
+
+- A term counts when a word of the hit STARTS WITH it — the same prefix rule
+  retrieval asks FTS5 for, so the gate never contradicts what proposed the hit.
+  The whole block is weighed, not the one-line snippet.
+- The gate runs LAST, after every stage that orders, and before the answer is
+  cut to `--limit`. Retrieval widens to twice the limit while it is armed, so
+  hits that pass refill the slots the dropped ones free.
+- It never empties an answer: when nothing reaches the floor, the best-ranked
+  hit comes back anyway. An operator who cannot tell a gate from an empty brain
+  is worse off than one holding a weak hit they can dismiss themselves.
+- It weighs lexical overlap, so it stands down for `--semantic`, `--hybrid` and
+  any reranked answer — a vector hit that shares no word with the query is what
+  semantic recall is FOR — and says on stderr that it did.
+- Every removal is reported, on stderr and as `note` in `--json`. A gate that
+  quietly swallows a hit you expected is worse than the hit it suppressed.
+
 ## What lives where
 
 The tree is the only storage of record, and that includes the automatic half
