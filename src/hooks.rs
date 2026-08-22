@@ -87,12 +87,32 @@ fn resident_with_deadline(cfg: &Config, scope: &SessionScope) -> String {
     rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
 }
 
+/// The state half of SessionStart: decides from the start reason whether the
+/// arriving conversation inherits this session's records or starts without
+/// them, and clears the file when it does not. Split out from the injection
+/// half so the decision can be exercised without a config or a daemon.
+fn session_start_state(state_dir: &Path, event: &HookEvent) -> session_state::StartKind {
+    let kind = session_state::StartKind::parse(event.start_reason());
+    // The session id cannot make this call: the harness keeps one id across
+    // compaction and resume, so the file routinely outlives the conversation
+    // that wrote it. Only the reason distinguishes the two.
+    if kind.resets_state() {
+        let _ = session_state::update(state_dir, event.session(), |st| st.reset());
+    }
+    kind
+}
+
 fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     // Subagents inherit fresh context on purpose; the resident set is for the
     // primary session (a fork re-injecting rings would double-pay the budget).
     if event.is_subagent() {
         return Ok(());
     }
+
+    // Before anything is injected: a session start that begins a new
+    // conversation must not leave the previous one's read history and spent
+    // reminder caps standing for the rest of this session.
+    let start = session_start_state(&paths::state_dir(), event);
 
     let mut emit = Emit::new("SessionStart");
 
@@ -117,14 +137,14 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
         Err(_) => String::new(),
     };
 
-    let reason = event.start_reason();
     if !digest.is_empty() {
-        if reason == "compact" || reason == "resume" {
-            emit.add_context(format!(
+        match start.continuation_label() {
+            // Memory arriving in the middle of a conversation needs its cause
+            // named, or the model reads the repeat as new instruction.
+            Some(reason) => emit.add_context(format!(
                 "[cfetch resident memory (rings 0-1), re-injected after {reason}]\n{digest}"
-            ));
-        } else {
-            emit.add_context(format!("[cfetch resident memory (rings 0-1)]\n{digest}"));
+            )),
+            None => emit.add_context(format!("[cfetch resident memory (rings 0-1)]\n{digest}")),
         }
     }
 
@@ -880,6 +900,83 @@ mod tests {
         };
         post_tool_budget(state.path(), &cfg, &budget_event("s-zero", &big)).unwrap();
         assert!(crate::session_state::load(state.path(), "s-zero").drain_reminders().is_empty());
+    }
+
+    fn start_event(session: &str, reason: &str) -> HookEvent {
+        HookEvent {
+            session_id: Some(session.into()),
+            reason: Some(reason.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A session file as a working conversation leaves it: something read,
+    /// something written, caps spent, warnings disarmed by a compaction.
+    fn seed_conversation(dir: &Path, session: &str) {
+        let mut st = session_state::SessionState::default();
+        st.record_read("/a.rs", 100);
+        st.record_write("/b.rs");
+        st.warned.insert("/a.rs".into());
+        st.shown_keys.insert("status".into());
+        st.compacted = true;
+        st.tool_events = 7;
+        session_state::store(dir, session, &st);
+    }
+
+    #[test]
+    fn a_cleared_conversation_starts_without_the_previous_one_s_records() {
+        let state = tempfile::tempdir().unwrap();
+        seed_conversation(state.path(), "s-clear");
+        session_start_state(state.path(), &start_event("s-clear", "clear"));
+
+        let mut st = session_state::load(state.path(), "s-clear");
+        assert!(st.reads.is_empty(), "the read history belongs to the conversation that is gone");
+        assert!(st.written.is_empty(), "so does the write history");
+        assert_eq!(st.tool_events, 0);
+        assert!(!st.compacted, "the new conversation has not been compacted");
+        assert!(st.queue_reminder("status", "nudge"), "the spent caps are returned");
+    }
+
+    #[test]
+    fn resume_and_compaction_continue_the_conversation_they_arrive_in() {
+        for reason in ["resume", "compact"] {
+            let state = tempfile::tempdir().unwrap();
+            seed_conversation(state.path(), "s");
+            session_start_state(state.path(), &start_event("s", reason));
+
+            let mut st = session_state::load(state.path(), "s");
+            assert_eq!(st.reads.len(), 1, "{reason} must not forget what was already read");
+            assert!(st.compacted, "{reason} must not re-arm what compaction disarmed");
+            assert!(!st.queue_reminder("status", "nudge"), "{reason} keeps spent caps spent");
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_start_reason_keeps_what_it_cannot_judge() {
+        let state = tempfile::tempdir().unwrap();
+        seed_conversation(state.path(), "s-unknown");
+        session_start_state(state.path(), &start_event("s-unknown", "rewound"));
+        assert_eq!(
+            session_state::load(state.path(), "s-unknown").reads.len(),
+            1,
+            "an unknown reason must take the recoverable branch, not the destructive one"
+        );
+    }
+
+    #[test]
+    fn the_historical_source_field_drives_the_same_decision() {
+        let state = tempfile::tempdir().unwrap();
+        seed_conversation(state.path(), "s-legacy");
+        let event = HookEvent {
+            session_id: Some("s-legacy".into()),
+            source: Some("startup".into()),
+            ..Default::default()
+        };
+        session_start_state(state.path(), &event);
+        assert!(
+            session_state::load(state.path(), "s-legacy").reads.is_empty(),
+            "the older field spelling names the same start"
+        );
     }
 
     #[test]

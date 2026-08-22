@@ -9,7 +9,9 @@
 //! - at most one advisory per file per session;
 //! - compaction disarms warnings — the model lost the earlier read;
 //! - subagents are never warned (enforced by the hook layer: they run in
-//!   fresh context where the "earlier content" does not exist).
+//!   fresh context where the "earlier content" does not exist);
+//! - only a start that begins a NEW conversation clears the file — see
+//!   [`StartKind`], which turns the SessionStart reason into that decision.
 //!
 //! Retention is enforced at the writer: every store GCs session files older
 //! than seven days, so the directory never needs a cleanup job.
@@ -144,6 +146,117 @@ impl SessionState {
         self.tool_events += 1;
         (every > 0 && self.tool_events.is_multiple_of(u64::from(every)))
             .then_some(self.tool_events)
+    }
+
+    /// Drops everything that describes the conversation, keeping the session
+    /// file itself. Called only for a start that begins a NEW conversation
+    /// under an id the harness may have reused — see [`StartKind`].
+    ///
+    /// Deliberately scoped to this file: the ledger and the exhaust stream are
+    /// facts of record — what a session spent and what it did happened, and no
+    /// start reason unhappens it.
+    ///
+    /// Written as a full destructure so that a field added to `SessionState`
+    /// stops compiling here until someone decides whether the new state
+    /// belongs to the conversation (cleared) or to the session id (kept).
+    pub fn reset(&mut self) {
+        let Self {
+            compacted,
+            reads,
+            warned,
+            hinted,
+            written,
+            queued_reminders,
+            shown_keys,
+            tool_events,
+            shell_writes,
+        } = self;
+        *compacted = false;
+        reads.clear();
+        warned.clear();
+        hinted.clear();
+        written.clear();
+        queued_reminders.clear();
+        shown_keys.clear();
+        *tool_events = 0;
+        *shell_writes = 0;
+    }
+}
+
+/// The SessionStart reason, reduced to the one question this file has to
+/// answer: does the arriving conversation still remember what the records
+/// describe?
+///
+/// It has to be asked, because the session id does not answer it. The harness
+/// keeps one id across compaction and resume, so the file outlives the
+/// conversation it was written for; without the reason, a resumed session
+/// either forgets what it read or re-spends every once-per-session cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartKind {
+    /// A fresh conversation, possibly under a recycled session id.
+    Startup,
+    /// The context was thrown away in place (`/clear`).
+    Clear,
+    /// The earlier turns are back in context.
+    Resume,
+    /// The conversation continues, summarized.
+    Compact,
+    /// A reason this build has no rule for.
+    Unknown,
+}
+
+impl StartKind {
+    /// Lenient parse. The harness already renamed the field once
+    /// (SessionStart `source` -> `reason`), so its values are assumed to drift
+    /// too: case and surrounding space never decide behaviour, and the plain
+    /// morphological variants of the four known reasons are accepted. Anything
+    /// else is `Unknown` — an unrecognized word is reported as unrecognized,
+    /// never mapped to the nearest guess.
+    pub fn parse(reason: &str) -> StartKind {
+        match reason.trim().to_ascii_lowercase().as_str() {
+            "startup" | "start" | "new" => StartKind::Startup,
+            "clear" | "cleared" | "reset" => StartKind::Clear,
+            "resume" | "resumed" | "continue" => StartKind::Resume,
+            "compact" | "compaction" | "compacted" => StartKind::Compact,
+            _ => StartKind::Unknown,
+        }
+    }
+
+    /// Whether this start begins a conversation that remembers nothing of what
+    /// the session file records.
+    ///
+    /// RESET on `startup` and `clear`: the context is empty, so every read
+    /// record, written path and spent once-per-session cap belongs to a
+    /// conversation that no longer exists. Keeping them would deny the new
+    /// conversation advisories it has never seen, and warn it about reads it
+    /// never made.
+    ///
+    /// CONTINUE on `resume` and `compact`: the conversation goes on. Resume
+    /// puts the earlier turns back in context, compaction keeps them in
+    /// summarized form; the caps those turns spent are spent. Compaction in
+    /// particular must continue, or the reset would erase the `compacted` flag
+    /// PreCompact just set and re-arm the warnings compaction disarmed.
+    ///
+    /// CONTINUE on an unknown reason, because continuing is the recoverable
+    /// branch. A stale record can only produce advice the existing guards
+    /// already bound — mtime-gated, once per file, disarmed by compaction —
+    /// while a wrong reset is irreversible: it drops queued reminders and
+    /// re-arms every once-per-session cap, and a hook that repeats itself is a
+    /// hook the operator turns off.
+    pub fn resets_state(self) -> bool {
+        matches!(self, StartKind::Startup | StartKind::Clear)
+    }
+
+    /// The cause named in the re-injection note, for the starts where memory
+    /// arrives mid-conversation and the model is owed an explanation for it.
+    /// `None` where there is nothing to explain (a fresh conversation) or
+    /// nothing we can state as fact (an unknown reason).
+    pub fn continuation_label(self) -> Option<&'static str> {
+        match self {
+            StartKind::Resume => Some("resume"),
+            StartKind::Compact => Some("compact"),
+            StartKind::Startup | StartKind::Clear | StartKind::Unknown => None,
+        }
     }
 }
 
@@ -383,6 +496,59 @@ mod tests {
         assert_eq!(back.tool_events, 24);
         assert!(!back.queue_reminder("staging", "dup"), "shown keys survive the roundtrip");
         assert_eq!(back.drain_reminders(), vec!["update the STATUS".to_string()]);
+    }
+
+    #[test]
+    fn only_a_new_conversation_resets_the_session_file() {
+        assert!(StartKind::parse("startup").resets_state());
+        assert!(StartKind::parse("clear").resets_state());
+        assert!(!StartKind::parse("resume").resets_state(), "resume continues the conversation");
+        assert!(!StartKind::parse("compact").resets_state(), "compaction continues it too");
+        assert_eq!(StartKind::parse("resume").continuation_label(), Some("resume"));
+        assert_eq!(StartKind::parse("compact").continuation_label(), Some("compact"));
+        assert_eq!(StartKind::parse("startup").continuation_label(), None);
+    }
+
+    #[test]
+    fn an_unknown_reason_takes_the_non_destructive_branch() {
+        let kind = StartKind::parse("teleported");
+        assert_eq!(kind, StartKind::Unknown, "no nearest-guess mapping");
+        assert!(!kind.resets_state(), "a reason we cannot read must never destroy state");
+        assert_eq!(kind.continuation_label(), None, "no cause we cannot name is asserted");
+    }
+
+    #[test]
+    fn reason_parsing_absorbs_case_and_spacing_drift() {
+        assert_eq!(StartKind::parse(" Resume\n"), StartKind::Resume);
+        assert_eq!(StartKind::parse("COMPACT"), StartKind::Compact);
+        assert_eq!(StartKind::parse("Startup"), StartKind::Startup);
+        assert_eq!(StartKind::parse(""), StartKind::Unknown);
+    }
+
+    #[test]
+    fn reset_drops_every_conversation_record_and_frees_the_caps() {
+        let mut st = SessionState::default();
+        st.record_read("/a.rs", 100);
+        assert!(st.should_warn_repeat_read("/a.rs", 100));
+        assert!(st.should_hint_slices("/a.rs"));
+        st.record_write("/b.rs");
+        st.record_shell_write();
+        st.count_tool_event(1);
+        assert!(st.queue_reminder("status", "nudge"));
+        st.drain_reminders();
+        st.compacted = true;
+
+        st.reset();
+
+        assert!(st.reads.is_empty() && st.written.is_empty());
+        assert!(st.queued_reminders.is_empty());
+        assert_eq!((st.tool_events, st.shell_writes), (0, 0));
+        assert!(!st.compacted, "a fresh conversation has not been compacted");
+        // The caps belong to the conversation, so the new one gets them whole.
+        st.record_read("/a.rs", 100);
+        assert!(st.should_warn_repeat_read("/a.rs", 100), "the warned cap is free again");
+        assert!(st.should_hint_slices("/a.rs"), "the hint cap is free again");
+        assert!(st.queue_reminder("status", "nudge"), "the shown-key cap is free again");
     }
 
     #[test]
