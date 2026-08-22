@@ -1,0 +1,154 @@
+name: Publish to Homebrew tap
+
+# Fires on the same 'v*' tag as release.yml, waits for that workflow to finish
+# uploading assets, then regenerates the formula in the tap repo from the
+# PUBLISHED checksums and pushes it.
+#
+# Needs: PACKAGES_TOKEN — a classic PAT with 'public_repo' scope on an account
+# that can write to julian-corbet/homebrew-cfetch.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without v-prefix (e.g. 0.9.1)'
+        required: true
+        type: string
+
+permissions: read-all
+
+jobs:
+  homebrew:
+    runs-on: ubuntu-latest
+    # The asset poll is a deliberate 15 min ceiling; steady-state runs are ~2 min.
+    timeout-minutes: 25
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check PACKAGES_TOKEN exists
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::PACKAGES_TOKEN secret is not configured."
+            echo "Create a classic PAT with 'public_repo' scope, then add it as"
+            echo "a repository secret named PACKAGES_TOKEN."
+            exit 1
+          fi
+
+      - name: Wait for release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          for i in $(seq 1 60); do
+            if gh release view "v${VERSION}" --repo julian-corbet/cfetch \
+                --json assets -q '.assets[].name' 2>/dev/null | grep -q '^checksums_sha256.txt$'; then
+              echo "release assets ready"
+              exit 0
+            fi
+            echo "waiting for release v${VERSION} assets ($i/60)..."
+            sleep 15
+          done
+          echo "::error::Release v${VERSION} assets never appeared"
+          exit 1
+
+      - name: Download checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release download "v${VERSION}" --repo julian-corbet/cfetch \
+            --pattern 'checksums_sha256.txt' --dir /tmp
+
+      - name: Check out tap repo
+        uses: actions/checkout@v7
+        with:
+          repository: julian-corbet/homebrew-cfetch
+          token: ${{ secrets.PACKAGES_TOKEN }}
+          path: tap
+
+      - name: Regenerate formula
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          sha_of() {
+            awk -v want="$1" '$2 == want || $2 == "*" want {print $1}' /tmp/checksums_sha256.txt
+          }
+          MAC_ARM="mac-cfetch-arm64-v${VERSION}.tar.gz"
+          MAC_X86="mac-cfetch-x86_64-v${VERSION}.tar.gz"
+          LNX_X86="linux-cfetch-x86_64-v${VERSION}.tar.gz"
+          SHA_MAC_ARM=$(sha_of "$MAC_ARM")
+          SHA_MAC_X86=$(sha_of "$MAC_X86")
+          SHA_LNX_X86=$(sha_of "$LNX_X86")
+          for pair in "$MAC_ARM:$SHA_MAC_ARM" "$MAC_X86:$SHA_MAC_X86" "$LNX_X86:$SHA_LNX_X86"; do
+            if [ -z "${pair#*:}" ]; then
+              echo "::error::No checksum for ${pair%%:*}"
+              cat /tmp/checksums_sha256.txt
+              exit 1
+            fi
+          done
+
+          mkdir -p tap/Formula
+          cat > tap/Formula/cfetch.rb <<RUBY
+          class Cfetch < Formula
+            desc "Agent memory: ring-ordered recall over a shared brain, with native Claude Code and Codex hooks"
+            homepage "https://github.com/julian-corbet/cfetch"
+            license "FSL-1.1-ALv2"
+            version "${VERSION}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${MAC_ARM}"
+                sha256 "${SHA_MAC_ARM}"
+              else
+                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${MAC_X86}"
+                sha256 "${SHA_MAC_X86}"
+              end
+            end
+
+            on_linux do
+              # cfetch publishes no linux-arm64 build yet. Saying so is better
+              # than resolving to an x86_64 tarball that cannot execute.
+              odie "cfetch has no linux-arm64 build; install from source" if Hardware::CPU.arm?
+
+              url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${LNX_X86}"
+              sha256 "${SHA_LNX_X86}"
+            end
+
+            def install
+              bin.install "cfetch"
+              doc.install "LICENSE.md"
+              doc.install "THIRD-PARTY-LICENSES.txt"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/cfetch --version")
+            end
+          end
+          RUBY
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --quiet; then
+            echo "No changes — formula already at ${VERSION}"
+          else
+            git add Formula/cfetch.rb
+            git commit -m "formula: bump cfetch to ${VERSION}"
+            git push origin main
+          fi

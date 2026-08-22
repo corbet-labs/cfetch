@@ -5,6 +5,13 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Homebrew install.** `brew tap julian-corbet/cfetch && brew install cfetch`
+  on macOS (Apple silicon and Intel) and Linux x86_64. Releases now publish
+  `checksums_sha256.txt`, and the tap's formula is regenerated from those
+  published checksums on every tag rather than hand-written. There is no
+  linux-arm64 build, and the formula says so instead of offering an x86_64
+  tarball that cannot execute.
+
 - **Dependency-license compliance.** CI now rejects unreviewed licenses and
   verifies a generated third-party license/NOTICE bundle. Release archives and
   the Nix and Arch packages all install that bundle beside cfetch's own license;

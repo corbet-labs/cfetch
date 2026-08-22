@@ -118,6 +118,16 @@ jobs:
           cp LICENSE.md dist/LICENSE.md
           cp THIRD-PARTY-LICENSES.txt dist/THIRD-PARTY-LICENSES.txt
           ls -la dist
+      # Published as a release asset because downstream packaging consumes it
+      # rather than re-hashing: the Homebrew tap regenerates its formula from
+      # these lines, and a formula whose sha256 came from anywhere but the
+      # released bytes is a formula that can silently install something else.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > "$RUNNER_TEMP/checksums_sha256.txt"
+          mv "$RUNNER_TEMP/checksums_sha256.txt" .
+          cat checksums_sha256.txt
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
