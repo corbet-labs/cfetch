@@ -1562,6 +1562,24 @@ fn index_liveness_line(
     (verdict.severity(), line)
 }
 
+fn delivery_status_line(agent: &str, verification: Option<(u64, u64)>) -> String {
+    let agent = match agent {
+        agent_session::AGENT_CLAUDE => "Claude",
+        agent_session::AGENT_CODEX => "Codex",
+        agent_session::AGENT_GEMINI => "Gemini",
+        agent_session::AGENT_CURSOR => "Cursor",
+        other => other,
+    };
+    match verification {
+        Some((fired, delivered)) => format!(
+            "delivery: {fired} hook firing(s) observed, {delivered} injection(s) verified ({agent} transcript)"
+        ),
+        None => format!(
+            "delivery: not measurable from newest {agent} transcript (no recognizable cfetch hook-delivery records)"
+        ),
+    }
+}
+
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
     // Diagnostics must survive a broken config: the paths below fall back to
@@ -1639,12 +1657,10 @@ fn status() -> anyhow::Result<()> {
         None => println!(
             "delivery: no supported transcripts found (measurement gap; checked Claude, Codex, Gemini and Cursor)"
         ),
-        Some(t) => match transcript::verified_injections(&t) {
-            Some((fired, delivered)) => println!(
-                "delivery: {fired} hook firing(s) observed, {delivered} injection(s) verified (transcript)"
-            ),
-            None => println!("delivery: unverifiable (transcript format drift)"),
-        },
+        Some(t) => {
+            let agent = agent_session::agent_source_for_path(&t).unwrap_or("unknown-agent");
+            println!("{}", delivery_status_line(agent, transcript::verified_injections(&t)));
+        }
     }
     // Ring 5/6 live in the tree, so their figures are the fleet's, not this
     // machine's.
@@ -2223,6 +2239,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_delivery_records_are_a_named_measurement_gap() {
+        let gap = delivery_status_line(agent_session::AGENT_CODEX, None);
+        assert!(gap.contains("not measurable"), "{gap}");
+        assert!(gap.contains("Codex"), "{gap}");
+        assert!(!gap.contains("format drift"), "absence alone does not prove schema drift: {gap}");
+
+        let observed = delivery_status_line(agent_session::AGENT_CLAUDE, Some((6, 4)));
+        assert!(observed.contains("6 hook firing(s) observed"), "{observed}");
+        assert!(observed.contains("4 injection(s) verified"), "{observed}");
+        assert!(observed.contains("Claude"), "{observed}");
+    }
 
     #[test]
     fn an_unbuilt_catalog_reports_absence_and_a_lagging_one_reports_its_age() {
