@@ -5,6 +5,14 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Hardware detection.** `cfetch hardware` reports the accelerators it can
+  see, what proved each one, and the variant this machine should run, under
+  the `<os>-cfetch-<silicon>[-<level>]` scheme. The policy is NPU > GPU > CPU
+  and it is encoded as an ordering rather than as a comment — an NPU is
+  preferred even where the GPU beside it is faster, because it draws less
+  power and is the one processor nothing else on the machine is competing
+  for.
+
 - **Document-side embedding prefixes, as part of the artifact identity.**
   `embeddings.document_prefix` carries the instruction models like E5 and
   EmbeddingGemma expect on documents. Because it changes every stored vector,

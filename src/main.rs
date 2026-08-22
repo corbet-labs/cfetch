@@ -8,6 +8,7 @@ mod exhaust;
 mod govern;
 mod grant;
 mod graph;
+mod hardware;
 mod heartbeat;
 mod hook_io;
 mod hooks;
@@ -134,6 +135,11 @@ enum Command {
     },
     /// Show who has been granted which slice, and which invites are unused
     Grants {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Detect accelerators and name the variant this machine should run
+    Hardware {
         #[arg(long)]
         json: bool,
     },
@@ -1273,6 +1279,32 @@ fn main() {
             if let Err(e) = grants(json) {
                 eprintln!("cfetch grants: {e:#}");
                 std::process::exit(1);
+            }
+        }
+        Command::Hardware { json } => {
+            let found = hardware::detect();
+            let variant = hardware::recommended_variant(&found);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "variant": variant,
+                        "os": hardware::os_token(),
+                        "x86_64_level": hardware::x86_64_level(),
+                        "devices": found.iter().map(|f| serde_json::json!({
+                            "device": f.device.describe(),
+                            "token": f.device.token(),
+                            "class": format!("{:?}", f.device.class()).to_lowercase(),
+                            "evidence": f.evidence,
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                println!("detected, best first (policy: NPU > GPU > CPU):");
+                for f in &found {
+                    println!("  {:<26} {}", f.device.describe(), f.evidence);
+                }
+                println!("\nrecommended variant: {variant}");
             }
         }
         Command::Identity { json } => {
