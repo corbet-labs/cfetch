@@ -5,6 +5,8 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+## 0.9.6
+
 ## 0.9.5
 
 - **crates.io distribution.** The verified v0.9.4 source release is available
