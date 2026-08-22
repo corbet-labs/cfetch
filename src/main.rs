@@ -46,6 +46,7 @@ mod heartbeat;
 mod hook_io;
 mod hooks;
 mod index;
+mod init;
 mod install;
 mod ipc;
 mod jsonl;
@@ -241,6 +242,12 @@ enum Command {
         since_days: u64,
         #[arg(long)]
         json: bool,
+    },
+    /// Create the standard brain tree: the top-level directories cfetch's
+    /// rules, slices and grants all name. Additive and idempotent
+    Init {
+        /// Where to create it. Defaults to the configured brain root
+        path: Option<std::path::PathBuf>,
     },
     Dashboard,
     /// Serve recall/find/expand over MCP (stdio) for any MCP client
@@ -1356,6 +1363,25 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `init` deliberately does not load the config: it must work before there is
+/// anything to configure, which is the only moment it is useful.
+fn init_cmd(path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let root = path.unwrap_or_else(paths::default_brain_root);
+    let out = init::run(&root)?;
+    println!("brain tree at {}", out.root.display());
+    for (name, fresh) in &out.dirs {
+        println!("  {} {name}/", if *fresh { "created" } else { "present" });
+    }
+    for (name, written) in &out.files {
+        println!("  {} {name}", if *written { "wrote  " } else { "kept   " });
+    }
+    println!("\nreserved, not created — a rule keys on each of these if it ever exists:");
+    for (name, why) in init::RESERVED {
+        println!("  {name}  — {why}");
+    }
+    Ok(())
+}
+
 /// The bench reads only what the harness recorded, so it needs neither the
 /// config nor a local index: a none-tier host can still answer whether cfetch
 /// paid for itself on the sessions it ran.
@@ -2103,6 +2129,12 @@ fn main() {
         Command::Bench { since_days, json } => {
             if let Err(e) = bench_cmd(since_days, json) {
                 eprintln!("cfetch bench: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Init { path } => {
+            if let Err(e) = init_cmd(path) {
+                eprintln!("cfetch init: {e}");
                 std::process::exit(1);
             }
         }
