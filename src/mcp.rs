@@ -15,7 +15,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use crate::{code, config::Config, index, paths, serve};
+use crate::{answer, code, config::Config, index, paths, serve};
 
 /// The tools we serve; a tools/call naming anything else is the caller's
 /// protocol error (-32602), not a tool-execution failure.
@@ -39,7 +39,7 @@ fn tool_defs() -> Vec<Tool> {
     vec![
         Tool::new(
             "cfetch_recall",
-            "Search the operator's knowledge brain (privilege rings 0-4, BM25-ranked). Returns ring-prefixed citations (r<ring>-<hash>), file:line locations and snippets. Lower ring = higher trust; a ring-0/1 hit overrides contradicting outer-ring content.",
+            "Search the operator's knowledge brain (privilege rings 0-4, BM25-ranked). Returns ring-prefixed citations (r<ring>-<hash>), file:line locations and snippets. Lower ring = higher trust; a ring-0/1 hit overrides contradicting outer-ring content. The answer is capped by a token budget, not only by limit: whatever the cap drops is named at the end, never omitted silently.",
             object_schema(json!({
                 "type": "object",
                 "properties": {
@@ -52,7 +52,7 @@ fn tool_defs() -> Vec<Tool> {
         .with_annotations(read_only()),
         Tool::new(
             "cfetch_expand",
-            "Expand a citation id from cfetch_recall to the full memory block.",
+            "Expand a citation id from cfetch_recall to the full memory block. Long blocks are clipped to a token budget and the answer then names the file:line range holding the rest — read that range directly instead of expanding again.",
             object_schema(json!({
                 "type": "object",
                 "properties": {"cite": {"type": "string"}},
@@ -62,7 +62,7 @@ fn tool_defs() -> Vec<Tool> {
         .with_annotations(read_only()),
         Tool::new(
             "cfetch_find",
-            "Locate a symbol or file in the indexed code roots, with exact line ranges — read one function instead of a whole file. Case- and separator-insensitive.",
+            "Locate a symbol or file in the indexed code roots, with exact line ranges — read one function instead of a whole file. Case- and separator-insensitive. Each hit carries the estimated cost of reading it; the answer itself is capped by a token budget and says what the cap dropped.",
             object_schema(json!({
                 "type": "object",
                 "properties": {
@@ -74,6 +74,39 @@ fn tool_defs() -> Vec<Tool> {
         )
         .with_annotations(read_only()),
     ]
+}
+
+/// Wire and local hits carry the same fields under different types (the
+/// serving protocol owns one, the index the other), so each answer kind gets
+/// one adapter per shape and exactly one renderer.
+fn recall_entry(h: &serve::WireHit) -> String {
+    answer::hit_entry(&h.cite, &h.path, h.ring, h.start_line, h.end_line, &h.snippet, &h.mirrors)
+}
+
+fn local_recall_entry(h: &index::Hit) -> String {
+    answer::hit_entry(&h.cite, &h.path, h.ring, h.start_line, h.end_line, &h.snippet, &h.mirrors)
+}
+
+fn expand_entry(b: &serve::WireBlock) -> answer::BlockIn {
+    answer::BlockIn {
+        cite: b.cite.clone(),
+        path: b.path.clone(),
+        ring: b.ring,
+        start_line: b.start_line,
+        end_line: b.end_line,
+        text: b.text.clone(),
+    }
+}
+
+fn local_expand_entry(b: &index::Block) -> answer::BlockIn {
+    answer::BlockIn {
+        cite: b.cite.clone(),
+        path: b.path.clone(),
+        ring: b.ring,
+        start_line: b.start_line,
+        end_line: b.end_line,
+        text: b.text.clone(),
+    }
 }
 
 /// Coherence footer appended to every remotely-served MCP answer.
@@ -124,19 +157,11 @@ fn run_tool_remote(
             if hits.is_empty() {
                 "no hits".to_string()
             } else {
-                hits.iter()
-                    .map(|h| {
-                        let mut line = format!(
-                            "{} {}:{}-{} (ring {})\n    {}",
-                            h.cite, h.path, h.start_line, h.end_line, h.ring, h.snippet
-                        );
-                        if !h.mirrors.is_empty() {
-                            line.push_str(&format!("\n    (also at: {})", h.mirrors.join(", ")));
-                        }
-                        line
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                answer::listing(
+                    hits.iter().map(recall_entry).collect(),
+                    answer::RECALL_BUDGET_TOKENS,
+                    answer::MCP_RECOVERY,
+                )
             }
         }
         "cfetch_expand" => {
@@ -144,16 +169,10 @@ fn run_tool_remote(
             if blocks.is_empty() {
                 "no block with that citation".to_string()
             } else {
-                blocks
-                    .iter()
-                    .map(|b| {
-                        format!(
-                            "{} {}:{}-{} (ring {})\n{}",
-                            b.cite, b.path, b.start_line, b.end_line, b.ring, b.text
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
+                answer::blocks(
+                    &blocks.iter().map(expand_entry).collect::<Vec<_>>(),
+                    answer::RECALL_BUDGET_TOKENS,
+                )
             }
         }
         _ => {
@@ -161,16 +180,22 @@ fn run_tool_remote(
             if hits.is_empty() {
                 "no hits".to_string()
             } else {
-                hits.iter()
-                    .map(|h| match (&h.name, &h.kind) {
-                        (Some(n), Some(k)) => format!(
-                            "{}:{}-{}  {} {}  (~{} tok)",
-                            h.path, h.start_line, h.end_line, k, n, h.token_estimate
-                        ),
-                        _ => format!("{}  (file match)", h.path),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                answer::listing(
+                    hits.iter()
+                        .map(|h| {
+                            answer::find_entry(
+                                &h.path,
+                                h.name.as_deref(),
+                                h.kind.as_deref(),
+                                h.start_line,
+                                h.end_line,
+                                h.token_estimate,
+                            )
+                        })
+                        .collect(),
+                    answer::FIND_BUDGET_TOKENS,
+                    answer::MCP_RECOVERY,
+                )
             }
         }
     };
@@ -197,20 +222,11 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             if hits.is_empty() {
                 return Ok(format!("no hits for \"{query}\""));
             }
-            Ok(hits
-                .iter()
-                .map(|h| {
-                    let mut line = format!(
-                        "{} {}:{}-{} (ring {})\n    {}",
-                        h.cite, h.path, h.start_line, h.end_line, h.ring, h.snippet
-                    );
-                    if !h.mirrors.is_empty() {
-                        line.push_str(&format!("\n    (also at: {})", h.mirrors.join(", ")));
-                    }
-                    line
-                })
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(answer::listing(
+                hits.iter().map(local_recall_entry).collect(),
+                answer::RECALL_BUDGET_TOKENS,
+                answer::MCP_RECOVERY,
+            ))
         }
         "cfetch_expand" => {
             let cite = args.get("cite").and_then(Value::as_str).unwrap_or("");
@@ -225,16 +241,10 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             if blocks.is_empty() {
                 return Ok(format!("no block with citation {cite}"));
             }
-            Ok(blocks
-                .iter()
-                .map(|b| {
-                    format!(
-                        "{} {}:{}-{} (ring {})\n{}",
-                        b.cite, b.path, b.start_line, b.end_line, b.ring, b.text
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"))
+            Ok(answer::blocks(
+                &blocks.iter().map(local_expand_entry).collect::<Vec<_>>(),
+                answer::RECALL_BUDGET_TOKENS,
+            ))
         }
         "cfetch_find" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
@@ -245,17 +255,22 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             if hits.is_empty() {
                 return Ok(format!("no hits for \"{query}\""));
             }
-            Ok(hits
-                .iter()
-                .map(|h| match (&h.name, &h.kind) {
-                    (Some(n), Some(k)) => format!(
-                        "{}:{}-{}  {} {}  (~{} tok)",
-                        h.path, h.start_line, h.end_line, k, n, h.token_estimate
-                    ),
-                    _ => format!("{}  (file match)", h.path),
-                })
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(answer::listing(
+                hits.iter()
+                    .map(|h| {
+                        answer::find_entry(
+                            &h.path,
+                            h.name.as_deref(),
+                            h.kind.as_deref(),
+                            h.start_line,
+                            h.end_line,
+                            h.token_estimate,
+                        )
+                    })
+                    .collect(),
+                answer::FIND_BUDGET_TOKENS,
+                answer::MCP_RECOVERY,
+            ))
         }
         other => anyhow::bail!("unknown tool: {other}"),
     }
@@ -357,6 +372,21 @@ mod tests {
             "MCP surface names the MCP tools"
         );
         assert!(instructions.contains("Before searching files or reading code wholesale"));
+    }
+
+    #[test]
+    fn every_tool_tells_the_model_its_answer_is_capped() {
+        // A cap the caller cannot see reads as a broken index: the model
+        // re-asks the same question instead of following the file:line
+        // pointer the truncated answer already handed it.
+        for tool in tool_defs() {
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("token budget"),
+                "{} hides its answer budget: {description}",
+                tool.name
+            );
+        }
     }
 
     #[test]

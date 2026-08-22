@@ -122,6 +122,9 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Token budget the answer must fit; 0 lifts the cap
+        #[arg(long, default_value_t = answer::FIND_BUDGET_TOKENS)]
+        budget_tokens: u64,
         #[arg(long)]
         json: bool,
     },
@@ -155,6 +158,10 @@ enum Command {
         slice: Option<String>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        /// Token budget the answer must fit — hits or an expanded block;
+        /// 0 lifts the cap
+        #[arg(long, default_value_t = answer::RECALL_BUDGET_TOKENS)]
+        budget_tokens: u64,
         #[arg(long)]
         json: bool,
     },
@@ -509,26 +516,287 @@ fn scan(background: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
+/// What a query answer is allowed to COST, in estimated tokens, instead of
+/// how many rows it may contain.
+///
+/// A result count prices eight one-line file matches the same as eight
+/// thousand-line blocks, so the same `--limit 8` bought answers two orders of
+/// magnitude apart and the Ledger only learned about it afterwards. The
+/// budget is applied where the answer is RENDERED, by whoever renders it —
+/// local index or remote serving host — so a peer's idea of a reasonable
+/// answer cannot spend this host's context window.
+///
+/// Truncation is never silent. Every cut is followed by a line naming how
+/// much went and the exact way to get it back: a narrower query, a lifted cap
+/// (`--budget-tokens 0`), or the file range that still holds the text. A short
+/// answer is cheap; an answer that quietly lost the hit you needed is wrong.
+mod answer {
+    use crate::hook_io::estimate_tokens;
+
+    /// Default budget for a `find` answer. One hit is one line, so this binds
+    /// only on deep paths or a raised `--limit`; it exists so that no answer
+    /// path is unpriced, not because find is the expensive one.
+    pub const FIND_BUDGET_TOKENS: u64 = 1200;
+
+    /// Default budget for a `recall` answer, hits or expanded blocks. Blocks
+    /// are why this mechanism exists: a hit snippet is capped at 160
+    /// characters, a block is whatever the operator wrote.
+    pub const RECALL_BUDGET_TOKENS: u64 = 1500;
+
+    /// What the CLI tells a caller to do about a truncated answer. Naming the
+    /// escape hatch is the whole point — "results omitted" alone is the
+    /// silent drop this mechanism exists to prevent.
+    pub const CLI_RECOVERY: &str =
+        "narrow the query, or re-run with --budget-tokens 0 for the whole answer";
+
+    /// The MCP surface has no flags, so the pointers already in the answer are
+    /// the way back: every hit carries its file and line range.
+    pub const MCP_RECOVERY: &str = "narrow the query, or read the file ranges above";
+
+    /// Zero lifts the cap. It is the documented recovery from a truncated
+    /// answer, so it can never also mean "nothing fits".
+    fn uncapped(budget: u64) -> bool {
+        budget == 0
+    }
+
+    /// Largest prefix of a `max`-byte string whose estimate still fits.
+    /// Binary search over [`estimate_tokens`] rather than an inverse formula,
+    /// so the two cannot drift apart when the chars/3.5 heuristic is replaced
+    /// by the measured tokenizer.
+    fn fitting_bytes(budget: u64, max: usize) -> usize {
+        let (mut lo, mut hi) = (0usize, max);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if estimate_tokens(mid) <= budget {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
+    /// A ranked list fitted to a budget.
+    struct Fitted {
+        entries: Vec<String>,
+        dropped: usize,
+    }
+
+    /// Keeps the longest RANKED PREFIX of `entries` that fits. Entries arrive
+    /// best-first and a prefix is the only truncation that preserves that
+    /// order: skipping one fat entry to fit two thin ones hands back a
+    /// differently-ranked answer than the one the pipeline computed. At least
+    /// one entry always survives — an answer holding nothing answers nothing,
+    /// and the drop line still says what that cost.
+    fn fit(mut entries: Vec<String>, budget: u64) -> Fitted {
+        if uncapped(budget) {
+            return Fitted { entries, dropped: 0 };
+        }
+        let mut chars = 0usize;
+        let mut kept = 0usize;
+        for entry in &entries {
+            // +1 for the newline that joins this entry to the previous one.
+            let next = chars + entry.len() + usize::from(kept > 0);
+            if kept > 0 && estimate_tokens(next) > budget {
+                break;
+            }
+            chars = next;
+            kept += 1;
+        }
+        let dropped = entries.len() - kept;
+        entries.truncate(kept);
+        Fitted { entries, dropped }
+    }
+
+    /// The same fit over serialized JSON entries. An agent parsing stdout pays
+    /// for the bytes it reads, so `--json` is priced on the JSON it emits, not
+    /// on a text rendering it never sees.
+    pub fn fit_json(
+        entries: Vec<serde_json::Value>,
+        budget: u64,
+    ) -> (Vec<serde_json::Value>, usize) {
+        let fitted = fit(entries.iter().map(ToString::to_string).collect(), budget);
+        let kept = fitted.entries.len();
+        let mut entries = entries;
+        entries.truncate(kept);
+        (entries, fitted.dropped)
+    }
+
+    /// The line that makes a dropped tail honest. Charged ON TOP of the budget
+    /// on purpose: a truncation notice that could itself be truncated would
+    /// defeat the mechanism.
+    fn dropped_note(dropped: usize, budget: u64, recovery: &str) -> String {
+        format!("… {dropped} more hit(s) dropped by the {budget}-token answer budget — {recovery}")
+    }
+
+    fn clipped_note(omitted: u64, locator: &str) -> String {
+        format!(
+            "… ~{omitted} more token(s) of this block not shown (answer budget) — read {locator} for the rest"
+        )
+    }
+
+    /// One block body, clipped to what the budget had left.
+    pub struct Clipped {
+        pub text: String,
+        /// Estimated tokens NOT shown; zero means the body arrived whole.
+        pub omitted_tokens: u64,
+    }
+
+    /// Clips a block body, preferring the last line boundary that fits: half a
+    /// markdown line reads as corrupted content rather than as a truncation.
+    /// A body with no newline inside the budget is cut on a character
+    /// boundary instead — some text beats none, and the caller always prints
+    /// the file range holding the rest.
+    fn clip(text: &str, budget: u64) -> Clipped {
+        if uncapped(budget) || estimate_tokens(text.len()) <= budget {
+            return Clipped { text: text.to_string(), omitted_tokens: 0 };
+        }
+        let mut end = fitting_bytes(budget, text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if let Some(newline) = text[..end].rfind('\n') {
+            end = newline;
+        }
+        Clipped { text: text[..end].to_string(), omitted_tokens: estimate_tokens(text.len() - end) }
+    }
+
+    /// One budget spanning several blocks. `expand` hands back every mirrored
+    /// copy of a statement at once, so the copies share one allowance instead
+    /// of each being granted the whole of it.
+    pub struct BlockBudget {
+        left: u64,
+        uncapped: bool,
+    }
+
+    impl BlockBudget {
+        pub fn new(budget: u64) -> BlockBudget {
+            BlockBudget { left: budget, uncapped: uncapped(budget) }
+        }
+
+        pub fn take(&mut self, body: &str) -> Clipped {
+            if self.uncapped {
+                return Clipped { text: body.to_string(), omitted_tokens: 0 };
+            }
+            if self.left == 0 {
+                // Exhausted, which `clip` would read as "no cap" — the exact
+                // opposite. The block still gets named by its caller; only its
+                // text is withheld.
+                return Clipped { text: String::new(), omitted_tokens: estimate_tokens(body.len()) };
+            }
+            let clipped = clip(body, self.left);
+            self.left = self.left.saturating_sub(estimate_tokens(clipped.text.len()));
+            clipped
+        }
+    }
+
+    /// One `find` hit, as the CLI and the MCP server both render it.
+    pub fn find_entry(
+        path: &str,
+        name: Option<&str>,
+        kind: Option<&str>,
+        start_line: usize,
+        end_line: usize,
+        token_estimate: u64,
+    ) -> String {
+        match (name, kind) {
+            (Some(name), Some(kind)) => {
+                format!("{path}:{start_line}-{end_line}  {kind} {name}  (~{token_estimate} tok)")
+            }
+            _ => format!("{path}  (file match, ~{token_estimate} tok)"),
+        }
+    }
+
+    /// One `recall` hit, snippet and mirrors included.
+    pub fn hit_entry(
+        cite: &str,
+        path: &str,
+        ring: u8,
+        start_line: usize,
+        end_line: usize,
+        snippet: &str,
+        mirrors: &[String],
+    ) -> String {
+        let mut entry =
+            format!("{cite} {path}:{start_line}-{end_line} (ring {ring})\n    {snippet}");
+        if !mirrors.is_empty() {
+            entry.push_str(&format!("\n    (also at: {})", mirrors.join(", ")));
+        }
+        entry
+    }
+
+    /// A whole ranked listing: the prefix that fits, then — only when
+    /// something was cut — the line saying so.
+    pub fn listing(entries: Vec<String>, budget: u64, recovery: &str) -> String {
+        let fitted = fit(entries, budget);
+        let mut out = fitted.entries.join("\n");
+        if fitted.dropped > 0 {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&dropped_note(fitted.dropped, budget, recovery));
+        }
+        out
+    }
+
+    /// One expanded block on its way to being rendered.
+    pub struct BlockIn {
+        pub cite: String,
+        pub path: String,
+        pub ring: u8,
+        pub start_line: usize,
+        pub end_line: usize,
+        pub text: String,
+    }
+
+    /// Expanded blocks under ONE budget. Every block keeps its citation and
+    /// file range whatever the budget did to its text: a statement that is
+    /// merely unaffordable must still be findable, so nothing ever disappears
+    /// without a pointer to where it lives.
+    pub fn blocks(blocks: &[BlockIn], budget: u64) -> String {
+        let mut running = BlockBudget::new(budget);
+        blocks
+            .iter()
+            .map(|block| {
+                let locator = format!("{}:{}-{}", block.path, block.start_line, block.end_line);
+                let clipped = running.take(&block.text);
+                let mut out =
+                    format!("{} {locator} (ring {})\n{}", block.cite, block.ring, clipped.text);
+                if clipped.omitted_tokens > 0 {
+                    out.push('\n');
+                    out.push_str(&clipped_note(clipped.omitted_tokens, &locator));
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+fn find(query: &str, limit: usize, budget_tokens: u64, json: bool) -> anyhow::Result<()> {
     // None-tier: the serving host's code index answers; no local index opens.
     if let Some(cs) = config::Config::load()?.client.serving {
         let body = serde_json::json!({"op": "find", "query": query, "limit": limit});
         let resp = serve::client_call(&cs, body, serve::QUERY_TIMEOUT)?;
         let hits = resp.code_hits.clone().unwrap_or_default();
         if json {
-            let arr: Vec<_> = hits
-                .iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "path": h.path, "name": h.name, "kind": h.kind,
-                        "lines": [h.start_line, h.end_line], "tokens_estimated": h.token_estimate,
+            let (arr, dropped) = answer::fit_json(
+                hits.iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "path": h.path, "name": h.name, "kind": h.kind,
+                            "lines": [h.start_line, h.end_line],
+                            "tokens_estimated": h.token_estimate,
+                        })
                     })
-                })
-                .collect();
+                    .collect(),
+                budget_tokens,
+            );
             println!(
                 "{}",
                 serde_json::json!({
-                    "hits": arr, "origin": resp.origin, "generation": resp.generation,
+                    "hits": arr, "dropped": dropped, "budget_tokens": budget_tokens,
+                    "origin": resp.origin, "generation": resp.generation,
                     "fresh": resp.fresh, "stale_note": resp.stale_note,
                 })
             );
@@ -538,15 +806,20 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
             println!("no hits for \"{query}\" (served by {})", resp.origin.unwrap_or_default());
             return Ok(());
         }
-        for h in &hits {
-            match (&h.name, &h.kind) {
-                (Some(name), Some(kind)) => println!(
-                    "{}:{}-{}  {} {}  (~{} tok)",
-                    h.path, h.start_line, h.end_line, kind, name, h.token_estimate
-                ),
-                _ => println!("{}  (file match)", h.path),
-            }
-        }
+        let entries = hits
+            .iter()
+            .map(|h| {
+                answer::find_entry(
+                    &h.path,
+                    h.name.as_deref(),
+                    h.kind.as_deref(),
+                    h.start_line,
+                    h.end_line,
+                    h.token_estimate,
+                )
+            })
+            .collect();
+        println!("{}", answer::listing(entries, budget_tokens, answer::CLI_RECOVERY));
         print_served_by(&resp);
         return Ok(());
     }
@@ -563,17 +836,28 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
         eprintln!("note: a code scan is running — results may be stale");
     }
     if json {
-        let arr: Vec<_> = hits
-            .iter()
-            .map(|h| {
-                serde_json::json!({
-                    "path": h.path, "name": h.name, "kind": h.kind,
-                    "lines": [h.start_line, h.end_line], "tokens_estimated": h.token_estimate,
-                    "rank_pct": h.rank_pct,
+        // One shape whoever answered: the none-tier branch above has always
+        // emitted an object, so a caller parsing `find --json` no longer has
+        // to know which host holds the code index.
+        let (arr, dropped) = answer::fit_json(
+            hits.iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "path": h.path, "name": h.name, "kind": h.kind,
+                        "lines": [h.start_line, h.end_line],
+                        "tokens_estimated": h.token_estimate,
+                        "rank_pct": h.rank_pct,
+                    })
                 })
+                .collect(),
+            budget_tokens,
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "hits": arr, "dropped": dropped, "budget_tokens": budget_tokens,
             })
-            .collect();
-        println!("{}", serde_json::json!(arr));
+        );
         return Ok(());
     }
     if hits.is_empty() {
@@ -584,15 +868,20 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    for h in &hits {
-        match (&h.name, &h.kind) {
-            (Some(name), Some(kind)) => println!(
-                "{}:{}-{}  {} {}  (~{} tok)",
-                h.path, h.start_line, h.end_line, kind, name, h.token_estimate
-            ),
-            _ => println!("{}  (file match)", h.path),
-        }
-    }
+    let entries = hits
+        .iter()
+        .map(|h| {
+            answer::find_entry(
+                &h.path,
+                h.name.as_deref(),
+                h.kind.as_deref(),
+                h.start_line,
+                h.end_line,
+                h.token_estimate,
+            )
+        })
+        .collect();
+    println!("{}", answer::listing(entries, budget_tokens, answer::CLI_RECOVERY));
     Ok(())
 }
 
@@ -658,19 +947,31 @@ fn print_served_by(resp: &daemon::Response) {
     }
 }
 
-fn print_wire_hits(hits: &[serve::WireHit]) {
-    for h in hits {
-        println!("{} {}:{}-{} (ring {})", h.cite, h.path, h.start_line, h.end_line, h.ring);
-        println!("    {}", h.snippet);
-        if !h.mirrors.is_empty() {
-            println!("    (also at: {})", h.mirrors.join(", "));
-        }
-    }
+/// The rendered entries of a served hit list, best first.
+fn wire_hit_entries(hits: &[serve::WireHit]) -> Vec<String> {
+    hits.iter()
+        .map(|h| {
+            answer::hit_entry(
+                &h.cite,
+                &h.path,
+                h.ring,
+                h.start_line,
+                h.end_line,
+                &h.snippet,
+                &h.mirrors,
+            )
+        })
+        .collect()
 }
 
 /// recall/expand answered by a serving daemon (remote TCP or the local unix
 /// socket) — shared rendering for both.
-fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyhow::Result<()> {
+fn recall_served(
+    resp: &daemon::Response,
+    id: Option<&str>,
+    budget_tokens: u64,
+    json: bool,
+) -> anyhow::Result<()> {
     if let Some(cite) = id {
         let blocks = resp.blocks.clone().unwrap_or_default();
         if blocks.is_empty() {
@@ -679,23 +980,36 @@ fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyho
             );
             return Ok(());
         }
-        for b in &blocks {
-            if json {
+        if json {
+            let mut budget = answer::BlockBudget::new(budget_tokens);
+            for b in &blocks {
+                let clipped = budget.take(&b.text);
                 println!(
                     "{}",
                     serde_json::json!({
                         "cite": b.cite, "path": b.path, "ring": b.ring,
-                        "lines": [b.start_line, b.end_line], "text": b.text,
+                        "lines": [b.start_line, b.end_line], "text": clipped.text,
+                        "omitted_tokens": clipped.omitted_tokens,
+                        "budget_tokens": budget_tokens,
                         "origin": resp.origin, "generation": resp.generation, "fresh": resp.fresh,
                     })
                 );
-            } else {
-                println!("{} {}:{}-{} (ring {})\n{}\n", b.cite, b.path, b.start_line, b.end_line, b.ring, b.text);
             }
+            return Ok(());
         }
-        if !json {
-            print_served_by(resp);
-        }
+        let ins: Vec<answer::BlockIn> = blocks
+            .iter()
+            .map(|b| answer::BlockIn {
+                cite: b.cite.clone(),
+                path: b.path.clone(),
+                ring: b.ring,
+                start_line: b.start_line,
+                end_line: b.end_line,
+                text: b.text.clone(),
+            })
+            .collect();
+        println!("{}", answer::blocks(&ins, budget_tokens));
+        print_served_by(resp);
         return Ok(());
     }
     let hits = resp.hits.clone().unwrap_or_default();
@@ -706,20 +1020,23 @@ fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyho
         eprintln!("cfetch recall: {note}");
     }
     if json {
-        let arr: Vec<_> = hits
-            .iter()
-            .map(|h| {
-                serde_json::json!({
-                    "cite": h.cite, "path": h.path, "ring": h.ring,
-                    "lines": [h.start_line, h.end_line], "snippet": h.snippet,
-                    "mirrors": h.mirrors,
+        let (arr, dropped) = answer::fit_json(
+            hits.iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "cite": h.cite, "path": h.path, "ring": h.ring,
+                        "lines": [h.start_line, h.end_line], "snippet": h.snippet,
+                        "mirrors": h.mirrors,
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+            budget_tokens,
+        );
         println!(
             "{}",
             serde_json::json!({
-                "hits": arr, "origin": resp.origin, "generation": resp.generation,
+                "hits": arr, "dropped": dropped, "budget_tokens": budget_tokens,
+                "origin": resp.origin, "generation": resp.generation,
                 "fresh": resp.fresh, "stale_note": resp.stale_note, "note": resp.note,
             })
         );
@@ -727,7 +1044,10 @@ fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyho
         println!("no hits");
         print_served_by(resp);
     } else {
-        print_wire_hits(&hits);
+        println!(
+            "{}",
+            answer::listing(wire_hit_entries(&hits), budget_tokens, answer::CLI_RECOVERY)
+        );
         print_served_by(resp);
         println!("expand a hit: cfetch recall --id <citation>");
     }
@@ -747,6 +1067,7 @@ fn recall_remote(
     hybrid: bool,
     slice: Option<&str>,
     limit: usize,
+    budget_tokens: u64,
     json: bool,
 ) -> anyhow::Result<()> {
     if expand {
@@ -768,7 +1089,7 @@ fn recall_remote(
         }
     };
     let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
-    recall_served(&resp, id, json)
+    recall_served(&resp, id, budget_tokens, json)
 }
 
 /// A slice joined through an invite is routed through the daemon's persistent
@@ -783,6 +1104,7 @@ fn recall_iroh(
     semantic: bool,
     hybrid: bool,
     limit: usize,
+    budget_tokens: u64,
     json: bool,
 ) -> anyhow::Result<()> {
     let body = match id {
@@ -801,7 +1123,7 @@ fn recall_iroh(
         }
     };
     let resp = daemon::call_iroh(&membership.origin, body)?;
-    recall_served(&resp, id, json)
+    recall_served(&resp, id, budget_tokens, json)
 }
 
 #[allow(clippy::too_many_arguments)] // thin CLI adapter, mirrors the flag set
@@ -813,16 +1135,19 @@ fn recall(
     hybrid: bool,
     slice: Option<&str>,
     limit: usize,
+    budget_tokens: u64,
     json: bool,
 ) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     if let Some(slice) = slice
         && let Some(membership) = grant::membership_for_slice(&paths::state_dir(), slice)?
     {
-        return recall_iroh(&membership, query, id, semantic, hybrid, limit, json);
+        return recall_iroh(&membership, query, id, semantic, hybrid, limit, budget_tokens, json);
     }
     if let Some(cs) = &cfg.client.serving {
-        return recall_remote(cs, query, id, expand, semantic, hybrid, slice, limit, json);
+        return recall_remote(
+            cs, query, id, expand, semantic, hybrid, slice, limit, budget_tokens, json,
+        );
     }
     // On a serving host, plain recall/expand go through the local daemon's
     // drain barrier when it answers. The direct path below is an equally
@@ -842,7 +1167,7 @@ fn recall(
         )
         && resp.ok
     {
-        return recall_served(&resp, id, json);
+        return recall_served(&resp, id, budget_tokens, json);
     }
     let native = paths::native_projects_root();
     let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
@@ -853,19 +1178,34 @@ fn recall(
             println!("no block with citation {cite} (index may have moved on — content-addressed ids change when the entry changes)");
             return Ok(());
         }
-        for b in blocks {
-            if json {
+        if json {
+            let mut budget = answer::BlockBudget::new(budget_tokens);
+            for b in &blocks {
+                let clipped = budget.take(&b.text);
                 println!(
                     "{}",
                     serde_json::json!({
                         "cite": b.cite, "path": b.path, "ring": b.ring,
-                        "lines": [b.start_line, b.end_line], "text": b.text,
+                        "lines": [b.start_line, b.end_line], "text": clipped.text,
+                        "omitted_tokens": clipped.omitted_tokens,
+                        "budget_tokens": budget_tokens,
                     })
                 );
-            } else {
-                println!("{} {}:{}-{} (ring {})\n{}\n", b.cite, b.path, b.start_line, b.end_line, b.ring, b.text);
             }
+            return Ok(());
         }
+        let ins: Vec<answer::BlockIn> = blocks
+            .into_iter()
+            .map(|b| answer::BlockIn {
+                cite: b.cite,
+                path: b.path,
+                ring: b.ring,
+                start_line: b.start_line,
+                end_line: b.end_line,
+                text: b.text,
+            })
+            .collect();
+        println!("{}", answer::blocks(&ins, budget_tokens));
         return Ok(());
     }
 
@@ -889,36 +1229,50 @@ fn recall(
         Vec::new()
     };
     if json {
-        let arr: Vec<_> = hits
-            .iter()
-            .map(|h| {
-                serde_json::json!({
-                    "cite": h.cite, "path": h.path, "ring": h.ring,
-                    "lines": [h.start_line, h.end_line], "snippet": h.snippet,
-                    "mirrors": h.mirrors,
+        let (arr, dropped) = answer::fit_json(
+            hits.iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "cite": h.cite, "path": h.path, "ring": h.ring,
+                        "lines": [h.start_line, h.end_line], "snippet": h.snippet,
+                        "mirrors": h.mirrors,
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+            budget_tokens,
+        );
         let links: Vec<_> = linked
             .iter()
             .map(|(p, r)| serde_json::json!({"path": p, "ring": r}))
             .collect();
         // The note rides in the JSON too: an agent parsing stdout must see
-        // the degradation its human would have read on stderr.
+        // the degradation its human would have read on stderr — and the same
+        // goes for what the answer budget dropped.
         println!(
             "{}",
-            serde_json::json!({"hits": arr, "linked": links, "note": note})
+            serde_json::json!({
+                "hits": arr, "linked": links, "note": note,
+                "dropped": dropped, "budget_tokens": budget_tokens,
+            })
         );
     } else if hits.is_empty() {
         println!("no hits for \"{query}\"");
     } else {
-        for h in &hits {
-            println!("{} {}:{}-{} (ring {})", h.cite, h.path, h.start_line, h.end_line, h.ring);
-            println!("    {}", h.snippet);
-            if !h.mirrors.is_empty() {
-                println!("    (also at: {})", h.mirrors.join(", "));
-            }
-        }
+        let entries = hits
+            .iter()
+            .map(|h| {
+                answer::hit_entry(
+                    &h.cite,
+                    &h.path,
+                    h.ring,
+                    h.start_line,
+                    h.end_line,
+                    &h.snippet,
+                    &h.mirrors,
+                )
+            })
+            .collect();
+        println!("{}", answer::listing(entries, budget_tokens, answer::CLI_RECOVERY));
         if !linked.is_empty() {
             println!("\nlinked (curated wikilinks, 1 hop from top hits):");
             for (p, r) in &linked {
@@ -1772,8 +2126,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Find { query, limit, json } => {
-            if let Err(e) = find(&query, limit, json) {
+        Command::Find { query, limit, budget_tokens, json } => {
+            if let Err(e) = find(&query, limit, budget_tokens, json) {
                 eprintln!("cfetch find: {e}");
                 std::process::exit(1);
             }
@@ -1784,7 +2138,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Recall { query, id, expand, semantic, hybrid, slice, limit, json } => {
+        Command::Recall { query, id, expand, semantic, hybrid, slice, limit, budget_tokens, json } => {
             if let Err(e) = recall(
                 &query.join(" "),
                 id.as_deref(),
@@ -1793,6 +2147,7 @@ fn main() {
                 hybrid,
                 slice.as_deref(),
                 limit,
+                budget_tokens,
                 json,
             ) {
                 eprintln!("cfetch recall: {e}");
@@ -1891,5 +2246,156 @@ mod tests {
             !state.join("index.db").exists(),
             "a none-tier host must not create a second, silently stale catalog"
         );
+    }
+
+    use super::answer::{self, BlockIn};
+    use crate::hook_io::estimate_tokens;
+
+    /// Splits a rendered listing into (results, truncation note). The note is
+    /// deliberately charged outside the budget, so the assertion has to price
+    /// the two halves separately.
+    fn split_note(out: &str) -> (&str, &str) {
+        out.rsplit_once('\n').expect("a truncated listing ends with its note")
+    }
+
+    #[test]
+    fn a_listing_is_capped_in_tokens_not_in_result_count() {
+        // The defect, stated as data: the same `--limit 8` buys these two
+        // answers, and one of them costs an order of magnitude more.
+        let wide: Vec<String> = (0..8)
+            .map(|i| {
+                answer::find_entry(
+                    &format!("{}/file{i}.rs", "/deeply/nested/workspace/crate".repeat(4)),
+                    Some(&format!("resolve_cascade_tensor_variant_{i}")),
+                    Some("function_item"),
+                    1,
+                    420,
+                    5040,
+                )
+            })
+            .collect();
+        let narrow: Vec<String> = (0..8)
+            .map(|i| answer::find_entry(&format!("a{i}.rs"), Some("f"), Some("function_item"), 1, 2, 24))
+            .collect();
+        let ratio = wide.join("\n").len() as f64 / narrow.join("\n").len() as f64;
+        assert!(ratio > 4.0, "same count, {ratio:.1}x the cost — that is what a budget fixes");
+
+        let capped = answer::listing(wide.clone(), 200, answer::CLI_RECOVERY);
+        let (results, note) = split_note(&capped);
+        assert!(
+            estimate_tokens(results.len()) <= 200,
+            "results over budget: {} tok",
+            estimate_tokens(results.len())
+        );
+        assert!(note.contains("dropped by the 200-token answer budget"), "{note}");
+        assert!(note.contains("--budget-tokens 0"), "the note must name the way back: {note}");
+        // Kept hits are the ranked prefix, in order, unmodified.
+        assert!(capped.starts_with(&wide[0]), "the best hit must survive");
+        assert!(!capped.contains(&wide[7]), "the tail is what gets dropped");
+        // The cheap answer is not touched by the same budget.
+        assert_eq!(answer::listing(narrow.clone(), 200, answer::CLI_RECOVERY), narrow.join("\n"));
+    }
+
+    #[test]
+    fn one_entry_always_survives_and_zero_lifts_the_cap() {
+        let one = vec!["x".repeat(4000)];
+        let starved = answer::listing(one.clone(), 1, answer::CLI_RECOVERY);
+        assert!(starved.starts_with(&one[0]), "an answer holding nothing answers nothing");
+
+        let many: Vec<String> = (0..40).map(|i| format!("entry {i} {}", "y".repeat(200))).collect();
+        assert_eq!(
+            answer::listing(many.clone(), 0, answer::CLI_RECOVERY),
+            many.join("\n"),
+            "--budget-tokens 0 is the documented escape hatch and must drop nothing"
+        );
+    }
+
+    #[test]
+    fn expanded_blocks_share_one_budget_and_name_what_they_cut() {
+        // Mirrored copies of one statement arrive together. Before the budget
+        // each copy was printed whole, so `recall --id` on a mirrored heading
+        // chain cost N times a block nobody sized.
+        let body = "a line of block text that keeps going and going\n".repeat(300);
+        let blocks: Vec<BlockIn> = (0..3)
+            .map(|i| BlockIn {
+                cite: format!("r2-abcdef{i}"),
+                path: format!("knowledge/big{i}.md"),
+                ring: 2,
+                start_line: 1,
+                end_line: 300,
+                text: body.clone(),
+            })
+            .collect();
+
+        let whole = answer::blocks(&blocks, 0);
+        assert!(estimate_tokens(whole.len()) > 3000, "uncapped, this is the bill");
+
+        let capped = answer::blocks(&blocks, 300);
+        // 300 for the bodies plus one truncation note per block; nowhere near
+        // the uncapped cost.
+        assert!(
+            estimate_tokens(capped.len()) < 600,
+            "over budget: {} tok",
+            estimate_tokens(capped.len())
+        );
+        for i in 0..3 {
+            // Nothing vanishes: an unaffordable block is still named, with the
+            // exact range that holds its text.
+            assert!(capped.contains(&format!("r2-abcdef{i}")), "block {i} lost its citation");
+            assert!(capped.contains(&format!("knowledge/big{i}.md:1-300")), "block {i} lost its range");
+        }
+        assert_eq!(capped.matches("not shown (answer budget)").count(), 3);
+        // The first block gets the allowance, the last gets none of it.
+        let parts: Vec<&str> = capped.split("\n\n").collect();
+        assert!(parts[0].len() > parts[2].len() * 4, "the budget is spent in rank order");
+    }
+
+    #[test]
+    fn clipping_cuts_on_a_line_boundary_and_never_mid_character() {
+        let text = "ærste linje\nzweite Zeile mit Umlauten äöü\nthird line\n";
+        let clipped = answer::blocks(
+            &[BlockIn {
+                cite: "r3-deadbeef".into(),
+                path: "notes/x.md".into(),
+                ring: 3,
+                start_line: 4,
+                end_line: 6,
+                text: text.into(),
+            }],
+            4,
+        );
+        let body = clipped.strip_prefix("r3-deadbeef notes/x.md:4-6 (ring 3)\n").unwrap();
+        let (shown, note) = body.split_once("\n… ").expect("a clipped block says so");
+        assert!(text.starts_with(shown), "the clip must be a prefix of the block");
+        assert!(!shown.contains('\n'), "cut at the first line boundary that fits: {shown:?}");
+        assert!(note.contains("read notes/x.md:4-6 for the rest"), "{note}");
+
+        // A block that fits arrives whole, with no note at all.
+        let short = answer::blocks(
+            &[BlockIn {
+                cite: "r3-deadbeef".into(),
+                path: "notes/x.md".into(),
+                ring: 3,
+                start_line: 4,
+                end_line: 6,
+                text: text.into(),
+            }],
+            9999,
+        );
+        assert!(short.ends_with(text));
+        assert!(!short.contains("answer budget"));
+    }
+
+    #[test]
+    fn json_answers_are_priced_on_the_json_they_emit() {
+        let entries: Vec<serde_json::Value> = (0..30)
+            .map(|i| serde_json::json!({"cite": format!("r2-{i:08x}"), "snippet": "s".repeat(300)}))
+            .collect();
+        let (kept, dropped) = answer::fit_json(entries.clone(), 400);
+        assert_eq!(kept.len() + dropped, 30, "every entry is either kept or counted");
+        assert!(dropped > 0, "300-char snippets cannot all fit in 400 tokens");
+        let cost: usize = kept.iter().map(|v| v.to_string().len() + 1).sum();
+        assert!(estimate_tokens(cost) <= 400, "priced on serialized bytes, not on prose");
+        assert_eq!(answer::fit_json(entries, 0).1, 0, "zero lifts the cap here too");
     }
 }

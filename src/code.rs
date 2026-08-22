@@ -30,6 +30,9 @@ pub struct FindHit {
     pub start_line: usize,
     pub end_line: usize,
     pub score: i64,
+    /// Estimated cost of READING this hit: the symbol's lines for a symbol
+    /// match, the whole indexed file for a file match. Never zero for a hit
+    /// that exists — a free-looking hit defeats any budget built on it.
     pub token_estimate: u64,
     /// Import-graph importance percentile of the containing file (None when
     /// the project has no resolvable import edges — no signal, no score).
@@ -535,7 +538,7 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
         });
     }
     let mut fstmt = conn.prepare(
-        "SELECT path, rank_pct,
+        "SELECT path, size, rank_pct,
                 CASE WHEN norm_stem = ?1 THEN 50
                      WHEN norm_stem GLOB ?2 THEN 25
                      ELSE 10 END AS score
@@ -545,9 +548,14 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
          LIMIT ?4",
     )?;
     let frows = fstmt.query_map(rusqlite::params![q, prefix, substring, limit as i64], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<f64>>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
     })?;
-    for (path, rank_pct, score) in frows.filter_map(Result::ok) {
+    for (path, size, rank_pct, score) in frows.filter_map(Result::ok) {
         hits.push(FindHit {
             path,
             name: None,
@@ -555,7 +563,10 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
             start_line: 1,
             end_line: 1,
             score,
-            token_estimate: 0,
+            // A file match means "open this whole file", so its cost is the
+            // file. The constant 0 that stood here priced that as free, and
+            // every budget reading `token_estimate` believed it.
+            token_estimate: crate::hook_io::estimate_tokens(size.max(0) as usize),
             rank_pct,
         });
     }
@@ -877,6 +888,30 @@ mod tests {
         assert_eq!(report.files, 1);
         assert!(find(&conn, "scoped_out_symbol", 5).unwrap().is_empty());
         assert_eq!(find(&conn, "kept_symbol", 5).unwrap()[0].score, 100);
+    }
+
+    #[test]
+    fn a_file_match_prices_the_whole_file_instead_of_nothing() {
+        // A file hit says "open this file". While it reported 0 tokens, every
+        // budget reading `token_estimate` was told that opening a megabyte of
+        // vendored source was free, and the number printed next to it in JSON
+        // was a lie no caller could catch.
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("fn velmurano_helper() {{}}\n// {}\n", "padding ".repeat(400));
+        std::fs::write(dir.path().join("velmurano.rs"), &body).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        let hits = find(&conn, "velmurano", 10).unwrap();
+        let file_hit = hits.iter().find(|h| h.name.is_none()).expect("file hit listed");
+        assert_eq!(
+            file_hit.token_estimate,
+            crate::hook_io::estimate_tokens(body.len()),
+            "a file match costs the file"
+        );
+        // The symbol match in the same file still prices only its own lines.
+        let sym = hits.iter().find(|h| h.name.is_some()).unwrap();
+        assert!(sym.token_estimate < file_hit.token_estimate);
     }
 
     #[test]
