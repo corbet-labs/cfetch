@@ -1,0 +1,65 @@
+name: Bug report
+description: Report reproducible incorrect behavior in the latest cfetch release.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets or private brain content. Report vulnerabilities through the private security form instead.
+  - type: input
+    id: version
+    attributes:
+      label: cfetch version
+      description: Output of `cfetch --version`.
+      placeholder: "cfetch 0.9.4"
+    validations:
+      required: true
+  - type: input
+    id: variant
+    attributes:
+      label: Build variant
+      description: The `build_variant` value from `cfetch variants --json`.
+      placeholder: "linux-cfetch-remote-x86_64"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Platform and agent harness
+      placeholder: "Arch Linux x86_64; Codex CLI 0.149.0"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Give the smallest sequence that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: selfcheck
+    attributes:
+      label: Redacted selfcheck output
+      description: Paste relevant `cfetch selfcheck` output after removing private values.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I reproduced this on the latest release.
+          required: true
+        - label: I removed credentials, private memory, hostnames, and private configuration.
+          required: true
+        - label: This is not a vulnerability report.
+          required: true

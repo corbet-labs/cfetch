@@ -41,7 +41,7 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## 0.9.2
 
-- **Homebrew install.** `brew tap julian-corbet/cfetch && brew install cfetch`
+- **Homebrew install.** `brew tap corbet-labs/cfetch && brew install cfetch`
   on macOS (Apple silicon and Intel) and Linux x86_64. Releases now publish
   `checksums_sha256.txt`, and the tap's formula is regenerated from those
   published checksums on every tag rather than hand-written. There is no

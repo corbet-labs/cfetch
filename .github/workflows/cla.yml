@@ -23,12 +23,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: '.github/signatures/cla.json'
-          path-to-document: 'https://github.com/julian-corbet/cfetch/blob/main/CLA.md'
+          path-to-document: 'https://github.com/corbet-labs/cfetch/blob/main/CLA.md'
           branch: 'cla-signatures'
           allowlist: 'julian-corbet,dependabot[bot],*[bot]'
           custom-notsigned-prcomment: >
             Thank you for the contribution. Before it can be merged, please sign the
-            [Contributor License Agreement](https://github.com/julian-corbet/cfetch/blob/main/CLA.md)
+            [Contributor License Agreement](https://github.com/corbet-labs/cfetch/blob/main/CLA.md)
             by posting the sentence below as a comment on this pull request.
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-allsigned-prcomment: 'All contributors have signed the CLA.'

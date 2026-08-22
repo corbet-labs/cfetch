@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a problem for cfetch to solve.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem is not solved today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe the observable behavior you want, without requiring a particular implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or competing approaches have you tried?
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Area
+      options:
+        - Recall and ranking
+        - Hooks and agent adapters
+        - Capture and governance
+        - Network and sharing
+        - Packaging and platforms
+        - Documentation and usability
+        - Other
+    validations:
+      required: true

@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use cfetch in research or published work, please cite the software repository."
+type: software
+title: "cfetch"
+authors:
+  - family-names: "Corbet"
+    given-names: "Julian"
+repository-code: "https://github.com/corbet-labs/cfetch"
+url: "https://github.com/corbet-labs/cfetch"
+license: "FSL-1.1-ALv2"

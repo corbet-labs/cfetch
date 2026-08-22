@@ -47,8 +47,8 @@
           '';
 
           meta = {
-            description = "A second brain for coding agents: privilege-ring memory, hook injection, retrieval, and a code index in one binary";
-            homepage = "https://github.com/julian-corbet/cfetch";
+            description = "Cited, trust-tiered memory for AI coding agents over plain Markdown";
+            homepage = "https://github.com/corbet-labs/cfetch";
             # FSL-1.1-ALv2 has no identifier in nixpkgs' license set — declare
             # it literally rather than mislabel it with a nearby SPDX id.
             # Source-available, converts to Apache-2.0 two years per release.

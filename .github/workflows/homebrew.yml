@@ -52,7 +52,7 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           for i in $(seq 1 60); do
-            if gh release view "v${VERSION}" --repo julian-corbet/cfetch \
+            if gh release view "v${VERSION}" --repo corbet-labs/cfetch \
                 --json assets -q '.assets[].name' 2>/dev/null | grep -q '^checksums_sha256.txt$'; then
               echo "release assets ready"
               exit 0
@@ -68,7 +68,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          gh release download "v${VERSION}" --repo julian-corbet/cfetch \
+          gh release download "v${VERSION}" --repo corbet-labs/cfetch \
             --pattern 'checksums_sha256.txt' --pattern 'variants.json' --dir /tmp
 
       - name: Check out tap repo
@@ -110,26 +110,26 @@ jobs:
           cat > tap/Formula/cfetch.rb <<RUBY
           class Cfetch < Formula
             desc "Agent memory: ring-ordered recall over a shared brain, with native Claude Code and Codex hooks"
-            homepage "https://github.com/julian-corbet/cfetch"
+            homepage "https://github.com/corbet-labs/cfetch"
             license "FSL-1.1-ALv2"
             version "${VERSION}"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${MAC_ARM}"
+                url "https://github.com/corbet-labs/cfetch/releases/download/v${VERSION}/${MAC_ARM}"
                 sha256 "${SHA_MAC_ARM}"
               else
-                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${MAC_X86}"
+                url "https://github.com/corbet-labs/cfetch/releases/download/v${VERSION}/${MAC_X86}"
                 sha256 "${SHA_MAC_X86}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${LNX_ARM}"
+                url "https://github.com/corbet-labs/cfetch/releases/download/v${VERSION}/${LNX_ARM}"
                 sha256 "${SHA_LNX_ARM}"
               else
-                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${LNX_X86}"
+                url "https://github.com/corbet-labs/cfetch/releases/download/v${VERSION}/${LNX_X86}"
                 sha256 "${SHA_LNX_X86}"
               end
             end

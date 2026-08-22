@@ -42,6 +42,9 @@ contributor's original work. Missing provenance is a merge blocker.
 
 ## 4. House rules
 
+- Follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md),
+  never in a public issue.
 - All code, comments, commit messages, and docs in English.
 - `experiments/` is for throwaway spikes, `studies/` for written-up measurements
   that justify design decisions; shipped code lives in `src/` with tests.

@@ -4,8 +4,22 @@ version = "0.9.4"
 edition = "2024"
 rust-version = "1.95"
 license = "FSL-1.1-ALv2"
-description = "A second brain for coding agents: privilege-ring memory, hook injection, retrieval, and a code index in one binary"
-repository = "https://github.com/julian-corbet/cfetch"
+description = "Cited, trust-tiered memory for AI coding agents over plain Markdown"
+repository = "https://github.com/corbet-labs/cfetch"
+readme = "README.md"
+publish = ["crates-io"]
+keywords = ["ai-agents", "memory", "mcp", "retrieval", "markdown"]
+categories = ["command-line-utilities", "development-tools", "text-processing"]
+include = [
+  "/src/**",
+  "/build.rs",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE.md",
+  "/THIRD-PARTY-LICENSES.txt",
+  "/release/variants.json",
+]
 
 [dependencies]
 # Exact-pinned harness configuration adapter. cfetch decides which surfaces

@@ -1,8 +1,12 @@
 # cfetch
 
-A second brain for coding agents: kernel-style privilege rings over one global
-knowledge tree — unconditional hook injection, ranked retrieval with cited
-memories, and a code index, in one Rust binary.
+[![CI](https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/corbet-labs/cfetch?display_name=tag)](https://github.com/corbet-labs/cfetch/releases/latest)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE.md)
+
+A cited, trust-tiered memory layer for Claude Code, Codex, Gemini and other AI
+agents, built on plain Markdown and Rust. It combines hook injection, ranked
+retrieval, automatic capture and a code index in one binary.
 
 Your agent's accumulated knowledge (rules, decisions, facts, working state)
 lives as plain markdown in a single git-tracked tree (by default `~/agents`).
@@ -108,21 +112,31 @@ embedded in the executable. Current archives are explicitly named `remote`
 because they use the configured embeddings endpoint; accelerator names are not
 published until their inference runtime is actually linked and tested.
 
-Prebuilt archives are attached to [GitHub releases](https://github.com/julian-corbet/cfetch/releases).
+Prebuilt archives are attached to [GitHub releases](https://github.com/corbet-labs/cfetch/releases).
 Each archive contains the binary, `LICENSE.md`, and the generated
 `THIRD-PARTY-LICENSES.txt` attribution bundle.
 
-From source:
+Package-manager installs:
 
 ```console
-# cargo (any platform with Rust 1.95+)
-cargo install --git https://github.com/julian-corbet/cfetch
+# Homebrew (macOS and Linux)
+brew tap corbet-labs/cfetch
+brew install cfetch
+
+# Arch Linux (AUR)
+paru -S cfetch-agent
 
 # nix (flake; x86_64-linux and aarch64-linux)
-nix profile install github:julian-corbet/cfetch
+nix profile install github:corbet-labs/cfetch
+```
 
-# Arch Linux
-git clone https://github.com/julian-corbet/cfetch
+From source, on any platform with Rust 1.95 or later:
+
+```console
+cargo install --git https://github.com/corbet-labs/cfetch
+
+# or build the Arch package directly
+git clone https://github.com/corbet-labs/cfetch
 cd cfetch/packaging/arch && makepkg -si
 ```
 
@@ -637,3 +651,7 @@ to know up front:
 - cfetch is a clean-room implementation of mechanisms studied in two AGPL
   projects. Do not copy or closely paraphrase code from them (or any other
   incompatibly-licensed work) into a contribution.
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Use
+the structured issue forms for [support](SUPPORT.md), and report suspected
+vulnerabilities through the private process in [SECURITY.md](SECURITY.md).
