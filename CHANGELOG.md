@@ -5,6 +5,13 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Engine selection.** A variant is now a Cargo feature selection rather
+  than a source fork: which engines are compiled in is a build-time fact,
+  which device to use is a run-time one, and `cfetch hardware` reports both
+  plus what it will actually do. A device no compiled-in engine can drive is
+  skipped rather than selected and then failed on, and everything falls back
+  to the remote endpoint — which is the right answer for a host that holds
+  nothing.
 - **Hardware detection.** `cfetch hardware` reports the accelerators it can
   see, what proved each one, and the variant this machine should run, under
   the `<os>-cfetch-<silicon>[-<level>]` scheme. The policy is NPU > GPU > CPU

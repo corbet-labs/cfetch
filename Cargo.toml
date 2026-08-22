@@ -47,3 +47,15 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Inference engines. A variant is a feature selection, not a source fork:
+# the runtimes do not overlap (Core ML is Apple-only, LiteRT's NPU delegates
+# are per-vendor, OpenVINO is Intel's), so one binary carrying all of them
+# would be mostly code any given user cannot run.
+[features]
+default = []
+onnx = []
+llamacpp = []
+coreml = []
+litert = []
+openvino = []

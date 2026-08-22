@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod dashboard;
 mod embed;
+mod engine;
 mod exhaust;
 mod govern;
 mod grant;
@@ -1284,6 +1285,12 @@ fn main() {
         Command::Hardware { json } => {
             let found = hardware::detect();
             let variant = hardware::recommended_variant(&found);
+            let sel = engine::select(&found);
+            let selected = serde_json::json!({
+                "device": sel.device.describe(),
+                "backend": sel.backend.name(),
+                "format": sel.backend.format(),
+            });
             if json {
                 println!(
                     "{}",
@@ -1291,6 +1298,9 @@ fn main() {
                         "variant": variant,
                         "os": hardware::os_token(),
                         "x86_64_level": hardware::x86_64_level(),
+                        "compiled_backends": engine::compiled_backends()
+                            .iter().map(|b| b.name()).collect::<Vec<_>>(),
+                        "selected": selected,
                         "devices": found.iter().map(|f| serde_json::json!({
                             "device": f.device.describe(),
                             "token": f.device.token(),
@@ -1314,7 +1324,16 @@ fn main() {
                         println!("    note: {note}");
                     }
                 }
-                println!("\nrecommended variant: {variant}");
+                let engines: Vec<&str> =
+                    engine::compiled_backends().iter().map(|b| b.name()).collect();
+                println!("\nthis build contains: {}", engines.join(", "));
+                println!(
+                    "it will use:        {} via {} ({})",
+                    sel.device.describe(),
+                    sel.backend.name(),
+                    sel.backend.format()
+                );
+                println!("recommended variant: {variant}");
             }
         }
         Command::Identity { json } => {
