@@ -95,7 +95,10 @@ storage: it is a network call away from the whole brain.
 
 ## Install
 
-Prebuilt binaries are attached to [GitHub releases](https://github.com/julian-corbet/cfetch/releases).
+Prebuilt archives are attached to [GitHub releases](https://github.com/julian-corbet/cfetch/releases).
+Each archive contains the binary, `LICENSE.md`, and the generated
+`THIRD-PARTY-LICENSES.txt` attribution bundle.
+
 From source:
 
 ```console
@@ -544,7 +547,10 @@ of a machine, so they live in `<brain_root>/state/cfetch/vectors/`
 modify, and redistribute cfetch for any purpose except offering a competing
 commercial product or service. Each release automatically becomes
 [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) two years after it
-ships.
+ships. Dependency licenses, copyright notices, and any upstream Apache NOTICE
+files are collected in [THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt).
+CI rejects dependencies outside the reviewed allow list and verifies that the
+generated bundle matches `Cargo.lock`.
 
 ## Contributing
 

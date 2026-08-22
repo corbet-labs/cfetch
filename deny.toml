@@ -1,0 +1,43 @@
+# Dependency-license policy for every supported release target. The allow list
+# is intentionally permissive-only; source-available and copyleft licenses are
+# rejected unless a named crate has been reviewed and receives an exception.
+[graph]
+all-features = true
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "aarch64-unknown-linux-gnu" },
+  { triple = "x86_64-apple-darwin" },
+  { triple = "aarch64-apple-darwin" },
+  { triple = "x86_64-pc-windows-msvc" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+unused-allowed-license = "deny"
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+exceptions = [
+  # cfetch itself is source-available until each release's two-year change
+  # date. Keeping this crate-specific prevents another FSL dependency from
+  # entering unnoticed.
+  { crate = "cfetch", allow = ["FSL-1.1-ALv2"] },
+  # attohttpc is an existing iroh transitive dependency. MPL-2.0 is weak,
+  # file-level copyleft; a crate-specific review must not become a global
+  # permission for future MPL dependencies.
+  { crate = "attohttpc", allow = ["MPL-2.0"] },
+]
+
+# BSL-1.0 is the permissive Boost Software License, not the restrictive
+# Business Source License (BUSL-1.1). Neither is globally allowed here; crates
+# offering BSL-1.0 as an alternative are satisfied through Apache-2.0 instead.

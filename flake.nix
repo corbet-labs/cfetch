@@ -35,6 +35,11 @@
           inherit version;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
+          postInstall = ''
+            install -Dm644 LICENSE.md "$out/share/licenses/cfetch/LICENSE.md"
+            install -Dm644 THIRD-PARTY-LICENSES.txt \
+              "$out/share/licenses/cfetch/THIRD-PARTY-LICENSES.txt"
+          '';
 
           meta = {
             description = "A second brain for coding agents: privilege-ring memory, hook injection, retrieval, and a code index in one binary";

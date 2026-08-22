@@ -1,7 +1,7 @@
-# Tag v* -> GitHub release with a binary for every supported platform.
-# LICENSE.md rides along because FSL requires the terms to accompany every
-# redistribution. Uses only the workflow's own GITHUB_TOKEN (via the
-# contents: write permission) — no configured secrets.
+# Tag v* -> GitHub release with an archive for every supported platform.
+# Every archive contains the binary, cfetch's license and the generated
+# third-party license/NOTICE bundle. Uses only the workflow's own GITHUB_TOKEN
+# (via the contents: write permission) — no configured secrets.
 #
 # ARTIFACT NAMING: <os>-cfetch-<arch>-<tag>. The silicon and microarchitecture
 # axes of the full scheme (<os>-cfetch-<silicon>[-<level>][-bin]-<version>,
@@ -63,7 +63,7 @@ jobs:
             bin: cfetch
             target: x86_64-apple-darwin
           - os: windows-latest
-            artifact: win-cfetch-x86_64.exe
+            artifact: win-cfetch-x86_64
             bin: cfetch.exe
     runs-on: ${{ matrix.os }}
     steps:
@@ -82,16 +82,23 @@ jobs:
       - name: Stage artifact
         shell: bash
         run: |
-          mkdir -p dist
+          package="${{ matrix.artifact }}-${GITHUB_REF_NAME}"
+          mkdir -p "dist/$package"
           if [ -n "${{ matrix.target }}" ]; then
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$package/${{ matrix.bin }}"
           else
-            cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+            cp "target/release/${{ matrix.bin }}" "dist/$package/${{ matrix.bin }}"
+          fi
+          cp LICENSE.md THIRD-PARTY-LICENSES.txt "dist/$package/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd dist && 7z a "$package.zip" "$package" >/dev/null)
+          else
+            (cd dist && tar -czf "$package.tar.gz" "$package")
           fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}-${{ github.ref_name }}.*
           if-no-files-found: error
 
   publish:
@@ -109,6 +116,7 @@ jobs:
           mkdir -p dist
           find staged -type f -exec cp {} dist/ \;
           cp LICENSE.md dist/LICENSE.md
+          cp THIRD-PARTY-LICENSES.txt dist/THIRD-PARTY-LICENSES.txt
           ls -la dist
       - uses: softprops/action-gh-release@v2
         with:

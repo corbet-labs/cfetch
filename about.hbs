@@ -1,0 +1,18 @@
+cfetch dependency licenses and notices
+=======================================
+
+Generated from Cargo.lock by cargo-about. The generator includes the root
+package for completeness; LICENSE.md remains the authoritative copy of
+cfetch's own license.
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{name}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

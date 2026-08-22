@@ -5,6 +5,11 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Dependency-license compliance.** CI now rejects unreviewed licenses and
+  verifies a generated third-party license/NOTICE bundle. Release archives and
+  the Nix and Arch packages all install that bundle beside cfetch's own license;
+  copied third-party material requires an explicit provenance record.
+
 - **Authenticated iroh transport.** Invites now carry the origin's real iroh
   endpoint address, remote redemption binds a grant to the QUIC-authenticated
   joining endpoint, and `recall --slice` plus citation expansion route through
