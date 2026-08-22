@@ -8,8 +8,9 @@
 //! Four invariants, each of which exists because the naive version of this
 //! feature destroys something:
 //!
-//! 1. **stderr is never touched.** It is small, it is where errors live, and
-//!    condensing it would hide the thing the operator needs.
+//! 1. **Errors remain recoverable.** A caller with separate streams passes
+//!    stdout only. Codex exposes one merged Bash response, so that caller
+//!    persists the complete response before replacing its model-facing view.
 //! 2. **Test and build output is never rewritten.** The failing assertion is
 //!    frequently in the middle of exactly the region a head/tail window would
 //!    drop. These are advised on, not edited.
@@ -19,13 +20,6 @@
 //! 4. **Nothing is destroyed.** Condensation returns what was elided so the
 //!    caller can persist it and leave a pointer. This module never decides on
 //!    its own that information may be lost.
-
-// The hook that would call this is PostToolUse[Bash], which lives in hooks.rs
-// — a file a second agent is actively rewriting for Codex support. The module
-// is complete and tested on its own; wiring it is one call site, and doing it
-// while that rewrite is in flight would mean two agents editing one function.
-// Landed separately on purpose.
-#![allow(dead_code)]
 
 /// What kind of command produced this output. The family decides the strategy,
 /// because the useful part of `git status` is at the top and the useful part of

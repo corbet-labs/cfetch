@@ -37,6 +37,8 @@ pub struct AuditPaths {
     pub home: PathBuf,
     /// Where session transcripts live (native layout: one dir per project).
     pub transcripts_root: PathBuf,
+    /// Codex's date-nested session transcripts.
+    pub codex_transcripts_root: PathBuf,
 }
 
 impl AuditPaths {
@@ -50,6 +52,7 @@ impl AuditPaths {
                 .unwrap_or_else(|_| PathBuf::from(".mcp.json")),
             home,
             transcripts_root: paths::native_projects_root(),
+            codex_transcripts_root: paths::codex_sessions_root(),
         }
     }
 }
@@ -283,10 +286,16 @@ pub fn build(
     };
 
     let mut gaps = Vec::new();
-    if crate::transcript::newest_transcript(&paths.transcripts_root).is_none() {
+    if crate::transcript::newest_transcript_among(&[
+        paths.transcripts_root.clone(),
+        paths.codex_transcripts_root.clone(),
+    ])
+    .is_none()
+    {
         gaps.push(format!(
-            "no transcripts found under {} — delivery and usage cannot be verified",
-            paths.transcripts_root.display()
+            "no transcripts found under {} or {} — delivery and usage cannot be verified",
+            paths.transcripts_root.display(),
+            paths.codex_transcripts_root.display()
         ));
     }
     if measured_sessions == 0 {
@@ -451,6 +460,7 @@ mod tests {
             mcp_json: dir.join(".mcp.json"),
             home: dir.to_path_buf(),
             transcripts_root: transcripts,
+            codex_transcripts_root: dir.join("codex-sessions"),
         }
     }
 

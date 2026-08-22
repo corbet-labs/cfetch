@@ -114,10 +114,26 @@ pub fn config_path() -> PathBuf {
     }
 }
 
+/// Codex's public configuration/state root. `CODEX_HOME` is the supported
+/// override used by the CLI, IDE, app server and installers; an empty value
+/// behaves like an unset value.
+pub fn codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".codex"))
+}
+
 /// Claude Code's per-project native auto-memory stores live under here.
 /// cfetch indexes them read-only; it never writes to the native store.
 pub fn native_projects_root() -> PathBuf {
     home().join(".claude/projects")
+}
+
+/// Codex session transcripts. Unlike Claude's project store this is nested by
+/// date, so transcript discovery walks recursively.
+pub fn codex_sessions_root() -> PathBuf {
+    codex_home().join("sessions")
 }
 
 /// The shared brain tree (source of truth, git-tracked markdown).

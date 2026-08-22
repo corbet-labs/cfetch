@@ -114,7 +114,8 @@ impl Slices {
         let mut seen = std::collections::HashSet::new();
         for r in &rules {
             let name = r.name.trim();
-            anyhow::ensure!(!name.is_empty(), "a slice must have a name");
+            anyhow::ensure!(name == r.name, "slice names may not have surrounding whitespace");
+            crate::grant::validate_slice_name(name)?;
             anyhow::ensure!(
                 name != ROOT_SLICE,
                 "slice name {ROOT_SLICE:?} is reserved for documents no slice claims"
@@ -173,6 +174,16 @@ impl Slices {
                 .map(|r| r.prefixes.as_slice())
                 .unwrap_or(&[]),
         )
+    }
+
+    /// Whether `rel` belongs to the named slice or anything nested beneath
+    /// it. This is the response-side guard for operations such as citation
+    /// expansion, where the lookup starts from an id instead of a path filter.
+    pub fn contains(&self, name: &str, rel: &str) -> bool {
+        match self.prefixes_of(name) {
+            None => name == ROOT_SLICE,
+            Some(prefixes) => prefixes.iter().any(|prefix| under_prefix(rel, prefix)),
+        }
     }
 }
 
@@ -1342,6 +1353,9 @@ mod tests {
         assert!(Slices::new(vec![slice("x", &[])]).is_err(), "claims nothing");
         assert!(Slices::new(vec![slice("x", &[""])]).is_err(), "an empty prefix claims the tree");
         assert!(Slices::new(vec![slice("x", &["/"])]).is_err());
+        for bad in ["../escape", r"..\escape", "with space", " leading"] {
+            assert!(Slices::new(vec![slice(bad, &["a"])]).is_err(), "name {bad:?}");
+        }
     }
 
     #[test]

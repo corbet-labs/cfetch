@@ -18,6 +18,11 @@
 //! gated by a bearer token (`token` field in every request; token sourced
 //! from `serve.token_file`, 0600). Shutdown is refused on that listener.
 //!
+//! The daemon also owns this host's single iroh endpoint. Invite redemption
+//! and slice-scoped read queries use the same line-JSON request/response
+//! objects over one QUIC bidirectional stream. QUIC authenticates the peer's
+//! endpoint id; the origin then checks that id against its grant record.
+//!
 //! Three channels, one gate. [`Channel`] is the whole policy surface: whether
 //! a connection must present a token, and whether it may shut the daemon
 //! down. A unix socket is access-controlled by its file mode and needs no
@@ -30,12 +35,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::{heartbeat, hooks, index, ipc, paths, resident, serve};
+use crate::{grant, heartbeat, hooks, index, ipc, net, paths, resident, serve};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Request {
     op: String,
     #[serde(default)]
@@ -70,6 +76,18 @@ struct Request {
     /// the injection scope has to travel with the request.
     #[serde(default)]
     cwd: Option<String>,
+    /// Invite redemption fields. The remote endpoint id is NEVER accepted
+    /// from this payload; it comes from the authenticated iroh connection.
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    mode: Option<grant::Mode>,
+    /// Local-only forwarding envelope: target plus the ordinary line-JSON
+    /// request to send through this daemon's persistent endpoint.
+    #[serde(default)]
+    target: Option<iroh::EndpointAddr>,
+    #[serde(default)]
+    request: Option<Box<Request>>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -121,12 +139,25 @@ pub struct Response {
     pub slices: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve: Option<ServeInfo>,
+    /// Current address of this daemon's authenticated iroh endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iroh_addr: Option<iroh::EndpointAddr>,
+    /// Present only on successful invite redemption.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant: Option<WireGrant>,
 }
 
 impl Response {
     fn err(msg: impl Into<String>) -> Response {
         Response { ok: false, error: Some(msg.into()), ..Response::default() }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireGrant {
+    pub slice: String,
+    pub mode: grant::Mode,
+    pub peer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +392,51 @@ pub fn call_req(body: &serde_json::Value, timeout: Duration) -> Option<Response>
     serde_json::from_str(&line).ok()
 }
 
+/// Current dialable address of the running daemon's endpoint. Invites require
+/// a live daemon so the ticket cannot contain a plausible id with no process
+/// actually listening behind it.
+pub fn iroh_addr() -> anyhow::Result<iroh::EndpointAddr> {
+    let resp = call("iroh-addr", IROH_ONLINE_WAIT + Duration::from_secs(2))
+        .context("daemon is not running — start it before minting an invite")?;
+    anyhow::ensure!(resp.ok, "{}", resp.error.unwrap_or_else(|| "iroh endpoint unavailable".into()));
+    resp.iroh_addr.context("daemon returned no iroh address")
+}
+
+/// Sends one ordinary daemon protocol request through the local daemon's
+/// persistent iroh endpoint. The caller never opens a competing endpoint with
+/// the same host key.
+pub fn call_iroh(
+    target: &iroh::EndpointAddr,
+    body: serde_json::Value,
+) -> anyhow::Result<Response> {
+    // Validate the nested request here so malformed locally constructed JSON
+    // never reaches the network.
+    let request: Request = serde_json::from_value(body).context("invalid iroh request")?;
+    let envelope = serde_json::to_value(Request {
+        op: "iroh-forward".to_string(),
+        target: Some(target.clone()),
+        request: Some(Box::new(request)),
+        ..Request::default()
+    })?;
+    let resp = call_req(&envelope, IROH_REQUEST_TIMEOUT + Duration::from_secs(2))
+        .context("local daemon is not running — start it before using a remote slice")?;
+    anyhow::ensure!(resp.ok, "{}", resp.error.clone().unwrap_or_else(|| "iroh request failed".into()));
+    Ok(resp)
+}
+
+pub fn redeem_iroh(ticket: &grant::Ticket) -> anyhow::Result<WireGrant> {
+    let resp = call_iroh(
+        &ticket.origin,
+        serde_json::json!({
+            "op": "redeem",
+            "slice": ticket.slice,
+            "secret": ticket.secret,
+            "mode": ticket.mode,
+        }),
+    )?;
+    resp.grant.context("origin accepted redemption without returning the grant")
+}
+
 /// Shared state of one daemon process across its connection threads.
 struct Ctx {
     /// The daemon's own configuration. A serving host ranks ON BEHALF OF
@@ -374,8 +450,27 @@ struct Ctx {
     /// Bearer token required on the LOCAL channel — `Some` only where the
     /// local transport is not access-controlled by the operating system.
     local_token: Option<String>,
+    /// Set exactly once after the endpoint has bound. The endpoint and runtime
+    /// handle are cloneable, so synchronous local-channel workers can ask the
+    /// async iroh runtime to make an outbound call without minting a second
+    /// endpoint with the same host identity.
+    iroh: Mutex<Option<IrohClient>>,
     shutdown: AtomicBool,
 }
+
+#[derive(Clone)]
+struct IrohClient {
+    endpoint: iroh::Endpoint,
+    runtime: tokio::runtime::Handle,
+}
+
+const IROH_ALPN: &[u8] = b"cfetch/1/line-json";
+const IROH_MAX_REQUEST: usize = 64 * 1024;
+const IROH_MAX_RESPONSE: usize = 16 * 1024 * 1024;
+const IROH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const IROH_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const IROH_ONLINE_WAIT: Duration = Duration::from_secs(5);
+const MAX_LINE_REQUEST: u64 = 64 * 1024;
 
 /// Which connection a request arrived on, and therefore what it may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +504,26 @@ impl Channel {
     fn allows_shutdown(self) -> bool {
         !matches!(self, Channel::Remote)
     }
+
+    fn allows_local_only(self) -> bool {
+        !matches!(self, Channel::Remote)
+    }
+
+    fn allows_op(self, op: &str) -> bool {
+        !matches!(self, Channel::Remote)
+            || matches!(
+                op,
+                "ping"
+                    | "serve-status"
+                    | "recall"
+                    | "expand"
+                    | "find"
+                    | "map"
+                    | "slices"
+                    | "generation"
+                    | "checksum"
+            )
+    }
 }
 
 /// Bearer check for a channel that demands one. A missing expectation and a
@@ -418,6 +533,253 @@ fn authorized(expected: Option<&String>, presented: Option<&String>) -> bool {
     match (expected, presented) {
         (Some(expected), Some(got)) => serve::token_eq(expected, got),
         _ => false,
+    }
+}
+
+fn iroh_client(ctx: &Ctx) -> anyhow::Result<IrohClient> {
+    ctx.iroh
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .context("iroh endpoint is not ready")
+}
+
+fn dialable_iroh_addr(client: &IrohClient) -> iroh::EndpointAddr {
+    let addr = client.endpoint.addr();
+    if addr.relay_urls().next().is_some() {
+        return addr;
+    }
+    // A freshly bound endpoint has direct routes immediately but may need a
+    // moment to select its relay. Waiting here (when minting an invite), not
+    // at daemon boot, preserves offline local operation while making WAN
+    // tickets self-contained whenever a relay is reachable.
+    client.runtime.block_on(async {
+        let _ = tokio::time::timeout(IROH_ONLINE_WAIT, client.endpoint.online()).await;
+    });
+    client.endpoint.addr()
+}
+
+async fn iroh_exchange(
+    endpoint: &iroh::Endpoint,
+    target: iroh::EndpointAddr,
+    req: &Request,
+) -> anyhow::Result<Response> {
+    let mut body = serde_json::to_vec(req)?;
+    body.push(b'\n');
+    anyhow::ensure!(body.len() <= IROH_MAX_REQUEST, "iroh request is too large");
+
+    let conn = tokio::time::timeout(
+        IROH_CONNECT_TIMEOUT,
+        endpoint.connect(target, IROH_ALPN),
+    )
+    .await
+    .context("timed out connecting to the invite origin")??;
+    let (mut send, mut recv) = tokio::time::timeout(IROH_CONNECT_TIMEOUT, conn.open_bi())
+        .await
+        .context("timed out opening an iroh request stream")??;
+    send.write_all(&body).await.context("send iroh request")?;
+    send.finish().context("finish iroh request")?;
+    let raw = tokio::time::timeout(IROH_REQUEST_TIMEOUT, recv.read_to_end(IROH_MAX_RESPONSE))
+        .await
+        .context("timed out reading the iroh response")??;
+    conn.close(0u32.into(), b"request complete");
+    serde_json::from_slice(&raw).context("origin returned an invalid response")
+}
+
+fn forward_iroh(ctx: &Ctx, target: iroh::EndpointAddr, req: &Request) -> anyhow::Result<Response> {
+    let client = iroh_client(ctx)?;
+    client.runtime.block_on(iroh_exchange(&client.endpoint, target, req))
+}
+
+/// Handles a request after QUIC has authenticated `peer` as the remote
+/// endpoint id. A ticket secret may create a grant; every subsequent data
+/// request must name a slice that this exact peer holds.
+fn handle_iroh(req: &Request, peer: &str, ctx: &Ctx) -> Response {
+    if req.op == "redeem" {
+        let Some(slice) = req.slice.as_deref() else {
+            return Response::err("redeem request names no slice");
+        };
+        let Some(secret) = req.secret.as_deref() else {
+            return Response::err("redeem request carries no secret");
+        };
+        let Some(mode) = req.mode else {
+            return Response::err("redeem request names no mode");
+        };
+        return match grant::redeem(&ctx.cfg.brain_root, slice, secret, mode, peer, now_secs()) {
+            Ok(g) => Response {
+                ok: true,
+                grant: Some(WireGrant { slice: g.slice, mode: g.mode, peer: peer.to_string() }),
+                ..Response::default()
+            },
+            Err(e) => Response::err(e.to_string()),
+        };
+    }
+
+    // Connection authentication alone says WHO is asking, not what it may
+    // read. Even harmless-looking catalog responses are gated so a grant is
+    // the single authorization boundary for the remote protocol.
+    let Some(slice) = req.slice.as_deref() else {
+        return Response::err("iroh requests must name the granted slice");
+    };
+    match grant::access(&ctx.cfg.brain_root, slice, peer, now_secs()) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Response::err("this endpoint has no active grant for that slice"),
+        Err(e) => return Response::err(e.to_string()),
+    }
+
+    match req.op.as_str() {
+        "recall" | "generation" => handle(req, ctx).0,
+        "checksum" => {
+            let model = match ctx.cfg.slice_model() {
+                Ok(model) => model,
+                Err(e) => return Response::err(e.to_string()),
+            };
+            serve_query(ctx, |conn| {
+                Ok(Response {
+                    checksum: Some(index::catalog_checksum_matching(conn, |path| {
+                        model.contains(slice, path)
+                    })?),
+                    ..Response::default()
+                })
+            })
+        }
+        "expand" => {
+            if ctx.serve.is_none() {
+                return Response::err("serving is not enabled on this daemon (config serve.enabled)");
+            }
+            let cite = req.cite.clone().unwrap_or_default();
+            let model = match ctx.cfg.slice_model() {
+                Ok(model) => model,
+                Err(e) => return Response::err(e.to_string()),
+            };
+            serve_query(ctx, |conn| {
+                let blocks = index::expand(conn, &cite)?
+                    .into_iter()
+                    .filter(|block| model.contains(slice, &block.path))
+                    .map(Into::into)
+                    .collect();
+                Ok(Response { blocks: Some(blocks), ..Response::default() })
+            })
+        }
+        // These operations either mutate the host or are not slice-scoped.
+        // Returning them through a slice grant would widen that grant to code
+        // roots, daemon control, or resident private context.
+        other => Response::err(format!("op {other:?} is not available through a slice grant")),
+    }
+}
+
+async fn serve_iroh_connection(
+    incoming: iroh::endpoint::Incoming,
+    ctx: Arc<Ctx>,
+) -> anyhow::Result<()> {
+    let conn = tokio::time::timeout(IROH_CONNECT_TIMEOUT, incoming)
+        .await
+        .context("iroh handshake timed out")??;
+    let peer = conn.remote_id().to_string();
+    let (mut send, mut recv) = tokio::time::timeout(IROH_CONNECT_TIMEOUT, conn.accept_bi())
+        .await
+        .context("iroh peer did not open a request stream")??;
+    let raw = tokio::time::timeout(
+        IROH_CONNECT_TIMEOUT,
+        recv.read_to_end(IROH_MAX_REQUEST),
+    )
+    .await
+    .context("iroh request read timed out")??;
+    let resp = match serde_json::from_slice::<Request>(&raw) {
+        Ok(req) => {
+            // Barrier waits, SQLite and grant lockfiles are intentionally
+            // synchronous. Keep them off Tokio's networking workers so a few
+            // slow queries cannot starve QUIC progress for every peer.
+            let ctx = ctx.clone();
+            match tokio::task::spawn_blocking(move || handle_iroh(&req, &peer, &ctx)).await {
+                Ok(resp) => resp,
+                Err(e) => Response::err(format!("request worker failed: {e}")),
+            }
+        }
+        Err(e) => Response::err(format!("bad request: {e}")),
+    };
+    let mut raw = serde_json::to_vec(&resp)?;
+    raw.push(b'\n');
+    anyhow::ensure!(raw.len() <= IROH_MAX_RESPONSE, "iroh response is too large");
+    send.write_all(&raw).await.context("send iroh response")?;
+    send.finish().context("finish iroh response")?;
+    // `finish` queues the FIN; dropping the last connection handle
+    // immediately can tear down QUIC before the peer has read the response.
+    // The client closes after `read_to_end`, so this normally returns at once.
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+    Ok(())
+}
+
+/// Starts the one persistent endpoint for this host and waits until its UDP
+/// sockets are bound. WAN discovery/relay selection continues asynchronously;
+/// the current direct routes are already enough for a same-LAN invite.
+fn start_iroh(ctx: Arc<Ctx>) -> anyhow::Result<()> {
+    let secret = net::load_or_create(&paths::state_dir())?;
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::sync_channel::<Result<iroh::EndpointAddr, String>>(1);
+    std::thread::Builder::new()
+        .name("cfetch-iroh".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("cfetch-iroh-rt")
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("create iroh runtime: {e}")));
+                    return;
+                }
+            };
+            let handle = runtime.handle().clone();
+            runtime.block_on(async move {
+                let endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                    .secret_key(secret)
+                    .alpns(vec![IROH_ALPN.to_vec()])
+                    .bind()
+                    .await
+                {
+                    Ok(endpoint) => endpoint,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("bind iroh endpoint: {e}")));
+                        return;
+                    }
+                };
+                *ctx.iroh
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(IrohClient {
+                    endpoint: endpoint.clone(),
+                    runtime: handle,
+                });
+                let _ = ready_tx.send(Ok(endpoint.addr()));
+                let permits = Arc::new(tokio::sync::Semaphore::new(64));
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        // Bound unauthenticated connection work. Dropping the
+                        // handshake refuses overload without growing a task
+                        // queue an attacker can hold open.
+                        drop(incoming);
+                        continue;
+                    };
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Err(e) = serve_iroh_connection(incoming, ctx).await {
+                            eprintln!("cfetch iroh: {e:#}");
+                        }
+                    });
+                }
+            });
+        })
+        .context("start iroh runtime thread")?;
+
+    match ready_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(addr)) => {
+            eprintln!("cfetch daemon serving iroh as {}", addr.id);
+            Ok(())
+        }
+        Ok(Err(e)) => anyhow::bail!(e),
+        Err(_) => anyhow::bail!("timed out starting the iroh endpoint"),
     }
 }
 
@@ -460,6 +822,29 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
             },
             false,
         ),
+        "iroh-addr" => match iroh_client(ctx) {
+            Ok(client) => (
+                Response {
+                    ok: true,
+                    iroh_addr: Some(dialable_iroh_addr(&client)),
+                    ..Response::default()
+                },
+                false,
+            ),
+            Err(e) => (Response::err(e.to_string()), false),
+        },
+        "iroh-forward" => {
+            let Some(target) = req.target.clone() else {
+                return (Response::err("iroh forward request names no target"), false);
+            };
+            let Some(remote) = req.request.as_deref() else {
+                return (Response::err("iroh forward request has no payload"), false);
+            };
+            match forward_iroh(ctx, target, remote) {
+                Ok(resp) => (resp, false),
+                Err(e) => (Response::err(e.to_string()), false),
+            }
+        }
         "resident" => {
             // Config is reloaded per request: a startup snapshot would make
             // the warm path silently diverge from the daemon-less fallback
@@ -623,25 +1008,43 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
 fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, chan: Channel) -> bool {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    let read = {
+        let mut limited = std::io::Read::take(&mut reader, MAX_LINE_REQUEST + 1);
+        std::io::BufRead::read_line(&mut limited, &mut line)
+    };
+    if read.is_err() {
         return false;
     }
-    let (resp, shutdown) = match serde_json::from_str::<Request>(&line) {
-        Ok(req) => {
-            // Bearer gate wherever the transport is not access-controlled by
-            // the operating system: every op requires the token.
-            if let Some(expected) = chan.expected_token(ctx)
-                && !authorized(expected, req.token.as_ref())
-            {
-                (Response::err("unauthorized"), false)
-            } else if req.op == "shutdown" && !chan.allows_shutdown() {
-                (Response::err("shutdown is local-only"), false)
-            } else {
-                let (r, shutdown) = handle(&req, ctx);
-                (r, shutdown && chan.allows_shutdown())
+    let (resp, shutdown) = if line.len() as u64 > MAX_LINE_REQUEST {
+        (Response::err("request exceeds the 64 KiB protocol limit"), false)
+    } else {
+        match serde_json::from_str::<Request>(&line) {
+            Ok(req) => {
+                // Bearer gate wherever the transport is not access-controlled by
+                // the operating system: every op requires the token.
+                if let Some(expected) = chan.expected_token(ctx)
+                    && !authorized(expected, req.token.as_ref())
+                {
+                    (Response::err("unauthorized"), false)
+                } else if matches!(req.op.as_str(), "shutdown" | "iroh-addr" | "iroh-forward")
+                    && !chan.allows_local_only()
+                {
+                    (Response::err(format!("{} is local-only", req.op)), false)
+                } else if !chan.allows_op(&req.op) {
+                    (
+                        Response::err(format!(
+                            "{} is not available on the remote serving channel",
+                            req.op
+                        )),
+                        false,
+                    )
+                } else {
+                    let (r, shutdown) = handle(&req, ctx);
+                    (r, shutdown && chan.allows_shutdown())
+                }
             }
+            Err(e) => (Response::err(format!("bad request: {e}")), false),
         }
-        Err(e) => (Response::err(format!("bad request: {e}")), false),
     };
     let mut stream = reader.into_inner();
     if let Ok(s) = serde_json::to_string(&resp) {
@@ -669,8 +1072,10 @@ pub fn run() -> anyhow::Result<()> {
         serve: serve_handle.as_ref().map(|h| h.state.clone()),
         tcp_token: tcp_token.clone(),
         local_token: local_token.clone(),
+        iroh: Mutex::new(None),
         shutdown: AtomicBool::new(false),
     });
+    start_iroh(ctx.clone())?;
 
     if let (Some(bind), Some(_)) = (&cfg.serve.bind, &tcp_token) {
         let listener = std::net::TcpListener::bind(bind)?;
@@ -732,6 +1137,9 @@ pub fn run() -> anyhow::Result<()> {
                 ipc::wake();
             }
         });
+    }
+    if let Ok(client) = iroh_client(&ctx) {
+        client.runtime.block_on(client.endpoint.close());
     }
     listener.cleanup();
     Ok(())
@@ -902,6 +1310,7 @@ mod tests {
             serve: None,
             tcp_token: None,
             local_token: None,
+            iroh: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -1082,6 +1491,7 @@ mod tests {
             serve: None,
             tcp_token: Some("right-token".to_string()),
             local_token: None,
+            iroh: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         };
         let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "ping"}));
@@ -1091,6 +1501,76 @@ mod tests {
         assert_eq!(r.error.as_deref(), Some("unauthorized"));
         let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "ping", "token": "right-token"}));
         assert!(r.ok);
+    }
+
+    #[test]
+    fn tcp_token_never_widens_the_serving_port_into_host_control() {
+        let ctx = Ctx {
+            cfg: Arc::new(crate::config::Config::default()),
+            serve: None,
+            tcp_token: Some("right-token".to_string()),
+            local_token: None,
+            iroh: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        };
+        for op in ["resident", "health", "scan-code", "scan-status", "iroh-forward"] {
+            let r = roundtrip(
+                &ctx,
+                Channel::Remote,
+                serde_json::json!({"op": op, "token": "right-token"}),
+            );
+            assert!(!r.ok, "remote {op} must be refused even with the bearer token");
+        }
+    }
+
+    #[test]
+    fn line_protocol_rejects_oversized_requests_before_json_parsing() {
+        let body = format!(
+            "{{\"op\":\"ping\",\"padding\":\"{}\"}}\n",
+            "x".repeat(MAX_LINE_REQUEST as usize)
+        );
+        let mut stream = Duplex {
+            input: std::io::Cursor::new(body.into_bytes()),
+            output: Vec::new(),
+        };
+        serve_conn(&mut stream, &no_serve_ctx(), Channel::LocalTrusted);
+        let response: Response = serde_json::from_slice(&stream.output).unwrap();
+        assert_eq!(response.error.as_deref(), Some("request exceeds the 64 KiB protocol limit"));
+    }
+
+    #[test]
+    fn iroh_redeem_uses_the_authenticated_connection_peer() {
+        let brain = tempfile::tempdir().unwrap();
+        let origin = iroh::SecretKey::from_bytes(&[1; 32]).public().into();
+        let ticket = grant::invite(brain.path(), &origin, "shared", grant::Mode::Ro, 1, None)
+            .unwrap();
+        let cfg = crate::config::Config {
+            brain_root: brain.path().to_path_buf(),
+            ..crate::config::Config::default()
+        };
+        let ctx = Ctx {
+            cfg: Arc::new(cfg),
+            serve: None,
+            tcp_token: None,
+            local_token: None,
+            iroh: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        };
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public().to_string();
+        let response = handle_iroh(
+            &Request {
+                op: "redeem".into(),
+                slice: Some(ticket.slice),
+                secret: Some(ticket.secret),
+                mode: Some(ticket.mode),
+                ..Request::default()
+            },
+            &peer,
+            &ctx,
+        );
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.grant.unwrap().peer, peer);
+        assert_eq!(grant::read(brain.path(), "shared").unwrap()[0].peer.as_deref(), Some(peer.as_str()));
     }
 
     #[test]
@@ -1118,6 +1598,7 @@ mod tests {
             serve: None,
             tcp_token: Some("t".to_string()),
             local_token: None,
+            iroh: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         };
         let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "shutdown", "token": "t"}));
@@ -1154,6 +1635,7 @@ mod tests {
             serve: None,
             tcp_token: None,
             local_token: Some("local-token".to_string()),
+            iroh: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         };
         let r = roundtrip(&ctx, Channel::LocalToken, serde_json::json!({"op": "ping"}));

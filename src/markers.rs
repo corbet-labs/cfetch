@@ -120,16 +120,6 @@ pub fn remove_block(content: &str) -> anyhow::Result<Option<String>> {
     }
 }
 
-fn write_atomic(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("cfetch-tmp.{}", std::process::id()));
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// Upserts into a file, creating it when absent. Returns a short human verb.
 pub fn upsert_file(path: &std::path::Path) -> anyhow::Result<&'static str> {
     let current = match std::fs::read_to_string(path) {
@@ -141,7 +131,7 @@ pub fn upsert_file(path: &std::path::Path) -> anyhow::Result<&'static str> {
     if let Upsert::Unchanged = outcome {
         return Ok("unchanged");
     }
-    write_atomic(path, &next)?;
+    crate::fsutil::atomic_write(path, &next)?;
     Ok(match outcome {
         Upsert::Created => "created block in",
         Upsert::Updated => "updated block in",
@@ -162,7 +152,7 @@ pub fn remove_block_file(path: &std::path::Path) -> anyhow::Result<bool> {
     match remove_block(&current)? {
         None => Ok(false),
         Some(next) => {
-            write_atomic(path, &next)?;
+            crate::fsutil::atomic_write(path, &next)?;
             Ok(true)
         }
     }

@@ -7,6 +7,7 @@ mod dashboard;
 mod embed;
 mod engine;
 mod exhaust;
+mod fsutil;
 mod govern;
 mod grant;
 mod graph;
@@ -36,6 +37,7 @@ mod staging;
 mod transcript;
 mod vectors;
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -60,7 +62,7 @@ enum Command {
     /// Register (or remove) cfetch in Claude Code settings and every other
     /// detected agent (Codex, Gemini): hooks, MCP servers, instruction blocks
     Install {
-        /// Path to settings.json (default: ~/.claude/settings.json)
+        /// Explicit Claude settings.json path (otherwise Claude is feature-detected)
         #[arg(long)]
         settings: Option<std::path::PathBuf>,
         /// Remove cfetch's managed entries instead of adding them
@@ -676,6 +678,39 @@ fn recall_remote(
     recall_served(&resp, id, json)
 }
 
+/// A slice joined through an invite is routed through the daemon's persistent
+/// iroh endpoint. The line-JSON body is identical to the TCP serving path;
+/// transport authentication replaces the bearer token and the origin checks
+/// the caller's endpoint id against the slice grant.
+#[allow(clippy::too_many_arguments)]
+fn recall_iroh(
+    membership: &grant::Membership,
+    query: &str,
+    id: Option<&str>,
+    semantic: bool,
+    hybrid: bool,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let body = match id {
+        Some(cite) => serde_json::json!({
+            "op": "expand", "cite": cite, "slice": membership.slice,
+        }),
+        None => {
+            if query.trim().is_empty() {
+                anyhow::bail!("empty query (pass search terms or --id <citation>)");
+            }
+            serde_json::json!({
+                "op": "recall", "query": query, "limit": limit,
+                "semantic": semantic, "hybrid": hybrid,
+                "slice": membership.slice,
+            })
+        }
+    };
+    let resp = daemon::call_iroh(&membership.origin, body)?;
+    recall_served(&resp, id, json)
+}
+
 #[allow(clippy::too_many_arguments)] // thin CLI adapter, mirrors the flag set
 fn recall(
     query: &str,
@@ -688,6 +723,11 @@ fn recall(
     json: bool,
 ) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
+    if let Some(slice) = slice
+        && let Some(membership) = grant::membership_for_slice(&paths::state_dir(), slice)?
+    {
+        return recall_iroh(&membership, query, id, semantic, hybrid, limit, json);
+    }
     if let Some(cs) = &cfg.client.serving {
         return recall_remote(cs, query, id, expand, semantic, hybrid, slice, limit, json);
     }
@@ -942,11 +982,12 @@ fn status() -> anyhow::Result<()> {
     // Transcript-VERIFIED delivery: did our hook output actually enter the
     // conversation? Read from the newest transcript, never assumed — and a
     // drifted format is reported as unverifiable, never as zero.
-    let transcripts_root = paths::native_projects_root();
-    match transcript::newest_transcript(&transcripts_root) {
+    let transcript_roots = [paths::native_projects_root(), paths::codex_sessions_root()];
+    match transcript::newest_transcript_among(&transcript_roots) {
         None => println!(
-            "delivery: no transcripts found under {} (measurement gap)",
-            transcripts_root.display()
+            "delivery: no transcripts found under {} or {} (measurement gap)",
+            transcript_roots[0].display(),
+            transcript_roots[1].display()
         ),
         Some(t) => match transcript::verified_injections(&t) {
             Some((fired, delivered)) => println!(
@@ -1048,21 +1089,37 @@ fn invite(
         if model.is_empty() { "none".into() } else { model.names().collect::<Vec<_>>().join(", ") }
     );
     let mode: grant::Mode = mode.parse()?;
-    let origin = net::endpoint_id(&paths::state_dir())?;
+    anyhow::ensure!(
+        cfg.serve.enabled,
+        "serving is disabled; set serve.enabled=true and start the daemon before inviting a remote host"
+    );
+    let origin = daemon::iroh_addr()?;
+    let identity = net::endpoint_id(&paths::state_dir())?;
+    anyhow::ensure!(
+        origin.id == identity,
+        "running daemon identity does not match this host's endpoint key; restart the daemon"
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let expires_at = expires_in_hours.map(|h| now + h * 3600);
-    let ticket =
-        grant::invite(&cfg.brain_root, &origin.to_string(), slice, mode, now, expires_at)?;
+    let expires_at = match expires_in_hours {
+        Some(hours) => Some(
+            hours
+                .checked_mul(3600)
+                .and_then(|seconds| now.checked_add(seconds))
+                .context("invite expiry is too far in the future")?,
+        ),
+        None => None,
+    };
+    let ticket = grant::invite(&cfg.brain_root, &origin, slice, mode, now, expires_at)?;
     let text = ticket.encode();
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "ticket": text, "slice": slice, "mode": mode.as_str(),
-                "origin": origin.to_string(), "expires_at": expires_at,
+                "origin": origin.id.to_string(), "address": origin, "expires_at": expires_at,
             })
         );
     } else {
@@ -1137,14 +1194,14 @@ fn join(ticket: &str, json: bool) -> anyhow::Result<()> {
     anyhow::ensure!(!t.expired(now), "this invite has expired — ask the origin for a new one");
 
     let me = net::endpoint_id(&paths::state_dir())?.to_string();
-    match grant::redeem(&cfg.brain_root, &t.slice, &t.secret, &me, now) {
+    match grant::redeem(&cfg.brain_root, &t.slice, &t.secret, t.mode, &me, now) {
         Ok(g) => {
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "slice": g.slice, "mode": g.mode.as_str(),
-                        "origin": t.origin, "peer": me, "shared_tree": true,
+                        "origin": t.origin.id.to_string(), "peer": me, "shared_tree": true,
                     })
                 );
             } else {
@@ -1152,7 +1209,7 @@ fn join(ticket: &str, json: bool) -> anyhow::Result<()> {
                     "joined slice {:?} as {} (origin {}, redeemed on the shared tree)",
                     g.slice,
                     g.mode.as_str(),
-                    &t.origin[..t.origin.len().min(12)]
+                    &t.origin.id.to_string()[..12]
                 );
             }
             Ok(())
@@ -1161,13 +1218,44 @@ fn join(ticket: &str, json: bool) -> anyhow::Result<()> {
         // has never seen might belong to an origin that does not share the
         // tree. Every other refusal — already redeemed, expired — is known
         // precisely, and dressing it up with a maybe would mislead.
-        Err(e) if e.to_string().contains("not known to this host") => anyhow::bail!(
-            "this tree has no invite matching that ticket for slice {:?}. Either the invite \
-             is from an origin that does NOT share this tree — redeeming across storage \
-             groups needs the iroh transport, which is not wired yet — or the ticket is \
-             not genuine.",
-            t.slice
-        ),
+        Err(e) if e.to_string().contains("not known to this host") => {
+            let g = daemon::redeem_iroh(&t).with_context(|| {
+                format!(
+                    "this tree has no local invite for slice {:?}; remote redemption at {} failed",
+                    t.slice, t.origin.id
+                )
+            })?;
+            anyhow::ensure!(g.slice == t.slice, "origin returned a grant for the wrong slice");
+            anyhow::ensure!(g.mode == t.mode, "origin returned a grant with the wrong mode");
+            anyhow::ensure!(g.peer == me, "origin bound the invite to a different endpoint");
+            grant::remember_membership(
+                &paths::state_dir(),
+                grant::Membership {
+                    origin: t.origin.clone(),
+                    slice: g.slice.clone(),
+                    mode: g.mode,
+                    joined_at: now,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "slice": g.slice, "mode": g.mode.as_str(),
+                        "origin": t.origin.id.to_string(), "peer": me,
+                        "shared_tree": false,
+                    })
+                );
+            } else {
+                println!(
+                    "joined slice {:?} as {} over iroh (origin {})",
+                    g.slice,
+                    g.mode.as_str(),
+                    &t.origin.id.to_string()[..12]
+                );
+            }
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }
@@ -1264,8 +1352,13 @@ fn main() {
             }
         }
         Command::Install { settings, remove } => {
-            let path = settings.unwrap_or_else(install::default_settings_path);
-            if let Err(e) = install::apply(&path, remove) {
+            let claude = settings.or_else(|| {
+                let path = install::default_settings_path();
+                path.parent().is_some_and(std::path::Path::is_dir).then_some(path)
+            });
+            if let Some(path) = claude
+                && let Err(e) = install::apply(&path, remove)
+            {
                 eprintln!("cfetch install: {e}");
                 std::process::exit(1);
             }

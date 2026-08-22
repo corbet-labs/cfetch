@@ -374,6 +374,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tokio",
  "toml_edit 0.23.10+spec-1.0.0",
  "tree-sitter",
  "tree-sitter-go",
@@ -382,6 +383,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

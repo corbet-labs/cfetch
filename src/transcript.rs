@@ -13,7 +13,7 @@
 //! cumulative usage grows within one streamed message. Distinct ids are the
 //! api-call count.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Usage summed over all distinct API calls found in one transcript. The
@@ -63,16 +63,28 @@ fn scan_text(text: &str) -> Option<TranscriptUsage> {
     // Last usage per message id wins; a line that fails to parse mid-file is
     // skipped (one torn write must not discard the rest).
     let mut per_id: BTreeMap<String, [u64; 4]> = BTreeMap::new();
+    let mut codex_totals = Vec::new();
     for line in &lines {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         if let Some((id, usage)) = usage_record(&v) {
             per_id.insert(id, usage);
         }
+        if let Some(usage) = codex_usage_record(&v) {
+            codex_totals.push(usage);
+        }
     }
     // JSON parsed but zero usage records recognized: the schema drifted under
     // us. Refuse to report a measured zero.
     if per_id.is_empty() {
-        return None;
+        let last = *codex_totals.last()?;
+        let calls = codex_totals.into_iter().collect::<BTreeSet<_>>().len() as u64;
+        return Some(TranscriptUsage {
+            api_calls: calls,
+            input_tokens: last[0],
+            output_tokens: last[1],
+            cache_read_input_tokens: last[2],
+            cache_creation_input_tokens: last[3],
+        });
     }
 
     let mut total = TranscriptUsage { api_calls: per_id.len() as u64, ..Default::default() };
@@ -98,10 +110,6 @@ pub fn verified_injections(path: &Path) -> Option<(u64, u64)> {
 }
 
 fn verified_injections_text(text: &str) -> Option<(u64, u64)> {
-    /// Our hook invocations as they appear in the harness's record of the
-    /// command it ran (`'<abs path>/cfetch' hook <event>`).
-    const HOOK_NEEDLE: &str = "cfetch hook";
-
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() || !probe_ok(&lines) {
         return None;
@@ -109,15 +117,8 @@ fn verified_injections_text(text: &str) -> Option<(u64, u64)> {
     let mut fired = 0u64;
     let mut delivered = 0u64;
     for line in &lines {
-        if !line.contains(HOOK_NEEDLE) {
-            continue;
-        }
-        // Only JSON-object records count — a stray mention inside prose (a
-        // user message quoting the command) is not a hook record... but the
-        // harness nests hook records inside larger objects, so the needle
-        // check on the raw line is the recognizer and the parse is the gate.
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if !v.is_object() {
+        if is_user_record(&v) || !has_cfetch_hook_record(&v) {
             continue;
         }
         fired += 1;
@@ -131,6 +132,43 @@ fn verified_injections_text(text: &str) -> Option<(u64, u64)> {
         return None;
     }
     Some((fired, delivered))
+}
+
+fn is_user_record(v: &serde_json::Value) -> bool {
+    v.get("type").and_then(serde_json::Value::as_str) == Some("user")
+        || v.pointer("/message/role").and_then(serde_json::Value::as_str) == Some("user")
+        || v.get("role").and_then(serde_json::Value::as_str) == Some("user")
+}
+
+fn is_cfetch_hook_command(command: &str) -> bool {
+    let words = crate::exhaust::shell_words(command);
+    if words.len() < 3 || words.get(1).map(String::as_str) != Some("hook") {
+        return false;
+    }
+    Path::new(&words[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "cfetch" || name == "cfetch.exe")
+}
+
+/// Recognizes only harness hook fields, never a raw prose mention. Supported
+/// shapes are `hookCommand: <command>` and `hook: { command: <command> }`, at
+/// any nesting depth used by the harness.
+fn has_cfetch_hook_record(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            (key == "hookCommand"
+                && value.as_str().is_some_and(is_cfetch_hook_command))
+                || (key == "hook"
+                    && value
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_cfetch_hook_command))
+                || has_cfetch_hook_record(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(has_cfetch_hook_record),
+        _ => false,
+    }
 }
 
 /// Recursive search for a non-empty `additionalContext` (either harness
@@ -148,34 +186,35 @@ fn has_nonempty_additional_context(v: &serde_json::Value) -> bool {
     }
 }
 
-/// Most recently modified `*.jsonl` under `root`. The native layout is
-/// `~/.claude/projects/<project-slug>/<session-id>.jsonl`, so one directory
-/// level is walked; flat files directly under `root` are accepted too.
+/// Most recently modified `*.jsonl` under `root`, recursively. Claude nests
+/// by project and Codex nests by date, so a fixed depth is not portable.
 pub fn newest_transcript(root: &Path) -> Option<std::path::PathBuf> {
     let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    let mut consider = |p: std::path::PathBuf| {
-        if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            return;
-        }
-        if let Ok(mtime) = std::fs::metadata(&p).and_then(|m| m.modified())
-            && best.as_ref().is_none_or(|(t, _)| mtime > *t)
-        {
-            best = Some((mtime, p));
-        }
-    };
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(&p) {
-                for e in rd.flatten() {
-                    consider(e.path());
-                }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
+                && best.as_ref().is_none_or(|(t, _)| mtime > *t)
+            {
+                best = Some((mtime, path));
             }
-        } else {
-            consider(p);
         }
     }
     best.map(|(_, p)| p)
+}
+
+pub fn newest_transcript_among(roots: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    roots
+        .iter()
+        .filter_map(|root| newest_transcript(root))
+        .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
 }
 
 /// Extracts (message id, usage) from one transcript line. Assistant lines
@@ -202,6 +241,32 @@ fn usage_record(v: &serde_json::Value) -> Option<(String, [u64; 4])> {
             g("cache_creation_input_tokens"),
         ],
     ))
+}
+
+/// Codex emits cumulative session totals on `event_msg/token_count` records.
+/// The last total is the session measurement; distinct totals approximate API
+/// calls without summing cumulative values repeatedly.
+fn codex_usage_record(v: &serde_json::Value) -> Option<[u64; 4]> {
+    if v.get("type").and_then(serde_json::Value::as_str) != Some("event_msg")
+        || v.pointer("/payload/type").and_then(serde_json::Value::as_str)
+            != Some("token_count")
+    {
+        return None;
+    }
+    let usage = v.pointer("/payload/info/total_token_usage")?.as_object()?;
+    if !["input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens"]
+        .iter()
+        .any(|key| usage.contains_key(*key))
+    {
+        return None;
+    }
+    let get = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Some([
+        get("input_tokens"),
+        get("output_tokens"),
+        get("cached_input_tokens"),
+        get("cache_write_input_tokens"),
+    ])
 }
 
 #[cfg(test)]
@@ -277,6 +342,22 @@ mod tests {
     }
 
     #[test]
+    fn codex_cumulative_token_records_use_the_last_total() {
+        let line = |input, cached, output| {
+            format!(
+                r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":3,"output_tokens":{output},"reasoning_output_tokens":2,"total_tokens":999}}}}}}}}"#
+            )
+        };
+        let text = [line(10, 5, 2), line(10, 5, 2), line(30, 12, 8)].join("\n");
+        let usage = scan_text(&text).unwrap();
+        assert_eq!(usage.api_calls, 2, "repeated cumulative records are deduplicated");
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cache_read_input_tokens, 12);
+        assert_eq!(usage.cache_creation_input_tokens, 3);
+    }
+
+    #[test]
     fn missing_or_empty_file_is_none() {
         assert!(scan(Path::new("/nonexistent/cfetch-transcript.jsonl")).is_none());
         assert!(scan_text("").is_none());
@@ -288,10 +369,10 @@ mod tests {
     fn hook_line(cmd: &str, ctx: Option<&str>) -> String {
         match ctx {
             Some(c) => format!(
-                r#"{{"type":"system","subtype":"hook_success","hookCommand":"'{cmd}'","output":{{"hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":"{c}"}}}}}}"#
+                r#"{{"type":"system","subtype":"hook_success","hookCommand":"{cmd}","output":{{"hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":"{c}"}}}}}}"#
             ),
             None => {
-                format!(r#"{{"type":"system","subtype":"hook_success","hookCommand":"'{cmd}'"}}"#)
+                format!(r#"{{"type":"system","subtype":"hook_success","hookCommand":"{cmd}"}}"#)
             }
         }
     }
@@ -300,10 +381,10 @@ mod tests {
     fn verified_delivery_counts_firings_and_nonempty_context() {
         let lines = [
             r#"{"type":"user","message":{"role":"user","content":"hi"}}"#.to_string(),
-            hook_line("/usr/local/bin/cfetch hook session-start", Some("[cfetch resident memory]")),
-            hook_line("/usr/local/bin/cfetch hook stop", None),
+            hook_line("'/usr/local/bin/cfetch' hook session-start", Some("[cfetch resident memory]")),
+            hook_line("'/usr/local/bin/cfetch' hook stop", None),
             // Fired but delivered nothing: empty context must not count.
-            hook_line("/usr/local/bin/cfetch hook pre-tool", Some("")),
+            hook_line("'/usr/local/bin/cfetch' hook pre-tool", Some("")),
             // Another tool's hook is not ours.
             hook_line("/opt/other-brain hook whatever", Some("noise")),
             assistant_line("msg_a", 1, 1, 0, 0),
@@ -315,6 +396,14 @@ mod tests {
     fn verified_delivery_accepts_snake_case_and_drifted_nesting() {
         let line = r#"{"role":"system","content":[{"hook":{"command":"cfetch hook session-start","additional_context":"resident digest"}}]}"#;
         assert_eq!(verified_injections_text(line), Some((1, 1)));
+    }
+
+    #[test]
+    fn prose_mentions_and_user_messages_are_not_hook_firings() {
+        let user = r#"{"type":"user","message":{"role":"user","content":"please run cfetch hook stop"}}"#;
+        let structured_but_user = r#"{"type":"user","message":{"role":"user","hookCommand":"'/usr/bin/cfetch' hook stop"}}"#;
+        assert_eq!(verified_injections_text(user), None);
+        assert_eq!(verified_injections_text(structured_but_user), None);
     }
 
     #[test]
@@ -346,6 +435,7 @@ mod tests {
     fn newest_transcript_picks_latest_jsonl_and_ignores_others() {
         let dir = tempfile::tempdir().unwrap();
         let proj = dir.path().join("-home-x-repo");
+        let proj = proj.join("2026/08/22");
         std::fs::create_dir_all(&proj).unwrap();
         let old = proj.join("old.jsonl");
         let new = proj.join("new.jsonl");

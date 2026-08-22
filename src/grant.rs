@@ -53,14 +53,15 @@ impl std::str::FromStr for Mode {
 
 /// Human-visible ticket prefix. Versioned so a future format is refused by
 /// name rather than misparsed.
-const TICKET_PREFIX: &str = "cfetch-invite-1:";
+const TICKET_PREFIX: &str = "cfetch-invite-2:";
 
 /// What `cfetch invite` prints and `cfetch join` consumes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Ticket {
-    /// Endpoint id of the origin — who to dial. iroh discovery resolves this
-    /// to addresses, so no volatile IP is baked into the ticket.
-    pub origin: String,
+    /// Authenticated endpoint plus the direct/relay routes known when the
+    /// invite was minted. The endpoint id is the authority; the routes only
+    /// make it reachable without depending on a discovery lookup succeeding.
+    pub origin: iroh::EndpointAddr,
     pub slice: String,
     pub mode: Mode,
     /// The one-time secret, hex. The origin holds only its hash.
@@ -79,14 +80,18 @@ impl Ticket {
     }
 
     pub fn decode(text: &str) -> anyhow::Result<Ticket> {
+        anyhow::ensure!(text.trim().len() <= 32 * 1024, "invite is unreasonably large");
         let body = text.trim().strip_prefix(TICKET_PREFIX).ok_or_else(|| {
             anyhow::anyhow!("not a cfetch invite (expected it to start with {TICKET_PREFIX:?})")
         })?;
         let raw = b64_decode(body).context("invite is not valid base64url")?;
         let t: Ticket = serde_json::from_slice(&raw).context("invite payload is not a ticket")?;
-        anyhow::ensure!(!t.origin.is_empty(), "invite names no origin");
-        anyhow::ensure!(!t.slice.is_empty(), "invite names no slice");
-        anyhow::ensure!(!t.secret.is_empty(), "invite carries no secret");
+        validate_slice_name(&t.slice)?;
+        anyhow::ensure!(
+            t.secret.len() == 64
+                && t.secret.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "invite carries an invalid secret"
+        );
         Ok(t)
     }
 
@@ -125,9 +130,34 @@ fn grants_file(brain_root: &Path, slice: &str) -> PathBuf {
     grants_dir(brain_root).join(format!("{slice}.json"))
 }
 
+/// Slice names become filenames on every supported platform. Keep them to a
+/// portable identifier rather than letting separators or drive syntax escape
+/// the grants directory.
+pub fn validate_slice_name(slice: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!slice.is_empty(), "a slice must have a name");
+    anyhow::ensure!(slice != "." && slice != "..", "invalid slice name {slice:?}");
+    anyhow::ensure!(
+        slice
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+        "invalid slice name {slice:?}: use only ASCII letters, digits, dot, underscore, or dash"
+    );
+    Ok(())
+}
+
+fn grant_lock(brain_root: &Path, slice: &str) -> anyhow::Result<crate::lockfile::Lock> {
+    validate_slice_name(slice)?;
+    let dir = grants_dir(brain_root);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!(".{slice}.lock"));
+    crate::lockfile::acquire(&path, 2_000, 0)
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", path.display()))
+}
+
 /// Reads a slice's grants. A missing file is an empty list, not an error: a
 /// slice nobody has been invited to is the normal case.
 pub fn read(brain_root: &Path, slice: &str) -> anyhow::Result<Vec<Grant>> {
+    validate_slice_name(slice)?;
     let path = grants_file(brain_root, slice);
     match std::fs::read(&path) {
         Ok(raw) => serde_json::from_slice(&raw)
@@ -137,27 +167,13 @@ pub fn read(brain_root: &Path, slice: &str) -> anyhow::Result<Vec<Grant>> {
     }
 }
 
-/// Replaces a slice's grants atomically: write a sibling temp file, fsync,
-/// rename. A reader either sees the old list or the new one, never a torn one.
-///
-/// Single-writer by construction — only a slice's ORIGIN writes its grants,
-/// and a slice has exactly one origin.
-pub fn write(brain_root: &Path, slice: &str, grants: &[Grant]) -> anyhow::Result<()> {
-    let dir = grants_dir(brain_root);
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+/// Replaces a slice's grants atomically while the caller holds its slice
+/// lock. A reader either sees the old list or the new one, never a torn one.
+fn write_unlocked(brain_root: &Path, slice: &str, grants: &[Grant]) -> anyhow::Result<()> {
+    validate_slice_name(slice)?;
     let path = grants_file(brain_root, slice);
-    let tmp = dir.join(format!(".{slice}.json.tmp"));
     let body = serde_json::to_vec_pretty(grants)?;
-    {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
-        use std::io::Write as _;
-        f.write_all(&body)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    crate::fsutil::atomic_write(&path, body)
 }
 
 /// Mints an invite for `slice` and records it as pending on the origin.
@@ -167,13 +183,14 @@ pub fn write(brain_root: &Path, slice: &str, grants: &[Grant]) -> anyhow::Result
 /// re-minted rather than looked up.
 pub fn invite(
     brain_root: &Path,
-    origin: &str,
+    origin: &iroh::EndpointAddr,
     slice: &str,
     mode: Mode,
     now: u64,
     expires_at: Option<u64>,
 ) -> anyhow::Result<Ticket> {
-    anyhow::ensure!(!slice.is_empty(), "an invite must name a slice");
+    validate_slice_name(slice)?;
+    let _lock = grant_lock(brain_root, slice)?;
     let secret = random_hex_32();
     let mut grants = read(brain_root, slice)?;
     grants.push(Grant {
@@ -184,9 +201,9 @@ pub fn invite(
         created_at: now,
         expires_at,
     });
-    write(brain_root, slice, &grants)?;
+    write_unlocked(brain_root, slice, &grants)?;
     Ok(Ticket {
-        origin: origin.to_string(),
+        origin: origin.clone(),
         slice: slice.to_string(),
         mode,
         secret,
@@ -203,9 +220,12 @@ pub fn redeem(
     brain_root: &Path,
     slice: &str,
     secret: &str,
+    mode: Mode,
     peer: &str,
     now: u64,
 ) -> anyhow::Result<Grant> {
+    validate_slice_name(slice)?;
+    let _lock = grant_lock(brain_root, slice)?;
     let want = hash_hex(secret);
     let mut grants = read(brain_root, slice)?;
     let idx = grants
@@ -213,6 +233,10 @@ pub fn redeem(
         .position(|g| constant_time_eq(&g.secret_hash, &want))
         .context("invite is not known to this host")?;
     let g = &grants[idx];
+    anyhow::ensure!(
+        g.mode == mode,
+        "invite mode does not match the origin's grant"
+    );
     anyhow::ensure!(
         !g.expires_at.is_some_and(|e| now >= e),
         "invite expired"
@@ -223,8 +247,70 @@ pub fn redeem(
         None => {}
     }
     grants[idx].peer = Some(peer.to_string());
-    write(brain_root, slice, &grants)?;
+    write_unlocked(brain_root, slice, &grants)?;
     Ok(grants[idx].clone())
+}
+
+/// A remotely joined slice remembered on the consuming host. This is routing
+/// state, not authority: every request is still authorized by the origin
+/// against its grant record and the caller's authenticated iroh endpoint id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Membership {
+    pub origin: iroh::EndpointAddr,
+    pub slice: String,
+    pub mode: Mode,
+    pub joined_at: u64,
+}
+
+const MEMBERSHIPS_FILE: &str = "memberships.json";
+
+fn memberships_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(MEMBERSHIPS_FILE)
+}
+
+fn read_memberships(state_dir: &Path) -> anyhow::Result<Vec<Membership>> {
+    let path = memberships_path(state_dir);
+    match std::fs::read(&path) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .with_context(|| format!("{} is not a memberships document", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Records a successful remote redemption without ever persisting its secret.
+pub fn remember_membership(state_dir: &Path, membership: Membership) -> anyhow::Result<()> {
+    validate_slice_name(&membership.slice)?;
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
+    let lock_path = state_dir.join("memberships.lock");
+    let _lock = crate::lockfile::acquire(&lock_path, 2_000, 0)
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", lock_path.display()))?;
+    let mut all = read_memberships(state_dir)?;
+    if let Some(existing) = all.iter_mut().find(|m| {
+        m.slice == membership.slice && m.origin.id == membership.origin.id
+    }) {
+        *existing = membership;
+    } else {
+        all.push(membership);
+    }
+    crate::fsutil::atomic_write(&memberships_path(state_dir), serde_json::to_vec_pretty(&all)?)
+}
+
+/// Returns the one origin joined for `slice`. Ambiguous same-named slices are
+/// refused instead of silently querying whichever record happened to come
+/// first; a future origin selector can make that choice explicit.
+pub fn membership_for_slice(state_dir: &Path, slice: &str) -> anyhow::Result<Option<Membership>> {
+    validate_slice_name(slice)?;
+    let mut matches = read_memberships(state_dir)?
+        .into_iter()
+        .filter(|m| m.slice == slice);
+    let first = matches.next();
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "slice {slice:?} was joined from more than one origin; refusing an ambiguous route"
+    );
+    Ok(first)
 }
 
 /// The access `peer` holds on `slice`, if any.
@@ -318,14 +404,17 @@ fn b64_decode(text: &str) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    const ORIGIN: &str = "aa11bb22cc33";
     const PEER: &str = "dd44ee55ff66";
     const OTHER: &str = "9900aabbccdd";
+
+    fn origin() -> iroh::EndpointAddr {
+        iroh::SecretKey::from_bytes(&[7; 32]).public().into()
+    }
 
     #[test]
     fn a_ticket_survives_a_round_trip_through_text() {
         let dir = tempfile::tempdir().unwrap();
-        let t = invite(dir.path(), ORIGIN, "hosts", Mode::Ro, 100, Some(500)).unwrap();
+        let t = invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, Some(500)).unwrap();
         let text = t.encode();
         assert!(text.starts_with(TICKET_PREFIX));
         assert!(!text.contains(' '), "a ticket must paste as one token: {text}");
@@ -346,7 +435,7 @@ mod tests {
     fn a_ticket_that_is_not_ours_is_refused_by_name() {
         assert!(Ticket::decode("hello").unwrap_err().to_string().contains("not a cfetch invite"));
         assert!(
-            Ticket::decode("cfetch-invite-1:!!!").unwrap_err().to_string().contains("base64url")
+            Ticket::decode("cfetch-invite-2:!!!").unwrap_err().to_string().contains("base64url")
         );
     }
 
@@ -354,7 +443,7 @@ mod tests {
     fn the_origin_stores_the_hash_and_never_the_secret() {
         // A leaked grants file must not hand anyone a usable invite.
         let dir = tempfile::tempdir().unwrap();
-        let t = invite(dir.path(), ORIGIN, "hosts", Mode::Rw, 100, None).unwrap();
+        let t = invite(dir.path(), &origin(), "hosts", Mode::Rw, 100, None).unwrap();
         let raw = std::fs::read_to_string(grants_dir(dir.path()).join("hosts.json")).unwrap();
         assert!(!raw.contains(&t.secret), "the secret is on disk: {raw}");
         assert!(raw.contains(&hash_hex(&t.secret)));
@@ -363,10 +452,10 @@ mod tests {
     #[test]
     fn redeeming_binds_the_invite_to_the_peer_that_used_it() {
         let dir = tempfile::tempdir().unwrap();
-        let t = invite(dir.path(), ORIGIN, "hosts", Mode::Ro, 100, None).unwrap();
+        let t = invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, None).unwrap();
         assert!(read(dir.path(), "hosts").unwrap()[0].pending());
 
-        let g = redeem(dir.path(), "hosts", &t.secret, PEER, 200).unwrap();
+        let g = redeem(dir.path(), "hosts", &t.secret, t.mode, PEER, 200).unwrap();
         assert_eq!(g.peer.as_deref(), Some(PEER));
         assert_eq!(access(dir.path(), "hosts", PEER, 300).unwrap(), Some(Mode::Ro));
         assert_eq!(access(dir.path(), "hosts", OTHER, 300).unwrap(), None);
@@ -376,27 +465,41 @@ mod tests {
     fn a_retried_join_from_the_same_host_is_not_an_error() {
         // Networks drop replies; the second attempt must not look like theft.
         let dir = tempfile::tempdir().unwrap();
-        let t = invite(dir.path(), ORIGIN, "hosts", Mode::Ro, 100, None).unwrap();
-        redeem(dir.path(), "hosts", &t.secret, PEER, 200).unwrap();
-        assert!(redeem(dir.path(), "hosts", &t.secret, PEER, 201).is_ok());
+        let t = invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, None).unwrap();
+        redeem(dir.path(), "hosts", &t.secret, t.mode, PEER, 200).unwrap();
+        assert!(redeem(dir.path(), "hosts", &t.secret, t.mode, PEER, 201).is_ok());
     }
 
     #[test]
     fn an_invite_cannot_be_redeemed_twice_by_different_hosts() {
         let dir = tempfile::tempdir().unwrap();
-        let t = invite(dir.path(), ORIGIN, "hosts", Mode::Ro, 100, None).unwrap();
-        redeem(dir.path(), "hosts", &t.secret, PEER, 200).unwrap();
-        let e = redeem(dir.path(), "hosts", &t.secret, OTHER, 201).unwrap_err().to_string();
+        let t = invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, None).unwrap();
+        redeem(dir.path(), "hosts", &t.secret, t.mode, PEER, 200).unwrap();
+        let e = redeem(dir.path(), "hosts", &t.secret, t.mode, OTHER, 201)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("already redeemed"), "{e}");
         // And the original holder keeps its access.
         assert_eq!(access(dir.path(), "hosts", PEER, 202).unwrap(), Some(Mode::Ro));
     }
 
     #[test]
+    fn a_tampered_mode_does_not_consume_the_invite() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, None).unwrap();
+        let e = redeem(dir.path(), "hosts", &t.secret, Mode::Rw, PEER, 200)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("mode does not match"), "{e}");
+        assert!(read(dir.path(), "hosts").unwrap()[0].pending());
+        redeem(dir.path(), "hosts", &t.secret, Mode::Ro, PEER, 201).unwrap();
+    }
+
+    #[test]
     fn an_unknown_secret_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        invite(dir.path(), ORIGIN, "hosts", Mode::Ro, 100, None).unwrap();
-        let e = redeem(dir.path(), "hosts", "not-a-real-secret", PEER, 200)
+        invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, None).unwrap();
+        let e = redeem(dir.path(), "hosts", "not-a-real-secret", Mode::Ro, PEER, 200)
             .unwrap_err()
             .to_string();
         assert!(e.contains("not known to this host"), "{e}");
@@ -406,11 +509,16 @@ mod tests {
     #[test]
     fn expiry_is_enforced_on_redeem_and_on_access() {
         let dir = tempfile::tempdir().unwrap();
-        let t = invite(dir.path(), ORIGIN, "hosts", Mode::Ro, 100, Some(500)).unwrap();
-        assert!(redeem(dir.path(), "hosts", &t.secret, PEER, 500).unwrap_err().to_string().contains("expired"));
+        let t = invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, Some(500)).unwrap();
+        assert!(
+            redeem(dir.path(), "hosts", &t.secret, t.mode, PEER, 500)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
 
-        let t2 = invite(dir.path(), ORIGIN, "docs", Mode::Ro, 100, Some(500)).unwrap();
-        redeem(dir.path(), "docs", &t2.secret, PEER, 200).unwrap();
+        let t2 = invite(dir.path(), &origin(), "docs", Mode::Ro, 100, Some(500)).unwrap();
+        redeem(dir.path(), "docs", &t2.secret, t2.mode, PEER, 200).unwrap();
         assert_eq!(access(dir.path(), "docs", PEER, 499).unwrap(), Some(Mode::Ro));
         assert_eq!(access(dir.path(), "docs", PEER, 500).unwrap(), None, "expired access is gone");
         assert!(t2.expired(500));
@@ -419,13 +527,44 @@ mod tests {
     #[test]
     fn many_invites_to_one_slice_coexist() {
         let dir = tempfile::tempdir().unwrap();
-        let a = invite(dir.path(), ORIGIN, "hosts", Mode::Ro, 100, None).unwrap();
-        let b = invite(dir.path(), ORIGIN, "hosts", Mode::Rw, 101, None).unwrap();
-        redeem(dir.path(), "hosts", &a.secret, PEER, 200).unwrap();
-        redeem(dir.path(), "hosts", &b.secret, OTHER, 201).unwrap();
+        let a = invite(dir.path(), &origin(), "hosts", Mode::Ro, 100, None).unwrap();
+        let b = invite(dir.path(), &origin(), "hosts", Mode::Rw, 101, None).unwrap();
+        redeem(dir.path(), "hosts", &a.secret, a.mode, PEER, 200).unwrap();
+        redeem(dir.path(), "hosts", &b.secret, b.mode, OTHER, 201).unwrap();
         assert_eq!(access(dir.path(), "hosts", PEER, 300).unwrap(), Some(Mode::Ro));
         assert_eq!(access(dir.path(), "hosts", OTHER, 300).unwrap(), Some(Mode::Rw));
         assert_eq!(read(dir.path(), "hosts").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_invites_do_not_clobber_one_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::sync::Arc::new(dir.path().to_path_buf());
+        let workers: Vec<_> = (0..24)
+            .map(|n| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    invite(&root, &origin(), "hosts", Mode::Ro, n, None).unwrap()
+                })
+            })
+            .collect();
+        let tickets: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let grants = read(dir.path(), "hosts").unwrap();
+        assert_eq!(grants.len(), tickets.len());
+        for ticket in tickets {
+            assert!(grants.iter().any(|g| g.secret_hash == hash_hex(&ticket.secret)));
+        }
+    }
+
+    #[test]
+    fn slice_names_cannot_escape_the_grants_directory() {
+        for bad in ["", ".", "..", "../outside", r"..\outside", "C:drive", "has space"] {
+            assert!(validate_slice_name(bad).is_err(), "must reject {bad:?}");
+            assert!(read(tempfile::tempdir().unwrap().path(), bad).is_err());
+        }
+        for good in ["hosts", "team.eu", "project_2", "read-only"] {
+            validate_slice_name(good).unwrap();
+        }
     }
 
     #[test]
@@ -443,5 +582,43 @@ mod tests {
         // fork is not a grant: it needs no permission from the origin.
         assert!("fork".parse::<Mode>().is_err());
         assert!("admin".parse::<Mode>().is_err());
+    }
+
+    #[test]
+    fn membership_routing_is_atomic_idempotent_and_never_stores_the_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let membership = Membership {
+            origin: origin(),
+            slice: "hosts".to_string(),
+            mode: Mode::Ro,
+            joined_at: 100,
+        };
+        remember_membership(dir.path(), membership.clone()).unwrap();
+        remember_membership(dir.path(), membership.clone()).unwrap();
+        assert_eq!(membership_for_slice(dir.path(), "hosts").unwrap(), Some(membership));
+        let raw = std::fs::read_to_string(memberships_path(dir.path())).unwrap();
+        assert!(!raw.contains("secret"), "routing state must not grow a credential field: {raw}");
+    }
+
+    #[test]
+    fn same_named_remote_slices_are_never_routed_ambiguously() {
+        let dir = tempfile::tempdir().unwrap();
+        remember_membership(
+            dir.path(),
+            Membership { origin: origin(), slice: "hosts".into(), mode: Mode::Ro, joined_at: 1 },
+        )
+        .unwrap();
+        let other = iroh::SecretKey::from_bytes(&[8; 32]).public().into();
+        remember_membership(
+            dir.path(),
+            Membership { origin: other, slice: "hosts".into(), mode: Mode::Ro, joined_at: 2 },
+        )
+        .unwrap();
+        assert!(
+            membership_for_slice(dir.path(), "hosts")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
     }
 }

@@ -23,6 +23,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Enforce the operator's pre-1.0 lock
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          case "$version" in
+            0.*) ;;
+            *) echo "cfetch 1.0+ is operator-blocked (Cargo.toml has $version)" >&2; exit 1 ;;
+          esac
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -30,4 +38,3 @@ jobs:
         run: cargo test --locked
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
-

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 #[allow(dead_code)] // this struct IS the wire contract; later milestones read the rest
 pub struct HookEvent {
     pub session_id: Option<String>,
+    pub turn_id: Option<String>,
     pub transcript_path: Option<String>,
     pub cwd: Option<String>,
     pub hook_event_name: Option<String>,
@@ -81,6 +82,12 @@ pub struct HookSpecificOutput {
 
 #[derive(Debug, Default, Serialize)]
 pub struct HookOutput {
+    #[serde(skip_serializing_if = "Option::is_none", rename = "continue")]
+    pub continue_processing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "stopReason")]
+    pub stop_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "systemMessage")]
     pub system_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "suppressOutput")]
@@ -95,11 +102,12 @@ pub struct Emit {
     event_name: &'static str,
     context: Vec<String>,
     system_message: Option<String>,
+    replacement: Option<String>,
 }
 
 impl Emit {
     pub fn new(event_name: &'static str) -> Emit {
-        Emit { event_name, context: Vec::new(), system_message: None }
+        Emit { event_name, context: Vec::new(), system_message: None, replacement: None }
     }
 
     pub fn add_context(&mut self, s: impl Into<String>) {
@@ -114,14 +122,26 @@ impl Emit {
         self.system_message = Some(s.into());
     }
 
+    /// Replaces a successful Codex tool result with model-facing feedback.
+    /// Codex currently implements this through PostToolUse `continue:false`;
+    /// callers must only use it for Codex events because Claude interprets the
+    /// universal field as a request to stop the agent.
+    pub fn replace_tool_output(&mut self, s: impl Into<String>) {
+        self.replacement = Some(s.into());
+    }
+
     /// Returns the number of context characters actually emitted, for booking.
     pub fn finish(self) -> usize {
-        if self.context.is_empty() && self.system_message.is_none() {
+        if self.context.is_empty() && self.system_message.is_none() && self.replacement.is_none() {
             return 0;
         }
         let joined = self.context.join("\n\n");
-        let emitted = joined.len();
+        let emitted = joined.len() + self.replacement.as_ref().map_or(0, String::len);
+        let replacing = self.replacement.is_some();
         let out = HookOutput {
+            continue_processing: replacing.then_some(false),
+            reason: self.replacement,
+            stop_reason: replacing.then(|| "cfetch condensed oversized tool output".to_string()),
             system_message: self.system_message,
             suppress_output: None,
             hook_specific_output: if joined.is_empty() {
@@ -179,6 +199,9 @@ mod tests {
     #[test]
     fn output_shape_is_camel_case() {
         let out = HookOutput {
+            continue_processing: None,
+            reason: None,
+            stop_reason: None,
             system_message: None,
             suppress_output: None,
             hook_specific_output: Some(HookSpecificOutput {
@@ -196,5 +219,25 @@ mod tests {
     fn token_estimate_is_ceiled() {
         assert_eq!(estimate_tokens(0), 0);
         assert_eq!(estimate_tokens(7), 2);
+    }
+
+    #[test]
+    fn replacement_uses_the_codex_post_tool_feedback_contract() {
+        let mut emit = Emit::new("PostToolUse");
+        emit.replace_tool_output("short output");
+        assert_eq!(emit.replacement.as_deref(), Some("short output"));
+
+        let out = HookOutput {
+            continue_processing: Some(false),
+            reason: emit.replacement,
+            stop_reason: Some("cfetch condensed oversized tool output".into()),
+            system_message: None,
+            suppress_output: None,
+            hook_specific_output: None,
+        };
+        let value = serde_json::to_value(out).unwrap();
+        assert_eq!(value["continue"], false);
+        assert_eq!(value["reason"], "short output");
+        assert!(value.get("continueProcessing").is_none());
     }
 }

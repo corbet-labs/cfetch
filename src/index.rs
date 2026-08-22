@@ -989,6 +989,15 @@ pub fn generation(conn: &Connection) -> u64 {
 /// must produce the same checksum: the coherence invariant's cross-holder
 /// verification value. Generation is deliberately NOT part of the digest.
 pub fn catalog_checksum(conn: &Connection) -> anyhow::Result<String> {
+    catalog_checksum_matching(conn, |_| true)
+}
+
+/// Catalog checksum restricted by path. Remote slice holders use this rather
+/// than learning a digest over documents outside their grant.
+pub fn catalog_checksum_matching(
+    conn: &Connection,
+    include: impl Fn(&str) -> bool,
+) -> anyhow::Result<String> {
     let mut stmt = conn.prepare(
         "SELECT b.cite, d.path, d.ring FROM blocks b JOIN docs d ON d.id = b.doc_id
          ORDER BY b.cite, d.path, d.ring",
@@ -997,6 +1006,9 @@ pub fn catalog_checksum(conn: &Connection) -> anyhow::Result<String> {
         stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
     let mut hasher = sha2::Sha256::new();
     for (cite, path, ring) in rows.filter_map(Result::ok) {
+        if !include(&path) {
+            continue;
+        }
         hasher.update(cite.as_bytes());
         hasher.update([0u8]);
         hasher.update(path.as_bytes());
@@ -2129,6 +2141,25 @@ mod tests {
         std::fs::write(dir.path().join("knowledge/b.md"), "- gamma\n- delta prime\n").unwrap();
         scan(&mut c1, dir.path(), None, &RingRules::default()).unwrap();
         assert_ne!(catalog_checksum(&c1).unwrap(), k2);
+    }
+
+    #[test]
+    fn a_slice_checksum_cannot_observe_changes_outside_its_paths() {
+        let dir = brain(&[
+            ("knowledge/shared/a.md", "visible fact\n"),
+            ("knowledge/private/b.md", "private fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let shared = |path: &str| path == "knowledge/shared" || path.starts_with("knowledge/shared/");
+        let before = catalog_checksum_matching(&conn, shared).unwrap();
+        std::fs::write(dir.path().join("knowledge/private/b.md"), "changed private fact\n").unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(catalog_checksum_matching(&conn, shared).unwrap(), before);
+        std::fs::write(dir.path().join("knowledge/shared/a.md"), "changed visible fact\n").unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_ne!(catalog_checksum_matching(&conn, shared).unwrap(), before);
     }
 
     #[test]

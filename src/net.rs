@@ -32,26 +32,61 @@ pub fn key_path(state_dir: &Path) -> PathBuf {
 /// there is nothing to version and nothing to misparse.
 pub fn load_or_create(state_dir: &Path) -> anyhow::Result<iroh::SecretKey> {
     let path = key_path(state_dir);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            let bytes: [u8; KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
-                anyhow::anyhow!(
-                    "{} is {} bytes, not {KEY_LEN}: refusing to mint a new identity over it — \
-                     every grant made to this host names the OLD one. Move the file aside \
-                     deliberately if you mean to become a different host.",
-                    path.display(),
-                    bytes.len()
-                )
-            })?;
-            Ok(iroh::SecretKey::from_bytes(&bytes))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let sk = iroh::SecretKey::generate();
-            write_key(&path, &sk)?;
-            Ok(sk)
-        }
-        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    match read_key(&path) {
+        Ok(sk) => return Ok(sk),
+        Err(e) if e.downcast_ref::<std::io::Error>().is_none_or(|io| {
+            io.kind() != std::io::ErrorKind::NotFound
+        }) => return Err(e),
+        Err(_) => {}
     }
+
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
+    let lock_path = state_dir.join("endpoint.lock");
+    let _lock = crate::lockfile::acquire(&lock_path, 2_000, 0)
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", lock_path.display()))?;
+
+    // The winner may have created the key while this process waited.
+    match read_key(&path) {
+        Ok(sk) => return Ok(sk),
+        Err(e) if e.downcast_ref::<std::io::Error>().is_none_or(|io| {
+            io.kind() != std::io::ErrorKind::NotFound
+        }) => return Err(e),
+        Err(_) => {}
+    }
+
+    let sk = iroh::SecretKey::generate();
+    write_key(&path, &sk)?;
+    // Always return the persisted winner, never an in-memory candidate.
+    read_key(&path)
+}
+
+fn read_key(path: &Path) -> anyhow::Result<iroh::SecretKey> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        anyhow::ensure!(
+            mode == 0o600,
+            "{} has mode {mode:04o}, expected 0600; refusing to use an exposed identity key",
+            path.display()
+        );
+    }
+    let bytes: [u8; KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "{} is {} bytes, not {KEY_LEN}: refusing to mint a new identity over it — \
+             every grant made to this host names the OLD one. Move the file aside \
+             deliberately if you mean to become a different host.",
+            path.display(),
+            bytes.len()
+        )
+    })?;
+    Ok(iroh::SecretKey::from_bytes(&bytes))
 }
 
 /// Writes the key 0600, creating the parent directory. The mode is set before
@@ -70,11 +105,6 @@ fn write_key(path: &Path, sk: &iroh::SecretKey) -> anyhow::Result<()> {
     }
     let mut f = match opts.open(path) {
         Ok(f) => f,
-        // Another process on this host won the race; its key is as good as
-        // ours would have been, and there must only ever be one.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Ok(());
-        }
         Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
     };
     use std::io::Write as _;
@@ -102,6 +132,22 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_use_has_exactly_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::sync::Arc::new(dir.path().to_path_buf());
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let root = root.clone();
+            workers.push(std::thread::spawn(move || endpoint_id(&root).unwrap()));
+        }
+        let ids: std::collections::HashSet<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1, "every successful caller must return the persisted identity");
+    }
+
+    #[test]
     fn two_hosts_are_two_identities() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
@@ -123,9 +169,27 @@ mod tests {
         // Regenerating would mint a new identity and quietly orphan every
         // grant that names the old one.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(key_path(dir.path()), b"too short").unwrap();
+        let path = key_path(dir.path());
+        std::fs::write(&path, b"too short").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let e = endpoint_id(dir.path()).unwrap_err().to_string();
         assert!(e.contains("refusing to mint a new identity"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exposed_existing_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = key_path(dir.path());
+        std::fs::write(&path, iroh::SecretKey::generate().to_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = endpoint_id(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("expected 0600"), "{e}");
     }
 
     #[test]

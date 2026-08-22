@@ -146,6 +146,7 @@ fn codex_entry_is_current(entry: &toml_edit::Item, exe: &str) -> bool {
         && t.get("args")
             .and_then(|v| v.as_array())
             .is_some_and(|a| a.len() == 1 && a.get(0).and_then(|x| x.as_str()) == Some("mcp"))
+        && t.get("enabled").and_then(|v| v.as_bool()) != Some(false)
 }
 
 /// Structured upsert of the cfetch MCP server into Codex's config.toml,
@@ -186,6 +187,9 @@ fn codex_toml_with_mcp(content: &str, exe: &str) -> anyhow::Result<Option<String
     let mut args = toml_edit::Array::new();
     args.push("mcp");
     entry.insert("args", toml_edit::value(args));
+    if entry.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+        entry.insert("enabled", toml_edit::value(true));
+    }
     Ok(Some(doc.to_string()))
 }
 
@@ -268,38 +272,58 @@ fn hooks_are_current(settings: &Value, exe: &str) -> bool {
     let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
         return false;
     };
-    EVENTS.iter().all(|(event, subcommand)| {
+    let mut managed_total = 0usize;
+    let events_current = EVENTS.iter().all(|(event, subcommand)| {
         let expected = hook_command_for(exe, subcommand);
-        hooks
+        let mut matching = 0usize;
+        if let Some(groups) = hooks
             .get(*event)
             .and_then(Value::as_array)
-            .is_some_and(|groups| {
-                groups.iter().any(|group| {
-                    group
-                        .get("hooks")
-                        .and_then(Value::as_array)
-                        .is_some_and(|handlers| {
-                            handlers.iter().any(|handler| {
-                                handler.get("_managedBy").and_then(Value::as_str)
-                                    == Some(MANAGED_BY)
-                                    && handler.get("command").and_then(Value::as_str)
-                                        == Some(expected.as_str())
-                            })
-                        })
-                })
-            })
-    })
+        {
+            for group in groups {
+                let catch_all = group.get("matcher").is_none();
+                if let Some(handlers) = group.get("hooks").and_then(Value::as_array) {
+                    for handler in handlers {
+                        if handler.get("_managedBy").and_then(Value::as_str) != Some(MANAGED_BY) {
+                            continue;
+                        }
+                        managed_total += 1;
+                        if catch_all
+                            && handler.get("type").and_then(Value::as_str) == Some("command")
+                            && handler.get("command").and_then(Value::as_str)
+                                == Some(expected.as_str())
+                            && handler.get("timeout").and_then(Value::as_u64) == Some(10)
+                        {
+                            matching += 1;
+                        }
+                    }
+                }
+            }
+        }
+        matching == 1
+    });
+    // Includes managed entries under unknown/stale event names.
+    let all_managed = hooks
+        .values()
+        .filter_map(Value::as_array)
+        .flat_map(|groups| groups.iter())
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flat_map(|handlers| handlers.iter())
+        .filter(|handler| {
+            handler.get("_managedBy").and_then(Value::as_str) == Some(MANAGED_BY)
+        })
+        .count();
+    events_current && managed_total == EVENTS.len() && all_managed == EVENTS.len()
 }
 
 /// Reports drift in a detected Codex installation. `None` means Codex is not
 /// installed; an empty list means AGENTS.md, native hooks, and MCP all point
 /// at this executable. This is deliberately read-only for `selfcheck`.
 pub fn codex_registration_issues() -> Option<Vec<String>> {
-    codex_registration_issues_at(&paths::home(), &current_exe_str())
+    codex_registration_issues_at(&paths::codex_home(), &current_exe_str())
 }
 
-fn codex_registration_issues_at(home: &Path, exe: &str) -> Option<Vec<String>> {
-    let codex = home.join(".codex");
+fn codex_registration_issues_at(codex: &Path, exe: &str) -> Option<Vec<String>> {
     if !codex.is_dir() {
         return None;
     }
@@ -331,16 +355,31 @@ fn codex_registration_issues_at(home: &Path, exe: &str) -> Option<Vec<String>> {
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", toml_path.display()))
     }) {
-        Ok(doc)
+        Ok(doc) => {
             if doc
+                .get("features")
+                .and_then(|features| features.as_table_like())
+                .and_then(|features| features.get("hooks"))
+                .and_then(|hooks| hooks.as_bool())
+                == Some(false)
+            {
+                issues.push(format!(
+                    "{} disables native hooks with features.hooks=false",
+                    toml_path.display()
+                ));
+            }
+            if !doc
                 .get("mcp_servers")
                 .and_then(|servers| servers.as_table_like())
                 .and_then(|servers| servers.get("cfetch"))
-                .is_some_and(|entry| codex_entry_is_current(entry, exe)) => {}
-        Ok(_) => issues.push(format!(
-            "{} has no current cfetch MCP command",
-            toml_path.display()
-        )),
+                .is_some_and(|entry| codex_entry_is_current(entry, exe))
+            {
+                issues.push(format!(
+                    "{} has no enabled current cfetch MCP command",
+                    toml_path.display()
+                ));
+            }
+        }
         Err(e) => issues.push(e.to_string()),
     }
     Some(issues)
@@ -357,15 +396,12 @@ fn read_or_empty(path: &Path) -> anyhow::Result<String> {
     }
 }
 
-/// Atomic replace: tmp file in the same directory + rename.
-fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("cfetch-tmp.{}", std::process::id()));
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+fn install_lock(agent: &str) -> anyhow::Result<crate::lockfile::Lock> {
+    let dir = paths::state_dir().join("locks");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("install-{agent}.lock"));
+    crate::lockfile::acquire(&path, 2_000, 0)
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", path.display()))
 }
 
 /// Registers cfetch with every other agent found on this machine —
@@ -374,8 +410,9 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
 /// embedded binary path went stale is updated in place.
 pub fn install_agents() -> anyhow::Result<()> {
     let exe = current_exe_str();
-    let codex = paths::home().join(".codex");
+    let codex = paths::codex_home();
     if codex.is_dir() {
+        let _lock = install_lock("codex")?;
         let agents_md = codex.join("AGENTS.md");
         let verb = crate::markers::upsert_file(&agents_md)?;
         println!("codex: {verb} {}", agents_md.display());
@@ -384,14 +421,14 @@ pub fn install_agents() -> anyhow::Result<()> {
         if let Some(next) = codex_toml_with_mcp(&current, &exe)
             .map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?
         {
-            write_atomic(&toml_path, &next)?;
+            crate::fsutil::atomic_write(&toml_path, &next)?;
             println!("codex: registered MCP server in {}", toml_path.display());
         }
         let hooks_path = codex.join("hooks.json");
         let current = json_file(&hooks_path)?;
         let next = merge_for_exe(current.clone(), &exe)?;
         if next != current {
-            write_atomic(&hooks_path, &serde_json::to_string_pretty(&next)?)?;
+            crate::fsutil::atomic_write(&hooks_path, serde_json::to_string_pretty(&next)?)?;
             println!(
                 "codex: registered native hooks in {} (approve once with /hooks)",
                 hooks_path.display()
@@ -400,6 +437,7 @@ pub fn install_agents() -> anyhow::Result<()> {
     }
     let gemini = paths::home().join(".gemini");
     if gemini.is_dir() {
+        let _lock = install_lock("gemini")?;
         let gemini_md = gemini.join("GEMINI.md");
         let verb = crate::markers::upsert_file(&gemini_md)?;
         println!("gemini: {verb} {}", gemini_md.display());
@@ -413,7 +451,7 @@ pub fn install_agents() -> anyhow::Result<()> {
             })?
         };
         if let Some(next) = gemini_settings_with_mcp(current, &exe)? {
-            write_atomic(&settings_path, &serde_json::to_string_pretty(&next)?)?;
+            crate::fsutil::atomic_write(&settings_path, serde_json::to_string_pretty(&next)?)?;
             println!("gemini: registered MCP server in {}", settings_path.display());
         }
     }
@@ -425,8 +463,9 @@ pub fn install_agents() -> anyhow::Result<()> {
 /// `mcp_servers.cfetch`, and the Gemini `mcpServers.cfetch` entry.
 /// Feature-detected the same way; everything the user wrote stays.
 pub fn uninstall_agents() -> anyhow::Result<()> {
-    let codex = paths::home().join(".codex");
+    let codex = paths::codex_home();
     if codex.is_dir() {
+        let _lock = install_lock("codex")?;
         let agents_md = codex.join("AGENTS.md");
         if crate::markers::remove_block_file(&agents_md)? {
             println!("codex: removed block from {}", agents_md.display());
@@ -437,7 +476,7 @@ pub fn uninstall_agents() -> anyhow::Result<()> {
             if let Some(next) = codex_toml_without_mcp(&current)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?
             {
-                write_atomic(&toml_path, &next)?;
+                crate::fsutil::atomic_write(&toml_path, &next)?;
                 println!("codex: removed MCP server from {}", toml_path.display());
             }
         }
@@ -446,13 +485,14 @@ pub fn uninstall_agents() -> anyhow::Result<()> {
             let current = json_file(&hooks_path)?;
             let next = unmerge(current.clone())?;
             if next != current {
-                write_atomic(&hooks_path, &serde_json::to_string_pretty(&next)?)?;
+                crate::fsutil::atomic_write(&hooks_path, serde_json::to_string_pretty(&next)?)?;
                 println!("codex: removed native hooks from {}", hooks_path.display());
             }
         }
     }
     let gemini = paths::home().join(".gemini");
     if gemini.is_dir() {
+        let _lock = install_lock("gemini")?;
         let gemini_md = gemini.join("GEMINI.md");
         if crate::markers::remove_block_file(&gemini_md)? {
             println!("gemini: removed block from {}", gemini_md.display());
@@ -464,7 +504,7 @@ pub fn uninstall_agents() -> anyhow::Result<()> {
                 anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display())
             })?;
             if let Some(next) = gemini_settings_without_mcp(current) {
-                write_atomic(&settings_path, &serde_json::to_string_pretty(&next)?)?;
+                crate::fsutil::atomic_write(&settings_path, serde_json::to_string_pretty(&next)?)?;
                 println!("gemini: removed MCP server from {}", settings_path.display());
             }
         }
@@ -473,20 +513,17 @@ pub fn uninstall_agents() -> anyhow::Result<()> {
 }
 
 pub fn apply(settings_path: &Path, remove: bool) -> anyhow::Result<()> {
+    let _lock = install_lock("claude")?;
     let current: Value = match std::fs::read_to_string(settings_path) {
         Ok(s) => serde_json::from_str(&s)
             .map_err(|e| anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && remove => return Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", settings_path.display())),
     };
     let next = if remove { unmerge(current)? } else { merge(current)? };
-    if let Some(dir) = settings_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let rendered = serde_json::to_string_pretty(&next)?;
-    let tmp = settings_path.with_extension("json.cfetch-tmp");
-    std::fs::write(&tmp, rendered)?;
-    std::fs::rename(&tmp, settings_path)?;
+    crate::fsutil::atomic_write(settings_path, rendered)?;
     println!(
         "{} cfetch hooks in {}",
         if remove { "removed" } else { "registered" },
@@ -619,6 +656,15 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_codex_mcp_entry_is_reenabled_and_not_current() {
+        let disabled = "[mcp_servers.cfetch]\ncommand = \"/usr/bin/cfetch\"\nargs = [\"mcp\"]\nenabled = false\n";
+        let doc: toml_edit::DocumentMut = disabled.parse().unwrap();
+        assert!(!codex_entry_is_current(&doc["mcp_servers"]["cfetch"], "/usr/bin/cfetch"));
+        let repaired = codex_toml_with_mcp(disabled, "/usr/bin/cfetch").unwrap().unwrap();
+        assert!(repaired.contains("enabled = true"), "{repaired}");
+    }
+
+    #[test]
     fn codex_toml_removal_is_grep_proof_and_leaves_others() {
         let input = "# keep this comment\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.cfetch]\ncommand = \"/usr/bin/cfetch\"\nargs = [\"mcp\"]\n";
         let out = codex_toml_without_mcp(input).unwrap().unwrap();
@@ -636,7 +682,7 @@ mod tests {
         std::fs::create_dir(&codex).unwrap();
         let exe = "/usr/bin/cfetch";
 
-        let initial = codex_registration_issues_at(home.path(), exe).unwrap();
+        let initial = codex_registration_issues_at(&codex, exe).unwrap();
         assert_eq!(initial.len(), 3, "all three Codex surfaces are absent");
 
         let (agents, _) = crate::markers::upsert("# user instructions\n").unwrap();
@@ -647,7 +693,7 @@ mod tests {
         std::fs::write(codex.join("config.toml"), config).unwrap();
 
         assert!(
-            codex_registration_issues_at(home.path(), exe).unwrap().is_empty(),
+            codex_registration_issues_at(&codex, exe).unwrap().is_empty(),
             "fully registered Codex installation is current"
         );
 
@@ -657,9 +703,50 @@ mod tests {
             serde_json::to_string(&stale_hooks).unwrap(),
         )
         .unwrap();
-        let issues = codex_registration_issues_at(home.path(), exe).unwrap();
+        let issues = codex_registration_issues_at(&codex, exe).unwrap();
         assert_eq!(issues.len(), 1);
         assert!(issues[0].contains("native hooks"));
+    }
+
+    #[test]
+    fn codex_hook_health_rejects_handlers_that_cannot_run() {
+        let exe = "/usr/bin/cfetch";
+        let current = merge_for_exe(Value::Null, exe).unwrap();
+        assert!(hooks_are_current(&current, exe));
+
+        let mut prompt = current.clone();
+        for event in EVENTS {
+            prompt["hooks"][event.0][0]["hooks"][0]["type"] = json!("prompt");
+        }
+        assert!(!hooks_are_current(&prompt, exe), "only command handlers execute");
+
+        let mut disabled_match = current.clone();
+        disabled_match["hooks"]["Stop"][0]["matcher"] = json!("Bash");
+        assert!(!hooks_are_current(&disabled_match, exe), "all-event hooks must be catch-all");
+
+        let mut duplicate = current.clone();
+        let extra = duplicate["hooks"]["Stop"][0].clone();
+        duplicate["hooks"]["Stop"].as_array_mut().unwrap().push(extra);
+        assert!(!hooks_are_current(&duplicate, exe), "duplicate managed handlers are drift");
+    }
+
+    #[test]
+    fn codex_registration_reports_globally_disabled_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let codex = root.path().join("custom-codex-home");
+        std::fs::create_dir(&codex).unwrap();
+        let exe = "/usr/bin/cfetch";
+        let (agents, _) = crate::markers::upsert("").unwrap();
+        std::fs::write(codex.join("AGENTS.md"), agents).unwrap();
+        let hooks = merge_for_exe(Value::Null, exe).unwrap();
+        std::fs::write(codex.join("hooks.json"), serde_json::to_string(&hooks).unwrap()).unwrap();
+        let config = codex_toml_with_mcp("[features]\nhooks = false\n", exe)
+            .unwrap()
+            .unwrap();
+        std::fs::write(codex.join("config.toml"), config).unwrap();
+        let issues = codex_registration_issues_at(&codex, exe).unwrap();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("features.hooks=false"));
     }
 
     #[test]
@@ -738,6 +825,16 @@ mod tests {
                 assert!(cmd.starts_with('\''), "{event}: {cmd}");
             }
         }
+    }
+
+    #[test]
+    fn arch_package_tracks_the_cargo_release_version() {
+        let pkgbuild = include_str!("../packaging/arch/PKGBUILD");
+        let declared = pkgbuild
+            .lines()
+            .find_map(|line| line.strip_prefix("pkgver="))
+            .expect("PKGBUILD has pkgver");
+        assert_eq!(declared, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

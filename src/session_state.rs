@@ -190,6 +190,24 @@ pub fn store(state_dir: &Path, session_id: &str, state: &SessionState) {
     gc(&dir, &path);
 }
 
+/// Lock-safe read/modify/write for hook processes that share one session.
+/// Contention is bounded: a missed advisory or cadence tick is preferable to
+/// stalling the agent or overwriting another hook's newer state.
+pub fn update<R>(
+    state_dir: &Path,
+    session_id: &str,
+    mutate: impl FnOnce(&mut SessionState) -> R,
+) -> Option<R> {
+    let dir = sessions_dir(state_dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let lock_path = dir.join(format!("{}.lock", sanitize(session_id)));
+    let _lock = crate::lockfile::acquire(&lock_path, 500, 0)?;
+    let mut state = load(state_dir, session_id);
+    let result = mutate(&mut state);
+    store(state_dir, session_id, &state);
+    Some(result)
+}
+
 fn gc(dir: &Path, keep: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let now = SystemTime::now();
@@ -232,6 +250,27 @@ mod tests {
         // escape did not consume the once-per-file budget.
         st.record_read("/a.rs", 200);
         assert!(st.should_warn_repeat_read("/a.rs", 200));
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_lose_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::sync::Arc::new(dir.path().to_path_buf());
+        let workers: Vec<_> = (0..24)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    update(&root, "shared", |state| {
+                        state.tool_events += 1;
+                    })
+                    .expect("lock acquired");
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(load(dir.path(), "shared").tool_events, 24);
     }
 
     #[test]

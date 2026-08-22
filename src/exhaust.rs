@@ -79,7 +79,12 @@ pub struct Exhaust {
 
 impl Exhaust {
     pub fn new(logs_dir: PathBuf, staging_dir: PathBuf, host: String, max_bytes: u64) -> Exhaust {
-        Exhaust { logs_dir, staging_dir, host, max_bytes }
+        Exhaust {
+            logs_dir,
+            staging_dir,
+            host,
+            max_bytes,
+        }
     }
 
     pub fn from_config(cfg: &Config) -> Exhaust {
@@ -140,11 +145,17 @@ impl Exhaust {
     ) -> anyhow::Result<()> {
         let session = event.session();
         let str_field = |key: &str| {
-            event.tool_input.as_ref().and_then(|i| i.get(key)).and_then(serde_json::Value::as_str)
+            event
+                .tool_input
+                .as_ref()
+                .and_then(|i| i.get(key))
+                .and_then(serde_json::Value::as_str)
         };
         match event.tool_name.as_deref() {
             Some("Bash") => {
-                let Some(cmd) = str_field("command") else { return Ok(()) };
+                let Some(cmd) = str_field("command") else {
+                    return Ok(());
+                };
                 let redacted = clamp(&redact_secrets(cmd), MAX_COMMAND_CHARS);
                 let norm = clamp(&normalize_command(&redacted), MAX_COMMAND_CHARS);
                 self.record(
@@ -162,7 +173,9 @@ impl Exhaust {
                 Ok(())
             }
             Some("Read") => {
-                let Some(path) = str_field("file_path") else { return Ok(()) };
+                let Some(path) = str_field("file_path") else {
+                    return Ok(());
+                };
                 self.record(session, "read", &file_payload(path))
             }
             _ => Ok(()),
@@ -172,8 +185,7 @@ impl Exhaust {
     /// Stop: writes one 'turn' summary event (counts by kind this session),
     /// then runs the 6->5 traps over the bounded window and stages what fires.
     pub fn record_stop(&self, session: &str) -> anyhow::Result<()> {
-        let window =
-            jsonl::read_tail(&self.logs_dir, STREAM, &self.host, TRAP_WINDOW_BYTES);
+        let window = jsonl::read_tail(&self.logs_dir, STREAM, &self.host, TRAP_WINDOW_BYTES);
 
         let mut counts = serde_json::Map::new();
         for r in &window.records {
@@ -181,7 +193,9 @@ impl Exhaust {
                 continue;
             }
             if matches!(r.kind(), "bash" | "write" | "read") {
-                let n = counts.entry(r.kind().to_string()).or_insert(serde_json::Value::from(0));
+                let n = counts
+                    .entry(r.kind().to_string())
+                    .or_insert(serde_json::Value::from(0));
                 *n = serde_json::Value::from(n.as_i64().unwrap_or(0) + 1);
             }
         }
@@ -243,7 +257,11 @@ impl Exhaust {
             }),
         };
         if staging::write(&self.staging_dir, &candidate)? {
-            self.record(session, "stage", &serde_json::json!({"id": id, "reason": "staging-full"}))?;
+            self.record(
+                session,
+                "stage",
+                &serde_json::json!({"id": id, "reason": "staging-full"}),
+            )?;
         }
         Ok(())
     }
@@ -255,7 +273,11 @@ impl Exhaust {
         let s = staging::stats(&self.staging_dir);
         ExhaustStats {
             staged_total: s.total as i64,
-            staged_by_reason: s.by_reason.into_iter().map(|(r, n)| (r, n as i64)).collect(),
+            staged_by_reason: s
+                .by_reason
+                .into_iter()
+                .map(|(r, n)| (r, n as i64))
+                .collect(),
             bytes: jsonl::footprint(&self.logs_dir, STREAM),
         }
     }
@@ -266,7 +288,9 @@ impl Exhaust {
 /// `tool_input.command`. Codex patches are rooted at the hook event's cwd, so
 /// relative paths are resolved before ring classification and capture.
 pub(crate) fn written_paths(event: &HookEvent) -> Vec<String> {
-    let Some(input) = event.tool_input.as_ref() else { return Vec::new() };
+    let Some(input) = event.tool_input.as_ref() else {
+        return Vec::new();
+    };
     match event.tool_name.as_deref() {
         Some("Write" | "Edit" | "MultiEdit") => input
             .get("file_path")
@@ -287,7 +311,9 @@ pub(crate) fn written_paths(event: &HookEvent) -> Vec<String> {
                 ]
                 .iter()
                 .find_map(|prefix| line.strip_prefix(prefix));
-                let Some(path) = path.filter(|path| !path.is_empty()) else { continue };
+                let Some(path) = path.filter(|path| !path.is_empty()) else {
+                    continue;
+                };
                 let resolved = if Path::new(path).is_absolute() {
                     PathBuf::from(path)
                 } else if let Some(cwd) = event.cwd.as_deref() {
@@ -368,8 +394,14 @@ fn bash_rows<'a>(records: &'a [Record]) -> Vec<BashRow<'a>> {
             Some(BashRow {
                 session: r.str("session"),
                 norm: p.get("norm")?.as_str()?,
-                command: p.get("command").and_then(|v| v.as_str()).unwrap_or_default(),
-                failed: p.get("failed").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                command: p
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                failed: p
+                    .get("failed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 ts: r.ts,
             })
         })
@@ -444,7 +476,9 @@ fn recurring_failure(host: &str, bash: &[BashRow<'_>], out: &mut Vec<Candidate>)
     let mut by_norm: std::collections::BTreeMap<&str, (Vec<&str>, &str, i64)> =
         std::collections::BTreeMap::new();
     for row in bash.iter().filter(|b| b.failed) {
-        let entry = by_norm.entry(row.norm).or_insert_with(|| (Vec::new(), row.command, row.ts));
+        let entry = by_norm
+            .entry(row.norm)
+            .or_insert_with(|| (Vec::new(), row.command, row.ts));
         if !entry.0.contains(&row.session) {
             entry.0.push(row.session);
         }
@@ -475,7 +509,9 @@ fn hot_files(session: &str, host: &str, writes: &[WriteRow<'_>], out: &mut Vec<C
     let mut by_path: std::collections::BTreeMap<&str, (Vec<&str>, usize, i64, i64)> =
         std::collections::BTreeMap::new();
     for w in writes.iter().filter(|w| (0..=3).contains(&w.ring)) {
-        let entry = by_path.entry(w.path).or_insert_with(|| (Vec::new(), 0, w.ring, w.ts));
+        let entry = by_path
+            .entry(w.path)
+            .or_insert_with(|| (Vec::new(), 0, w.ring, w.ts));
         if !entry.0.contains(&w.session) {
             entry.0.push(w.session);
         }
@@ -509,89 +545,152 @@ fn hot_files(session: &str, host: &str, writes: &[WriteRow<'_>], out: &mut Vec<C
 pub fn redact_secrets(cmd: &str) -> String {
     let mut out = String::with_capacity(cmd.len() + 16);
     let mut redact_next = false;
-    // How many more words to look through for the VALUE of a name we already
-    // decided is secret-shaped. Only `-flags` are looked through, and only a
-    // couple of them, so an armed redaction cannot wander into the next
-    // command.
-    let mut seeking_value = 0u8;
-    // The word before this one was a setter (`set`, `export`, `Set-Item`, …),
-    // possibly with flags in between.
+    let mut pending_assignment = false;
+    let mut seeking_setter_value = 0u8;
     let mut after_setter = false;
-    let mut prev_keyish = false;
-    let mut rest = cmd;
-    while !rest.is_empty() {
-        let ws_end = rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len());
-        out.push_str(&rest[..ws_end]);
-        rest = &rest[ws_end..];
-        if rest.is_empty() {
-            break;
-        }
-        let w_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let word = &rest[..w_end];
-        rest = &rest[w_end..];
-
+    let mut cursor = 0;
+    for (start, end) in shell_token_spans(cmd) {
+        out.push_str(&cmd[cursor..start]);
+        let word = &cmd[start..end];
+        let plain = unquote_shell_word(word);
         if redact_next {
             out.push_str(REDACTED);
             redact_next = false;
-            seeking_value = 0;
+            seeking_setter_value = 0;
             after_setter = false;
-            prev_keyish = false;
-            continue;
-        }
-        // Looking for the value of a name already judged secret-shaped: step
-        // over flags, redact the first real word.
-        if seeking_value > 0 {
-            if word.starts_with('-') {
-                seeking_value -= 1;
+            pending_assignment = false;
+        } else if seeking_setter_value > 0 {
+            if plain.starts_with('-') {
+                seeking_setter_value -= 1;
                 out.push_str(word);
-                continue;
+            } else {
+                out.push_str(REDACTED);
+                seeking_setter_value = 0;
+                after_setter = false;
             }
-            out.push_str(REDACTED);
-            seeking_value = 0;
-            after_setter = false;
-            prev_keyish = false;
-            continue;
-        }
-        // `NAME = value` — the spaced assignment every shell but POSIX uses.
-        if word == "=" && prev_keyish {
+            pending_assignment = false;
+        } else if pending_assignment && plain == "=" {
             out.push_str(word);
             redact_next = true;
+        } else {
+            pending_assignment = false;
+            if after_setter && !plain.contains('=') && keyish(&plain) {
+                out.push_str(word);
+                seeking_setter_value = 3;
+                cursor = end;
+                continue;
+            }
+            if is_setter(&plain) {
+                after_setter = true;
+                out.push_str(word);
+                cursor = end;
+                continue;
+            }
+            if after_setter && plain.starts_with('-') {
+                out.push_str(word);
+                cursor = end;
+                continue;
+            }
+            after_setter = false;
+            pending_assignment = !plain.contains('=') && keyish(&plain);
+            out.push_str(&redact_word(word, &mut redact_next));
+        }
+        cursor = end;
+    }
+    out.push_str(&cmd[cursor..]);
+    out
+}
+
+/// Shell-like token boundaries, including whitespace inside single/double
+/// quotes. This is intentionally not a command evaluator; it only prevents
+/// capture and read-hygiene code from splitting quoted values incorrectly.
+pub(crate) fn shell_token_spans(command: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut escaped = false;
+    for (idx, ch) in command.char_indices() {
+        if start.is_none() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            start = Some(idx);
+        }
+        if escaped {
+            escaped = false;
             continue;
         }
-        // A secret-shaped NAME introduced by a setter: fish's
-        // `set -x api_token …`, PowerShell's `Set-Item Env:\API_TOKEN -Value …`.
-        // Without this, every shell that assigns with SPACES walks straight
-        // through the KEY=value rule.
-        if after_setter && !word.contains('=') && keyish(word) {
-            out.push_str(word);
-            seeking_value = 3;
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
             continue;
         }
-        if is_setter(word) {
-            after_setter = true;
-            out.push_str(word);
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                spans.push((start.take().expect("token started"), idx));
+            }
+            None => {}
+        }
+    }
+    if let Some(start) = start {
+        spans.push((start, command.len()));
+    }
+    spans
+}
+
+pub(crate) fn shell_words(command: &str) -> Vec<String> {
+    shell_token_spans(command)
+        .into_iter()
+        .map(|(start, end)| unquote_shell_word(&command[start..end]))
+        .collect()
+}
+
+fn unquote_shell_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in word.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
             continue;
         }
-        // Flags do not end a setter clause: `set -gx NAME value`.
-        if after_setter && word.starts_with('-') {
-            out.push_str(word);
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
             continue;
         }
-        after_setter = false;
-        prev_keyish = !word.contains('=') && keyish(word);
-        out.push_str(&redact_word(word, &mut redact_next));
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => out.push(ch),
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None => out.push(ch),
+        }
+    }
+    if escaped {
+        out.push('\\');
     }
     out
 }
 
-/// Commands that introduce `NAME value` rather than `NAME=value`. Covers
-/// fish (`set`), POSIX (`export`, `declare`, `typeset`, `env`) and PowerShell
-/// (`Set-Item`, `Set-Variable`, `New-Variable`).
+/// Commands that introduce `NAME value` rather than `NAME=value`. The
+/// secret-shaped name remains the gate, so ordinary assignments stay visible.
 fn is_setter(word: &str) -> bool {
     matches!(
         word.to_ascii_lowercase().as_str(),
-        "set" | "setenv" | "export" | "declare" | "typeset" | "env" | "local"
-            | "set-item" | "set-variable" | "new-variable" | "si" | "sv"
+        "set"
+            | "setenv"
+            | "export"
+            | "declare"
+            | "typeset"
+            | "env"
+            | "local"
+            | "set-item"
+            | "set-variable"
+            | "new-variable"
+            | "si"
+            | "sv"
     )
 }
 
@@ -599,7 +698,17 @@ fn is_setter(word: &str) -> bool {
 /// redacting a harmless value is free, missing a secret is not.
 fn keyish(word: &str) -> bool {
     let w = word.trim_start_matches('-').to_ascii_lowercase();
-    ["token", "secret", "key", "pass", "pwd", "auth", "credential"].iter().any(|k| w.contains(k))
+    [
+        "token",
+        "secret",
+        "key",
+        "pass",
+        "pwd",
+        "auth",
+        "credential",
+    ]
+    .iter()
+    .any(|k| w.contains(k))
 }
 
 fn redact_word(word: &str, redact_next: &mut bool) -> String {
@@ -610,6 +719,17 @@ fn redact_word(word: &str, redact_next: &mut bool) -> String {
         && keyish(key)
     {
         return format!("{key}={REDACTED}");
+    }
+    // Header syntax, including `Authorization: Bearer ...`. A header name
+    // without an inline value redacts the following token.
+    if let Some((key, value)) = word.split_once(':')
+        && keyish(key.trim_matches(['\'', '"']))
+    {
+        if value.is_empty() {
+            *redact_next = true;
+            return word.to_string();
+        }
+        return format!("{key}:{REDACTED}");
     }
     // --password / --api-key style flags redact their next argument.
     if word.starts_with('-') && !word.contains('=') && keyish(word) {
@@ -702,11 +822,17 @@ fn is_jwtish(c: char) -> bool {
 /// Redacts `eyJ…`-led base64url runs of at least 20 chars (a bare JWT header
 /// is exactly 20) anywhere in the word, shorter lookalikes stay.
 fn redact_jwt_runs(s: &str) -> String {
-    let Some(start) = s.find("eyJ") else { return s.to_string() };
+    let Some(start) = s.find("eyJ") else {
+        return s.to_string();
+    };
     let tail = &s[start..];
     let run_len = tail.find(|c: char| !is_jwtish(c)).unwrap_or(tail.len());
     if run_len >= 20 {
-        format!("{}{REDACTED}{}", &s[..start], redact_jwt_runs(&tail[run_len..]))
+        format!(
+            "{}{REDACTED}{}",
+            &s[..start],
+            redact_jwt_runs(&tail[run_len..])
+        )
     } else {
         format!("{}{}", &s[..start + 3], redact_jwt_runs(&s[start + 3..]))
     }
@@ -719,7 +845,7 @@ pub fn normalize_command(cmd: &str) -> String {
     let mut tokens = Vec::new();
     for word in cmd.split_whitespace() {
         let lower = word.to_ascii_lowercase();
-        if lower.contains('/') {
+        if lower.contains('/') || lower.contains('\\') {
             tokens.push("<path>".to_string());
             continue;
         }
@@ -733,10 +859,13 @@ pub fn normalize_command(cmd: &str) -> String {
 /// secret-store path components): such paths are withheld at capture.
 pub fn secret_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    if lower.split('/').any(|c| matches!(c, "secrets" | ".ssh" | ".gnupg" | ".aws")) {
+    if lower
+        .split(['/', '\\'])
+        .any(|c| matches!(c, "secrets" | ".ssh" | ".gnupg" | ".aws"))
+    {
         return true;
     }
-    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
     base.contains("secret")
         || base.contains("credential")
         || base.contains("password")
@@ -799,14 +928,24 @@ fn tool_failed(event: &HookEvent) -> bool {
     if event.tool_error.as_ref().is_some_and(|v| !v.is_null()) {
         return true;
     }
-    let Some(obj) = event.tool_response.as_ref().and_then(serde_json::Value::as_object) else {
+    let Some(obj) = event
+        .tool_response
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
         return false;
     };
-    if obj.get("stderr").and_then(serde_json::Value::as_str).is_some_and(|s| !s.trim().is_empty())
+    if obj
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
     {
         return true;
     }
-    if ["tool_error", "error"].iter().any(|k| obj.get(*k).is_some_and(|v| !v.is_null())) {
+    if ["tool_error", "error"]
+        .iter()
+        .any(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
+    {
         return true;
     }
     ["is_error", "isError"]
@@ -816,63 +955,6 @@ fn tool_failed(event: &HookEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
-
-    /// Every shell but POSIX assigns with SPACES, and the KEY=value rule
-    /// walks straight past that. These are the forms that leaked before the
-    /// setter-aware pass — verified by running the old code, not assumed.
-    #[test]
-    fn secrets_assigned_with_spaces_are_redacted_in_every_shell() {
-        for (shell, cmd) in [
-            ("fish", "set -x api_token sk-live-abc"),
-            ("fish", "set -gx OPENAI_API_KEY sk-live-abc"),
-            ("fish", "set --export ANTHROPIC_AUTH_TOKEN sk-live-abc"),
-            ("powershell", "$env:API_TOKEN = \"sk-live-abc\""),
-            ("powershell", "Set-Item Env:\\API_TOKEN -Value sk-live-abc"),
-            ("powershell", "Set-Variable -Name api_secret -Value sk-live-abc"),
-            ("posix", "export api_token sk-live-abc"),
-            ("posix", "declare -x DB_PASSWORD hunter2"),
-        ] {
-            let got = redact_secrets(cmd);
-            assert!(!got.contains("sk-live-abc"), "{shell}: leaked in {got:?}");
-            assert!(!got.contains("hunter2"), "{shell}: leaked in {got:?}");
-        }
-    }
-
-    #[test]
-    fn the_forms_that_already_worked_still_work() {
-        for cmd in [
-            "export API_TOKEN=sk-live-abc",
-            "$env:API_TOKEN=\"sk-live-abc\"",
-            "curl --header \"x\" --api-key sk-live-abc",
-        ] {
-            assert!(!redact_secrets(cmd).contains("sk-live-abc"), "{cmd}");
-        }
-    }
-
-    #[test]
-    fn setting_a_harmless_variable_is_left_alone() {
-        // Over-redaction makes the exhaust useless for diagnosis, so the
-        // setter rule must fire on the NAME being secret-shaped, not on the
-        // setter itself.
-        for cmd in [
-            "set -x PATH /usr/local/bin",
-            "set -gx EDITOR nvim",
-            "export RUST_LOG=debug",
-            "env TZ=UTC date",
-        ] {
-            let got = redact_secrets(cmd);
-            assert_eq!(got, cmd, "needlessly redacted: {got:?}");
-        }
-    }
-
-    #[test]
-    fn an_armed_redaction_cannot_wander_into_the_next_command() {
-        // Only a couple of flags are stepped over; a name with no value must
-        // not swallow something far away.
-        let got = redact_secrets("set -x api_token -a -b -c -d -e echo hello");
-        assert!(got.contains("hello"), "wandered too far: {got:?}");
-    }
-
     use super::*;
     use serde_json::json;
 
@@ -899,7 +981,12 @@ mod tests {
 
     /// A second host writing into the SAME tree.
     fn peer(f: &Fixture, host: &str) -> Exhaust {
-        Exhaust::new(f.ex.logs_dir.clone(), f.ex.staging_dir.clone(), host.into(), 1 << 20)
+        Exhaust::new(
+            f.ex.logs_dir.clone(),
+            f.ex.staging_dir.clone(),
+            host.into(),
+            1 << 20,
+        )
     }
 
     fn bash_event(session: &str, cmd: &str, failed: bool) -> HookEvent {
@@ -923,7 +1010,9 @@ mod tests {
 
     impl Fixture {
         fn cap(&self, event: &HookEvent) {
-            self.ex.capture_post_tool(event, Path::new(BRAIN), &RingRules::default()).unwrap();
+            self.ex
+                .capture_post_tool(event, Path::new(BRAIN), &RingRules::default())
+                .unwrap();
         }
 
         fn stop(&self, session: &str) {
@@ -984,7 +1073,10 @@ mod tests {
         for r in &all[..3] {
             assert_eq!(r.value("payload").unwrap()["file_path"], WITHHELD);
         }
-        assert_eq!(all[3].value("payload").unwrap()["file_path"], "/home/x/src/main.rs");
+        assert_eq!(
+            all[3].value("payload").unwrap()["file_path"],
+            "/home/x/src/main.rs"
+        );
     }
 
     #[test]
@@ -994,7 +1086,9 @@ mod tests {
             session_id: Some("codex-session".into()),
             cwd: Some(BRAIN.into()),
             tool_name: Some("apply_patch".into()),
-            tool_input: Some(json!({"command": "*** Begin Patch\n*** Update File: knowledge/a.md\n*** Move to: knowledge/b.md\n*** Add File: /tmp/new.rs\n*** Delete File: mind/secrets/token.md\n*** End Patch"})),
+            tool_input: Some(
+                json!({"command": "*** Begin Patch\n*** Update File: knowledge/a.md\n*** Move to: knowledge/b.md\n*** Add File: /tmp/new.rs\n*** Delete File: mind/secrets/token.md\n*** End Patch"}),
+            ),
             ..Default::default()
         };
         f.cap(&event);
@@ -1035,14 +1129,19 @@ mod tests {
         let event = HookEvent {
             cwd: Some("/work".into()),
             tool_name: Some("apply_patch".into()),
-            tool_input: Some(json!({"command": "*** Update File: src/lib.rs\n*** Update File: src/lib.rs\nnot a header"})),
+            tool_input: Some(
+                json!({"command": "*** Update File: src/lib.rs\n*** Update File: src/lib.rs\nnot a header"}),
+            ),
             ..Default::default()
         };
         let paths = written_paths(&event);
         assert_eq!(paths.len(), 1);
         assert_eq!(
             Path::new(&paths[0]).components().collect::<Vec<_>>(),
-            Path::new("/work").join("src/lib.rs").components().collect::<Vec<_>>()
+            Path::new("/work")
+                .join("src/lib.rs")
+                .components()
+                .collect::<Vec<_>>()
         );
 
         let missing = HookEvent {
@@ -1086,10 +1185,14 @@ mod tests {
     fn long_commands_are_clamped_so_one_event_stays_one_short_line() {
         let f = fixture("h1");
         f.cap(&bash_event("s1", &"x".repeat(MAX_COMMAND_CHARS * 3), false));
-        let raw = std::fs::read_to_string(jsonl::stream_path(&f.ex.logs_dir, STREAM, "h1"))
-            .unwrap();
+        let raw =
+            std::fs::read_to_string(jsonl::stream_path(&f.ex.logs_dir, STREAM, "h1")).unwrap();
         assert_eq!(raw.lines().count(), 1);
-        assert!(raw.len() < 3 * MAX_COMMAND_CHARS, "line stayed small: {}", raw.len());
+        assert!(
+            raw.len() < 3 * MAX_COMMAND_CHARS,
+            "line stayed small: {}",
+            raw.len()
+        );
     }
 
     #[test]
@@ -1106,7 +1209,10 @@ mod tests {
         }
         let files = jsonl::stream_paths(&ex.logs_dir, STREAM);
         assert!(files.len() > 1, "the cap rotated the live file");
-        assert!(files.len() <= jsonl::MAX_ROTATIONS + 1, "at most 2 rotations are kept");
+        assert!(
+            files.len() <= jsonl::MAX_ROTATIONS + 1,
+            "at most 2 rotations are kept"
+        );
         for p in &files {
             assert!(
                 std::fs::metadata(p).unwrap().len() <= 1000 + 128,
@@ -1157,7 +1263,10 @@ mod tests {
         f.cap(&bash_event("s1", "cargo test", false));
         f.cap(&bash_event("s1", "cargo test", true));
         f.stop("s1");
-        assert!(f.staged().is_empty(), "success BEFORE failure is not a discovered fix");
+        assert!(
+            f.staged().is_empty(),
+            "success BEFORE failure is not a discovered fix"
+        );
     }
 
     #[test]
@@ -1181,15 +1290,29 @@ mod tests {
         let f = fixture("h1");
         for _ in 0..10 {
             f.cap(&file_event("s1", "Write", "/elsewhere/churn.rs"));
-            f.cap(&file_event("s1", "Write", "/b/agents/todo/active/x/STATUS.md"));
-            f.cap(&file_event("s1", "Write", "/b/agents/knowledge/hosts/server.md"));
+            f.cap(&file_event(
+                "s1",
+                "Write",
+                "/b/agents/todo/active/x/STATUS.md",
+            ));
+            f.cap(&file_event(
+                "s1",
+                "Write",
+                "/b/agents/knowledge/hosts/server.md",
+            ));
         }
         f.stop("s1");
         let staged = f.staged();
         assert_eq!(staged.len(), 1, "code and ring-4 working files never fire");
         assert_eq!(staged[0].reason, "hot-file");
-        assert_eq!(staged[0].payload["file_path"], "/b/agents/knowledge/hosts/server.md");
-        assert_eq!(staged[0].payload["ring"], 3, "the candidate carries the resolved ring");
+        assert_eq!(
+            staged[0].payload["file_path"],
+            "/b/agents/knowledge/hosts/server.md"
+        );
+        assert_eq!(
+            staged[0].payload["ring"], 3,
+            "the candidate carries the resolved ring"
+        );
         f.stop("s1");
         assert_eq!(f.staged().len(), 1, "the trap must be idempotent");
     }
@@ -1201,7 +1324,10 @@ mod tests {
             f.cap(&file_event("s1", "Write", "/b/agents/knowledge/one.md"));
         }
         f.stop("s1");
-        assert!(f.staged().is_empty(), "9 same-session writes are churn, not heat");
+        assert!(
+            f.staged().is_empty(),
+            "9 same-session writes are churn, not heat"
+        );
         f.cap(&file_event("s1", "Write", "/b/agents/knowledge/one.md"));
         f.stop("s1");
         assert_eq!(f.staged().len(), 1, "the 10th write crosses the threshold");
@@ -1212,13 +1338,20 @@ mod tests {
         let f = fixture("h1");
         f.cap(&file_event("s1", "Write", "/b/agents/knowledge/two.md"));
         f.stop("s1");
-        assert!(f.staged().is_empty(), "one session alone is no cross-session pattern");
+        assert!(
+            f.staged().is_empty(),
+            "one session alone is no cross-session pattern"
+        );
         f.cap(&file_event("s2", "Write", "/b/agents/knowledge/two.md"));
         f.stop("s2");
         assert_eq!(f.staged().len(), 1);
         f.stop("s2");
         f.stop("s1");
-        assert_eq!(f.staged().len(), 1, "the trap must be idempotent across sessions");
+        assert_eq!(
+            f.staged().len(),
+            1,
+            "the trap must be idempotent across sessions"
+        );
     }
 
     #[test]
@@ -1236,19 +1369,25 @@ mod tests {
         let f = fixture("h1");
         for s in ["s1", "s2"] {
             for p in [&quarantined, &promoted] {
-                f.ex
-                    .capture_post_tool(
-                        &file_event(s, "Write", &p.to_string_lossy()),
-                        brain.path(),
-                        &RingRules::default(),
-                    )
-                    .unwrap();
+                f.ex.capture_post_tool(
+                    &file_event(s, "Write", &p.to_string_lossy()),
+                    brain.path(),
+                    &RingRules::default(),
+                )
+                .unwrap();
             }
             f.stop(s);
         }
         let staged = f.staged();
-        assert_eq!(staged.len(), 1, "the ring-5 override quarantines, the ring-3 override admits");
-        assert_eq!(staged[0].payload["file_path"], promoted.to_string_lossy().as_ref());
+        assert_eq!(
+            staged.len(),
+            1,
+            "the ring-5 override quarantines, the ring-3 override admits"
+        );
+        assert_eq!(
+            staged[0].payload["file_path"],
+            promoted.to_string_lossy().as_ref()
+        );
         assert_eq!(staged[0].payload["ring"], 3);
     }
 
@@ -1258,8 +1397,16 @@ mod tests {
         // placeholder across two sessions: they must not merge into a fake hot
         // file (withheld payloads carry no ring).
         let f = fixture("h1");
-        f.cap(&file_event("s1", "Write", "/b/agents/knowledge/api-password.md"));
-        f.cap(&file_event("s2", "Write", "/b/agents/knowledge/db-password.md"));
+        f.cap(&file_event(
+            "s1",
+            "Write",
+            "/b/agents/knowledge/api-password.md",
+        ));
+        f.cap(&file_event(
+            "s2",
+            "Write",
+            "/b/agents/knowledge/db-password.md",
+        ));
         f.stop("s2");
         assert!(f.staged().is_empty());
     }
@@ -1275,7 +1422,10 @@ mod tests {
         assert!(staging::consume(&f.ex.staging_dir, &id).unwrap());
         f.ex.record_decision(&id, "consume").unwrap();
         f.stop("s2");
-        assert!(f.staged().is_empty(), "a consumed candidate must not come back");
+        assert!(
+            f.staged().is_empty(),
+            "a consumed candidate must not come back"
+        );
     }
 
     #[test]
@@ -1288,7 +1438,10 @@ mod tests {
         let id = f.staged()[0].id.clone();
         assert!(staging::dismiss(&f.ex.staging_dir, &id).unwrap());
         f.stop("s2");
-        assert!(f.staged().is_empty(), "the dismissed file is the tree-wide marker");
+        assert!(
+            f.staged().is_empty(),
+            "the dismissed file is the tree-wide marker"
+        );
         // …including for a different host writing the same pattern.
         let other = peer(&f, "host-beta");
         for s in ["s3", "s4"] {
@@ -1301,7 +1454,10 @@ mod tests {
                 .unwrap();
         }
         other.record_stop("s4").unwrap();
-        assert!(f.staged().is_empty(), "candidate ids are content-addressed, not per host");
+        assert!(
+            f.staged().is_empty(),
+            "candidate ids are content-addressed, not per host"
+        );
     }
 
     #[test]
@@ -1376,10 +1532,20 @@ mod tests {
         }
         ex.record_stop("s2").unwrap();
         let staged = staging::list(&ex.staging_dir);
-        assert_eq!(staged.len(), MAX_STAGED + 1, "the queue grew by exactly the notice");
-        assert_eq!(staged.iter().filter(|c| c.reason == "staging-full").count(), 1);
         assert_eq!(
-            staged.iter().filter(|c| c.reason == "hot-file" && c.session == "s2").count(),
+            staged.len(),
+            MAX_STAGED + 1,
+            "the queue grew by exactly the notice"
+        );
+        assert_eq!(
+            staged.iter().filter(|c| c.reason == "staging-full").count(),
+            1
+        );
+        assert_eq!(
+            staged
+                .iter()
+                .filter(|c| c.reason == "hot-file" && c.session == "s2")
+                .count(),
             0,
             "no new candidate is admitted past the cap"
         );
@@ -1397,7 +1563,10 @@ mod tests {
         let empty = f.ex.stats();
         assert_eq!(empty.staged_total, 0);
         assert_eq!(empty.bytes, 0);
-        assert!(!f.ex.logs_dir.exists(), "a reporting surface must never create ring-6 state");
+        assert!(
+            !f.ex.logs_dir.exists(),
+            "a reporting surface must never create ring-6 state"
+        );
 
         for s in ["s1", "s2"] {
             f.cap(&file_event(s, "Write", "/b/agents/knowledge/one.md"));
@@ -1408,7 +1577,10 @@ mod tests {
         assert_eq!(s.staged_total, 2);
         assert_eq!(
             s.staged_by_reason,
-            vec![("recurring-failure".to_string(), 1), ("hot-file".to_string(), 1)],
+            vec![
+                ("recurring-failure".to_string(), 1),
+                ("hot-file".to_string(), 1)
+            ],
             "reasons in trap order"
         );
         assert!(s.bytes > 0);
@@ -1423,19 +1595,64 @@ mod tests {
             ("AUTH_HEADER=Basic123", "AUTH_HEADER=<redacted>"),
             // --flag=value and --flag value style
             ("run --password=hunter2", "run --password=<redacted>"),
-            ("mysql --password hunter2 -h db", "mysql --password <redacted> -h db"),
+            (
+                "mysql --password hunter2 -h db",
+                "mysql --password <redacted> -h db",
+            ),
             ("curl --api-key sk-live-abc", "curl --api-key <redacted>"),
+            // Quoted values and PowerShell assignment syntax.
+            (
+                "export API_TOKEN=\"value with spaces\"",
+                "export API_TOKEN=<redacted>",
+            ),
+            (
+                "$env:API_TOKEN = \"totally-fake-password-12345\"",
+                "$env:API_TOKEN = <redacted>",
+            ),
+            (
+                "set -x api_token sk-live-abc",
+                "set -x api_token <redacted>",
+            ),
+            (
+                "set -gx OPENAI_API_KEY sk-live-abc",
+                "set -gx OPENAI_API_KEY <redacted>",
+            ),
+            (
+                "Set-Item Env:\\API_TOKEN -Value sk-live-abc",
+                "Set-Item Env:\\API_TOKEN -Value <redacted>",
+            ),
+            (
+                "Set-Variable -Name api_secret -Value sk-live-abc",
+                "Set-Variable -Name api_secret -Value <redacted>",
+            ),
+            (
+                "declare -x DB_PASSWORD hunter2",
+                "declare -x DB_PASSWORD <redacted>",
+            ),
+            (
+                "curl -H 'Authorization: Bearer totally-fake-token' https://example.com",
+                "curl -H 'Authorization:<redacted> https://example.com",
+            ),
             // URL userinfo
             (
                 "git clone https://user:hunter2@github.com/x/y.git",
                 "git clone https://<redacted>@github.com/x/y.git",
             ),
             // JWT
-            ("echo eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcDEF123", "echo <redacted>"),
+            (
+                "echo eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcDEF123",
+                "echo <redacted>",
+            ),
             // 32+ hex run
-            ("verify deadbeefdeadbeefdeadbeefdeadbeef", "verify <redacted>"),
+            (
+                "verify deadbeefdeadbeefdeadbeefdeadbeef",
+                "verify <redacted>",
+            ),
             // 32+ mixed-case base64 run
-            ("echo VGhpc0lzQVNlY3JldFZhbHVlMTIzNDU2Nzg5MA==", "echo <redacted>"),
+            (
+                "echo VGhpc0lzQVNlY3JldFZhbHVlMTIzNDU2Nzg5MA==",
+                "echo <redacted>",
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(redact_secrets(input), want, "input: {input}");
@@ -1457,13 +1674,28 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_setter_does_not_redact_a_later_command() {
+        let got = redact_secrets("set -x api_token -a -b -c -d -e echo hello");
+        assert!(
+            got.contains("hello"),
+            "setter state wandered too far: {got:?}"
+        );
+    }
+
+    #[test]
     fn normalization_matches_across_noise() {
-        assert_eq!(normalize_command("CARGO  TEST --lib"), normalize_command("cargo test --lib"));
+        assert_eq!(
+            normalize_command("CARGO  TEST --lib"),
+            normalize_command("cargo test --lib")
+        );
         assert_eq!(
             normalize_command("bash /tmp/a/b.sh 42"),
             normalize_command("bash /opt/c/d.sh 7")
         );
-        assert_eq!(normalize_command("git checkout deadbeefcafe1234"), "git checkout <hex>");
+        assert_eq!(
+            normalize_command("git checkout deadbeefcafe1234"),
+            "git checkout <hex>"
+        );
         assert_eq!(normalize_command("retry attempt 12"), "retry attempt n");
     }
 
@@ -1477,12 +1709,18 @@ mod tests {
             "/home/x/my-password-list.md",
             "cert.pem",
             "/home/x/.ssh/config",
+            r"C:\Users\alice\.ssh\config",
+            r"C:\repo\secrets\token.txt",
             "/home/x/id_ed25519",
             "/srv/deploy/terraform.tfstate",
         ] {
             assert!(secret_path(yes), "must be withheld: {yes}");
         }
-        for no in ["/home/x/src/main.rs", "/home/x/keyboard.md", "notes/envelope-budget.md"] {
+        for no in [
+            "/home/x/src/main.rs",
+            "/home/x/keyboard.md",
+            "notes/envelope-budget.md",
+        ] {
             assert!(!secret_path(no), "must pass through: {no}");
         }
     }

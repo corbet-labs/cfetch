@@ -5,6 +5,19 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Authenticated iroh transport.** Invites now carry the origin's real iroh
+  endpoint address, remote redemption binds a grant to the QUIC-authenticated
+  joining endpoint, and `recall --slice` plus citation expansion route through
+  the joining daemon without persisting the one-time secret. Citation results
+  are filtered against the granted slice before they cross the network.
+- **Pre-1.0 release lock.** The crate build, blocking CI, and release preflight
+  all reject a 1.x package version. A release tag must also match Cargo.toml.
+  The lock stays in place until the operator explicitly authorizes 1.0.
+- **Codex output condensation.** Oversized Bash listings now use Codex's
+  PostToolUse model-feedback replacement path instead of adding a second copy
+  as context. The complete original is preserved in private local state and
+  linked from the condensed result; test and build output remains untouched.
+
 - **Engine selection.** A variant is now a Cargo feature selection rather
   than a source fork: which engines are compiled in is a build-time fact,
   which device to use is a run-time one, and `cfetch hardware` reports both

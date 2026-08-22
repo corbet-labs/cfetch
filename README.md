@@ -173,6 +173,13 @@ leave your own settings untouched, and `cfetch install --remove` takes exactly
 ours back out. Restart the agent after changing MCP configuration so its tool
 inventory is rebuilt.
 
+On Codex, completed oversized Bash listings are structurally condensed before
+their result enters the next model turn. Build and test output is never
+rewritten. The full original is kept as a private file under
+`$CFETCH_STATE_DIR/condensed-output/` (or the default local state directory),
+with mode `0600` on Unix, and the condensed result carries its exact path.
+Claude events never receive Codex's `continue:false` replacement signal.
+
 ## Configuration
 
 `~/.config/cfetch/config.json` (all keys optional; partial files merge over
@@ -441,6 +448,26 @@ $ cfetch recall --slice hosts backup
   without a rescan.
 - With no slices configured, nothing changes — the whole tree is one implicit
   slice.
+
+To share one, enable serving on the origin and keep its daemon running:
+
+```console
+origin$ cfetch invite hosts --mode ro
+cfetch-invite-2:...
+
+peer$ cfetch join 'cfetch-invite-2:...'
+peer$ cfetch recall --slice hosts backup
+```
+
+The ticket contains the origin's authenticated iroh endpoint address and a
+one-time secret. The origin stores only the secret hash; the peer stores only
+the successfully joined route. QUIC supplies the peer identity used to bind
+and check the grant, so an endpoint id claimed inside a request is never
+trusted. A ticket can still be redeemed locally when both hosts share the
+same tree; otherwise the running daemons exchange the same line-JSON query
+protocol over iroh. A slice grant permits `recall`, citation expansion,
+generation and checksum reads for that slice only—host control and unscoped
+code-index operations are refused.
 
 ### Reranking (`rerank`)
 
