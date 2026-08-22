@@ -21,120 +21,164 @@
 
 use std::path::{Path, PathBuf};
 
-/// One created directory and the README that explains it. The README is the
-/// point: a directory whose purpose is only recorded in a distant tool's
-/// source is a directory people put the wrong things in.
+/// One directory in the standard tree.
+///
+/// `reserved` names are documented in the README but never created: a rule
+/// keys on each of them, so the rule has to be visible where someone would
+/// look for it, while creating the directory would prescribe a workflow
+/// nobody asked for.
 struct Dir {
     name: &'static str,
     readme: &'static str,
+    children: &'static [&'static str],
+    reserved: &'static [(&'static str, &'static str)],
 }
 
-/// Top-level directories. Order is the order they are reported in.
 const DIRS: &[Dir] = &[
     Dir {
         name: "knowledge",
+        children: &["decisions", "people", "projects", "hosts", "world", "vocabulary"],
+        reserved: &[("archive", "retired knowledge: indexed, held out of ordinary recall")],
         readme: "\
 # knowledge
 
 What is true, by subject. Ring 3 — recallable, never injected unasked.
 
-Subdirectories are yours: one per subject you actually have. Nothing here is
-created for you, because a subject list is a description of a life.
+- `decisions/` — why things are the way they are. The question agents ask most
+  and can answer least: a decision recorded only in the thread that made it is
+  a decision nobody can revisit without re-arguing it.
+- `people/` — who is involved, and what they need.
+- `projects/` — per-project knowledge that outlives any one task.
+- `hosts/` — machines you operate.
+- `world/` — external services and vendors: what is true about someone else's
+  system.
+- `vocabulary/` — the terms an agent must use correctly. The cheapest fix
+  there is for a whole class of repeated error: a word used loosely once is
+  used loosely for the rest of the session.
 
-Reserved name: `archive/` — retired knowledge. Kept for provenance, and held
-out of ordinary recall, so a superseded decision cannot answer a question as
-though it were current.
+Add subjects freely; these are the ones worth having before you have any.
+
+Reserved: `archive/` — retired knowledge. Indexed, but held out of ordinary
+recall, so a superseded decision cannot answer a question as though it were
+current.
 ",
     },
     Dir {
         name: "mind",
+        children: &["memories", "skills", "tools", "identities", "policy"],
+        reserved: &[("secrets", "never indexed, recalled or injected, at ANY configuration")],
         readme: "\
 # mind
 
-How to behave, and what grants access.
+How to behave, who you are, and what grants access.
 
 - `memories/` — distilled behaviour, ring 2. `memories/MEMORY.md` is the index
-  and is ring 1: it is read every session, so it is the one file whose size is
-  a standing cost.
-- `secrets/` — RESERVED. Never indexed, never recalled, never injected, at any
-  configuration. cfetch refuses this prefix rather than merely defaulting to
+  and is ring 1: read every session, so its size is a standing cost.
+- `skills/` — procedures, written to be followed.
+- `tools/` — executables. Keep build artifacts out: a `target/` directory here
+  is indexed as prose and poisons retrieval for everyone.
+- `identities/` — who the agent acts as, and who the operator is to a service.
+- `secrets/` — RESERVED. Never indexed, recalled or injected, at ANY
+  configuration: cfetch refuses this prefix rather than merely defaulting to
   skipping it.
-- `skills/`, `tools/`, `config/` — procedures and executables. Recallable.
-
-Subdirectories beyond those are yours.
+- `policy/` — standing conventions, declared rather than learned: where memory
+  lives, how each agent client is wired, what is never done. `memories/` is
+  case law; this is the constitution. Named for ring 1 rather than \"config\",
+  because machine-readable tool settings live in `.cfetch/` and two things
+  called config is the confusion this tree exists to remove.
 ",
     },
     Dir {
         name: "todo",
+        children: &["active", "backlog", "blocked", "done"],
+        reserved: &[
+            ("scratch", "never indexed: high-volume disposable working files"),
+            ("staging", "never indexed: ring-5 candidates awaiting distillation"),
+        ],
         readme: "\
 # todo
 
 Work state. Ring 4 — the current task, not the finished record.
 
-Lanes are yours: whatever you actually move work through.
+- `active/` — work in progress. `active/<task>/STATUS.md` is a convention
+  cfetch keys on: a session that writes to the tree without touching one is
+  reminded that it has not.
+- `backlog/`, `blocked/`, `done/` — the rest of the lifecycle.
 
-Reserved name: `scratch/` — high-volume disposable working files. NEVER
-indexed. Without this exclusion a scratch directory drowns the ring it shares:
-a real tree measured 12,276 scratch files against 27 files of live task state,
-and every query paid for the ratio.
+Two reserved lanes are never indexed. `scratch/` is disposable working
+material — without the exclusion it drowns the ring it shares, measured at
+12,276 scratch files against 27 files of live task state. `staging/` holds
+ring-5 candidates: captured, quarantined, and promoted only by a deliberate
+act. Both are quarantined by LOCATION, so a file whose frontmatter was
+stripped or hand-edited is still quarantined.
 ",
     },
     Dir {
         name: "logs",
+        children: &["audits"],
+        reserved: &[],
         readme: "\
 # logs
 
-Ring 6: raw exhaust, per agent client. Never injected, never committed.
+Ring 6: raw exhaust. Never injected, never committed.
 
-One subdirectory per client you run — `claude/`, `codex/`, `gemini/`, and so
-on. Which ones exist is yours; the shape is the standard, so that a question
-like \"which client costs least for this work\" has one answer across machines.
+- One directory per agent client you run — `claude/`, `codex/`, `gemini/`, and
+  so on. Which exist is yours; the shape is the standard, so a question like
+  \"which client costs least for this work\" has one answer across machines.
+- `audits/` — periodic findings, distinct from per-session exhaust: an audit
+  is a conclusion, a transcript is evidence.
+- `cfetch/` — this tool's own exhaust and injection ledger.
 
-Transcripts may embed plaintext secrets. This directory is excluded from git
-by the .gitignore written alongside it, and exclusion means \"no history\", not
-\"no backup\".
-",
-    },
-    Dir {
-        name: "staging",
-        readme: "\
-# staging
-
-Ring 5: candidates awaiting distillation.
-
-Written by cfetch when a capture looks worth keeping. Never recallable and
-never injected — the LOCATION decides that, so a candidate whose frontmatter
-was stripped or hand-edited is still quarantined.
-
-Promotion out of here is a deliberate act. Nothing is promoted automatically.
+Transcripts may embed plaintext secrets verbatim. Excluded from git by the
+.gitignore written alongside, and exclusion means \"no history\", not \"no
+backup\".
 ",
     },
     Dir {
         name: "state",
+        children: &[],
+        reserved: &[],
         readme: "\
 # state
 
 No ring: nothing here is a statement, so nothing here can be recalled,
-injected, or contradict anything. Derived artifacts that are expensive enough
-to share but are not the record.
+injected, or contradict anything.
 
-Vector embeddings live here, keyed by content hash, so a document is embedded
-once per storage group rather than once per machine. Delete any of it and it
-rebuilds; the markdown is the truth.
+Derived artifacts expensive enough to share but which are not the record —
+vector embeddings keyed by content hash, so a document is embedded once per
+storage group rather than once per machine. Namespaced by tool (`cfetch/`).
 
-Not committed: it is derived, and it is large.
+Delete any of it and it rebuilds. The markdown is the truth.
+",
+    },
+    Dir {
+        name: ".cfetch",
+        children: &[],
+        reserved: &[],
+        readme: "\
+# .cfetch
+
+Machine-readable tool configuration: ring rules, slices, endpoints.
+
+Hidden on purpose, and for two reasons. The walker skips hidden paths, so
+nothing here is indexed without a rule having to say so. And it sits beside
+`.git/` and `.obsidian/` — tool-owned, tool-written, not something to browse.
+
+Config DECLARES; it does not contain. A resident entry names a visible file
+and assigns it a ring; the ring-0 text itself lives in the tree where it can
+be read and edited. Anything here that would be worth recalling is in the
+wrong place — prose conventions belong in `mind/config/`.
 ",
     },
 ];
 
-/// Subdirectory names a rule already keys on. Documented in the parent's
-/// README, never created — a reserved name costs nothing while unused, and
-/// creating it would prescribe a workflow.
-pub const RESERVED: &[(&str, &str)] = &[
-    ("mind/secrets", "never indexed at any configuration"),
-    ("todo/scratch", "never indexed: high-volume disposable working files"),
-    ("knowledge/archive", "indexed, held out of ordinary recall"),
-];
+/// Every reserved name, as `("parent/child", why)`. Derived from the table so
+/// the list cfetch reports and the list its READMEs document cannot drift.
+pub fn reserved() -> Vec<(String, &'static str)> {
+    DIRS.iter()
+        .flat_map(|d| d.reserved.iter().map(move |(c, why)| (format!("{}/{c}", d.name), *why)))
+        .collect()
+}
 
 const GITIGNORE: &str = "\
 # Written by `cfetch init`. Exclusion here means \"no history\", not \"no backup\":
@@ -146,27 +190,31 @@ const GITIGNORE: &str = "\
 # Derived, and large. Rebuilt from the markdown at any time.
 /state/
 
-# Ring 5. Candidates are working material, not record — they graduate into the
-# tree by a deliberate promotion, and until then they are not history.
-/staging/
+# Ring 5 candidates and disposable working material. Both are working
+# material, not record: they graduate into the tree by a deliberate promotion,
+# and until then they are not history.
+/todo/staging/
+/todo/scratch/
 ";
 
 const ROOT_README: &str = "\
 # The brain
 
 A markdown tree that agents read, write and recall from. The markdown IS the
-record: everything cfetch derives from it — indexes, embeddings, graphs — is a
-cache that can be deleted and rebuilt.
+record: everything derived from it — indexes, embeddings, graphs — is a cache
+that can be deleted and rebuilt.
 
-Privilege runs by ring: 0 and 1 are operator invariants and policy, 2 is
+Privilege runs by ring. 0 and 1 are operator invariants and policy, 2 is
 distilled behaviour, 3 is knowledge, 4 is work state, 5 is unpromoted
 candidates, 6 is raw exhaust. A lower ring wins a contradiction, and the ring
 of a statement is visible in the citation that carries it.
 
-The top-level directories are a standard, so that a slice shared with someone
-else means the same thing on both ends. What goes inside them is yours.
+The top-level directories and the subdirectories listed in each README are a
+STANDARD: they are what a ring rule, a slice and a grant each name, so unless
+they mean the same thing on every machine none of those three is portable
+between people. What you add beside them is yours.
 
-By convention `projects/` holds code, and is excluded from the prose index —
+By convention `projects/` holds code and is excluded from the prose index —
 source is reached through `cfetch find`, which reads symbols, not paragraphs.
 ";
 
@@ -190,6 +238,12 @@ pub fn run(root: &Path) -> anyhow::Result<Created> {
         std::fs::create_dir_all(&path)?;
         created.dirs.push((dir.name.to_string(), fresh));
         created.files.push(write_if_absent(&path.join("README.md"), dir.readme)?);
+        for child in dir.children {
+            let child_path = path.join(child);
+            let fresh = !child_path.exists();
+            std::fs::create_dir_all(&child_path)?;
+            created.dirs.push((format!("{}/{child}", dir.name), fresh));
+        }
     }
     created.files.push(write_if_absent(&root.join("README.md"), ROOT_README)?);
     created.files.push(write_if_absent(&root.join(".gitignore"), GITIGNORE)?);
@@ -219,7 +273,8 @@ mod tests {
     fn every_top_level_directory_gets_a_readme_naming_its_ring_or_its_rule() {
         let dir = tempfile::tempdir().unwrap();
         let out = run(dir.path()).unwrap();
-        assert_eq!(out.dirs.len(), DIRS.len());
+        let expected: usize = DIRS.len() + DIRS.iter().map(|d| d.children.len()).sum::<usize>();
+        assert_eq!(out.dirs.len(), expected, "every top-level dir and canonical child is reported");
         for d in DIRS {
             let readme = dir.path().join(d.name).join("README.md");
             assert!(readme.exists(), "{} has no README", d.name);
@@ -239,7 +294,7 @@ mod tests {
     fn the_created_tree_covers_every_directory_the_default_rules_name() {
         let dir = tempfile::tempdir().unwrap();
         run(dir.path()).unwrap();
-        for named in ["mind", "todo", "staging", "logs", "knowledge", "state"] {
+        for named in ["mind", "todo", "logs", "knowledge", "state"] {
             assert!(dir.path().join(named).is_dir(), "{named} is named by a rule but not created");
         }
     }
@@ -251,11 +306,27 @@ mod tests {
     fn reserved_subdirectories_are_documented_but_not_created() {
         let dir = tempfile::tempdir().unwrap();
         run(dir.path()).unwrap();
-        for (path, _) in RESERVED {
-            assert!(!dir.path().join(path).exists(), "{path} must not be created");
+        for (path, _) in reserved() {
+            assert!(!dir.path().join(&path).exists(), "{path} must not be created");
             let (parent, child) = path.split_once('/').unwrap();
             let readme = std::fs::read_to_string(dir.path().join(parent).join("README.md")).unwrap();
             assert!(readme.contains(child), "{parent}/README.md never mentions {child}");
+        }
+    }
+
+    /// A canonical child that no README mentions is a directory people will
+    /// put the wrong things in, which is the failure this whole table exists
+    /// to prevent.
+    #[test]
+    fn every_canonical_child_is_created_and_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path()).unwrap();
+        for d in DIRS {
+            let readme = std::fs::read_to_string(dir.path().join(d.name).join("README.md")).unwrap();
+            for child in d.children {
+                assert!(dir.path().join(d.name).join(child).is_dir(), "{}/{child} missing", d.name);
+                assert!(readme.contains(child), "{}/README.md never mentions {child}", d.name);
+            }
         }
     }
 

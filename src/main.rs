@@ -1376,7 +1376,7 @@ fn init_cmd(path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
         println!("  {} {name}", if *written { "wrote  " } else { "kept   " });
     }
     println!("\nreserved, not created — a rule keys on each of these if it ever exists:");
-    for (name, why) in init::RESERVED {
+    for (name, why) in init::reserved() {
         println!("  {name}  — {why}");
     }
     Ok(())
