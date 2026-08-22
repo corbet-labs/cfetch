@@ -12,6 +12,12 @@
 //! an n-call session are re-read by every later call, so their effective
 //! cost is ~n times their size in cache reads. `cost_weight` encodes that;
 //! raw token counts mis-rank waste.
+//!
+//! That weighting assumes the prefix stays cached. When it does not, the
+//! whole conversation is paid for again at once, so the report also names
+//! every prompt-cache rebuild in the newest transcript and what changed at
+//! that boundary — including "unattributed", which is where the recoverable
+//! money usually hides.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +32,9 @@ pub const WINDOW_DAYS: u64 = 14;
 pub const CLAUDE_MD_WARN_LINES: usize = 200;
 /// The ledger source label the resident digest is booked under (hooks.rs).
 const RESIDENT_SOURCE: &str = "resident-digest";
+/// Rebuilds listed individually before the report switches to a remainder
+/// count. Every one of them stays in the JSON.
+const REBUILD_ROWS: usize = 10;
 
 /// Every path the audit reads, overridable so tests run against a fabricated
 /// home directory instead of the operator's real one.
@@ -119,6 +128,42 @@ pub struct RecurringCost {
     pub recurring_tokens_estimated: u64,
 }
 
+/// One prompt-cache prefix rebuild, priced and attributed.
+#[derive(Debug, Serialize)]
+pub struct RebuildRow {
+    pub call_index: u64,
+    pub cache_creation_tokens: u64,
+    pub prior_context_tokens: u64,
+    /// Gap since the previous call; absent when the transcript carried no
+    /// usable stamp.
+    pub idle_secs: Option<u64>,
+    pub cause: String,
+    /// Every signal present at the boundary. More than one means the single
+    /// cause above is a ranked choice, not a deduction.
+    pub signals: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CauseTotal {
+    pub cause: String,
+    pub rebuilds: usize,
+    pub tokens: u64,
+}
+
+/// Prefix rebuilds in ONE session: the newest transcript. The ledger books
+/// cumulative counters per turn, not the per-call cache split a rebuild is
+/// visible in, so this is a single-session reading and the report says so.
+#[derive(Debug, Serialize)]
+pub struct RebuildCost {
+    pub transcript: String,
+    pub api_calls: u64,
+    pub rebuilds: Vec<RebuildRow>,
+    /// Cache-creation tokens re-paid by those rebuilds.
+    pub tokens: u64,
+    /// Per-cause totals in precedence order; only non-empty buckets appear.
+    pub by_cause: Vec<CauseTotal>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuditReport {
     pub window_days: u64,
@@ -136,6 +181,9 @@ pub struct AuditReport {
     /// injected" — a bill of zero is only credible while the meter runs.
     pub hooks_unobserved: Vec<String>,
     pub hooks_registered: usize,
+    /// `None` = no transcript, or one whose per-call cache counters could not
+    /// be read; the reason is then a measurement gap below.
+    pub rebuilds: Option<RebuildCost>,
     /// Explicit measurement gaps — what this audit could NOT see.
     pub gaps: Vec<String>,
 }
@@ -304,14 +352,13 @@ pub fn build(
     };
 
     let mut gaps = Vec::new();
-    if crate::transcript::newest_transcript_among(&[
+    let newest_transcript = crate::transcript::newest_transcript_among(&[
         (agent_session::AGENT_CLAUDE, paths.transcripts_root.clone()),
         (agent_session::AGENT_CODEX, paths.codex_transcripts_root.clone()),
         (agent_session::AGENT_GEMINI, paths.gemini_transcripts_root.clone()),
         (agent_session::AGENT_CURSOR, paths.cursor_transcripts_root.clone()),
-    ])
-    .is_none()
-    {
+    ]);
+    if newest_transcript.is_none() {
         gaps.push(format!(
             "no supported transcripts found under {}, {}, {}, or {} — delivery and usage cannot be verified",
             paths.transcripts_root.display(),
@@ -320,6 +367,19 @@ pub fn build(
             paths.cursor_transcripts_root.display()
         ));
     }
+    // Prefix rebuilds are read from the transcript, not the ledger: the
+    // per-call cache split a rebuild shows up in is flattened into cumulative
+    // counters by the time it is booked.
+    let rebuilds = newest_transcript.as_ref().and_then(|path| {
+        let found = crate::transcript::cache_rebuilds(path);
+        if found.is_none() {
+            gaps.push(format!(
+                "prefix rebuilds are not attributable in {} — no per-call cache counters recognized",
+                path.display()
+            ));
+        }
+        found.map(|found| rebuild_cost(path, &found))
+    });
     if measured_sessions == 0 {
         gaps.push(format!(
             "no measured usage booked in the last {WINDOW_DAYS} days — every token figure here is a chars/3.5 estimate"
@@ -350,7 +410,45 @@ pub fn build(
         recurring,
         hooks_unobserved,
         hooks_registered: hooks.registered_count(),
+        rebuilds,
         gaps,
+    }
+}
+
+/// Prices one transcript's rebuilds. Buckets follow the cause precedence, so
+/// they sum to the rebuild count exactly once each — a rebuild with several
+/// coincident signals is counted under its ranked cause and keeps the others
+/// in its own row.
+fn rebuild_cost(path: &Path, found: &crate::transcript::CacheRebuilds) -> RebuildCost {
+    let by_cause = crate::transcript::RebuildCause::ALL
+        .iter()
+        .filter_map(|cause| {
+            let matching: Vec<_> =
+                found.rebuilds.iter().filter(|r| r.cause() == *cause).collect();
+            (!matching.is_empty()).then(|| CauseTotal {
+                cause: cause.label().to_string(),
+                rebuilds: matching.len(),
+                tokens: matching.iter().map(|r| r.cache_creation_tokens).sum(),
+            })
+        })
+        .collect();
+    RebuildCost {
+        transcript: path.display().to_string(),
+        api_calls: found.api_calls,
+        rebuilds: found
+            .rebuilds
+            .iter()
+            .map(|r| RebuildRow {
+                call_index: r.call_index,
+                cache_creation_tokens: r.cache_creation_tokens,
+                prior_context_tokens: r.prior_context_tokens,
+                idle_secs: r.idle_secs,
+                cause: r.cause().label().to_string(),
+                signals: r.signals.iter().map(|s| s.label().to_string()).collect(),
+            })
+            .collect(),
+        tokens: found.tokens(),
+        by_cause,
     }
 }
 
@@ -465,6 +563,65 @@ pub fn render(r: &AuditReport) -> String {
                 w,
                 "  resident digest recurring cost: unavailable — needs both booked digest injections and measured api calls"
             );
+        }
+    }
+
+    let _ = writeln!(
+        w,
+        "\nprompt-cache prefix rebuilds (newest session transcript only; a rebuild is >= {} cache-creation tokens AND >= 30% of the previous call's context):",
+        crate::transcript::REBUILD_MIN_CACHE_CREATION
+    );
+    match &r.rebuilds {
+        None => {
+            let _ = writeln!(
+                w,
+                "  unavailable — no transcript with per-call cache counters (see measurement gaps)"
+            );
+        }
+        Some(rb) => {
+            let _ = writeln!(w, "  {}", rb.transcript);
+            if rb.rebuilds.is_empty() {
+                let _ = writeln!(
+                    w,
+                    "  no rebuilds across {} api call(s) — the prefix held",
+                    rb.api_calls
+                );
+            } else {
+                let _ = writeln!(
+                    w,
+                    "  {} rebuild(s) across {} api call(s) re-created {} cache-creation tokens",
+                    rb.rebuilds.len(),
+                    rb.api_calls,
+                    rb.tokens
+                );
+                for c in &rb.by_cause {
+                    let _ = writeln!(w, "    {}: {} rebuild(s), {} tokens", c.cause, c.rebuilds, c.tokens);
+                }
+                for row in rb.rebuilds.iter().take(REBUILD_ROWS) {
+                    let also = if row.signals.len() > 1 {
+                        format!(" (also {})", row.signals[1..].join(", "))
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(
+                        w,
+                        "  call {}: {} tokens re-created over a {}-token context{} — {}{}",
+                        row.call_index,
+                        row.cache_creation_tokens,
+                        row.prior_context_tokens,
+                        match row.idle_secs {
+                            Some(s) if s >= 120 => format!(", {} min since the previous call", s / 60),
+                            Some(s) => format!(", {s}s since the previous call"),
+                            None => String::new(),
+                        },
+                        row.cause,
+                        also
+                    );
+                }
+                if rb.rebuilds.len() > REBUILD_ROWS {
+                    let _ = writeln!(w, "  ... and {} more", rb.rebuilds.len() - REBUILD_ROWS);
+                }
+            }
         }
     }
 
@@ -686,10 +843,17 @@ mod tests {
         assert!(text.contains("measurement gap"));
         assert!(text.contains("no supported transcripts found"));
 
-        // With a transcript present and measured usage booked, the gaps close.
-        let proj = p.transcripts_root.join("-home-x");
-        std::fs::create_dir_all(&proj).unwrap();
-        std::fs::write(proj.join("s1.jsonl"), "{}").unwrap();
+        // With a transcript present and measured usage booked, the gaps
+        // close. The transcript has to carry real per-call counters: a stub
+        // file is a transcript the audit cannot read, which is itself a gap.
+        transcript(
+            &p,
+            "s1.jsonl",
+            &[
+                call("m1", "model-a", "2026-08-20T10:00:00.000Z", 1_000, 0),
+                call("m2", "model-a", "2026-08-20T10:00:30.000Z", 1_040, 0),
+            ],
+        );
         let mut l = Ledger::default();
         l.sessions.insert(
             "s1".into(),
@@ -702,6 +866,101 @@ mod tests {
         let r = build(&p, &l, &all_reporting(), 6000, NOW);
         assert!(r.gaps.is_empty(), "gaps must close when data exists: {:?}", r.gaps);
         assert!(render(&r).contains("none"));
+    }
+
+    /// Writes a transcript into the fabricated home's Claude root.
+    fn transcript(p: &AuditPaths, name: &str, lines: &[String]) {
+        let proj = p.transcripts_root.join("-home-x");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(name), lines.join("\n")).unwrap();
+    }
+
+    fn call(id: &str, model: &str, stamp: &str, read: u64, created: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{stamp}","version":"1.0.0","message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":{read},"cache_creation_input_tokens":{created}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn prefix_rebuilds_are_priced_and_attributed_from_the_newest_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fab(dir.path());
+        transcript(
+            &p,
+            "s1.jsonl",
+            &[
+                call("m1", "model-a", "2026-08-20T10:00:00.000Z", 299_980, 0),
+                // Same model, seconds later: a rebuilt prefix nothing explains.
+                call("m2", "model-a", "2026-08-20T10:00:30.000Z", 0, 300_000),
+                call("m3", "model-a", "2026-08-20T10:01:00.000Z", 299_980, 0),
+                // A different model: the prefix is cached under another key.
+                call("m4", "model-b", "2026-08-20T10:01:30.000Z", 0, 400_000),
+            ],
+        );
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
+        let rb = r.rebuilds.as_ref().expect("the transcript carries per-call cache counters");
+        assert_eq!(rb.api_calls, 4);
+        assert_eq!(rb.rebuilds.len(), 2);
+        assert_eq!(rb.tokens, 700_000, "cache-creation tokens re-paid");
+        assert_eq!(
+            rb.by_cause.iter().map(|c| (c.cause.as_str(), c.rebuilds, c.tokens)).collect::<Vec<_>>(),
+            vec![("model-switch", 1, 400_000), ("unattributed", 1, 300_000)],
+            "buckets in precedence order, each rebuild counted once"
+        );
+        let text = render(&r);
+        assert!(text.contains("2 rebuild(s)"), "{text}");
+        assert!(text.contains("700000"), "{text}");
+        // The unexplained rebuild is reported as unexplained, not folded into
+        // the nearest bucket.
+        assert!(text.contains("unattributed"), "{text}");
+        assert!(text.contains("model-switch"), "{text}");
+        assert!(r.gaps.iter().all(|g| !g.contains("prefix rebuilds")), "gaps: {:?}", r.gaps);
+    }
+
+    #[test]
+    fn a_session_whose_prefix_held_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fab(dir.path());
+        transcript(
+            &p,
+            "s1.jsonl",
+            &[
+                call("m1", "model-a", "2026-08-20T10:00:00.000Z", 299_980, 0),
+                call("m2", "model-a", "2026-08-20T10:00:30.000Z", 300_000, 4_000),
+            ],
+        );
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
+        let rb = r.rebuilds.as_ref().unwrap();
+        assert!(rb.rebuilds.is_empty());
+        assert_eq!(rb.tokens, 0);
+        assert!(render(&r).contains("the prefix held"));
+    }
+
+    #[test]
+    fn a_transcript_without_cache_counters_is_a_gap_not_a_clean_bill() {
+        // A parseable transcript whose records carry no per-call cache split
+        // must never render as "no rebuilds" — that is the difference between
+        // a measurement and an advertisement.
+        let dir = tempfile::tempdir().unwrap();
+        let p = fab(dir.path());
+        transcript(
+            &p,
+            "s1.jsonl",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#.to_string(),
+                r#"{"type":"progress","n":1}"#.to_string(),
+            ],
+        );
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
+        assert!(r.rebuilds.is_none());
+        assert!(
+            r.gaps.iter().any(|g| g.contains("prefix rebuilds are not attributable")),
+            "gaps: {:?}",
+            r.gaps
+        );
+        let text = render(&r);
+        assert!(text.contains("unavailable"));
+        assert!(!text.contains("the prefix held"));
     }
 
     #[test]
