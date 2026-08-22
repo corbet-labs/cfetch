@@ -24,6 +24,7 @@ jobs:
         id: catalog
         shell: bash
         run: |
+          bash scripts/check-packaging-variants.sh
           echo "matrix=$(bash scripts/variant-matrix.sh)" >> "$GITHUB_OUTPUT"
 
   variant-build:
