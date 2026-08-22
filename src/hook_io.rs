@@ -78,6 +78,21 @@ pub struct HookSpecificOutput {
     pub hook_event_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_context: Option<String>,
+    /// PostToolUse only: the tool result the model sees, replaced.
+    ///
+    /// UNDOCUMENTED. It appears in no version of the published hooks
+    /// reference, and the harness ignores a value whose shape does not match
+    /// the tool's own output schema — SILENTLY, which is why the field must be
+    /// built as a bet rather than a guarantee. The bet is safe in one
+    /// direction: honoured, it removes the single largest category of
+    /// tool-result tokens; ignored, the full output enters context exactly as
+    /// it does today. Nothing is lost by emitting it.
+    ///
+    /// Mirror the received `tool_response` and change only the fields you
+    /// mean to change; a fresh object of the "right" shape is what gets
+    /// dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_tool_output: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -103,11 +118,18 @@ pub struct Emit {
     context: Vec<String>,
     system_message: Option<String>,
     replacement: Option<String>,
+    updated_tool_output: Option<serde_json::Value>,
 }
 
 impl Emit {
     pub fn new(event_name: &'static str) -> Emit {
-        Emit { event_name, context: Vec::new(), system_message: None, replacement: None }
+        Emit {
+            event_name,
+            context: Vec::new(),
+            system_message: None,
+            replacement: None,
+            updated_tool_output: None,
+        }
     }
 
     pub fn add_context(&mut self, s: impl Into<String>) {
@@ -130,26 +152,49 @@ impl Emit {
         self.replacement = Some(s.into());
     }
 
+    /// Claude's route to the same outcome. Takes the WHOLE replacement object
+    /// rather than a string, because the value has to mirror the tool's own
+    /// output schema — see [`HookSpecificOutput::updated_tool_output`].
+    pub fn replace_claude_tool_output(&mut self, value: serde_json::Value) {
+        self.updated_tool_output = Some(value);
+    }
+
     /// Returns the number of context characters actually emitted, for booking.
     pub fn finish(self) -> usize {
-        if self.context.is_empty() && self.system_message.is_none() && self.replacement.is_none() {
+        if self.context.is_empty()
+            && self.system_message.is_none()
+            && self.replacement.is_none()
+            && self.updated_tool_output.is_none()
+        {
             return 0;
         }
         let joined = self.context.join("\n\n");
-        let emitted = joined.len() + self.replacement.as_ref().map_or(0, String::len);
+        let replaced_len = self
+            .updated_tool_output
+            .as_ref()
+            .and_then(|v| v.get("stdout"))
+            .and_then(serde_json::Value::as_str)
+            .map_or(0, str::len);
+        let emitted =
+            joined.len() + self.replacement.as_ref().map_or(0, String::len) + replaced_len;
+        // `continue: false` is CODEX's replacement channel. Claude reads that
+        // same universal field as "stop the agent", so it must never be set
+        // for a Claude replacement — which travels in hookSpecificOutput.
         let replacing = self.replacement.is_some();
+        let updated_tool_output = self.updated_tool_output;
         let out = HookOutput {
             continue_processing: replacing.then_some(false),
             reason: self.replacement,
             stop_reason: replacing.then(|| "cfetch condensed oversized tool output".to_string()),
             system_message: self.system_message,
             suppress_output: None,
-            hook_specific_output: if joined.is_empty() {
+            hook_specific_output: if joined.is_empty() && updated_tool_output.is_none() {
                 None
             } else {
                 Some(HookSpecificOutput {
                     hook_event_name: self.event_name.to_string(),
-                    additional_context: Some(joined),
+                    additional_context: (!joined.is_empty()).then_some(joined),
+                    updated_tool_output,
                 })
             },
         };
@@ -207,6 +252,7 @@ mod tests {
             hook_specific_output: Some(HookSpecificOutput {
                 hook_event_name: "SessionStart".into(),
                 additional_context: Some("x".into()),
+                updated_tool_output: None,
             }),
         };
         let s = serde_json::to_string(&out).unwrap();

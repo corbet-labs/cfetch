@@ -46,20 +46,54 @@ impl Family {
 /// Classifies a command line by its leading program, following `sudo`, `env`
 /// and simple assignments. Deliberately conservative: an unrecognized command
 /// is Generic, never assumed safe to treat specially.
-pub fn classify(command: &str) -> Family {
-    let mut words = command.split_whitespace().peekable();
-    // Step over prefixes that are not the real program.
+/// Words that stand in FRONT of the real program rather than being it.
+///
+/// Deliberately covers more than bash: `command` and `builtin` are POSIX and
+/// idiomatic in fish, `noglob` and `nocorrect` are zsh, `doas` is the BSD
+/// sudo. Getting this wrong is not cosmetic — the program name selects the
+/// condensation strategy, so a missed prefix silently downgrades a known
+/// family to Generic and a test log gets head/tail-clipped as if it were a
+/// listing.
+const PROGRAM_PREFIXES: &[&str] = &[
+    "sudo", "doas", "env", "time", "nohup", "nice", "ionice", "stdbuf", "command", "builtin",
+    "exec", "noglob", "nocorrect",
+];
+
+/// The program a command segment actually runs, with prefixes stepped over,
+/// any directory stripped, and the remaining words handed back so the caller
+/// can read a subcommand off the SAME iterator.
+pub fn leading_program<'a>(
+    segment: &'a str,
+) -> Option<(&'a str, std::iter::Peekable<std::str::SplitWhitespace<'a>>)> {
+    let mut words = segment.split_whitespace().peekable();
+    let mut saw_prefix = false;
     while let Some(w) = words.peek() {
         let w = *w;
-        if w == "sudo" || w == "env" || w == "time" || w == "nohup" || w.contains('=') {
+        // `FOO=bar cmd` is bash/zsh, and fish has accepted it since 3.1.
+        if PROGRAM_PREFIXES.contains(&w) || w.contains('=') {
+            saw_prefix = true;
             words.next();
+        } else if saw_prefix && w.starts_with('-') {
+            // A prefix brings its OWN flags: `nice -n 19`, `stdbuf -oL`,
+            // `ionice -c2`. Stopping at the flag takes it for the program and
+            // downgrades the family to Generic — which is the UNSAFE
+            // direction, because Generic is rewritable and Verification is
+            // not, so a test log would get its middle clipped away.
+            words.next();
+            // A separated numeric value belongs to the flag, not the command.
+            if words.peek().is_some_and(|v| v.chars().all(|c| c.is_ascii_digit())) {
+                words.next();
+            }
         } else {
             break;
         }
     }
-    let Some(prog) = words.next() else { return Family::Generic };
-    // Strip any path: /usr/bin/rg is rg.
-    let prog = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+    let prog = words.next()?;
+    Some((prog.rsplit(['/', '\\']).next().unwrap_or(prog), words))
+}
+
+pub fn classify(command: &str) -> Family {
+    let Some((prog, mut words)) = leading_program(command) else { return Family::Generic };
     // The subcommand comes from the SAME iterator, after the prefixes were
     // stepped over — reading it off the raw word list makes `RUST_LOG=x cargo
     // test` look like the subcommand is `cargo`.
