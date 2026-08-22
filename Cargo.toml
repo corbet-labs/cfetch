@@ -2,11 +2,19 @@
 name = "cfetch"
 version = "0.9.1"
 edition = "2024"
+rust-version = "1.95"
 license = "FSL-1.1-ALv2"
 description = "A second brain for coding agents: privilege-ring memory, hook injection, retrieval, and a code index in one binary"
 repository = "https://github.com/julian-corbet/cfetch"
 
 [dependencies]
+# Exact-pinned harness configuration adapter. cfetch decides which surfaces
+# are behaviorally compatible; this crate owns per-harness schemas, paths,
+# atomic writes, first-touch backups, and ownership ledgers.
+agent-config = "=0.4.0"
+# Exact-pinned transcript normalizer. cfetch retains its cumulative-ledger
+# semantics at the boundary instead of exposing this crate's IR directly.
+agent-session = "=0.5.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
@@ -14,14 +22,16 @@ ignore = "0.4"
 iroh = "1.0.3"
 notify = "8"
 ratatui = "0.30.2"
+# Exact-pinned official MCP SDK. cfetch owns its tools; rmcp owns JSON-RPC,
+# protocol negotiation, capability discovery, schemas, and stdio framing.
+rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
-# Codex config.toml registration (src/install.rs): structured upsert that
-# preserves the user's comments and formatting — string-appending to a foreign
-# config file is how files get corrupted.
+# Used only by the cfetch 0.9 one-time Codex registration conversion and the
+# features.hooks health check. New registrations are owned by agent-config.
 toml_edit = "0.23"
 tree-sitter = "0.26.12"
 tree-sitter-go = "0.25.0"

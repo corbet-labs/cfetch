@@ -80,13 +80,16 @@ storage: it is a network call away from the whole brain.
   (Rust, TypeScript/JavaScript, Python, Go): symbols with exact line ranges
   and token estimates, so agents read the 40 relevant lines instead of the
   whole file.
-- **Hooks** — `cfetch install` registers the same session lifecycle in Claude
-  Code and Codex: injection, capture, governance reminders and compaction.
+- **Hooks** — `cfetch install` registers the full session lifecycle in Claude
+  Code, Codex and CodeBuddy, plus safe tool-event hooks in compatible
+  harnesses. Injection, capture, governance reminders and compaction remain
+  fail-open: a broken brain never breaks the agent session.
   Hooks are thin clients of a warm per-host daemon and always exit 0;
   a broken brain degrades to silence, never to a broken session.
 - **MCP** — `cfetch mcp` serves `cfetch_recall` / `cfetch_expand` /
-  `cfetch_find` over stdio to any MCP client (Claude Desktop, Codex, Gemini
-  CLI).
+  `cfetch_find` over the official MCP SDK's stdio transport. The installer can
+  register it in every MCP-capable harness known to the pinned adapter
+  library.
 - **`cfetch dashboard`** — a terminal dashboard: daemon and hook health,
   injection ledger, live recall.
 - **`cfetch selfcheck` / `cfetch status`** — verify the installation end to
@@ -102,7 +105,7 @@ Each archive contains the binary, `LICENSE.md`, and the generated
 From source:
 
 ```console
-# cargo (any platform with Rust 1.85+)
+# cargo (any platform with Rust 1.95+)
 cargo install --git https://github.com/julian-corbet/cfetch
 
 # nix (flake; x86_64-linux and aarch64-linux)
@@ -133,7 +136,10 @@ listener (`serve.bind`) uses.
 ## Quick start
 
 ```console
-$ cfetch install          # register Claude/Codex hooks and Codex/Gemini MCP when detected
+$ cfetch install          # configure every supported harness detected on this machine
+$ cfetch install --agent qwen --agent iflow
+$ cfetch install --all    # explicitly create every supported global configuration
+$ cfetch install --project . --all  # all confirmed project-local surfaces
 $ cfetch daemon start     # warm per-host daemon (optional but recommended)
 $ cfetch scan             # build the recall + code index
 indexed 412 docs, 3187 blocks (2 file(s) skipped as ring 5+)
@@ -167,14 +173,31 @@ server:
 { "mcpServers": { "cfetch": { "command": "cfetch", "args": ["mcp"] } } }
 ```
 
-`cfetch install` writes Codex's instruction block (`~/.codex/AGENTS.md`), native
-hooks (`~/.codex/hooks.json`) and MCP server (`~/.codex/config.toml`), plus the
-equivalent Gemini CLI instruction/MCP entries, automatically when those agents
-are installed. Codex asks you to approve changed command hooks once in `/hooks`;
-cfetch never bypasses that trust gate. Marker-fenced blocks and tagged entries
-leave your own settings untouched, and `cfetch install --remove` takes exactly
-ours back out. Restart the agent after changing MCP configuration so its tool
-inventory is rebuilt.
+`cfetch install` feature-detects initialized harnesses and leaves absent ones
+alone. Use repeatable `--agent <id>` for an explicit selection or `--all` for
+every surface in the selected scope. The default scope is global;
+`--project <path>` selects project-local files and makes local-only harnesses
+such as Trae available. The current adapter registry covers:
+
+```text
+claude cursor gemini openclaw hermes codex copilot opencode cline roo
+windsurf kilocode antigravity antigravitycli amp codebuddy crush forge
+iflow junie pi qodercli qwen tabnine trae
+```
+
+Support is capability-based, not a blanket claim. MCP is registered wherever
+the harness exposes a confirmed MCP file contract; recall-first instructions
+are installed wherever it exposes a confirmed instruction surface; native
+hooks are installed only where cfetch also understands the hook payload and
+output contract. Measured transcript accounting currently normalizes Claude,
+Codex, Gemini and Cursor sessions. This gives every listed harness at least its
+confirmed surfaces without inventing unsupported hooks.
+
+Codex asks you to approve changed command hooks once in `/hooks`; cfetch never
+bypasses that trust gate. Adapter-managed entries are atomic, backed up on
+first touch, ownership-ledgered, and reversible. `cfetch install --remove`
+removes only cfetch-owned entries. Restart an agent after changing MCP
+configuration so its tool inventory is rebuilt.
 
 On Codex, completed oversized Bash listings are structurally condensed before
 their result enters the next model turn. Build and test output is never

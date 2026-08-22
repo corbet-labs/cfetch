@@ -12,6 +12,14 @@ listed here is a fix or an internal change with no effect on behavior.
   linux-arm64 build, and the formula says so instead of offering an x86_64
   tarball that cannot execute.
 
+- **Multi-harness adapters.** The official `rmcp` SDK now owns MCP framing and
+  negotiation, `agent-session` normalizes Claude/Codex/Gemini/Cursor transcript
+  discovery, and `agent-config` installs cfetch's confirmed MCP, instruction,
+  and native-hook surfaces across its 25-harness registry. The libraries are
+  exact-pinned behind cfetch-owned compatibility facades; cfetch 0.9 marker
+  formats are converted once without leaving parallel legacy registrations.
+  `cfetch install --project <path>` exposes confirmed project-only surfaces.
+
 - **Dependency-license compliance.** CI now rejects unreviewed licenses and
   verifies a generated third-party license/NOTICE bundle. Release archives and
   the Nix and Arch packages all install that bundle beside cfetch's own license;

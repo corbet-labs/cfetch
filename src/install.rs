@@ -1,265 +1,223 @@
-//! Registers cfetch's hooks in Claude Code and Codex using the
-//! managed-entry merge: only entries tagged `_managedBy: "cfetch"` are ever
-//! removed or replaced; everything else in the file — including a user hook
-//! that happens to invoke the same command — is preserved byte-for-byte at the
-//! JSON level.
+//! cfetch's installation facade.
+//!
+//! cfetch owns the behavior it promises to agent harnesses. `agent-config`
+//! owns the volatile file locations, schemas, atomic writes, backups, and
+//! ownership ledgers for each harness. Claude's explicit `--settings` path is
+//! deliberately kept here because it is a public cfetch feature that cannot be
+//! represented by agent-config's global/project scopes.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use agent_config::{
+    Event, HookCommand, HookSpec, InstallPlan, InstallReport, InstallStatus, InstructionPlacement,
+    InstructionSpec, Matcher, McpSpec, PlanStatus, PlannedChange, Scope, ScopeKind, UninstallPlan,
+};
 use serde_json::{Map, Value, json};
 
 use crate::paths;
 
-const MANAGED_BY: &str = "cfetch";
+const OWNER: &str = "cfetch";
+const INSTRUCTION_NAME: &str = "CFETCH";
+const LEGACY_MANAGED_BY: &str = "cfetch";
 
-/// (harness event key, cfetch hook subcommand)
-const EVENTS: &[(&str, &str)] = &[
-    ("SessionStart", "session-start"),
-    ("UserPromptSubmit", "user-prompt"),
-    ("PreToolUse", "pre-tool"),
-    ("PostToolUse", "post-tool"),
-    ("Stop", "stop"),
-    ("PreCompact", "precompact"),
+/// cfetch lifecycle events. Tags are intentionally distinct: agent-config's
+/// hook tag is an ownership key, and one cfetch installation owns several
+/// independent commands.
+#[derive(Clone, Copy)]
+struct HookRegistration {
+    tag: &'static str,
+    subcommand: &'static str,
+    event: CfetchEvent,
+}
+
+#[derive(Clone, Copy)]
+enum CfetchEvent {
+    SessionStart,
+    UserPromptSubmit,
+    PreToolUse,
+    PostToolUse,
+    Stop,
+    PreCompact,
+}
+
+impl CfetchEvent {
+    fn agent_config(self) -> Event {
+        match self {
+            Self::SessionStart => Event::SessionStart,
+            Self::UserPromptSubmit => Event::UserPromptSubmit,
+            Self::PreToolUse => Event::PreToolUse,
+            Self::PostToolUse => Event::PostToolUse,
+            Self::Stop => Event::Stop,
+            Self::PreCompact => Event::PreCompact,
+        }
+    }
+}
+
+const FULL_HOOKS: &[HookRegistration] = &[
+    HookRegistration {
+        tag: "cfetch-session-start",
+        subcommand: "session-start",
+        event: CfetchEvent::SessionStart,
+    },
+    HookRegistration {
+        tag: "cfetch-user-prompt",
+        subcommand: "user-prompt",
+        event: CfetchEvent::UserPromptSubmit,
+    },
+    HookRegistration {
+        tag: "cfetch-pre-tool",
+        subcommand: "pre-tool",
+        event: CfetchEvent::PreToolUse,
+    },
+    HookRegistration {
+        tag: "cfetch-post-tool",
+        subcommand: "post-tool",
+        event: CfetchEvent::PostToolUse,
+    },
+    HookRegistration {
+        tag: "cfetch-stop",
+        subcommand: "stop",
+        event: CfetchEvent::Stop,
+    },
+    HookRegistration {
+        tag: "cfetch-precompact",
+        subcommand: "precompact",
+        event: CfetchEvent::PreCompact,
+    },
 ];
+
+const TOOL_HOOKS: &[HookRegistration] = &[
+    HookRegistration {
+        tag: "cfetch-pre-tool",
+        subcommand: "pre-tool",
+        event: CfetchEvent::PreToolUse,
+    },
+    HookRegistration {
+        tag: "cfetch-post-tool",
+        subcommand: "post-tool",
+        event: CfetchEvent::PostToolUse,
+    },
+];
+
+/// Native hooks are a stricter capability than "agent-config can write this
+/// harness's files": cfetch also has to understand the hook's JSON contract.
+/// Prompt-only agents and unverified payload shapes still get MCP and/or
+/// instructions, but never a hook registration that only looks supported.
+fn native_hooks(agent: &str, scope: &Scope) -> &'static [HookRegistration] {
+    match agent {
+        // The historical global Claude `--settings` contract is retained by
+        // the cfetch-owned merger. Project-local Claude hooks use the adapter.
+        "claude" if matches!(scope, Scope::Local(_)) => FULL_HOOKS,
+        "codex" | "codebuddy" => FULL_HOOKS,
+        "gemini" | "iflow" | "tabnine" => TOOL_HOOKS,
+        // Claude supports the full lifecycle, but its public `--settings`
+        // path is managed by the cfetch-owned merger below.
+        _ => &[],
+    }
+}
 
 pub fn default_settings_path() -> PathBuf {
     paths::home().join(".claude/settings.json")
 }
 
-/// POSIX shell quoting: single-quote the whole word, and close/escape/reopen
-/// around any embedded single quote.
 fn posix_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
-/// Windows command-processor quoting: double-quote the whole word.
-///
-/// `cmd.exe` treats an apostrophe as an ordinary character, so the POSIX form
-/// would make the harness look for a program literally named `'C:\...` and
-/// every hook would silently never run. A double quote cannot appear in a
-/// Windows path (it is an illegal filename character), so there is nothing
-/// left to escape. `%` is legal in a path and would still be read as an
-/// environment reference by `cmd.exe`; that is inherent to the command
-/// processor and out of reach of quoting.
 fn windows_quote(word: &str) -> String {
     format!("\"{word}\"")
 }
 
-/// Quoting for THIS platform's command processor.
-//
-// The branch is a runtime `cfg!`, not a `#[cfg]`: both quoters stay compiled
-// on every platform, so the tests below prove both on any runner.
 fn shell_quote(word: &str) -> String {
-    if cfg!(windows) { windows_quote(word) } else { posix_quote(word) }
+    if cfg!(windows) {
+        windows_quote(word)
+    } else {
+        posix_quote(word)
+    }
 }
 
-/// The command embeds the absolute binary path: hooks run outside a login
-/// shell, so PATH is not a contract. Quoted for the platform's command
-/// processor, against spaces in the path.
 fn hook_command_for(exe: &str, subcommand: &str) -> String {
     format!("{} hook {subcommand}", shell_quote(exe))
 }
 
-#[cfg(test)]
-fn hook_command(subcommand: &str) -> String {
-    hook_command_for(&current_exe_str(), subcommand)
-}
-
-fn managed_entry_for(exe: &str, subcommand: &str) -> Value {
+fn legacy_managed_entry(exe: &str, subcommand: &str) -> Value {
     json!({
         "hooks": [{
             "type": "command",
             "command": hook_command_for(exe, subcommand),
             "timeout": 10,
-            "_managedBy": MANAGED_BY,
+            "_managedBy": LEGACY_MANAGED_BY,
         }]
     })
 }
 
-/// Removes OUR tagged hook objects from an entry's inner `hooks` array —
-/// never the whole entry, which may co-locate user hooks. Returns whether the
-/// entry still does anything and should be kept.
-fn strip_managed(entry: &mut Value) -> bool {
+fn strip_legacy_managed(entry: &mut Value) -> bool {
     match entry.get_mut("hooks").and_then(Value::as_array_mut) {
         Some(hooks) => {
-            hooks.retain(|h| h.get("_managedBy").and_then(Value::as_str) != Some(MANAGED_BY));
+            hooks.retain(|hook| {
+                hook.get("_managedBy").and_then(Value::as_str) != Some(LEGACY_MANAGED_BY)
+            });
             !hooks.is_empty()
         }
-        None => true, // not a shape we own; leave it alone
+        None => true,
     }
 }
 
-/// Pure merge with an explicit executable so both agent installers and tests
-/// can key registration to the same binary path.
-fn merge_for_exe(settings: Value, exe: &str) -> anyhow::Result<Value> {
+/// Claude's explicit-settings merger. Only the handler object is tagged, so a
+/// user hook co-located in the same group survives both repair and removal.
+fn merge_claude_for_exe(settings: Value, exe: &str) -> anyhow::Result<Value> {
     let mut root = match settings {
-        Value::Object(m) => m,
+        Value::Object(map) => map,
         Value::Null => Map::new(),
         other => anyhow::bail!("settings.json is not a JSON object (found {other})"),
     };
     let hooks = root
         .entry("hooks")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let hooks = hooks
+        .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks' is not an object"))?;
 
-    for (event_key, subcommand) in EVENTS {
-        let list = hooks
-            .entry(event_key.to_string())
-            .or_insert_with(|| Value::Array(vec![]));
-        let list = list
+    for registration in FULL_HOOKS {
+        let event = registration.event.agent_config();
+        let event = event.as_str();
+        let entries = hooks
+            .entry(event)
+            .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
-            .ok_or_else(|| anyhow::anyhow!("settings.json hooks.{event_key} is not an array"))?;
-        list.retain_mut(strip_managed);
-        list.push(managed_entry_for(exe, subcommand));
+            .ok_or_else(|| anyhow::anyhow!("settings.json hooks.{event} is not an array"))?;
+        entries.retain_mut(strip_legacy_managed);
+        entries.push(legacy_managed_entry(exe, registration.subcommand));
     }
     Ok(Value::Object(root))
 }
 
-/// Pure merge so it is testable: returns the new settings document.
-pub fn merge(settings: Value) -> anyhow::Result<Value> {
-    merge_for_exe(settings, &current_exe_str())
-}
-
-/// Removes every managed entry (uninstall). Leaves empty arrays in place —
-/// removing structure the user may have had reasons for is not our call.
-pub fn unmerge(settings: Value) -> anyhow::Result<Value> {
+fn unmerge_legacy(settings: Value) -> anyhow::Result<Value> {
     let mut root = match settings {
-        Value::Object(m) => m,
+        Value::Object(map) => map,
         other => return Ok(other),
     };
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
-        for (_, list) in hooks.iter_mut() {
-            if let Some(arr) = list.as_array_mut() {
-                arr.retain_mut(strip_managed);
-            }
+        for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
+            entries.retain_mut(strip_legacy_managed);
         }
     }
     Ok(Value::Object(root))
 }
 
-/// Whether a TOML mcp-server entry already carries the CURRENT command/args.
-fn codex_entry_is_current(entry: &toml_edit::Item, exe: &str) -> bool {
-    let Some(t) = entry.as_table_like() else { return false };
-    t.get("command").and_then(|v| v.as_str()) == Some(exe)
-        && t.get("args")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| a.len() == 1 && a.get(0).and_then(|x| x.as_str()) == Some("mcp"))
-        && t.get("enabled").and_then(|v| v.as_bool()) != Some(false)
-}
-
-/// Structured upsert of the cfetch MCP server into Codex's config.toml,
-/// via toml_edit so the user's comments and formatting survive byte-for-byte.
-/// An unparseable file is refused outright (like the Gemini JSON path) —
-/// appending to a file we cannot parse could corrupt it. Content-keyed:
-/// `Ok(None)` = entry already carries the current command/args; a stale entry
-/// (the binary moved) is repaired in place, extra user keys preserved.
-fn codex_toml_with_mcp(content: &str, exe: &str) -> anyhow::Result<Option<String>> {
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|e| anyhow::anyhow!("refusing to touch unparseable TOML: {e}"))?;
-    let already_current = doc
-        .get("mcp_servers")
-        .and_then(|s| s.as_table_like())
-        .and_then(|s| s.get("cfetch"))
-        .is_some_and(|entry| codex_entry_is_current(entry, exe));
-    if already_current {
-        return Ok(None);
-    }
-    if doc.get("mcp_servers").is_none() {
-        let mut t = toml_edit::Table::new();
-        // Implicit: renders only `[mcp_servers.cfetch]`, no bare header line.
-        t.set_implicit(true);
-        doc.insert("mcp_servers", toml_edit::Item::Table(t));
-    }
-    let servers = doc["mcp_servers"]
-        .as_table_like_mut()
-        .ok_or_else(|| anyhow::anyhow!("config.toml `mcp_servers` is not a table"))?;
-    if servers
-        .get("cfetch")
-        .is_none_or(|e| e.as_table_like().is_none())
-    {
-        servers.insert("cfetch", toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    let entry = servers
-        .get_mut("cfetch")
-        .and_then(|e| e.as_table_like_mut())
-        .expect("just ensured a table-like cfetch entry");
-    entry.insert("command", toml_edit::value(exe));
-    let mut args = toml_edit::Array::new();
-    args.push("mcp");
-    entry.insert("args", toml_edit::value(args));
-    if entry.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-        entry.insert("enabled", toml_edit::value(true));
-    }
-    Ok(Some(doc.to_string()))
-}
-
-/// Removes the cfetch MCP server from Codex's config.toml. `Ok(None)` =
-/// nothing of ours present. Unparseable = refuse, same as the upsert.
-fn codex_toml_without_mcp(content: &str) -> anyhow::Result<Option<String>> {
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|e| anyhow::anyhow!("refusing to touch unparseable TOML: {e}"))?;
-    let removed = doc
-        .get_mut("mcp_servers")
-        .and_then(|s| s.as_table_like_mut())
-        .and_then(|s| s.remove("cfetch"))
-        .is_some();
-    if !removed {
-        return Ok(None);
-    }
-    Ok(Some(doc.to_string()))
-}
-
-/// Content-keyed merge of the cfetch MCP server into Gemini's settings.json:
-/// `Ok(None)` = entry already carries the current command/args; a stale entry
-/// is repaired in place, extra user keys inside it preserved.
-fn gemini_settings_with_mcp(settings: Value, exe: &str) -> anyhow::Result<Option<Value>> {
-    let mut root = match settings {
-        Value::Object(m) => m,
-        Value::Null => Map::new(),
-        other => anyhow::bail!("settings.json is not a JSON object (found {other})"),
-    };
-    let servers = root
-        .entry("mcpServers")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let servers = servers
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json 'mcpServers' is not an object"))?;
-    let desired_command = Value::String(exe.to_string());
-    let desired_args = json!(["mcp"]);
-    if let Some(current) = servers.get("cfetch").and_then(Value::as_object)
-        && current.get("command") == Some(&desired_command)
-        && current.get("args") == Some(&desired_args)
-    {
-        return Ok(None);
-    }
-    let entry = servers.entry("cfetch").or_insert_with(|| json!({}));
-    if !entry.is_object() {
-        *entry = json!({});
-    }
-    let entry = entry.as_object_mut().expect("just ensured an object");
-    entry.insert("command".into(), desired_command);
-    entry.insert("args".into(), desired_args);
-    Ok(Some(Value::Object(root)))
-}
-
-/// Removes the cfetch entry from Gemini's settings.json; `None` = nothing of
-/// ours present (including a non-object document: nothing we wrote survives
-/// in a shape we did not write).
-fn gemini_settings_without_mcp(settings: Value) -> Option<Value> {
-    let Value::Object(mut root) = settings else { return None };
-    root.get_mut("mcpServers")?.as_object_mut()?.remove("cfetch")?;
-    Some(Value::Object(root))
-}
-
 fn current_exe_str() -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.to_str().map(String::from))
+        .and_then(|path| path.to_str().map(String::from))
         .unwrap_or_else(|| "cfetch".to_string())
+}
+
+fn read_or_empty(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(anyhow::anyhow!("read {}: {error}", path.display())),
+    }
 }
 
 fn json_file(path: &Path) -> anyhow::Result<Value> {
@@ -267,136 +225,621 @@ fn json_file(path: &Path) -> anyhow::Result<Value> {
     if raw.trim().is_empty() {
         return Ok(Value::Object(Map::new()));
     }
-    serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("refusing to touch unparseable {}: {e}", path.display()))
+    serde_json::from_str(&raw).map_err(|error| {
+        anyhow::anyhow!("refusing to touch unparseable {}: {error}", path.display())
+    })
 }
 
-fn hooks_are_current(settings: &Value, exe: &str) -> bool {
-    let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
-        return false;
+fn apply_claude(settings_path: &Path, remove: bool, exe: &str) -> anyhow::Result<()> {
+    let current = match std::fs::read_to_string(settings_path) {
+        Ok(content) => serde_json::from_str(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "refusing to touch unparseable {}: {error}",
+                settings_path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && remove => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
+        Err(error) => {
+            return Err(anyhow::anyhow!("read {}: {error}", settings_path.display()));
+        }
     };
-    let mut managed_total = 0usize;
-    let events_current = EVENTS.iter().all(|(event, subcommand)| {
-        let expected = hook_command_for(exe, subcommand);
-        let mut matching = 0usize;
-        if let Some(groups) = hooks
-            .get(*event)
-            .and_then(Value::as_array)
-        {
-            for group in groups {
-                let catch_all = group.get("matcher").is_none();
-                if let Some(handlers) = group.get("hooks").and_then(Value::as_array) {
-                    for handler in handlers {
-                        if handler.get("_managedBy").and_then(Value::as_str) != Some(MANAGED_BY) {
-                            continue;
-                        }
-                        managed_total += 1;
-                        if catch_all
-                            && handler.get("type").and_then(Value::as_str) == Some("command")
-                            && handler.get("command").and_then(Value::as_str)
-                                == Some(expected.as_str())
-                            && handler.get("timeout").and_then(Value::as_u64) == Some(10)
-                        {
-                            matching += 1;
-                        }
+    let next = if remove {
+        unmerge_legacy(current)?
+    } else {
+        merge_claude_for_exe(current, exe)?
+    };
+    crate::fsutil::atomic_write(settings_path, serde_json::to_string_pretty(&next)?)?;
+    println!(
+        "claude: {} hooks in {}",
+        if remove { "removed" } else { "registered" },
+        settings_path.display()
+    );
+    Ok(())
+}
+
+fn hook_spec(exe: &str, registration: HookRegistration) -> anyhow::Result<HookSpec> {
+    let builder = HookSpec::builder(registration.tag)
+        .matcher(Matcher::All)
+        .event(registration.event.agent_config())
+        .timeout_seconds(10);
+    let builder = if cfg!(windows) {
+        builder.command_shell_unchecked(hook_command_for(exe, registration.subcommand))
+    } else {
+        builder.command_program(exe, ["hook", registration.subcommand])
+    };
+    Ok(builder
+        .windows_command(HookCommand::shell_unchecked(hook_command_for(
+            exe,
+            registration.subcommand,
+        )))
+        .try_build()?)
+}
+
+fn mcp_name(agent: &str) -> String {
+    match agent {
+        // Preserve the public names shipped by cfetch 0.9. Other adapters get
+        // a per-harness key so agent-config ledgers shared by sibling config
+        // files cannot overwrite one another's content hash.
+        "claude" | "codex" | "gemini" => OWNER.to_string(),
+        _ => format!("{OWNER}-{agent}"),
+    }
+}
+
+fn mcp_spec(agent: &str, exe: &str) -> anyhow::Result<McpSpec> {
+    Ok(McpSpec::builder(mcp_name(agent))
+        .owner(OWNER)
+        .stdio(exe, ["mcp"])
+        // cfetch <=0.9 registered this same server name without a ledger.
+        // Explicit installation is authority to convert that one entry.
+        .adopt_unowned(true)
+        .try_build()?)
+}
+
+fn instruction_placement(agent: &str) -> InstructionPlacement {
+    match agent {
+        "claude" => InstructionPlacement::ReferencedFile,
+        "cline" | "roo" | "kilocode" | "windsurf" | "antigravity" => {
+            InstructionPlacement::StandaloneFile
+        }
+        _ => InstructionPlacement::InlineBlock,
+    }
+}
+
+fn instruction_spec(agent: &str) -> anyhow::Result<InstructionSpec> {
+    let body = format!(
+        "## cfetch — the operator's memory brain\n\n{}",
+        crate::markers::doctrine(crate::markers::Surface::Cli)
+    );
+    Ok(InstructionSpec::builder(INSTRUCTION_NAME)
+        .owner(OWNER)
+        .placement(instruction_placement(agent))
+        .body(body)
+        .adopt_unowned(true)
+        .try_build()?)
+}
+
+fn refused_install(agent: &str, surface: &str, plan: &InstallPlan) -> anyhow::Result<()> {
+    if plan.status == PlanStatus::Refused {
+        anyhow::bail!("{agent} {surface} installation refused: {:?}", plan.changes);
+    }
+    Ok(())
+}
+
+fn refused_uninstall(agent: &str, surface: &str, plan: &UninstallPlan) -> anyhow::Result<()> {
+    if plan.status == PlanStatus::Refused {
+        anyhow::bail!("{agent} {surface} removal refused: {:?}", plan.changes);
+    }
+    Ok(())
+}
+
+fn supports_scope(supported: &[ScopeKind], scope: &Scope) -> bool {
+    supported.contains(&scope.kind())
+}
+
+#[derive(Clone, Copy, Default)]
+struct SurfaceSelection {
+    mcp: bool,
+    instructions: bool,
+    hooks: bool,
+}
+
+fn content_paths(plan: &InstallPlan) -> BTreeSet<PathBuf> {
+    plan.changes
+        .iter()
+        .filter_map(|change| match change {
+            PlannedChange::CreateFile { path }
+            | PlannedChange::PatchFile { path }
+            | PlannedChange::NoOp { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn claim_distinct(paths: BTreeSet<PathBuf>, claimed: &mut BTreeSet<PathBuf>) -> bool {
+    if paths.is_empty() || paths.is_disjoint(claimed) {
+        claimed.extend(paths);
+        true
+    } else {
+        false
+    }
+}
+
+fn select_surfaces(
+    agents: &[String],
+    scope: &Scope,
+    exe: &str,
+) -> anyhow::Result<Vec<SurfaceSelection>> {
+    // Several project harnesses deliberately consume the same `.mcp.json` or
+    // instruction file. Register that physical surface once: asking each
+    // adapter to own the same `cfetch` entry can rewrite its schema and makes
+    // the earlier adapter correctly report drift during removal.
+    let mut mcp_paths = BTreeSet::new();
+    let mut instruction_paths = BTreeSet::new();
+    agents
+        .iter()
+        .map(|agent| {
+            let mcp = match agent_config::mcp_by_id(agent) {
+                Some(surface) if supports_scope(surface.supported_mcp_scopes(), scope) => {
+                    let plan = surface.plan_install_mcp(scope, &mcp_spec(agent, exe)?)?;
+                    claim_distinct(content_paths(&plan), &mut mcp_paths)
+                }
+                _ => false,
+            };
+            let instructions = match agent_config::instruction_by_id(agent) {
+                Some(surface) if supports_scope(surface.supported_instruction_scopes(), scope) => {
+                    let plan =
+                        surface.plan_install_instruction(scope, &instruction_spec(agent)?)?;
+                    claim_distinct(content_paths(&plan), &mut instruction_paths)
+                }
+                _ => false,
+            };
+            let hooks = agent_config::by_id(agent)
+                .is_some_and(|integration| supports_scope(integration.supported_scopes(), scope));
+            Ok(SurfaceSelection {
+                mcp,
+                instructions,
+                hooks,
+            })
+        })
+        .collect()
+}
+
+fn ownership_recovery_only(plan: &InstallPlan) -> bool {
+    // Some integrations keep different global config files in the same
+    // directory and therefore share agent-config's sidecar ledger. Removing
+    // one cfetch registration can orphan the next one's identical entry. A
+    // ledger-only plan proves the on-disk entry is still byte-for-byte our
+    // current spec; never reclaim when the config itself would be changed.
+    plan.status != PlanStatus::Refused
+        && plan.changes.iter().all(|change| {
+            matches!(
+                change,
+                PlannedChange::WriteLedger { .. } | PlannedChange::NoOp { .. }
+            )
+        })
+}
+
+fn preflight_agent(
+    agent: &str,
+    scope: &Scope,
+    exe: &str,
+    remove: bool,
+    selected: SurfaceSelection,
+) -> anyhow::Result<()> {
+    if selected.mcp
+        && let Some(surface) = agent_config::mcp_by_id(agent)
+        && supports_scope(surface.supported_mcp_scopes(), scope)
+    {
+        if remove {
+            let plan = surface.plan_uninstall_mcp(scope, &mcp_name(agent), OWNER)?;
+            if plan.status == PlanStatus::Refused {
+                let recovery = surface.plan_install_mcp(scope, &mcp_spec(agent, exe)?)?;
+                if !ownership_recovery_only(&recovery) {
+                    refused_uninstall(agent, "MCP", &plan)?;
+                }
+            } else {
+                refused_uninstall(agent, "MCP", &plan)?;
+            }
+        } else {
+            let plan = surface.plan_install_mcp(scope, &mcp_spec(agent, exe)?)?;
+            refused_install(agent, "MCP", &plan)?;
+        }
+    }
+    if selected.instructions
+        && let Some(surface) = agent_config::instruction_by_id(agent)
+        && supports_scope(surface.supported_instruction_scopes(), scope)
+    {
+        if remove {
+            let plan = surface.plan_uninstall_instruction(scope, INSTRUCTION_NAME, OWNER)?;
+            if plan.status == PlanStatus::Refused {
+                let recovery =
+                    surface.plan_install_instruction(scope, &instruction_spec(agent)?)?;
+                if !ownership_recovery_only(&recovery) {
+                    refused_uninstall(agent, "instructions", &plan)?;
+                }
+            } else {
+                refused_uninstall(agent, "instructions", &plan)?;
+            }
+        } else {
+            let plan = surface.plan_install_instruction(scope, &instruction_spec(agent)?)?;
+            refused_install(agent, "instructions", &plan)?;
+        }
+    }
+    if selected.hooks
+        && let Some(integration) = agent_config::by_id(agent)
+        && supports_scope(integration.supported_scopes(), scope)
+    {
+        for registration in native_hooks(agent, scope) {
+            if remove {
+                let plan = integration.plan_uninstall(scope, registration.tag)?;
+                refused_uninstall(agent, "hooks", &plan)?;
+            } else {
+                let plan = integration.plan_install(scope, &hook_spec(exe, *registration)?)?;
+                refused_install(agent, "hooks", &plan)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct InstalledSurfaces {
+    mcp: bool,
+    instructions: bool,
+    hooks: usize,
+}
+
+#[derive(Default)]
+struct InstallTracker {
+    created: BTreeSet<PathBuf>,
+}
+
+impl InstallTracker {
+    fn record(&mut self, report: InstallReport) -> anyhow::Result<()> {
+        // Some harnesses share one config file across several cfetch surfaces.
+        // agent-config correctly backs up an existing file on the second
+        // write, but if the first write created that file in THIS invocation,
+        // the backup is only a partial cfetch installation. It is not user
+        // data and would otherwise survive --remove. Never apply this rule to
+        // a path that existed before cfetch started.
+        self.created.extend(report.created);
+        for backup in report.backed_up {
+            let Some(raw) = backup.to_str().and_then(|path| path.strip_suffix(".bak")) else {
+                continue;
+            };
+            if self.created.contains(Path::new(raw)) {
+                match std::fs::remove_file(&backup) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "remove cfetch-only backup {}: {error}",
+                            backup.display()
+                        ));
                     }
                 }
             }
         }
-        matching == 1
-    });
-    // Includes managed entries under unknown/stale event names.
-    let all_managed = hooks
-        .values()
-        .filter_map(Value::as_array)
-        .flat_map(|groups| groups.iter())
-        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-        .flat_map(|handlers| handlers.iter())
-        .filter(|handler| {
-            handler.get("_managedBy").and_then(Value::as_str) == Some(MANAGED_BY)
-        })
-        .count();
-    events_current && managed_total == EVENTS.len() && all_managed == EVENTS.len()
+        Ok(())
+    }
 }
 
-/// Reports drift in a detected Codex installation. `None` means Codex is not
-/// installed; an empty list means AGENTS.md, native hooks, and MCP all point
-/// at this executable. This is deliberately read-only for `selfcheck`.
-pub fn codex_registration_issues() -> Option<Vec<String>> {
-    codex_registration_issues_at(&paths::codex_home(), &current_exe_str())
+impl InstalledSurfaces {
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.mcp {
+            parts.push("MCP".to_string());
+        }
+        if self.instructions {
+            parts.push("instructions".to_string());
+        }
+        if self.hooks > 0 {
+            parts.push(format!("{} native hooks", self.hooks));
+        }
+        parts.join(", ")
+    }
 }
 
-fn codex_registration_issues_at(codex: &Path, exe: &str) -> Option<Vec<String>> {
-    if !codex.is_dir() {
-        return None;
-    }
-    let mut issues = Vec::new();
+#[cfg(test)]
+fn install_agent(agent: &str, scope: &Scope, exe: &str) -> anyhow::Result<InstalledSurfaces> {
+    let selected = select_surfaces(&[agent.to_string()], scope, exe)?
+        .into_iter()
+        .next()
+        .expect("one agent has one surface selection");
+    install_agent_selected(agent, scope, exe, selected)
+}
 
-    let agents_md = codex.join("AGENTS.md");
-    match std::fs::read_to_string(&agents_md) {
-        Ok(content) => match crate::markers::upsert(&content) {
-            Ok((next, _)) if next == content => {}
-            Ok(_) => issues.push(format!("{} lacks the current cfetch block", agents_md.display())),
-            Err(e) => issues.push(format!("{}: {e}", agents_md.display())),
-        },
-        Err(e) => issues.push(format!("read {}: {e}", agents_md.display())),
+fn install_agent_selected(
+    agent: &str,
+    scope: &Scope,
+    exe: &str,
+    selected: SurfaceSelection,
+) -> anyhow::Result<InstalledSurfaces> {
+    preflight_agent(agent, scope, exe, false, selected)?;
+    let mut installed = InstalledSurfaces::default();
+    let mut tracker = InstallTracker::default();
+    if selected.mcp
+        && let Some(surface) = agent_config::mcp_by_id(agent)
+        && supports_scope(surface.supported_mcp_scopes(), scope)
+    {
+        tracker.record(surface.install_mcp(scope, &mcp_spec(agent, exe)?)?)?;
+        installed.mcp = true;
     }
-
-    let hooks_path = codex.join("hooks.json");
-    match json_file(&hooks_path) {
-        Ok(settings) if hooks_are_current(&settings, exe) => {}
-        Ok(_) => issues.push(format!(
-            "{} lacks current cfetch native hooks",
-            hooks_path.display()
-        )),
-        Err(e) => issues.push(e.to_string()),
+    if selected.instructions
+        && let Some(surface) = agent_config::instruction_by_id(agent)
+        && supports_scope(surface.supported_instruction_scopes(), scope)
+    {
+        tracker.record(surface.install_instruction(scope, &instruction_spec(agent)?)?)?;
+        installed.instructions = true;
     }
+    if selected.hooks
+        && let Some(integration) = agent_config::by_id(agent)
+        && supports_scope(integration.supported_scopes(), scope)
+    {
+        for registration in native_hooks(agent, scope) {
+            tracker.record(integration.install(scope, &hook_spec(exe, *registration)?)?)?;
+            installed.hooks += 1;
+        }
+    }
+    Ok(installed)
+}
 
-    let toml_path = codex.join("config.toml");
-    match read_or_empty(&toml_path).and_then(|content| {
-        content
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| anyhow::anyhow!("parse {}: {e}", toml_path.display()))
-    }) {
-        Ok(doc) => {
-            if doc
-                .get("features")
-                .and_then(|features| features.as_table_like())
-                .and_then(|features| features.get("hooks"))
-                .and_then(|hooks| hooks.as_bool())
-                == Some(false)
-            {
-                issues.push(format!(
-                    "{} disables native hooks with features.hooks=false",
-                    toml_path.display()
-                ));
-            }
-            if !doc
-                .get("mcp_servers")
-                .and_then(|servers| servers.as_table_like())
-                .and_then(|servers| servers.get("cfetch"))
-                .is_some_and(|entry| codex_entry_is_current(entry, exe))
-            {
-                issues.push(format!(
-                    "{} has no enabled current cfetch MCP command",
-                    toml_path.display()
-                ));
+#[cfg(test)]
+fn uninstall_agent(agent: &str, scope: &Scope, exe: &str) -> anyhow::Result<InstalledSurfaces> {
+    let selected = select_surfaces(&[agent.to_string()], scope, exe)?
+        .into_iter()
+        .next()
+        .expect("one agent has one surface selection");
+    uninstall_agent_selected(agent, scope, exe, selected)
+}
+
+fn uninstall_agent_selected(
+    agent: &str,
+    scope: &Scope,
+    exe: &str,
+    selected: SurfaceSelection,
+) -> anyhow::Result<InstalledSurfaces> {
+    preflight_agent(agent, scope, exe, true, selected)?;
+    let mut installed = InstalledSurfaces::default();
+    if selected.hooks
+        && let Some(integration) = agent_config::by_id(agent)
+        && supports_scope(integration.supported_scopes(), scope)
+    {
+        for registration in native_hooks(agent, scope) {
+            let backups =
+                FreshBackups::for_uninstall(&integration.plan_uninstall(scope, registration.tag)?);
+            let _ = integration.uninstall(scope, registration.tag)?;
+            backups.remove_after_success()?;
+            installed.hooks += 1;
+        }
+    }
+    if selected.instructions
+        && let Some(surface) = agent_config::instruction_by_id(agent)
+        && supports_scope(surface.supported_instruction_scopes(), scope)
+    {
+        let removal = surface.plan_uninstall_instruction(scope, INSTRUCTION_NAME, OWNER)?;
+        if removal.status == PlanStatus::Refused {
+            let recovery = surface.plan_install_instruction(scope, &instruction_spec(agent)?)?;
+            if ownership_recovery_only(&recovery) {
+                let _ = surface.install_instruction(scope, &instruction_spec(agent)?)?;
             }
         }
-        Err(e) => issues.push(e.to_string()),
+        let backups = FreshBackups::for_uninstall(&surface.plan_uninstall_instruction(
+            scope,
+            INSTRUCTION_NAME,
+            OWNER,
+        )?);
+        let _ = surface.uninstall_instruction(scope, INSTRUCTION_NAME, OWNER)?;
+        backups.remove_after_success()?;
+        installed.instructions = true;
     }
-    Some(issues)
+    if selected.mcp
+        && let Some(surface) = agent_config::mcp_by_id(agent)
+        && supports_scope(surface.supported_mcp_scopes(), scope)
+    {
+        let name = mcp_name(agent);
+        let removal = surface.plan_uninstall_mcp(scope, &name, OWNER)?;
+        if removal.status == PlanStatus::Refused {
+            let recovery = surface.plan_install_mcp(scope, &mcp_spec(agent, exe)?)?;
+            if ownership_recovery_only(&recovery) {
+                let _ = surface.install_mcp(scope, &mcp_spec(agent, exe)?)?;
+            }
+        }
+        let backups =
+            FreshBackups::for_uninstall(&surface.plan_uninstall_mcp(scope, &name, OWNER)?);
+        let _ = surface.uninstall_mcp(scope, &name, OWNER)?;
+        backups.remove_after_success()?;
+        installed.mcp = true;
+    }
+    Ok(installed)
 }
 
-/// Reads a file that may legitimately not exist yet. Only NotFound maps to
-/// empty — an unreadable existing file must never be treated as absent and
-/// then overwritten.
-fn read_or_empty(path: &Path) -> anyhow::Result<String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(anyhow::anyhow!("read {}: {e}", path.display())),
+fn change_paths(change: &PlannedChange) -> Vec<&Path> {
+    match change {
+        PlannedChange::CreateFile { path }
+        | PlannedChange::PatchFile { path }
+        | PlannedChange::RemoveFile { path }
+        | PlannedChange::CreateDir { path }
+        | PlannedChange::RemoveDir { path }
+        | PlannedChange::WriteLedger { path, .. }
+        | PlannedChange::RemoveLedgerEntry { path, .. }
+        | PlannedChange::SetPermissions { path, .. }
+        | PlannedChange::NoOp { path, .. } => vec![path],
+        PlannedChange::CreateBackup { backup, target }
+        | PlannedChange::RestoreBackup { backup, target } => vec![backup, target],
+        PlannedChange::Refuse { path, .. } => path.iter().map(PathBuf::as_path).collect(),
+        _ => Vec::new(),
     }
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    PathBuf::from(backup)
+}
+
+struct FreshBackups {
+    absent_before: BTreeSet<PathBuf>,
+}
+
+impl FreshBackups {
+    fn for_uninstall(plan: &UninstallPlan) -> Self {
+        let absent_before = plan
+            .changes
+            .iter()
+            .flat_map(change_paths)
+            .map(backup_path)
+            .filter(|path| !path.exists())
+            .collect();
+        Self { absent_before }
+    }
+
+    fn remove_after_success(self) -> anyhow::Result<()> {
+        // A successful uninstall leaves the user's non-cfetch content in the
+        // live file. Backups created by that uninstall contain only the state
+        // immediately before cfetch was removed and are not first-touch user
+        // snapshots. Existing backups were excluded above and are preserved.
+        for path in self.absent_before {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "remove uninstall-only backup {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn planned_paths(agent: &str, exe: &str, scope: &Scope) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(surface) = agent_config::mcp_by_id(agent)
+        && supports_scope(surface.supported_mcp_scopes(), scope)
+        && let Ok(plan) =
+            surface.plan_install_mcp(scope, &mcp_spec(agent, exe).expect("valid MCP spec"))
+    {
+        paths.extend(
+            plan.changes
+                .iter()
+                .flat_map(change_paths)
+                .map(Path::to_path_buf),
+        );
+    }
+    if let Some(surface) = agent_config::instruction_by_id(agent)
+        && supports_scope(surface.supported_instruction_scopes(), scope)
+        && let Ok(spec) = instruction_spec(agent)
+        && let Ok(plan) = surface.plan_install_instruction(scope, &spec)
+    {
+        paths.extend(
+            plan.changes
+                .iter()
+                .flat_map(change_paths)
+                .map(Path::to_path_buf),
+        );
+    }
+    if let Some(integration) = agent_config::by_id(agent)
+        && supports_scope(integration.supported_scopes(), scope)
+    {
+        for registration in native_hooks(agent, scope) {
+            if let Ok(spec) = hook_spec(exe, *registration)
+                && let Ok(plan) = integration.plan_install(scope, &spec)
+            {
+                paths.extend(
+                    plan.changes
+                        .iter()
+                        .flat_map(change_paths)
+                        .map(Path::to_path_buf),
+                );
+            }
+        }
+    }
+    paths
+}
+
+fn common_config_roots(scope: &Scope) -> Vec<PathBuf> {
+    if let Some(root) = scope.local_root() {
+        return vec![root.to_path_buf()];
+    }
+    let mut roots = vec![paths::home()];
+    if let Ok(config) = agent_config::paths::config_dir() {
+        roots.push(config.clone());
+        let code = config.join("Code");
+        roots.push(code.clone());
+        let user = code.join("User");
+        roots.push(user.clone());
+        roots.push(user.join("globalStorage"));
+    }
+    roots
+}
+
+fn path_has_agent_footprint(path: &Path, common: &[PathBuf]) -> bool {
+    if path.exists() {
+        return true;
+    }
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        if common.iter().any(|root| candidate == root) {
+            return false;
+        }
+        if candidate.exists() {
+            return true;
+        }
+        ancestor = candidate.parent();
+    }
+    false
+}
+
+fn agent_detected(agent: &str, exe: &str, scope: &Scope) -> bool {
+    let common = common_config_roots(scope);
+    planned_paths(agent, exe, scope)
+        .iter()
+        .any(|path| path_has_agent_footprint(path, &common))
+}
+
+fn supported_agent_ids() -> Vec<&'static str> {
+    agent_config::all()
+        .into_iter()
+        .map(|agent| agent.id())
+        .collect()
+}
+
+fn resolve_agents(
+    requested: &[String],
+    all: bool,
+    exe: &str,
+    scope: &Scope,
+) -> anyhow::Result<Vec<String>> {
+    let supported = supported_agent_ids();
+    if all {
+        return Ok(supported.into_iter().map(String::from).collect());
+    }
+    if !requested.is_empty() {
+        let requested: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !supported.iter().any(|supported| supported == *id))
+        {
+            anyhow::bail!(
+                "unknown agent {unknown:?}; supported agents: {}",
+                supported.join(", ")
+            );
+        }
+        return Ok(supported
+            .into_iter()
+            .filter(|id| requested.contains(id))
+            .map(String::from)
+            .collect());
+    }
+    Ok(supported
+        .into_iter()
+        .filter(|id| agent_detected(id, exe, scope))
+        .map(String::from)
+        .collect())
 }
 
 fn install_lock(agent: &str) -> anyhow::Result<crate::lockfile::Lock> {
@@ -407,132 +850,219 @@ fn install_lock(agent: &str) -> anyhow::Result<crate::lockfile::Lock> {
         .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", path.display()))
 }
 
-/// Registers cfetch with every other agent found on this machine —
-/// feature-detected, instruction blocks + MCP, nothing is created for agents
-/// that are not installed. Re-running repairs drift: a registration whose
-/// embedded binary path went stale is updated in place.
-pub fn install_agents() -> anyhow::Result<()> {
-    let exe = current_exe_str();
-    let codex = paths::codex_home();
-    if codex.is_dir() {
-        let _lock = install_lock("codex")?;
-        let agents_md = codex.join("AGENTS.md");
-        let verb = crate::markers::upsert_file(&agents_md)?;
-        println!("codex: {verb} {}", agents_md.display());
-        let toml_path = codex.join("config.toml");
-        let current = read_or_empty(&toml_path)?;
-        if let Some(next) = codex_toml_with_mcp(&current, &exe)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?
-        {
-            crate::fsutil::atomic_write(&toml_path, &next)?;
-            println!("codex: registered MCP server in {}", toml_path.display());
-        }
-        let hooks_path = codex.join("hooks.json");
-        let current = json_file(&hooks_path)?;
-        let next = merge_for_exe(current.clone(), &exe)?;
-        if next != current {
-            crate::fsutil::atomic_write(&hooks_path, serde_json::to_string_pretty(&next)?)?;
-            println!(
-                "codex: registered native hooks in {} (approve once with /hooks)",
-                hooks_path.display()
-            );
-        }
-    }
-    let gemini = paths::home().join(".gemini");
-    if gemini.is_dir() {
-        let _lock = install_lock("gemini")?;
-        let gemini_md = gemini.join("GEMINI.md");
-        let verb = crate::markers::upsert_file(&gemini_md)?;
-        println!("gemini: {verb} {}", gemini_md.display());
-        let settings_path = gemini.join("settings.json");
-        let raw = read_or_empty(&settings_path)?;
-        let current: Value = if raw.trim().is_empty() {
-            Value::Object(Map::new())
-        } else {
-            serde_json::from_str(&raw).map_err(|e| {
-                anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display())
-            })?
-        };
-        if let Some(next) = gemini_settings_with_mcp(current, &exe)? {
-            crate::fsutil::atomic_write(&settings_path, serde_json::to_string_pretty(&next)?)?;
-            println!("gemini: registered MCP server in {}", settings_path.display());
-        }
-    }
-    Ok(())
+fn codex_toml_without_mcp(content: &str) -> anyhow::Result<Option<String>> {
+    let mut document: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|error| anyhow::anyhow!("refusing to touch unparseable TOML: {error}"))?;
+    let removed = document
+        .get_mut("mcp_servers")
+        .and_then(|servers| servers.as_table_like_mut())
+        .and_then(|servers| servers.remove(OWNER))
+        .is_some();
+    Ok(removed.then(|| document.to_string()))
 }
 
-/// Symmetric uninstall: removes exactly what install_agents() creates — the
-/// AGENTS.md/GEMINI.md marker blocks, Codex native hooks and
-/// `mcp_servers.cfetch`, and the Gemini `mcpServers.cfetch` entry.
-/// Feature-detected the same way; everything the user wrote stays.
-pub fn uninstall_agents() -> anyhow::Result<()> {
-    let codex = paths::codex_home();
-    if codex.is_dir() {
-        let _lock = install_lock("codex")?;
-        let agents_md = codex.join("AGENTS.md");
-        if crate::markers::remove_block_file(&agents_md)? {
-            println!("codex: removed block from {}", agents_md.display());
-        }
-        let toml_path = codex.join("config.toml");
-        if toml_path.is_file() {
-            let current = read_or_empty(&toml_path)?;
-            if let Some(next) = codex_toml_without_mcp(&current)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", toml_path.display()))?
-            {
-                crate::fsutil::atomic_write(&toml_path, &next)?;
-                println!("codex: removed MCP server from {}", toml_path.display());
-            }
-        }
+fn gemini_settings_without_mcp(settings: Value) -> Option<Value> {
+    let Value::Object(mut root) = settings else {
+        return None;
+    };
+    root.get_mut("mcpServers")?.as_object_mut()?.remove(OWNER)?;
+    Some(Value::Object(root))
+}
+
+fn mcp_is_present_unowned(agent: &str) -> anyhow::Result<bool> {
+    let Some(surface) = agent_config::mcp_by_id(agent) else {
+        return Ok(false);
+    };
+    let report = surface.mcp_status(&Scope::Global, OWNER, OWNER)?;
+    Ok(matches!(report.status, InstallStatus::PresentUnowned))
+}
+
+/// One-time conversion from cfetch 0.9's private marker formats. Conversion
+/// happens before agent-config's first-touch backup so a later uninstall cannot
+/// resurrect the old entries from that backup.
+fn migrate_v090(agent: &str) -> anyhow::Result<()> {
+    if agent == "codex" {
+        let codex = paths::codex_home();
         let hooks_path = codex.join("hooks.json");
         if hooks_path.is_file() {
             let current = json_file(&hooks_path)?;
-            let next = unmerge(current.clone())?;
+            let next = unmerge_legacy(current.clone())?;
             if next != current {
                 crate::fsutil::atomic_write(&hooks_path, serde_json::to_string_pretty(&next)?)?;
-                println!("codex: removed native hooks from {}", hooks_path.display());
             }
         }
-    }
-    let gemini = paths::home().join(".gemini");
-    if gemini.is_dir() {
-        let _lock = install_lock("gemini")?;
-        let gemini_md = gemini.join("GEMINI.md");
-        if crate::markers::remove_block_file(&gemini_md)? {
-            println!("gemini: removed block from {}", gemini_md.display());
+        let agents_path = codex.join("AGENTS.md");
+        crate::markers::remove_block_file(&agents_path)?;
+        if mcp_is_present_unowned(agent)? {
+            let config = codex.join("config.toml");
+            let current = read_or_empty(&config)?;
+            if let Some(next) = codex_toml_without_mcp(&current)? {
+                crate::fsutil::atomic_write(&config, next)?;
+            }
         }
-        let settings_path = gemini.join("settings.json");
-        if settings_path.is_file() {
-            let raw = read_or_empty(&settings_path)?;
-            let current: Value = serde_json::from_str(&raw).map_err(|e| {
-                anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display())
-            })?;
+    } else if agent == "gemini" {
+        let gemini = paths::home().join(".gemini");
+        crate::markers::remove_block_file(&gemini.join("GEMINI.md"))?;
+        if mcp_is_present_unowned(agent)? {
+            let settings = gemini.join("settings.json");
+            let current = json_file(&settings)?;
             if let Some(next) = gemini_settings_without_mcp(current) {
-                crate::fsutil::atomic_write(&settings_path, serde_json::to_string_pretty(&next)?)?;
-                println!("gemini: removed MCP server from {}", settings_path.display());
+                crate::fsutil::atomic_write(&settings, serde_json::to_string_pretty(&next)?)?;
             }
         }
     }
     Ok(())
 }
 
-pub fn apply(settings_path: &Path, remove: bool) -> anyhow::Result<()> {
-    let _lock = install_lock("claude")?;
-    let current: Value = match std::fs::read_to_string(settings_path) {
-        Ok(s) => serde_json::from_str(&s)
-            .map_err(|e| anyhow::anyhow!("refusing to touch unparseable {}: {e}", settings_path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && remove => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
-        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", settings_path.display())),
+/// Configure cfetch for selected harnesses. With no explicit selection, only
+/// harnesses with an existing configuration footprint are touched. `--all` is
+/// the explicit authority to create configuration for every supported agent.
+pub fn configure(
+    settings: Option<&Path>,
+    requested: &[String],
+    all: bool,
+    remove: bool,
+    project: Option<&Path>,
+) -> anyhow::Result<()> {
+    if settings.is_some() && project.is_some() {
+        anyhow::bail!("--settings and --project target different scopes");
+    }
+    let scope = match project {
+        Some(path) => {
+            let root = path.canonicalize().map_err(|error| {
+                anyhow::anyhow!("resolve project root {}: {error}", path.display())
+            })?;
+            if !root.is_dir() {
+                anyhow::bail!("project root is not a directory: {}", root.display());
+            }
+            Scope::Local(root)
+        }
+        None => Scope::Global,
     };
-    let next = if remove { unmerge(current)? } else { merge(current)? };
-    let rendered = serde_json::to_string_pretty(&next)?;
-    crate::fsutil::atomic_write(settings_path, rendered)?;
-    println!(
-        "{} cfetch hooks in {}",
-        if remove { "removed" } else { "registered" },
-        settings_path.display()
-    );
+    let exe = current_exe_str();
+    let mut agents = resolve_agents(requested, all, &exe, &scope)?;
+    if settings.is_some() && !agents.iter().any(|agent| agent == "claude") {
+        agents.push("claude".to_string());
+    }
+    if agents.is_empty() {
+        println!(
+            "no supported agent configuration detected; use --agent <id> or --all (supported: {})",
+            supported_agent_ids().join(", ")
+        );
+        return Ok(());
+    }
+    let selections = select_surfaces(&agents, &scope, &exe)?;
+
+    // Refuse known schema/ownership conflicts before touching any harness.
+    for (agent, selected) in agents.iter().zip(&selections) {
+        if !remove {
+            preflight_agent(agent, &scope, &exe, false, *selected)?;
+        }
+    }
+
+    for (agent, selected) in agents.into_iter().zip(selections) {
+        let _lock = install_lock(&agent)?;
+        if scope.local_root().is_none() {
+            migrate_v090(&agent)?;
+        }
+        let surfaces = if remove {
+            uninstall_agent_selected(&agent, &scope, &exe, selected)
+        } else {
+            install_agent_selected(&agent, &scope, &exe, selected)
+        }
+        .map_err(|error| anyhow::anyhow!("{agent}: {error:#}"))?;
+        if agent == "claude" && scope.local_root().is_none() {
+            let path = settings
+                .map(Path::to_path_buf)
+                .unwrap_or_else(default_settings_path);
+            apply_claude(&path, remove, &exe)?;
+        }
+        let description = surfaces.describe();
+        if !description.is_empty() {
+            println!(
+                "{agent}: {} {description}",
+                if remove { "removed" } else { "registered" }
+            );
+        } else {
+            println!(
+                "{agent}: skipped (no confirmed {} surfaces)",
+                if scope.local_root().is_none() {
+                    "global"
+                } else {
+                    "project-local"
+                }
+            );
+        }
+    }
     Ok(())
+}
+
+/// Reports drift in a detected Codex installation. Plans are the health check:
+/// a correct registration is exactly a no-op for the current cfetch specs.
+pub fn codex_registration_issues() -> Option<Vec<String>> {
+    let codex = paths::codex_home();
+    if !codex.is_dir() {
+        return None;
+    }
+    let exe = current_exe_str();
+    let mut issues = Vec::new();
+    if let Some(surface) = agent_config::mcp_by_id("codex") {
+        match surface.plan_install_mcp(
+            &Scope::Global,
+            &mcp_spec("codex", &exe).expect("valid MCP spec"),
+        ) {
+            Ok(plan) if plan.status == PlanStatus::NoOp => {}
+            Ok(_) => issues.push("Codex MCP registration is absent or stale".to_string()),
+            Err(error) => issues.push(format!("Codex MCP registration: {error}")),
+        }
+    }
+    if let Some(surface) = agent_config::instruction_by_id("codex") {
+        match instruction_spec("codex")
+            .and_then(|spec| Ok(surface.plan_install_instruction(&Scope::Global, &spec)?))
+        {
+            Ok(plan) if plan.status == PlanStatus::NoOp => {}
+            Ok(_) => issues.push("Codex instruction registration is absent or stale".to_string()),
+            Err(error) => issues.push(format!("Codex instruction registration: {error}")),
+        }
+    }
+    if let Some(integration) = agent_config::by_id("codex") {
+        for registration in FULL_HOOKS {
+            match hook_spec(&exe, *registration)
+                .and_then(|spec| Ok(integration.plan_install(&Scope::Global, &spec)?))
+            {
+                Ok(plan) if plan.status == PlanStatus::NoOp => {}
+                Ok(_) => issues.push(format!(
+                    "Codex native hook {} is absent or stale",
+                    registration.event.agent_config().as_str()
+                )),
+                Err(error) => issues.push(format!("Codex native hooks: {error}")),
+            }
+        }
+    }
+    let config_path = codex.join("config.toml");
+    match read_or_empty(&config_path).and_then(|content| {
+        content
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| anyhow::anyhow!("parse {}: {error}", config_path.display()))
+    }) {
+        Ok(document)
+            if document
+                .get("features")
+                .and_then(|features| features.as_table_like())
+                .and_then(|features| features.get("hooks"))
+                .and_then(|hooks| hooks.as_bool())
+                == Some(false) =>
+        {
+            issues.push(format!(
+                "{} disables native hooks with features.hooks=false",
+                config_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => issues.push(error.to_string()),
+    }
+    Some(issues)
 }
 
 #[cfg(test)]
@@ -540,294 +1070,179 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_into_empty_registers_all_events() {
-        let out = merge(Value::Null).unwrap();
-        let hooks = out["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), EVENTS.len());
-        assert!(hooks["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("session-start"));
-    }
-
-    #[test]
-    fn codex_hook_document_uses_the_native_schema_and_absolute_commands() {
-        let out = merge_for_exe(Value::Null, "/opt/cfetch/bin/cfetch").unwrap();
-        assert!(out.get("hooks").is_some(), "Codex requires the hooks wrapper");
-        for (event, subcommand) in EVENTS {
-            let handler = &out["hooks"][event][0]["hooks"][0];
-            assert_eq!(handler["type"], "command");
-            let command = handler["command"].as_str().unwrap();
-            assert!(command.contains("/opt/cfetch/bin/cfetch"));
-            assert!(command.ends_with(&format!(" hook {subcommand}")));
-        }
-    }
-
-    #[test]
-    fn user_prompt_submit_hook_is_registered() {
-        let out = merge(Value::Null).unwrap();
-        let entry = &out["hooks"]["UserPromptSubmit"][0]["hooks"][0];
-        assert!(entry["command"].as_str().unwrap().contains("hook user-prompt"));
-        assert_eq!(entry["timeout"], 10);
-        assert_eq!(entry["_managedBy"], MANAGED_BY);
-    }
-
-    #[test]
-    fn merge_preserves_foreign_entries_and_is_idempotent() {
+    fn claude_merge_is_idempotent_and_preserves_foreign_entries() {
         let existing = json!({
             "permissions": {"allow": ["Bash(ls:*)"]},
-            "hooks": {
-                "SessionStart": [
-                    {"hooks": [{"type": "command", "command": "my-own-hook"}]}
-                ]
-            }
-        });
-        let once = merge(existing).unwrap();
-        let twice = merge(once.clone()).unwrap();
-        assert_eq!(once, twice, "merge must be idempotent");
-        let list = twice["hooks"]["SessionStart"].as_array().unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0]["hooks"][0]["command"], "my-own-hook");
-        assert_eq!(twice["permissions"]["allow"][0], "Bash(ls:*)");
-    }
-
-    #[test]
-    fn foreign_entry_with_same_command_is_not_ours() {
-        // A user hook invoking the identical command but without the tag must
-        // never be removed.
-        let existing = json!({
-            "hooks": {"Stop": [
-                {"hooks": [{"type": "command", "command": "cfetch hook stop"}]}
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": "my-own-hook"}]}
             ]}
         });
-        let out = merge(existing).unwrap();
-        let list = out["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(list.len(), 2);
+        let once = merge_claude_for_exe(existing, "/opt/cfetch/bin/cfetch").unwrap();
+        let twice = merge_claude_for_exe(once.clone(), "/opt/cfetch/bin/cfetch").unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(
+            twice["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "my-own-hook"
+        );
+        assert_eq!(twice["permissions"]["allow"][0], "Bash(ls:*)");
+        assert_eq!(twice["hooks"].as_object().unwrap().len(), FULL_HOOKS.len());
     }
 
     #[test]
-    fn user_hook_colocated_in_managed_entry_survives() {
-        // A user may append their own hook object INTO our managed entry's
-        // hooks array; merge/unmerge must remove only the tagged object.
-        let mut merged = merge(Value::Null).unwrap();
+    fn claude_removal_keeps_colocated_user_hooks() {
+        let mut merged = merge_claude_for_exe(Value::Null, "/usr/bin/cfetch").unwrap();
         merged["hooks"]["Stop"][0]["hooks"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"type": "command", "command": "user-added-inside"}));
-        let remerged = merge(merged.clone()).unwrap();
-        let all: String = serde_json::to_string(&remerged).unwrap();
-        assert!(all.contains("user-added-inside"), "co-located user hook was deleted");
-        let unmerged = unmerge(remerged).unwrap();
-        let s = serde_json::to_string(&unmerged).unwrap();
-        assert!(s.contains("user-added-inside"));
-        assert!(!s.contains(MANAGED_BY));
-    }
-
-    #[test]
-    fn codex_toml_upsert_preserves_comments_and_is_idempotent() {
-        let input = "# my codex config\nmodel = \"o5\" # pinned on purpose\n\n[profiles.fast]\nmodel = \"o5-mini\"\n";
-        let once = codex_toml_with_mcp(input, "/usr/bin/cfetch").unwrap().unwrap();
-        assert!(once.starts_with(input), "user bytes (comments included) preserved verbatim");
-        assert!(once.contains("[mcp_servers.cfetch]"));
-        assert!(once.contains("command = \"/usr/bin/cfetch\""));
-        assert!(once.contains("args = [\"mcp\"]"));
+            .push(json!({"type": "command", "command": "keep-me"}));
+        let clean = unmerge_legacy(merged).unwrap();
+        assert_eq!(clean["hooks"]["Stop"][0]["hooks"][0]["command"], "keep-me");
         assert!(
-            codex_toml_with_mcp(&once, "/usr/bin/cfetch").unwrap().is_none(),
-            "current registration: no rewrite"
+            !serde_json::to_string(&clean)
+                .unwrap()
+                .contains("_managedBy")
         );
-        // empty file (fresh install): just our table
-        let fresh = codex_toml_with_mcp("", "/usr/bin/cfetch").unwrap().unwrap();
-        assert!(fresh.trim_start().starts_with("[mcp_servers.cfetch]"), "no bare [mcp_servers] header:\n{fresh}");
     }
 
     #[test]
-    fn codex_toml_parse_error_is_refused() {
-        assert!(codex_toml_with_mcp("model = \"unclosed", "/x").is_err());
-        assert!(codex_toml_without_mcp("model = \"unclosed").is_err());
-    }
-
-    #[test]
-    fn codex_toml_stale_path_is_repaired_preserving_user_keys() {
-        // Binary moved (e.g. package update): the registration must follow.
-        let stale = "# note\n[mcp_servers.cfetch]\ncommand = \"/old/place/cfetch\"\nargs = [\"mcp\"]\nstartup_timeout_ms = 9000\n";
-        let out = codex_toml_with_mcp(stale, "/new/place/cfetch").unwrap().unwrap();
-        assert!(out.contains("command = \"/new/place/cfetch\""));
-        assert!(!out.contains("/old/place"), "stale path gone");
-        assert!(out.contains("startup_timeout_ms = 9000"), "user-added keys survive the repair");
-        assert!(out.contains("# note"));
-        assert!(codex_toml_with_mcp(&out, "/new/place/cfetch").unwrap().is_none());
-    }
-
-    #[test]
-    fn a_disabled_codex_mcp_entry_is_reenabled_and_not_current() {
-        let disabled = "[mcp_servers.cfetch]\ncommand = \"/usr/bin/cfetch\"\nargs = [\"mcp\"]\nenabled = false\n";
-        let doc: toml_edit::DocumentMut = disabled.parse().unwrap();
-        assert!(!codex_entry_is_current(&doc["mcp_servers"]["cfetch"], "/usr/bin/cfetch"));
-        let repaired = codex_toml_with_mcp(disabled, "/usr/bin/cfetch").unwrap().unwrap();
-        assert!(repaired.contains("enabled = true"), "{repaired}");
-    }
-
-    #[test]
-    fn codex_toml_removal_is_grep_proof_and_leaves_others() {
-        let input = "# keep this comment\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.cfetch]\ncommand = \"/usr/bin/cfetch\"\nargs = [\"mcp\"]\n";
-        let out = codex_toml_without_mcp(input).unwrap().unwrap();
-        assert!(!out.contains("cfetch"), "grep-proof: zero cfetch traces, got:\n{out}");
-        assert!(out.contains("[mcp_servers.other]"), "foreign server survives");
-        assert!(out.contains("# keep this comment"));
-        assert!(codex_toml_without_mcp(&out).unwrap().is_none(), "second removal is a no-op");
-        assert!(codex_toml_without_mcp("model = \"o5\"\n").unwrap().is_none(), "nothing of ours: no rewrite");
-    }
-
-    #[test]
-    fn codex_registration_check_covers_doctrine_hooks_and_mcp() {
-        let home = tempfile::tempdir().unwrap();
-        let codex = home.path().join(".codex");
-        std::fs::create_dir(&codex).unwrap();
-        let exe = "/usr/bin/cfetch";
-
-        let initial = codex_registration_issues_at(&codex, exe).unwrap();
-        assert_eq!(initial.len(), 3, "all three Codex surfaces are absent");
-
-        let (agents, _) = crate::markers::upsert("# user instructions\n").unwrap();
-        std::fs::write(codex.join("AGENTS.md"), agents).unwrap();
-        let hooks = merge_for_exe(Value::Null, exe).unwrap();
-        std::fs::write(codex.join("hooks.json"), serde_json::to_string(&hooks).unwrap()).unwrap();
-        let config = codex_toml_with_mcp("model = \"gpt-test\"\n", exe).unwrap().unwrap();
-        std::fs::write(codex.join("config.toml"), config).unwrap();
-
-        assert!(
-            codex_registration_issues_at(&codex, exe).unwrap().is_empty(),
-            "fully registered Codex installation is current"
-        );
-
-        let stale_hooks = merge_for_exe(Value::Null, "/retired/cfetch").unwrap();
-        std::fs::write(
-            codex.join("hooks.json"),
-            serde_json::to_string(&stale_hooks).unwrap(),
-        )
-        .unwrap();
-        let issues = codex_registration_issues_at(&codex, exe).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].contains("native hooks"));
-    }
-
-    #[test]
-    fn codex_hook_health_rejects_handlers_that_cannot_run() {
-        let exe = "/usr/bin/cfetch";
-        let current = merge_for_exe(Value::Null, exe).unwrap();
-        assert!(hooks_are_current(&current, exe));
-
-        let mut prompt = current.clone();
-        for event in EVENTS {
-            prompt["hooks"][event.0][0]["hooks"][0]["type"] = json!("prompt");
-        }
-        assert!(!hooks_are_current(&prompt, exe), "only command handlers execute");
-
-        let mut disabled_match = current.clone();
-        disabled_match["hooks"]["Stop"][0]["matcher"] = json!("Bash");
-        assert!(!hooks_are_current(&disabled_match, exe), "all-event hooks must be catch-all");
-
-        let mut duplicate = current.clone();
-        let extra = duplicate["hooks"]["Stop"][0].clone();
-        duplicate["hooks"]["Stop"].as_array_mut().unwrap().push(extra);
-        assert!(!hooks_are_current(&duplicate, exe), "duplicate managed handlers are drift");
-    }
-
-    #[test]
-    fn codex_registration_reports_globally_disabled_hooks() {
-        let root = tempfile::tempdir().unwrap();
-        let codex = root.path().join("custom-codex-home");
-        std::fs::create_dir(&codex).unwrap();
-        let exe = "/usr/bin/cfetch";
-        let (agents, _) = crate::markers::upsert("").unwrap();
-        std::fs::write(codex.join("AGENTS.md"), agents).unwrap();
-        let hooks = merge_for_exe(Value::Null, exe).unwrap();
-        std::fs::write(codex.join("hooks.json"), serde_json::to_string(&hooks).unwrap()).unwrap();
-        let config = codex_toml_with_mcp("[features]\nhooks = false\n", exe)
-            .unwrap()
-            .unwrap();
-        std::fs::write(codex.join("config.toml"), config).unwrap();
-        let issues = codex_registration_issues_at(&codex, exe).unwrap();
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(issues[0].contains("features.hooks=false"));
-    }
-
-    #[test]
-    fn gemini_merge_preserves_and_is_idempotent() {
-        let existing = json!({"theme": "dark", "mcpServers": {"other": {"command": "x"}}});
-        let merged = gemini_settings_with_mcp(existing, "/usr/bin/cfetch").unwrap().unwrap();
-        assert_eq!(merged["theme"], "dark");
-        assert_eq!(merged["mcpServers"]["other"]["command"], "x");
-        assert_eq!(merged["mcpServers"]["cfetch"]["args"][0], "mcp");
-        assert!(gemini_settings_with_mcp(merged, "/usr/bin/cfetch").unwrap().is_none());
-    }
-
-    #[test]
-    fn gemini_stale_path_is_repaired_preserving_user_keys() {
-        let stale = json!({"mcpServers": {"cfetch": {
-            "command": "/old/place/cfetch", "args": ["mcp"], "timeout": 30000
-        }}});
-        let out = gemini_settings_with_mcp(stale, "/new/place/cfetch").unwrap().unwrap();
-        assert_eq!(out["mcpServers"]["cfetch"]["command"], "/new/place/cfetch");
-        assert_eq!(out["mcpServers"]["cfetch"]["timeout"], 30000, "user-added keys survive");
-        assert!(gemini_settings_with_mcp(out, "/new/place/cfetch").unwrap().is_none());
-    }
-
-    #[test]
-    fn gemini_removal_is_grep_proof_and_leaves_others() {
-        let v = json!({"theme": "dark", "mcpServers": {
-            "other": {"command": "x"},
-            "cfetch": {"command": "/usr/bin/cfetch", "args": ["mcp"]}
-        }});
-        let out = gemini_settings_without_mcp(v).unwrap();
-        let s = serde_json::to_string(&out).unwrap();
-        assert!(!s.contains("cfetch"), "grep-proof: zero cfetch traces");
-        assert_eq!(out["mcpServers"]["other"]["command"], "x");
-        assert_eq!(out["theme"], "dark");
-        assert!(gemini_settings_without_mcp(out).is_none(), "second removal is a no-op");
-        assert!(gemini_settings_without_mcp(json!({"theme": "dark"})).is_none());
-    }
-
-    #[test]
-    fn posix_quoting_wraps_and_escapes_apostrophes() {
-        assert_eq!(posix_quote("/usr/bin/cfetch"), "'/usr/bin/cfetch'");
+    fn windows_and_posix_commands_quote_paths_with_spaces() {
         assert_eq!(posix_quote("/opt/a b/cfetch"), "'/opt/a b/cfetch'");
-        assert_eq!(posix_quote("/o'brien/cfetch"), r"'/o'\''brien/cfetch'");
-    }
-
-    #[test]
-    fn windows_quoting_double_quotes_the_path() {
-        // The POSIX form is not merely ugly on cmd.exe, it is broken: the
-        // apostrophes become part of the program name.
         assert_eq!(
             windows_quote(r"C:\Program Files\cfetch\cfetch.exe"),
             "\"C:\\Program Files\\cfetch\\cfetch.exe\""
         );
-        assert!(!windows_quote(r"C:\x\cfetch.exe").contains('\''), "no POSIX quoting on Windows");
     }
 
     #[test]
-    fn hook_command_uses_this_platforms_quoting() {
-        let cmd = hook_command("session-start");
-        let quoted = cmd
-            .strip_suffix(" hook session-start")
-            .unwrap_or_else(|| panic!("unexpected command shape: {cmd}"));
-        let (open, close) = if cfg!(windows) { ('"', '"') } else { ('\'', '\'') };
-        assert!(quoted.starts_with(open), "{cmd}");
-        assert!(quoted.ends_with(close), "{cmd}");
+    fn codex_agent_config_round_trip_owns_all_surfaces() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope::Local(root.path().to_path_buf());
+        let installed = install_agent("codex", &scope, "/opt/cfetch/bin/cfetch").unwrap();
+        assert!(installed.mcp);
+        assert!(installed.instructions);
+        assert_eq!(installed.hooks, FULL_HOOKS.len());
+
+        let hooks = std::fs::read_to_string(root.path().join(".codex/hooks.json")).unwrap();
+        assert_eq!(hooks.matches("_agent_config_tag").count(), FULL_HOOKS.len());
+        assert!(
+            !root.path().join(".codex/hooks.json.bak").exists(),
+            "a file created by this invocation has no user state to back up"
+        );
+        let config = std::fs::read_to_string(root.path().join(".codex/config.toml")).unwrap();
+        assert!(config.contains("[mcp_servers.cfetch]"));
+        let instructions = std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap();
+        assert!(instructions.contains("BEGIN AGENT-CONFIG-INSTR:CFETCH"));
+
+        uninstall_agent("codex", &scope, "/opt/cfetch/bin/cfetch").unwrap();
+        let remaining = [
+            root.path().join(".codex/hooks.json"),
+            root.path().join(".codex/config.toml"),
+            root.path().join("AGENTS.md"),
+        ]
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect::<String>();
+        assert!(!remaining.contains("cfetch"));
     }
 
     #[test]
-    fn registered_commands_are_quoted_for_this_platform() {
-        let out = merge(Value::Null).unwrap();
-        for (event, _) in EVENTS {
-            let cmd = out["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
-            if cfg!(windows) {
-                assert!(cmd.starts_with('"'), "{event}: {cmd}");
-            } else {
-                assert!(cmd.starts_with('\''), "{event}: {cmd}");
-            }
+    fn qwen_gets_core_surfaces_without_invented_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope::Local(root.path().to_path_buf());
+        let installed = install_agent("qwen", &scope, "/usr/bin/cfetch").unwrap();
+        assert!(installed.mcp);
+        assert!(installed.instructions);
+        assert_eq!(installed.hooks, 0);
+        assert!(root.path().join(".qwen/settings.json").is_file());
+        assert!(root.path().join("QWEN.md").is_file());
+        assert!(!root.path().join("QWEN.md.bak").exists());
+    }
+
+    #[test]
+    fn trae_project_scope_gets_its_confirmed_instruction_surface() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope::Local(root.path().to_path_buf());
+        let installed = install_agent("trae", &scope, "/usr/bin/cfetch").unwrap();
+        assert!(!installed.mcp);
+        assert!(installed.instructions);
+        assert_eq!(installed.hooks, 0);
+
+        let rules = std::fs::read_to_string(root.path().join(".trae/project_rules.md")).unwrap();
+        assert!(rules.contains("BEGIN AGENT-CONFIG-INSTR:CFETCH"));
+        uninstall_agent("trae", &scope, "/usr/bin/cfetch").unwrap();
+        assert!(!root.path().join(".trae/project_rules.md.bak").exists());
+    }
+
+    #[test]
+    fn a_preexisting_user_file_keeps_its_first_touch_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let codex = root.path().join(".codex");
+        std::fs::create_dir(&codex).unwrap();
+        let hooks = codex.join("hooks.json");
+        std::fs::write(&hooks, r#"{"userSetting": true}"#).unwrap();
+
+        install_agent(
+            "codex",
+            &Scope::Local(root.path().to_path_buf()),
+            "/usr/bin/cfetch",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(hooks.with_extension("json.bak")).unwrap(),
+            r#"{"userSetting": true}"#
+        );
+    }
+
+    #[test]
+    fn shared_project_mcp_file_is_registered_once() {
+        let root = tempfile::tempdir().unwrap();
+        let agents = vec!["claude".to_string(), "copilot".to_string()];
+        let selected = select_surfaces(
+            &agents,
+            &Scope::Local(root.path().to_path_buf()),
+            "/usr/bin/cfetch",
+        )
+        .unwrap();
+        assert!(selected[0].mcp);
+        assert!(!selected[1].mcp);
+    }
+
+    #[test]
+    fn sibling_configs_sharing_a_ledger_get_distinct_mcp_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope::Local(root.path().to_path_buf());
+        for agent in ["opencode", "crush"] {
+            let surface = agent_config::mcp_by_id(agent).unwrap();
+            let _ = surface
+                .install_mcp(&scope, &mcp_spec(agent, "/usr/bin/cfetch").unwrap())
+                .unwrap();
         }
+        let ledger = std::fs::read_to_string(root.path().join(".agent-config-mcp.json")).unwrap();
+        assert!(ledger.contains("cfetch-opencode"));
+        assert!(ledger.contains("cfetch-crush"));
+
+        for agent in ["opencode", "crush"] {
+            let surface = agent_config::mcp_by_id(agent).unwrap();
+            let _ = surface
+                .uninstall_mcp(&scope, &mcp_name(agent), OWNER)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_agent_is_refused_with_the_live_registry() {
+        let error = resolve_agents(
+            &["made-up-agent".into()],
+            false,
+            "/usr/bin/cfetch",
+            &Scope::Global,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown agent"));
+        assert!(error.contains("qwen"));
+        assert!(error.contains("codebuddy"));
     }
 
     #[test]
@@ -838,20 +1253,5 @@ mod tests {
             .find_map(|line| line.strip_prefix("pkgver="))
             .expect("PKGBUILD has pkgver");
         assert_eq!(declared, env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
-    fn unmerge_removes_only_ours() {
-        let merged = merge(json!({
-            "hooks": {"Stop": [
-                {"hooks": [{"type": "command", "command": "keep-me"}]}
-            ]}
-        }))
-        .unwrap();
-        let clean = unmerge(merged).unwrap();
-        let stop = clean["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1);
-        assert_eq!(stop[0]["hooks"][0]["command"], "keep-me");
-        assert!(!serde_json::to_string(&clean).unwrap().contains(MANAGED_BY));
     }
 }

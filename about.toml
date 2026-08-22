@@ -4,6 +4,7 @@
 accepted = [
   "Apache-2.0",
   "MIT",
+  "MIT-0",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
@@ -28,4 +29,7 @@ workarounds = ["rustix", "rustls"]
 accepted = ["FSL-1.1-ALv2"]
 
 [attohttpc]
+accepted = ["MPL-2.0"]
+
+[option-ext]
 accepted = ["MPL-2.0"]

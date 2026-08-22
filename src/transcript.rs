@@ -13,8 +13,8 @@
 //! cumulative usage grows within one streamed message. Distinct ids are the
 //! api-call count.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 /// Usage summed over all distinct API calls found in one transcript. The
 /// counters are cumulative for the SESSION — booking per-turn deltas out of
@@ -31,15 +31,15 @@ pub struct TranscriptUsage {
 /// How many leading non-empty lines the schema probe samples.
 const PROBE_LINES: usize = 20;
 
-/// The usage keys we know how to read. A "usage" object carrying none of
-/// them is a different schema, not a zero.
-const USAGE_KEYS: [&str; 4] =
-    ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
-
 /// Reads and sums measured usage. `None` means "could not measure" — file
 /// unreadable, schema probe refused, or no recognizable usage records.
 pub fn scan(path: &Path) -> Option<TranscriptUsage> {
-    scan_text(&std::fs::read_to_string(path).ok()?)
+    let text = std::fs::read_to_string(path).ok()?;
+    let agent = agent_session::agent_source_for_path(path)?;
+    let updated = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH);
+    scan_agent_text(agent, path, updated, &text)
 }
 
 /// Schema probe shared by every extractor: at least half of the first
@@ -54,47 +54,135 @@ fn probe_ok(lines: &[&str]) -> bool {
     yielded * 2 >= probe.len()
 }
 
-fn scan_text(text: &str) -> Option<TranscriptUsage> {
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() || !probe_ok(&lines) {
+fn scan_agent_text(
+    agent: &str,
+    path: &Path,
+    updated: std::time::SystemTime,
+    text: &str,
+) -> Option<TranscriptUsage> {
+    if agent != agent_session::AGENT_GEMINI {
+        let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+        if lines.is_empty() || !probe_ok(&lines) {
+            return None;
+        }
+    }
+    let Some(session) = agent_session::parse_session_content(agent, path, updated, text) else {
+        return (agent == agent_session::AGENT_CLAUDE).then(|| flat_usage(text)).flatten();
+    };
+    let positive_responses: Vec<_> = session
+        .events
+        .llm_responses
+        .iter()
+        .filter(|response| {
+            response.input_tokens > 0
+                || response.output_tokens > 0
+                || response.cache_tokens > 0
+                || response.total_tokens > 0
+        })
+        .collect();
+
+    // agent-session's response IR deduplicates streamed Claude fragments by
+    // source id and keeps the maximum counters. Its aggregate currently keeps
+    // the first fragment, so use the IR for input/output and the split
+    // aggregate for cache-read/cache-created until the IR exposes that split.
+    let (mut input_tokens, mut output_tokens) = if agent == agent_session::AGENT_CLAUDE {
+        (
+            positive_responses.iter().map(|response| response.input_tokens).sum(),
+            positive_responses.iter().map(|response| response.output_tokens).sum(),
+        )
+    } else {
+        (nonnegative(session.usage.input_tokens), nonnegative(session.usage.output_tokens))
+    };
+    let mut cache_read_input_tokens = nonnegative(session.usage.cache_read_tokens);
+    let mut cache_creation_input_tokens = nonnegative(session.usage.cache_creation_tokens);
+    let mut codex_calls = 0;
+    if agent == agent_session::AGENT_CODEX
+        && let Some((calls, [input, output, cache_read, cache_created])) = codex_counters(text)
+    {
+        // Preserve the native counters exactly as recorded. agent-session
+        // normalizes cached input out of `input_tokens`, which is useful for
+        // cross-agent analytics but would change cfetch's existing ledger
+        // field semantics and its cumulative watermarks during an upgrade.
+        codex_calls = calls;
+        input_tokens = input;
+        output_tokens = output;
+        cache_read_input_tokens = cache_read;
+        cache_creation_input_tokens = cache_created;
+    }
+    if input_tokens == 0
+        && output_tokens == 0
+        && cache_read_input_tokens == 0
+        && cache_creation_input_tokens == 0
+    {
+        // A parseable session without recognized counters is a measurement
+        // gap, never a measured-looking zero.
         return None;
     }
 
-    // Last usage per message id wins; a line that fails to parse mid-file is
-    // skipped (one torn write must not discard the rest).
-    let mut per_id: BTreeMap<String, [u64; 4]> = BTreeMap::new();
-    let mut codex_totals = Vec::new();
-    for line in &lines {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if let Some((id, usage)) = usage_record(&v) {
-            per_id.insert(id, usage);
-        }
-        if let Some(usage) = codex_usage_record(&v) {
-            codex_totals.push(usage);
-        }
+    let mut api_calls = positive_responses.len() as u64;
+    if agent == agent_session::AGENT_CODEX {
+        // Codex may record cumulative token_count events without an adjacent
+        // model-response body. Distinct cumulative totals are the best native
+        // call boundary available in that transcript shape.
+        api_calls = api_calls.max(codex_calls);
     }
-    // JSON parsed but zero usage records recognized: the schema drifted under
-    // us. Refuse to report a measured zero.
-    if per_id.is_empty() {
-        let last = *codex_totals.last()?;
-        let calls = codex_totals.into_iter().collect::<BTreeSet<_>>().len() as u64;
-        return Some(TranscriptUsage {
-            api_calls: calls,
-            input_tokens: last[0],
-            output_tokens: last[1],
-            cache_read_input_tokens: last[2],
-            cache_creation_input_tokens: last[3],
-        });
-    }
+    Some(TranscriptUsage {
+        api_calls: api_calls.max(1),
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+    })
+}
 
-    let mut total = TranscriptUsage { api_calls: per_id.len() as u64, ..Default::default() };
-    for [inp, out, cr, cc] in per_id.values() {
-        total.input_tokens += inp;
-        total.output_tokens += out;
-        total.cache_read_input_tokens += cr;
-        total.cache_creation_input_tokens += cc;
+fn nonnegative(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+fn codex_counters(text: &str) -> Option<(u64, [u64; 4])> {
+    let mut totals = std::collections::BTreeSet::new();
+    let mut last = None;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("event_msg")
+            && value.pointer("/payload/type").and_then(serde_json::Value::as_str)
+                == Some("token_count")
+            && let Some(usage) = value.pointer("/payload/info/total_token_usage")
+        {
+            let get = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let counters = [
+                get("input_tokens"),
+                get("output_tokens"),
+                get("cached_input_tokens"),
+                get("cache_write_input_tokens"),
+            ];
+            totals.insert(counters);
+            last = Some(counters);
+        }
     }
-    Some(total)
+    last.map(|last| (totals.len() as u64, last))
+}
+
+/// Minimal tolerance for a flattened Claude usage record. Native transcript
+/// parsing belongs to agent-session; this one-record fallback preserves the
+/// prior fail-soft contract for harness versions that briefly flattened the
+/// `message` envelope.
+fn flat_usage(text: &str) -> Option<TranscriptUsage> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let usage = value.get("usage")?.as_object()?;
+    let get = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let result = TranscriptUsage {
+        api_calls: 1,
+        input_tokens: get("input_tokens"),
+        output_tokens: get("output_tokens"),
+        cache_read_input_tokens: get("cache_read_input_tokens"),
+        cache_creation_input_tokens: get("cache_creation_input_tokens"),
+    };
+    (result.input_tokens > 0
+        || result.output_tokens > 0
+        || result.cache_read_input_tokens > 0
+        || result.cache_creation_input_tokens > 0)
+        .then_some(result)
 }
 
 /// Transcript-VERIFIED hook delivery: `Some((fired, delivered))` where
@@ -117,7 +205,9 @@ fn verified_injections_text(text: &str) -> Option<(u64, u64)> {
     let mut fired = 0u64;
     let mut delivered = 0u64;
     for line in &lines {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if is_user_record(&v) {
             continue;
         }
@@ -178,7 +268,9 @@ fn has_cfetch_injection(v: &serde_json::Value) -> bool {
 
 fn is_user_record(v: &serde_json::Value) -> bool {
     v.get("type").and_then(serde_json::Value::as_str) == Some("user")
-        || v.pointer("/message/role").and_then(serde_json::Value::as_str) == Some("user")
+        || v.pointer("/message/role")
+            .and_then(serde_json::Value::as_str)
+            == Some("user")
         || v.get("role").and_then(serde_json::Value::as_str) == Some("user")
 }
 
@@ -292,92 +384,36 @@ fn has_nonempty_additional_context(v: &serde_json::Value) -> bool {
     }
 }
 
-/// Most recently modified `*.jsonl` under `root`, recursively. Claude nests
-/// by project and Codex nests by date, so a fixed depth is not portable.
-pub fn newest_transcript(root: &Path) -> Option<std::path::PathBuf> {
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file()
-                && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
-                && best.as_ref().is_none_or(|(t, _)| mtime > *t)
-            {
-                best = Some((mtime, path));
-            }
-        }
-    }
-    best.map(|(_, p)| p)
+/// Most recently modified transcript under one agent's root. File names,
+/// extensions, nesting, and candidate timestamp rules belong to agent-session.
+pub fn newest_transcript(agent: &'static str, root: &Path) -> Option<std::path::PathBuf> {
+    agent_session::discover_session_files_in_dir(agent, root)
+        .into_iter()
+        .max_by_key(|candidate| candidate.updated)
+        .map(|candidate| candidate.path)
 }
 
-pub fn newest_transcript_among(roots: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+pub fn newest_transcript_among(
+    roots: &[(&'static str, std::path::PathBuf)],
+) -> Option<std::path::PathBuf> {
     roots
         .iter()
-        .filter_map(|root| newest_transcript(root))
+        .filter_map(|(agent, root)| newest_transcript(agent, root))
         .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
-}
-
-/// Extracts (message id, usage) from one transcript line. Assistant lines
-/// nest both under `message`; a top-level `id`/`usage` pair is accepted as a
-/// fallback so a flattening schema change degrades gracefully.
-fn usage_record(v: &serde_json::Value) -> Option<(String, [u64; 4])> {
-    let msg = v.get("message");
-    let id = msg
-        .and_then(|m| m.get("id"))
-        .or_else(|| v.get("id"))
-        .and_then(|x| x.as_str())?;
-    let usage = msg.and_then(|m| m.get("usage")).or_else(|| v.get("usage"))?;
-    let obj = usage.as_object()?;
-    if !USAGE_KEYS.iter().any(|k| obj.contains_key(*k)) {
-        return None;
-    }
-    let g = |k: &str| obj.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    Some((
-        id.to_string(),
-        [
-            g("input_tokens"),
-            g("output_tokens"),
-            g("cache_read_input_tokens"),
-            g("cache_creation_input_tokens"),
-        ],
-    ))
-}
-
-/// Codex emits cumulative session totals on `event_msg/token_count` records.
-/// The last total is the session measurement; distinct totals approximate API
-/// calls without summing cumulative values repeatedly.
-fn codex_usage_record(v: &serde_json::Value) -> Option<[u64; 4]> {
-    if v.get("type").and_then(serde_json::Value::as_str) != Some("event_msg")
-        || v.pointer("/payload/type").and_then(serde_json::Value::as_str)
-            != Some("token_count")
-    {
-        return None;
-    }
-    let usage = v.pointer("/payload/info/total_token_usage")?.as_object()?;
-    if !["input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens"]
-        .iter()
-        .any(|key| usage.contains_key(*key))
-    {
-        return None;
-    }
-    let get = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    Some([
-        get("input_tokens"),
-        get("output_tokens"),
-        get("cached_input_tokens"),
-        get("cache_write_input_tokens"),
-    ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_text(text: &str) -> Option<TranscriptUsage> {
+        scan_agent_text(
+            agent_session::AGENT_CLAUDE,
+            Path::new("/tmp/.claude/projects/test/session.jsonl"),
+            UNIX_EPOCH,
+            text,
+        )
+    }
 
     fn assistant_line(id: &str, inp: u64, out: u64, cr: u64, cc: u64) -> String {
         format!(
@@ -408,7 +444,10 @@ mod tests {
         for i in 0..8 {
             lines.push(assistant_line(&format!("m{i}"), 1, 1, 0, 0));
         }
-        assert!(scan_text(&lines.join("\n")).is_none(), "8/20 JSON yield is below 50%");
+        assert!(
+            scan_text(&lines.join("\n")).is_none(),
+            "8/20 JSON yield is below 50%"
+        );
     }
 
     #[test]
@@ -428,8 +467,9 @@ mod tests {
 
     #[test]
     fn parseable_json_without_usage_records_is_none() {
-        let lines: Vec<String> =
-            (0..5).map(|i| format!(r#"{{"type":"progress","n":{i}}}"#)).collect();
+        let lines: Vec<String> = (0..5)
+            .map(|i| format!(r#"{{"type":"progress","n":{i}}}"#))
+            .collect();
         assert!(
             scan_text(&lines.join("\n")).is_none(),
             "JSON without usage = schema drift, never a measured zero"
@@ -455,8 +495,17 @@ mod tests {
             )
         };
         let text = [line(10, 5, 2), line(10, 5, 2), line(30, 12, 8)].join("\n");
-        let usage = scan_text(&text).unwrap();
-        assert_eq!(usage.api_calls, 2, "repeated cumulative records are deduplicated");
+        let usage = scan_agent_text(
+            agent_session::AGENT_CODEX,
+            Path::new("/tmp/.codex/sessions/2026/08/22/session.jsonl"),
+            UNIX_EPOCH,
+            &text,
+        )
+        .unwrap();
+        assert_eq!(
+            usage.api_calls, 2,
+            "repeated cumulative records are deduplicated"
+        );
         assert_eq!(usage.input_tokens, 30);
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.cache_read_input_tokens, 12);
@@ -487,7 +536,10 @@ mod tests {
     fn verified_delivery_counts_firings_and_nonempty_context() {
         let lines = [
             r#"{"type":"user","message":{"role":"user","content":"hi"}}"#.to_string(),
-            hook_line("'/usr/local/bin/cfetch' hook session-start", Some("[cfetch resident memory]")),
+            hook_line(
+                "'/usr/local/bin/cfetch' hook session-start",
+                Some("[cfetch resident memory]"),
+            ),
             hook_line("'/usr/local/bin/cfetch' hook stop", None),
             // Fired but delivered nothing: empty context must not count.
             hook_line("'/usr/local/bin/cfetch' hook pre-tool", Some("")),
@@ -506,7 +558,8 @@ mod tests {
 
     #[test]
     fn prose_mentions_and_user_messages_are_not_hook_firings() {
-        let user = r#"{"type":"user","message":{"role":"user","content":"please run cfetch hook stop"}}"#;
+        let user =
+            r#"{"type":"user","message":{"role":"user","content":"please run cfetch hook stop"}}"#;
         let structured_but_user = r#"{"type":"user","message":{"role":"user","hookCommand":"'/usr/bin/cfetch' hook stop"}}"#;
         assert_eq!(verified_injections_text(user), None);
         assert_eq!(verified_injections_text(structured_but_user), None);
@@ -523,7 +576,10 @@ mod tests {
 
         let delivered = r#"{"type":"attachment","attachment":{"type":"hook_additional_context","content":["[cfetch: 11 staged candidate(s) await distillation]"],"hookName":"UserPromptSubmit","hookEvent":"UserPromptSubmit"}}"#;
         let fired = r#"{"type":"attachment","attachment":{"type":"hook_success","hookName":"UserPromptSubmit","hookEvent":"UserPromptSubmit","command":"'/usr/bin/cfetch' hook user-prompt","durationMs":7}}"#;
-        assert_eq!(verified_injections_text(&format!("{fired}\n{delivered}")), Some((2, 1)));
+        assert_eq!(
+            verified_injections_text(&format!("{fired}\n{delivered}")),
+            Some((2, 1))
+        );
 
         let stop_summary = r#"{"type":"system","subtype":"stop_hook_summary","hookCount":2,"hookInfos":[{"command":"bash ~/.claude/hooks/notify.sh","durationMs":17},{"command":"'/usr/bin/cfetch' hook stop","durationMs":21}],"hookErrors":[],"hookAdditionalContext":[]}"#;
         assert_eq!(verified_injections_text(stop_summary), Some((1, 0)));
@@ -562,8 +618,10 @@ mod tests {
         .join("\n");
         assert_eq!(verified_injections_text(&clean), None);
         // A non-JSON line mentioning the command is not a record.
-        let torn =
-            [r#"{"type":"user","message":{"content":"x"}}"#, "ran cfetch hook stop by hand"]
+        let torn = [
+            r#"{"type":"user","message":{"content":"x"}}"#,
+            "ran cfetch hook stop by hand",
+        ]
                 .join("\n");
         assert_eq!(verified_injections_text(&torn), None);
         assert_eq!(verified_injections_text(""), None);
@@ -585,10 +643,22 @@ mod tests {
         f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
             .unwrap();
         drop(f);
-        assert_eq!(newest_transcript(dir.path()), Some(new));
+        assert_eq!(
+            newest_transcript(agent_session::AGENT_CLAUDE, dir.path()),
+            Some(new)
+        );
 
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(newest_transcript(empty.path()), None);
-        assert_eq!(newest_transcript(Path::new("/nonexistent/cfetch-projects")), None);
+        assert_eq!(
+            newest_transcript(agent_session::AGENT_CLAUDE, empty.path()),
+            None
+        );
+        assert_eq!(
+            newest_transcript(
+                agent_session::AGENT_CLAUDE,
+                Path::new("/nonexistent/cfetch-projects")
+            ),
+            None
+        );
     }
 }

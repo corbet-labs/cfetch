@@ -39,6 +39,10 @@ pub struct AuditPaths {
     pub transcripts_root: PathBuf,
     /// Codex's date-nested session transcripts.
     pub codex_transcripts_root: PathBuf,
+    /// Gemini's per-project JSON session transcripts.
+    pub gemini_transcripts_root: PathBuf,
+    /// Cursor's per-project agent transcripts.
+    pub cursor_transcripts_root: PathBuf,
 }
 
 impl AuditPaths {
@@ -53,6 +57,8 @@ impl AuditPaths {
             home,
             transcripts_root: paths::native_projects_root(),
             codex_transcripts_root: paths::codex_sessions_root(),
+            gemini_transcripts_root: paths::gemini_sessions_root(),
+            cursor_transcripts_root: paths::cursor_sessions_root(),
         }
     }
 }
@@ -199,11 +205,15 @@ fn mcp_file(path: &Path) -> McpFile {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return McpFile { source, present: true, parse_ok: false, servers: vec![] };
     };
-    let servers = v
+    let mut servers: Vec<String> = v
         .get("mcpServers")
         .and_then(|m| m.as_object())
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
+    // serde_json's map representation is feature-unified across the whole
+    // dependency graph. Audit output must not change when another dependency
+    // enables insertion-order preservation.
+    servers.sort();
     McpFile { source, present: true, parse_ok: true, servers }
 }
 
@@ -287,15 +297,19 @@ pub fn build(
 
     let mut gaps = Vec::new();
     if crate::transcript::newest_transcript_among(&[
-        paths.transcripts_root.clone(),
-        paths.codex_transcripts_root.clone(),
+        (agent_session::AGENT_CLAUDE, paths.transcripts_root.clone()),
+        (agent_session::AGENT_CODEX, paths.codex_transcripts_root.clone()),
+        (agent_session::AGENT_GEMINI, paths.gemini_transcripts_root.clone()),
+        (agent_session::AGENT_CURSOR, paths.cursor_transcripts_root.clone()),
     ])
     .is_none()
     {
         gaps.push(format!(
-            "no transcripts found under {} or {} — delivery and usage cannot be verified",
+            "no supported transcripts found under {}, {}, {}, or {} — delivery and usage cannot be verified",
             paths.transcripts_root.display(),
-            paths.codex_transcripts_root.display()
+            paths.codex_transcripts_root.display(),
+            paths.gemini_transcripts_root.display(),
+            paths.cursor_transcripts_root.display()
         ));
     }
     if measured_sessions == 0 {
@@ -461,6 +475,8 @@ mod tests {
             home: dir.to_path_buf(),
             transcripts_root: transcripts,
             codex_transcripts_root: dir.join("codex-sessions"),
+            gemini_transcripts_root: dir.join("gemini-sessions"),
+            cursor_transcripts_root: dir.join("cursor-sessions"),
         }
     }
 
@@ -603,11 +619,11 @@ mod tests {
         let p = fab(dir.path());
         // Empty transcripts root, empty ledger: BOTH gaps must be named.
         let r = build(&p, &Ledger::default(), 6000, NOW);
-        assert!(r.gaps.iter().any(|g| g.contains("no transcripts found")), "gaps: {:?}", r.gaps);
+        assert!(r.gaps.iter().any(|g| g.contains("no supported transcripts found")), "gaps: {:?}", r.gaps);
         assert!(r.gaps.iter().any(|g| g.contains("no measured usage")), "gaps: {:?}", r.gaps);
         let text = render(&r);
         assert!(text.contains("measurement gap"));
-        assert!(text.contains("no transcripts found"));
+        assert!(text.contains("no supported transcripts found"));
 
         // With a transcript present and measured usage booked, the gaps close.
         let proj = p.transcripts_root.join("-home-x");

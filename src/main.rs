@@ -59,12 +59,20 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// Register (or remove) cfetch in Claude Code settings and every other
-    /// detected agent (Codex, Gemini): hooks, MCP servers, instruction blocks
+    /// Register (or remove) cfetch in detected coding-agent harnesses
     Install {
         /// Explicit Claude settings.json path (otherwise Claude is feature-detected)
         #[arg(long)]
         settings: Option<std::path::PathBuf>,
+        /// Target one agent ID; repeat to select several (defaults to detection)
+        #[arg(long = "agent", value_name = "ID")]
+        agents: Vec<String>,
+        /// Configure every harness supported by the pinned adapter library
+        #[arg(long, conflicts_with = "agents")]
+        all: bool,
+        /// Install project-local surfaces under this existing project root
+        #[arg(long, value_name = "PATH", conflicts_with = "settings")]
+        project: Option<std::path::PathBuf>,
         /// Remove cfetch's managed entries instead of adding them
         #[arg(long)]
         remove: bool,
@@ -982,12 +990,15 @@ fn status() -> anyhow::Result<()> {
     // Transcript-VERIFIED delivery: did our hook output actually enter the
     // conversation? Read from the newest transcript, never assumed — and a
     // drifted format is reported as unverifiable, never as zero.
-    let transcript_roots = [paths::native_projects_root(), paths::codex_sessions_root()];
+    let transcript_roots = [
+        (agent_session::AGENT_CLAUDE, paths::native_projects_root()),
+        (agent_session::AGENT_CODEX, paths::codex_sessions_root()),
+        (agent_session::AGENT_GEMINI, paths::gemini_sessions_root()),
+        (agent_session::AGENT_CURSOR, paths::cursor_sessions_root()),
+    ];
     match transcript::newest_transcript_among(&transcript_roots) {
         None => println!(
-            "delivery: no transcripts found under {} or {} (measurement gap)",
-            transcript_roots[0].display(),
-            transcript_roots[1].display()
+            "delivery: no supported transcripts found (measurement gap; checked Claude, Codex, Gemini and Cursor)"
         ),
         Some(t) => match transcript::verified_injections(&t) {
             Some((fired, delivered)) => println!(
@@ -1351,22 +1362,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Install { settings, remove } => {
-            let claude = settings.or_else(|| {
-                let path = install::default_settings_path();
-                path.parent().is_some_and(std::path::Path::is_dir).then_some(path)
-            });
-            if let Some(path) = claude
-                && let Err(e) = install::apply(&path, remove)
-            {
+        Command::Install { settings, agents, all, project, remove } => {
+            if let Err(e) = install::configure(
+                settings.as_deref(),
+                &agents,
+                all,
+                remove,
+                project.as_deref(),
+            ) {
                 eprintln!("cfetch install: {e}");
-                std::process::exit(1);
-            }
-            // Other agents (Codex, Gemini) follow symmetrically: install
-            // registers, --remove strips every trace.
-            let agents = if remove { install::uninstall_agents() } else { install::install_agents() };
-            if let Err(e) = agents {
-                eprintln!("cfetch install (other agents): {e}");
                 std::process::exit(1);
             }
         }

@@ -136,6 +136,16 @@ pub fn codex_sessions_root() -> PathBuf {
     codex_home().join("sessions")
 }
 
+/// Gemini CLI session transcripts, grouped by project.
+pub fn gemini_sessions_root() -> PathBuf {
+    home().join(".gemini/tmp")
+}
+
+/// Cursor agent transcripts, grouped by workspace.
+pub fn cursor_sessions_root() -> PathBuf {
+    home().join(".cursor/projects")
+}
+
 /// The shared brain tree (source of truth, git-tracked markdown).
 pub fn default_brain_root() -> PathBuf {
     match std::env::var_os("CFETCH_BRAIN") {

@@ -1,67 +1,79 @@
-//! MCP server (stdio JSON-RPC 2.0): the one-protocol answer to "support all
-//! common agents" — Claude Desktop, Codex CLI, Gemini CLI, Cursor and any MCP
-//! client get recall/find/expand without per-agent hook dialects.
+//! MCP server: the one-protocol answer to supporting every MCP-capable agent.
 //!
-//! Hand-rolled on purpose: the protocol subset we serve (initialize,
-//! tools/list, tools/call, ping) is ~200 lines; an SDK dependency would be
-//! larger than the feature. Tools are READ-ONLY.
+//! cfetch owns the read-only tool behavior. The official Rust MCP SDK owns
+//! JSON-RPC framing, lifecycle, version negotiation, capability discovery,
+//! schema validation, and stdio concurrency.
 
-use std::io::{BufRead, Write};
-
+use rmcp::{
+    ErrorData as McpError, ServerHandler, ServiceExt,
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        ToolAnnotations,
+    },
+    service::{RequestContext, RoleServer},
+};
 use serde_json::{Value, json};
 
 use crate::{code, config::Config, index, paths, serve};
-
-/// Protocol revisions this server implements, newest first. Negotiation per
-/// the MCP spec: a version we support is echoed back; anything else (or an
-/// absent field) is answered with OUR newest supported version — the client
-/// then decides whether it can proceed. Never a blind echo.
-const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// The tools we serve; a tools/call naming anything else is the caller's
 /// protocol error (-32602), not a tool-execution failure.
 const TOOL_NAMES: &[&str] = &["cfetch_recall", "cfetch_expand", "cfetch_find"];
 
-fn tool_defs() -> Value {
-    json!([
-        {
-            "name": "cfetch_recall",
-            "description": "Search the operator's knowledge brain (privilege rings 0-4, BM25-ranked). Returns ring-prefixed citations (r<ring>-<hash>), file:line locations and snippets. Lower ring = higher trust; a ring-0/1 hit overrides contradicting outer-ring content.",
-            "inputSchema": {
+fn object_schema(value: Value) -> JsonObject {
+    value
+        .as_object()
+        .cloned()
+        .expect("tool schema is an object")
+}
+
+fn tool_defs() -> Vec<Tool> {
+    let read_only = || {
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false)
+    };
+    vec![
+        Tool::new(
+            "cfetch_recall",
+            "Search the operator's knowledge brain (privilege rings 0-4, BM25-ranked). Returns ring-prefixed citations (r<ring>-<hash>), file:line locations and snippets. Lower ring = higher trust; a ring-0/1 hit overrides contradicting outer-ring content.",
+            object_schema(json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "search terms (word-prefix matched)"},
                     "limit": {"type": "integer", "default": 8}
                 },
                 "required": ["query"]
-            }
-        },
-        {
-            "name": "cfetch_expand",
-            "description": "Expand a citation id from cfetch_recall to the full memory block.",
-            "inputSchema": {
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_expand",
+            "Expand a citation id from cfetch_recall to the full memory block.",
+            object_schema(json!({
                 "type": "object",
                 "properties": {"cite": {"type": "string"}},
                 "required": ["cite"]
-            }
-        },
-        {
-            "name": "cfetch_find",
-            "description": "Locate a symbol or file in the indexed code roots, with exact line ranges — read one function instead of a whole file. Case- and separator-insensitive.",
-            "inputSchema": {
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_find",
+            "Locate a symbol or file in the indexed code roots, with exact line ranges — read one function instead of a whole file. Case- and separator-insensitive.",
+            object_schema(json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "default": 10}
                 },
                 "required": ["query"]
-            }
-        }
-    ])
-}
-
-fn text_result(text: String) -> Value {
-    json!({"content": [{"type": "text", "text": text}], "isError": false})
+            })),
+        )
+        .with_annotations(read_only()),
+    ]
 }
 
 /// Coherence footer appended to every remotely-served MCP answer.
@@ -71,7 +83,9 @@ fn served_footer(resp: &crate::daemon::Response) -> String {
     if resp.fresh == Some(false) {
         format!(
             "\n[served by {origin}, generation {generation} — STALE: {}]",
-            resp.stale_note.clone().unwrap_or_else(|| "barrier expired".to_string())
+            resp.stale_note
+                .clone()
+                .unwrap_or_else(|| "barrier expired".to_string())
         )
     } else {
         format!("\n[served by {origin}, generation {generation}, fresh]")
@@ -133,7 +147,10 @@ fn run_tool_remote(
                 blocks
                     .iter()
                     .map(|b| {
-                        format!("{} {}:{}-{} (ring {})\n{}", b.cite, b.path, b.start_line, b.end_line, b.ring, b.text)
+                        format!(
+                            "{} {}:{}-{} (ring {})\n{}",
+                            b.cite, b.path, b.start_line, b.end_line, b.ring, b.text
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n")
@@ -170,7 +187,12 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "cfetch_recall" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
             let native = paths::native_projects_root();
-            let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
+            let conn = index::ensure_fresh(
+                &paths::state_dir(),
+                &cfg.brain_root,
+                Some(&native),
+                &cfg.rings(),
+            )?;
             let hits = index::recall(&conn, query, if limit == 0 { 8 } else { limit })?;
             if hits.is_empty() {
                 return Ok(format!("no hits for \"{query}\""));
@@ -193,14 +215,24 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "cfetch_expand" => {
             let cite = args.get("cite").and_then(Value::as_str).unwrap_or("");
             let native = paths::native_projects_root();
-            let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
+            let conn = index::ensure_fresh(
+                &paths::state_dir(),
+                &cfg.brain_root,
+                Some(&native),
+                &cfg.rings(),
+            )?;
             let blocks = index::expand(&conn, cite)?;
             if blocks.is_empty() {
                 return Ok(format!("no block with citation {cite}"));
             }
             Ok(blocks
                 .iter()
-                .map(|b| format!("{} {}:{}-{} (ring {})\n{}", b.cite, b.path, b.start_line, b.end_line, b.ring, b.text))
+                .map(|b| {
+                    format!(
+                        "{} {}:{}-{} (ring {})\n{}",
+                        b.cite, b.path, b.start_line, b.end_line, b.ring, b.text
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n\n"))
         }
@@ -229,95 +261,67 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
     }
 }
 
-/// Handles one JSON-RPC message. Returns None for notifications (no id) —
-/// they get no response by contract.
-pub fn handle(msg: &Value) -> Option<Value> {
-    let id = msg.get("id")?.clone();
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let respond = |v: Value| Some(json!({"jsonrpc": "2.0", "id": id, "result": v}));
-    match method {
-        "initialize" => {
-            let requested = msg.pointer("/params/protocolVersion").and_then(Value::as_str);
-            let negotiated = match requested {
-                Some(v) if SUPPORTED_PROTOCOLS.contains(&v) => v,
-                _ => SUPPORTED_PROTOCOLS[0],
-            };
-            respond(json!({
-                "protocolVersion": negotiated,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "cfetch", "version": env!("CARGO_PKG_VERSION")},
-                // One doctrine, two renderers: the same source function feeds
-                // the AGENTS.md/GEMINI.md marker block (markers::protocol_block).
-                "instructions": crate::markers::doctrine(crate::markers::Surface::Mcp),
-            }))
+fn call_tool(name: &str, args: &Value) -> Result<CallToolResult, McpError> {
+    if !TOOL_NAMES.contains(&name) {
+        return Err(McpError::invalid_params(format!("unknown tool: {name}"), None));
+    }
+    Ok(match run_tool(name, args) {
+        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Err(error) => CallToolResult::error(vec![ContentBlock::text(format!("error: {error}"))]),
+    })
+}
+
+struct CfetchMcp;
+
+impl ServerHandler for CfetchMcp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("cfetch", env!("CARGO_PKG_VERSION")))
+            // One doctrine, two renderers: this same source function feeds
+            // the AGENTS.md/GEMINI.md marker block.
+            .with_instructions(crate::markers::doctrine(crate::markers::Surface::Mcp))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(tool_defs()))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        tool_defs().into_iter().find(|tool| tool.name == name)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.into_owned();
+        if !TOOL_NAMES.contains(&name.as_str()) {
+            return Err(McpError::invalid_params(format!("unknown tool: {name}"), None));
         }
-        "ping" => respond(json!({})),
-        "tools/list" => respond(json!({"tools": tool_defs()})),
-        "tools/call" => {
-            let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
-            if !TOOL_NAMES.contains(&name) {
-                // Unknown tool = invalid params per the MCP spec, a JSON-RPC
-                // -32602 error. `isError: true` results are reserved for
-                // failures of a REAL tool's execution (those the model can
-                // see and react to).
-                return Some(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32602, "message": format!("unknown tool: {name}")}
-                }));
-            }
-            let empty = json!({});
-            let args = msg.pointer("/params/arguments").unwrap_or(&empty);
-            match run_tool(name, args) {
-                Ok(text) => respond(text_result(text)),
-                Err(e) => respond(json!({
-                    "content": [{"type": "text", "text": format!("error: {e}")}],
-                    "isError": true
-                })),
-            }
-        }
-        _ => Some(json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": {"code": -32601, "message": format!("method not found: {method}")}
-        })),
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let result = tokio::task::spawn_blocking(move || call_tool(&name, &args))
+            .await
+            .map_err(|error| McpError::internal_error(format!("tool worker failed: {error}"), None))??;
+        Ok(result.into())
     }
 }
 
-/// Handles one wire message, which JSON-RPC 2.0 allows to be a batch array:
-/// a batch gets a batch response (notifications contribute nothing, and an
-/// all-notification batch gets no response at all); the empty batch is the
-/// spec's invalid-request error.
-pub fn handle_message(msg: &Value) -> Option<Value> {
-    match msg.as_array() {
-        Some(items) => {
-            if items.is_empty() {
-                return Some(json!({
-                    "jsonrpc": "2.0", "id": Value::Null,
-                    "error": {"code": -32600, "message": "invalid request: empty batch"}
-                }));
-            }
-            let responses: Vec<Value> = items.iter().filter_map(handle).collect();
-            (!responses.is_empty()).then_some(Value::Array(responses))
-        }
-        None => handle(msg),
-    }
-}
-
-/// Stdio serve loop: one JSON-RPC message per line in, one per line out.
+/// Serve over the SDK's stdio transport until the client closes the session.
 pub fn serve() -> anyhow::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-        if let Some(resp) = handle_message(&msg) {
-            writeln!(stdout, "{resp}")?;
-            stdout.flush()?;
-        }
-    }
-    Ok(())
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("cfetch-mcp")
+        .build()?;
+    runtime.block_on(async {
+        let service = CfetchMcp.serve(rmcp::transport::stdio()).await?;
+        service.waiting().await?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -325,100 +329,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialize_negotiates_protocol_and_lists_tools() {
-        // A supported (older) revision is accepted and echoed.
-        let resp = handle(&json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-03-26"}
-        }))
-        .unwrap();
-        assert_eq!(resp["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(resp["result"]["serverInfo"]["name"], "cfetch");
-
-        // An unknown revision gets OUR newest supported, never a blind echo.
-        let resp = handle(&json!({
-            "jsonrpc": "2.0", "id": 2, "method": "initialize",
-            "params": {"protocolVersion": "1999-01-01"}
-        }))
-        .unwrap();
-        assert_eq!(resp["result"]["protocolVersion"], SUPPORTED_PROTOCOLS[0]);
-
-        // Absent field: same answer as unknown.
-        let resp = handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "initialize"})).unwrap();
-        assert_eq!(resp["result"]["protocolVersion"], SUPPORTED_PROTOCOLS[0]);
-
-        let tools = handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})).unwrap();
-        let names: Vec<&str> = tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, TOOL_NAMES, "tools/list and the -32602 gate must agree");
-    }
-
-    #[test]
-    fn initialize_carries_recall_first_instructions() {
-        let resp = handle(&json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18"}
-        }))
-        .unwrap();
-        let instructions = resp["result"]["instructions"].as_str().unwrap();
+    fn server_info_and_tools_are_one_coherent_contract() {
+        let info = CfetchMcp.get_info();
+        assert_eq!(info.server_info.name, "cfetch");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(info.capabilities.tools.is_some());
+        let tools = tool_defs();
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(
+            names, TOOL_NAMES,
+            "tools/list and the -32602 gate must agree"
+        );
+        assert!(tools.iter().all(|tool| {
+            tool.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint)
+                == Some(true)
+        }));
+        let instructions = info.instructions.as_deref().unwrap();
         // Same source function as the AGENTS.md/GEMINI.md marker block.
-        assert_eq!(instructions, crate::markers::doctrine(crate::markers::Surface::Mcp));
-        assert!(instructions.contains("cfetch_recall"), "MCP surface names the MCP tools");
+        assert_eq!(
+            instructions,
+            crate::markers::doctrine(crate::markers::Surface::Mcp)
+        );
+        assert!(
+            instructions.contains("cfetch_recall"),
+            "MCP surface names the MCP tools"
+        );
         assert!(instructions.contains("Before searching files or reading code wholesale"));
     }
 
     #[test]
-    fn batch_requests_get_a_batch_response() {
-        let batch = json!([
-            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
-        ]);
-        let resp = handle_message(&batch).unwrap();
-        let arr = resp.as_array().expect("a batch request gets a batch response");
-        assert_eq!(arr.len(), 2, "the notification contributes no response");
-        assert_eq!(arr[0]["id"], 1);
-        assert_eq!(arr[1]["id"], 2);
-        assert!(arr[1]["result"]["tools"].is_array());
-
-        // All-notification batch: no response at all.
-        let silent = json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}]);
-        assert!(handle_message(&silent).is_none());
-
-        // Empty batch: the spec's single invalid-request error.
-        let err = handle_message(&json!([])).unwrap();
-        assert_eq!(err["error"]["code"], -32600);
-
-        // A single (non-array) message passes through unchanged.
-        let single = handle_message(&json!({"jsonrpc": "2.0", "id": 9, "method": "ping"})).unwrap();
-        assert_eq!(single["id"], 9);
-        assert!(!single.is_array());
-    }
-
-    #[test]
-    fn notifications_get_no_response() {
-        assert!(handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
-    }
-
-    #[test]
-    fn unknown_method_is_a_jsonrpc_error() {
-        let resp = handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"})).unwrap();
-        assert_eq!(resp["error"]["code"], -32601);
-    }
-
-    #[test]
     fn unknown_tool_is_a_jsonrpc_invalid_params_error() {
-        let resp = handle(&json!({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {"name": "cfetch_delete_everything", "arguments": {}}
-        }))
-        .unwrap();
-        assert_eq!(resp["error"]["code"], -32602, "protocol error, not an isError result");
-        assert!(resp.get("result").is_none());
-        assert_eq!(resp["id"], 4);
+        let error = call_tool("cfetch_delete_everything", &json!({})).unwrap_err();
+        assert_eq!(
+            error.code.0, -32602,
+            "protocol error, not an isError result"
+        );
     }
 }
