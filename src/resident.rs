@@ -130,13 +130,66 @@ pub struct ResidentDigest {
     pub skipped_by_scope: Vec<String>,
 }
 
+/// Splits `usable` chars across the sections by WEIGHT, then hands back what
+/// the small ones do not want.
+///
+/// An equal split wastes budget in the common case: one short invariants file
+/// and one long status file get the same share, the short one uses a fraction
+/// of its allowance, and the long one is clipped anyway with the remainder
+/// unspent. So this water-fills — every round distributes the remaining budget
+/// among the entries that are still short, in proportion to their weight, and
+/// an entry that needs less than its share takes only what it needs and
+/// releases the rest into the next round.
+///
+/// It terminates: each round either satisfies at least one entry (strictly
+/// shrinking the unsatisfied set) or satisfies none, which breaks immediately.
+fn allocate(sections: &[(String, String, f32)], usable: usize) -> Vec<usize> {
+    let mut granted = vec![0usize; sections.len()];
+    let mut settled = vec![false; sections.len()];
+    let mut pool = usable;
+    loop {
+        let open: Vec<usize> = (0..sections.len()).filter(|i| !settled[*i]).collect();
+        if open.is_empty() || pool == 0 {
+            break;
+        }
+        let total: f64 = open.iter().map(|i| f64::from(sections[*i].2)).sum();
+        if total <= 0.0 {
+            break;
+        }
+        let mut progressed = false;
+        let pool_at_round_start = pool;
+        for &i in &open {
+            let share = ((pool_at_round_start as f64) * f64::from(sections[i].2) / total) as usize;
+            let want = sections[i].1.len().saturating_sub(granted[i]);
+            let take = share.min(want).min(pool);
+            granted[i] += take;
+            pool -= take;
+            if take == want {
+                settled[i] = true;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            // Nobody was satisfied this round, so every remaining entry is
+            // clipped. Hand the rest out once, by weight, and stop.
+            for &i in &open {
+                let share = ((pool_at_round_start as f64) * f64::from(sections[i].2) / total) as usize;
+                granted[i] += share.min(pool);
+                pool = pool.saturating_sub(share);
+            }
+            break;
+        }
+    }
+    granted
+}
+
 /// Builds the injected digest for ONE session. Entries whose scope does not
 /// match the session are left out entirely — they cost no budget and are not
 /// booked. Each surviving file gets a proportional share of the budget; a
 /// file over its share is clipped with a marker naming the file so the model
 /// knows where the rest lives.
 pub fn build(cfg: &Config, scope: &SessionScope) -> ResidentDigest {
-    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut sections: Vec<(String, String, f32)> = Vec::new();
     let mut skipped_by_scope: Vec<String> = Vec::new();
     for entry in &cfg.resident {
         let label = format!("ring-{} {}", entry.ring, entry.path.display());
@@ -149,13 +202,17 @@ pub fn build(cfg: &Config, scope: &SessionScope) -> ResidentDigest {
             Ok(raw) => {
                 let clean = strip_private(&raw);
                 if !clean.trim().is_empty() {
-                    sections.push((label, clean.trim().to_string()));
+                    sections.push((label, clean.trim().to_string(), entry.budget_weight()));
                 }
             }
             Err(_) => {
                 // A missing resident file is worth one short line, not silence:
                 // the resident set is the contract the operator configured.
-                sections.push((label.clone(), format!("[resident file missing: {}]", path.display())));
+                sections.push((
+                    label.clone(),
+                    format!("[resident file missing: {}]", path.display()),
+                    entry.budget_weight(),
+                ));
             }
         }
     }
@@ -167,11 +224,12 @@ pub fn build(cfg: &Config, scope: &SessionScope) -> ResidentDigest {
     // The budget is a HARD cap on the whole digest: headers and clip markers
     // are charged against it, not added on top.
     let budget = cfg.budget_chars.max(200);
-    let overhead: usize = sections.iter().map(|(label, _)| label.len() + 8).sum();
-    let share = budget.saturating_sub(overhead).max(sections.len() * 60) / sections.len();
+    let overhead: usize = sections.iter().map(|(label, _, _)| label.len() + 8).sum();
+    let usable = budget.saturating_sub(overhead).max(sections.len() * 60);
+    let shares = allocate(&sections, usable);
     let mut text = String::new();
     let mut sources = Vec::new();
-    for (label, body) in sections {
+    for ((label, body, _), share) in sections.into_iter().zip(shares) {
         let clipped = if body.len() > share {
             let marker_reserve = 60 + label.len();
             let mut cut = share.saturating_sub(marker_reserve).max(40).min(body.len());
@@ -215,16 +273,19 @@ mod tests {
                     path: PathBuf::from("everywhere.md"),
                     ring: 1,
                     scope: Scope::default(),
+                    weight: None,
                 },
                 ResidentEntry {
                     path: PathBuf::from("on-host.md"),
                     ring: 1,
                     scope: Scope { hosts: vec!["build-box".into()], ..Scope::default() },
+                    weight: None,
                 },
                 ResidentEntry {
                     path: PathBuf::from("in-repo.md"),
                     ring: 1,
                     scope: Scope { repos: vec!["widget".into()], ..Scope::default() },
+                    weight: None,
                 },
                 ResidentEntry {
                     path: PathBuf::from("elsewhere.md"),
@@ -234,9 +295,90 @@ mod tests {
                         repos: vec!["gadget".into()],
                         always: false,
                     },
+                    weight: None,
                 },
             ],
             ..Config::default()
+        }
+    }
+
+    fn entry(path: &str, ring: u8, weight: Option<f32>) -> ResidentEntry {
+        ResidentEntry { path: PathBuf::from(path), ring, scope: Scope::default(), weight }
+    }
+
+    /// Two entries, one tiny and one long. Under an equal split the tiny file
+    /// reserves half the budget, uses a sliver of it, and the long file is
+    /// clipped with the remainder unspent. Water-filling must hand that slack
+    /// over instead.
+    #[test]
+    fn a_small_entry_releases_its_unused_budget_to_a_large_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.md"), "tiny\n").unwrap();
+        std::fs::write(dir.path().join("big.md"), "B".repeat(5000)).unwrap();
+        let cfg = Config {
+            brain_root: dir.path().to_path_buf(),
+            budget_chars: 2000,
+            resident: vec![entry("small.md", 1, None), entry("big.md", 1, None)],
+            ..Config::default()
+        };
+        let d = build(&cfg, &SessionScope::from_cwd(None));
+        let big = d.sources.iter().find(|(l, _)| l.contains("big.md")).unwrap().1;
+        // An equal split would cap this near half the usable budget.
+        assert!(big > 1200, "big.md got {big} chars; the small entry's slack was not released");
+        assert!(d.text.len() <= 2000, "the budget is still a hard cap: {}", d.text.len());
+    }
+
+    /// The ring is the default statement of how load-bearing an entry is, so
+    /// an invariant must out-compete a behavior note for the same budget.
+    #[test]
+    fn a_lower_ring_outbids_a_higher_one_when_both_are_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inv.md"), "I".repeat(5000)).unwrap();
+        std::fs::write(dir.path().join("beh.md"), "B".repeat(5000)).unwrap();
+        let cfg = Config {
+            brain_root: dir.path().to_path_buf(),
+            budget_chars: 2000,
+            resident: vec![entry("inv.md", 0, None), entry("beh.md", 2, None)],
+            ..Config::default()
+        };
+        let d = build(&cfg, &SessionScope::from_cwd(None));
+        let inv = d.sources.iter().find(|(l, _)| l.contains("inv.md")).unwrap().1;
+        let beh = d.sources.iter().find(|(l, _)| l.contains("beh.md")).unwrap().1;
+        assert!(inv > beh, "ring 0 got {inv}, ring 2 got {beh} — the ring did not weigh");
+    }
+
+    #[test]
+    fn an_explicit_weight_overrides_the_ring_and_degenerate_values_fall_back() {
+        // Explicit weight wins over the ring's default.
+        let e = entry("x.md", 2, Some(9.0));
+        assert_eq!(e.budget_weight(), 9.0);
+        // A NaN would poison the whole allocation; a zero would silently
+        // delete an entry the operator asked for. Both fall back to the ring.
+        assert_eq!(entry("x.md", 0, Some(f32::NAN)).budget_weight(), 4.0);
+        assert_eq!(entry("x.md", 1, Some(0.0)).budget_weight(), 2.0);
+        assert_eq!(entry("x.md", 1, Some(-3.0)).budget_weight(), 2.0);
+        assert_eq!(entry("x.md", 2, None).budget_weight(), 1.0);
+    }
+
+    /// Every entry must still be represented even when the budget is far too
+    /// small for any of them — silence about a configured resident file is the
+    /// failure this whole path exists to avoid.
+    #[test]
+    fn a_tiny_budget_still_names_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.md", "b.md", "c.md"] {
+            std::fs::write(dir.path().join(n), "X".repeat(4000)).unwrap();
+        }
+        let cfg = Config {
+            brain_root: dir.path().to_path_buf(),
+            budget_chars: 200,
+            resident: vec![entry("a.md", 0, None), entry("b.md", 1, None), entry("c.md", 2, None)],
+            ..Config::default()
+        };
+        let d = build(&cfg, &SessionScope::from_cwd(None));
+        assert_eq!(d.sources.len(), 3);
+        for n in ["a.md", "b.md", "c.md"] {
+            assert!(d.text.contains(n), "{n} vanished from the digest");
         }
     }
 
@@ -355,7 +497,7 @@ mod tests {
             brain_root: dir.path().to_path_buf(),
             resident: ["a.md", "b.md", "c.md"]
                 .iter()
-                .map(|n| ResidentEntry { path: PathBuf::from(n), ring: 1, scope: Scope::default() })
+                .map(|n| ResidentEntry { path: PathBuf::from(n), ring: 1, scope: Scope::default(), weight: None })
                 .collect(),
             code_roots: Vec::new(),
             budget_chars: 2000,
@@ -395,7 +537,7 @@ mod tests {
         std::fs::write(&big, "line\n".repeat(5000)).unwrap();
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
-            resident: vec![ResidentEntry { path: PathBuf::from("big.md"), ring: 0, scope: Scope::default() }],
+            resident: vec![ResidentEntry { path: PathBuf::from("big.md"), ring: 0, scope: Scope::default(), weight: None }],
             code_roots: Vec::new(),
             budget_chars: 1000,
             ..Config::default()
@@ -410,7 +552,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
-            resident: vec![ResidentEntry { path: PathBuf::from("absent.md"), ring: 1, scope: Scope::default() }],
+            resident: vec![ResidentEntry { path: PathBuf::from("absent.md"), ring: 1, scope: Scope::default(), weight: None }],
             code_roots: Vec::new(),
             budget_chars: 1000,
             ..Config::default()

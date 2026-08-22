@@ -887,6 +887,7 @@ mod tests {
                 path: std::path::PathBuf::from("rules.md"),
                 ring: 0,
                 scope: crate::config::Scope::default(),
+                weight: None,
             }],
             governance: crate::config::GovernanceConfig { enabled, reinject_every },
             ..Config::default()

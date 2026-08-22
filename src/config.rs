@@ -319,6 +319,29 @@ pub struct ResidentEntry {
     /// When this entry reaches a session. Absent = every session.
     #[serde(default)]
     pub scope: Scope,
+    /// Share of the digest budget this entry competes for, relative to the
+    /// other entries that reached this session. Absent = derived from the
+    /// ring, because the ring already states how load-bearing the content is:
+    /// an invariant that gets clipped is a worse outcome than a behavior note
+    /// that does, and an equal split cannot express that.
+    #[serde(default)]
+    pub weight: Option<f32>,
+}
+
+impl ResidentEntry {
+    /// Non-finite or non-positive weights are refused rather than propagated:
+    /// a NaN would poison the whole allocation, and a zero would silently
+    /// delete an entry the operator asked to inject.
+    pub fn budget_weight(&self) -> f32 {
+        match self.weight {
+            Some(w) if w.is_finite() && w > 0.0 => w,
+            _ => match self.ring {
+                0 => 4.0,
+                1 => 2.0,
+                _ => 1.0,
+            },
+        }
+    }
 }
 
 /// Ring-6 exhaust capture (PostToolUse/Stop -> the tree's exhaust stream).
@@ -747,6 +770,7 @@ impl Default for Config {
                 path: PathBuf::from("AGENT.md"),
                 ring: 1,
                 scope: Scope::default(),
+                weight: None,
             }],
             code_roots: Vec::new(),
             budget_chars: default_budget_chars(),

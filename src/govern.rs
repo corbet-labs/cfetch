@@ -356,8 +356,8 @@ mod tests {
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
             resident: vec![
-                ResidentEntry { path: PathBuf::from("guards.md"), ring: 0, scope: Scope::default() },
-                ResidentEntry { path: PathBuf::from("policy.md"), ring: 1, scope: Scope::default() },
+                ResidentEntry { path: PathBuf::from("guards.md"), ring: 0, scope: Scope::default(), weight: None },
+                ResidentEntry { path: PathBuf::from("policy.md"), ring: 1, scope: Scope::default(), weight: None },
             ],
             ..Config::default()
         };
@@ -460,7 +460,7 @@ mod tests {
         std::fs::write(dir.path().join("p.md"), "---\ndescription: d\n---\n").unwrap();
         let cfg = Config {
             brain_root: dir.path().to_path_buf(),
-            resident: vec![ResidentEntry { path: PathBuf::from("p.md"), ring: 1, scope: Scope::default() }],
+            resident: vec![ResidentEntry { path: PathBuf::from("p.md"), ring: 1, scope: Scope::default(), weight: None }],
             ..Config::default()
         };
         assert_eq!(top_ring0_rules(&cfg, &any_session()), None);
