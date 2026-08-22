@@ -12,6 +12,11 @@
 //! lines, so usage is deduped per message id, keeping the LAST record —
 //! cumulative usage grows within one streamed message. Distinct ids are the
 //! api-call count.
+//!
+//! The same per-call records also answer where the prompt cache went: a call
+//! that re-creates a prefix instead of reading it pays for the whole
+//! conversation again, so [`cache_rebuilds`] finds those calls and names what
+//! changed at each boundary (see [`RebuildCause`]).
 
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -183,6 +188,311 @@ fn flat_usage(text: &str) -> Option<TranscriptUsage> {
         || result.cache_read_input_tokens > 0
         || result.cache_creation_input_tokens > 0)
         .then_some(result)
+}
+
+/// Both halves of the prefix-rebuild test. The absolute floor keeps ordinary
+/// top-ups out — every turn appends a tool result to the warm prefix and pays
+/// a little cache creation for it. The share test keeps a large but
+/// proportionate build out, so the opening turns of a big session are not
+/// reported as invalidation. Either half alone flags noise.
+pub const REBUILD_MIN_CACHE_CREATION: u64 = 50_000;
+const REBUILD_MIN_SHARE_PERCENT: u64 = 30;
+
+/// Idle gap past which the prefix is gone whatever else happened: both
+/// ephemeral cache lifetimes (5 minutes and 1 hour) have expired.
+const REBUILD_IDLE_SECS: u64 = 65 * 60;
+
+/// What changed at a rebuild boundary. Declaration order is how directly the
+/// signal explains a rebuilt prefix, and it is the precedence
+/// [`CacheRebuild::cause`] applies when several coincide: a replaced prefix
+/// explains itself; a different model or harness version changes the prefix
+/// or the key it is cached under; expiry comes last because it is also true
+/// of most of the causes above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RebuildCause {
+    /// The harness compacted the conversation and the prefix it summarized
+    /// no longer exists.
+    Compaction,
+    ModelSwitch,
+    VersionChange,
+    /// The cache expired before the next call.
+    Idle,
+    /// Nothing observable explains this rebuild. A real answer, not a missing
+    /// one: sorting it into the nearest bucket would turn a measurement into
+    /// a story, and the unexplained rebuilds are exactly the ones worth
+    /// chasing.
+    Unattributed,
+}
+
+impl RebuildCause {
+    /// Stable identifiers — they reach the audit's JSON output.
+    pub fn label(self) -> &'static str {
+        match self {
+            RebuildCause::Compaction => "compaction",
+            RebuildCause::ModelSwitch => "model-switch",
+            RebuildCause::VersionChange => "version-change",
+            RebuildCause::Idle => "idle-over-65-min",
+            RebuildCause::Unattributed => "unattributed",
+        }
+    }
+
+    /// Every cause, in precedence order — the audit reports its buckets in it.
+    pub const ALL: [RebuildCause; 5] = [
+        RebuildCause::Compaction,
+        RebuildCause::ModelSwitch,
+        RebuildCause::VersionChange,
+        RebuildCause::Idle,
+        RebuildCause::Unattributed,
+    ];
+}
+
+/// One prompt-cache prefix rebuild: an API call that paid to re-create the
+/// cached prefix instead of reading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRebuild {
+    /// Position among the counted API calls.
+    pub call_index: u64,
+    pub cache_creation_tokens: u64,
+    /// Context size of the call before it — the share test's denominator.
+    pub prior_context_tokens: u64,
+    /// Gap since the previous call; `None` when either stamp was unusable.
+    pub idle_secs: Option<u64>,
+    /// EVERY signal present at this boundary, in precedence order. Empty means
+    /// unattributed; more than one means the single cause below is a choice,
+    /// not a deduction, and the report says so.
+    pub signals: Vec<RebuildCause>,
+}
+
+impl CacheRebuild {
+    pub fn cause(&self) -> RebuildCause {
+        self.signals.first().copied().unwrap_or(RebuildCause::Unattributed)
+    }
+}
+
+/// Rebuilds found in one transcript, with the call count they were found
+/// among — a rebuild count means nothing without its denominator.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheRebuilds {
+    pub api_calls: u64,
+    pub rebuilds: Vec<CacheRebuild>,
+}
+
+impl CacheRebuilds {
+    /// Tokens re-created by rebuilds — the bill this attribution explains.
+    pub fn tokens(&self) -> u64 {
+        self.rebuilds.iter().map(|r| r.cache_creation_tokens).sum()
+    }
+}
+
+/// Detects prompt-cache prefix rebuilds and attributes a cause to each.
+/// `None` means "could not measure" — unreadable file, schema probe refused,
+/// or no per-call cache counters recognized. `Some` with no rebuilds is the
+/// measured answer that the prefix held.
+pub fn cache_rebuilds(path: &Path) -> Option<CacheRebuilds> {
+    cache_rebuilds_text(&std::fs::read_to_string(path).ok()?)
+}
+
+fn cache_rebuilds_text(text: &str) -> Option<CacheRebuilds> {
+    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() || !probe_ok(&lines) {
+        return None;
+    }
+    let calls = calls_in_order(text);
+    if calls.is_empty() {
+        // Parseable, but nothing carried per-call cache counters: the record
+        // shape drifted, or this agent does not report the cache split.
+        // Unmeasurable — never a measured "the prefix held".
+        return None;
+    }
+    let mut rebuilds = Vec::new();
+    // The first call BUILDS the prefix; there is nothing yet to invalidate.
+    for (index, call) in calls.iter().enumerate().skip(1) {
+        let previous = &calls[index - 1];
+        let prior_context = previous.context();
+        if call.cache_creation < REBUILD_MIN_CACHE_CREATION
+            || prior_context == 0
+            || call.cache_creation.saturating_mul(100)
+                < prior_context.saturating_mul(REBUILD_MIN_SHARE_PERCENT)
+        {
+            continue;
+        }
+        let idle = match (previous.at, call.at) {
+            (Some(before), Some(now)) => Some(now.saturating_sub(before)),
+            _ => None,
+        };
+        let mut signals = Vec::new();
+        if call.after_compaction {
+            signals.push(RebuildCause::Compaction);
+        }
+        if changed(&previous.model, &call.model) {
+            signals.push(RebuildCause::ModelSwitch);
+        }
+        if changed(&previous.version, &call.version) {
+            signals.push(RebuildCause::VersionChange);
+        }
+        if idle.is_some_and(|seconds| seconds > REBUILD_IDLE_SECS) {
+            signals.push(RebuildCause::Idle);
+        }
+        rebuilds.push(CacheRebuild {
+            call_index: index as u64,
+            cache_creation_tokens: call.cache_creation,
+            prior_context_tokens: prior_context,
+            idle_secs: idle,
+            signals,
+        });
+    }
+    Some(CacheRebuilds { api_calls: calls.len() as u64, rebuilds })
+}
+
+/// A value that is missing on either side is not a change. Attributing a
+/// rebuild to a "switch" from an unrecorded model would invent the one thing
+/// this measurement exists to avoid.
+fn changed(before: &str, after: &str) -> bool {
+    !before.is_empty() && !after.is_empty() && before != after
+}
+
+/// Per-call context accounting, in transcript order — only what a rebuild
+/// boundary is judged on.
+struct Call {
+    id: String,
+    model: String,
+    version: String,
+    /// Epoch seconds; `None` when the record carried no usable stamp.
+    at: Option<u64>,
+    input: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    /// A compaction boundary stands between this call and the one before it.
+    after_compaction: bool,
+}
+
+impl Call {
+    /// Everything the model read on this call: the prefix, warm or rebuilt,
+    /// plus the fresh bytes.
+    fn context(&self) -> u64 {
+        self.input.saturating_add(self.cache_read).saturating_add(self.cache_creation)
+    }
+}
+
+fn calls_in_order(text: &str) -> Vec<Call> {
+    let mut calls: Vec<Call> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut after_compaction = false;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if is_compaction_boundary(&value) {
+            after_compaction = true;
+        }
+        let Some(call) = usage_call(&value, after_compaction) else { continue };
+        after_compaction = false;
+        match by_id.get(&call.id) {
+            // Streaming writes one record per fragment and resume replays old
+            // lines: one id is one API call, and its LAST record carries the
+            // final counters. The compaction flag survives from whichever
+            // fragment saw the boundary.
+            Some(&at) => {
+                let seen_boundary = calls[at].after_compaction;
+                calls[at] = Call { after_compaction: seen_boundary || call.after_compaction, ..call };
+            }
+            None => {
+                if !call.id.is_empty() {
+                    by_id.insert(call.id.clone(), calls.len());
+                }
+                calls.push(call);
+            }
+        }
+    }
+    calls
+}
+
+/// Compaction rewrites the prefix, so the record that announces it is the
+/// only evidence that the next rebuild was structural. The three spellings
+/// are the boundary marker, its metadata, and the summary message itself.
+fn is_compaction_boundary(value: &serde_json::Value) -> bool {
+    value.get("subtype").and_then(serde_json::Value::as_str) == Some("compact_boundary")
+        || value.get("compactMetadata").is_some()
+        || value.get("isCompactSummary").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+fn usage_call(value: &serde_json::Value, after_compaction: bool) -> Option<Call> {
+    // A subagent's records are interleaved into the parent transcript and
+    // carry their OWN cache prefix. Judging them against the main
+    // conversation's context would report every subagent's first call as a
+    // rebuild of a prefix it never used.
+    if value.get("isSidechain").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let message = value.get("message")?;
+    let usage = message.get("usage")?.as_object()?;
+    let get = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let call = Call {
+        id: message
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        model: message
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        version: value
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        at: value.get("timestamp").and_then(serde_json::Value::as_str).and_then(epoch_secs),
+        input: get("input_tokens"),
+        cache_read: get("cache_read_input_tokens"),
+        cache_creation: get("cache_creation_input_tokens"),
+        after_compaction,
+    };
+    // The harness writes a placeholder assistant record with an all-zero
+    // usage block for its own errors and interruptions, under a synthetic
+    // model name. Keeping it would make the NEXT real call look like a model
+    // switch — an attribution invented out of an API error.
+    (call.input > 0 || call.cache_read > 0 || call.cache_creation > 0).then_some(call)
+}
+
+/// Epoch seconds from the harness's ISO-8601 UTC stamp
+/// (`2026-08-20T21:49:31.142Z`). Deliberately strict, and UTC only: a stamp
+/// carrying an unknown offset could shift a gap across the 65-minute line in
+/// either direction, and dropping the idle signal is honest where guessing
+/// the zone is not.
+fn epoch_secs(stamp: &str) -> Option<u64> {
+    let stamp = stamp.strip_suffix('Z')?;
+    let (date, time) = stamp.split_once('T')?;
+    let mut fields = date.split('-');
+    let year: i64 = fields.next()?.parse().ok()?;
+    let month: i64 = fields.next()?.parse().ok()?;
+    let day: i64 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut fields = time.split(':');
+    let hour: i64 = fields.next()?.parse().ok()?;
+    let minute: i64 = fields.next()?.parse().ok()?;
+    // Fractional seconds are ignored: the gap this feeds is measured against
+    // a 65-minute threshold.
+    let second: i64 = fields.next()?.split('.').next()?.parse().ok()?;
+    if fields.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(seconds).ok()
+}
+
+/// Days since 1970-01-01 from a proleptic Gregorian date (Howard Hinnant's
+/// civil-calendar algorithm). Written out because the only alternative is a
+/// date crate, and this file needs exactly one number from one shape.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_shifted = (month + 9) % 12;
+    let day_of_year = (153 * month_shifted + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// Transcript-VERIFIED hook delivery: `Some((fired, delivered))` where
@@ -626,6 +936,279 @@ mod tests {
         assert_eq!(verified_injections_text(&torn), None);
         assert_eq!(verified_injections_text(""), None);
         assert!(verified_injections(Path::new("/nonexistent/cfetch-t.jsonl")).is_none());
+    }
+
+    /// One assistant record as the harness writes it, with everything a
+    /// rebuild boundary is judged on.
+    fn call_line(
+        id: &str,
+        model: &str,
+        version: &str,
+        stamp: &str,
+        input: u64,
+        cache_read: u64,
+        cache_creation: u64,
+    ) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{stamp}","version":"{version}","isSidechain":false,"message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":40,"cache_read_input_tokens":{cache_read},"cache_creation_input_tokens":{cache_creation}}}}}}}"#
+        )
+    }
+
+    /// A warm call: it read the prefix and appended a little.
+    fn warm(id: &str, stamp: &str, context: u64) -> String {
+        call_line(id, "model-a", "1.0.0", stamp, 20, context - 20, 0)
+    }
+
+    #[test]
+    fn a_rebuild_needs_both_the_floor_and_the_share() {
+        // 60k re-created over a 500k prior context is 12%: a big top-up, not
+        // a rebuilt prefix.
+        let proportionate = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 500_000),
+            call_line("m2", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 460_000, 60_000),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&proportionate).unwrap();
+        assert_eq!(found.api_calls, 2);
+        assert!(found.rebuilds.is_empty(), "12% of the prior context is not a rebuild");
+
+        // 40k is 80% of a small prior context but under the absolute floor:
+        // re-creating a tiny prefix is not the cost this measurement is for.
+        let small = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 50_000),
+            call_line("m3", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 0, 40_000),
+        ]
+        .join("\n");
+        assert!(cache_rebuilds_text(&small).unwrap().rebuilds.is_empty(), "under the 50k floor");
+
+        // Both halves satisfied: 60k re-created over a 100k prior context.
+        let rebuilt = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 100_000),
+            call_line("m4", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 0, 60_000),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&rebuilt).unwrap();
+        assert_eq!(found.rebuilds.len(), 1);
+        assert_eq!(found.rebuilds[0].call_index, 1);
+        assert_eq!(found.rebuilds[0].cache_creation_tokens, 60_000);
+        assert_eq!(found.rebuilds[0].prior_context_tokens, 100_000);
+        assert_eq!(found.tokens(), 60_000);
+    }
+
+    #[test]
+    fn the_sessions_first_prefix_build_is_not_a_rebuild() {
+        // Nothing was cached yet, so nothing was invalidated — counting the
+        // opening build would put a cost on every session that has no cause.
+        let opening = call_line(
+            "m1",
+            "model-a",
+            "1.0.0",
+            "2026-08-20T10:00:00.000Z",
+            20,
+            0,
+            400_000,
+        );
+        let found = cache_rebuilds_text(&opening).unwrap();
+        assert_eq!(found.api_calls, 1);
+        assert!(found.rebuilds.is_empty());
+    }
+
+    #[test]
+    fn an_unexplained_rebuild_stays_unattributed() {
+        // Same model, same harness version, 30 seconds apart, no compaction:
+        // the prefix was rebuilt and nothing observable says why. That must
+        // survive as its own answer.
+        let text = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 300_000),
+            call_line("m2", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 0, 300_000),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&text).unwrap();
+        assert_eq!(found.rebuilds.len(), 1);
+        assert!(found.rebuilds[0].signals.is_empty(), "no signal is not a weak signal");
+        assert_eq!(found.rebuilds[0].cause(), RebuildCause::Unattributed);
+        assert_eq!(found.rebuilds[0].idle_secs, Some(30));
+    }
+
+    #[test]
+    fn each_cause_is_recognized_on_its_own() {
+        let prior = warm("m1", "2026-08-20T10:00:00.000Z", 300_000);
+        let rebuild = |model: &str, version: &str, stamp: &str| {
+            [prior.clone(), call_line("m2", model, version, stamp, 20, 0, 300_000)].join("\n")
+        };
+        let cause = |text: &str| cache_rebuilds_text(text).unwrap().rebuilds[0].cause();
+
+        assert_eq!(
+            cause(&rebuild("model-b", "1.0.0", "2026-08-20T10:00:30.000Z")),
+            RebuildCause::ModelSwitch
+        );
+        assert_eq!(
+            cause(&rebuild("model-a", "1.1.0", "2026-08-20T10:00:30.000Z")),
+            RebuildCause::VersionChange
+        );
+        // 66 minutes later: both ephemeral cache windows have expired.
+        assert_eq!(
+            cause(&rebuild("model-a", "1.0.0", "2026-08-20T11:06:00.000Z")),
+            RebuildCause::Idle
+        );
+        // 64 minutes is inside the hour cache, so the clock explains nothing.
+        assert_eq!(
+            cause(&rebuild("model-a", "1.0.0", "2026-08-20T11:04:00.000Z")),
+            RebuildCause::Unattributed
+        );
+
+        let compacted = [
+            prior.clone(),
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto"}}"#
+                .to_string(),
+            call_line("m2", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 0, 300_000),
+        ]
+        .join("\n");
+        assert_eq!(cause(&compacted), RebuildCause::Compaction);
+    }
+
+    #[test]
+    fn coincident_signals_are_all_kept_and_ranked() {
+        // Resumed the next morning on another model after a compaction: three
+        // signals are true at once. The report must be able to say the single
+        // cause was a choice.
+        let text = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 300_000),
+            r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"summary"}}"#
+                .to_string(),
+            call_line("m2", "model-b", "1.0.0", "2026-08-21T09:00:00.000Z", 20, 0, 300_000),
+        ]
+        .join("\n");
+        let rebuild = cache_rebuilds_text(&text).unwrap().rebuilds.remove(0);
+        assert_eq!(
+            rebuild.signals,
+            vec![RebuildCause::Compaction, RebuildCause::ModelSwitch, RebuildCause::Idle]
+        );
+        assert_eq!(rebuild.cause(), RebuildCause::Compaction, "the replaced prefix outranks the clock");
+        assert_eq!(rebuild.idle_secs, Some(82_800));
+    }
+
+    #[test]
+    fn an_error_placeholder_does_not_fake_a_model_switch() {
+        // The harness records its own API errors as an assistant message with
+        // an all-zero usage block under a synthetic model name. Booking it as
+        // a call would make the next real call a "model switch" — a cause
+        // invented out of an error.
+        let text = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 300_000),
+            call_line("m2", "<synthetic>", "1.0.0", "2026-08-20T10:00:10.000Z", 0, 0, 0),
+            call_line("m3", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 0, 300_000),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&text).unwrap();
+        assert_eq!(found.api_calls, 2, "a zero-usage placeholder is not an api call");
+        assert_eq!(found.rebuilds.len(), 1);
+        assert_eq!(found.rebuilds[0].cause(), RebuildCause::Unattributed);
+    }
+
+    #[test]
+    fn a_subagents_records_are_not_the_main_prefix() {
+        // A sidechain runs its own conversation with its own cached prefix,
+        // interleaved into this file. Its opening build is not an
+        // invalidation here, and it must not become the denominator for the
+        // next main-conversation call either.
+        let sidechain = r#"{"type":"assistant","timestamp":"2026-08-20T10:00:10.000Z","version":"1.0.0","isSidechain":true,"message":{"id":"sub1","model":"model-a","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":900000}}}"#;
+        let text = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 300_000),
+            sidechain.to_string(),
+            warm("m2", "2026-08-20T10:00:30.000Z", 320_000),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&text).unwrap();
+        assert_eq!(found.api_calls, 2, "sidechain calls belong to another conversation");
+        assert!(found.rebuilds.is_empty());
+    }
+
+    #[test]
+    fn streamed_fragments_of_one_call_are_one_call() {
+        // Streaming repeats the id with growing counters. Treating fragments
+        // as separate calls would compare a call against its own earlier
+        // fragment and manufacture a rebuild out of a single request.
+        let text = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 300_000),
+            call_line("m2", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 0, 120_000),
+            call_line("m2", "model-a", "1.0.0", "2026-08-20T10:00:31.000Z", 20, 0, 300_000),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&text).unwrap();
+        assert_eq!(found.api_calls, 2);
+        assert_eq!(found.rebuilds.len(), 1);
+        assert_eq!(
+            found.rebuilds[0].cache_creation_tokens, 300_000,
+            "the last fragment carries the final counters"
+        );
+    }
+
+    #[test]
+    fn a_compaction_boundary_survives_the_fragments_that_follow_it() {
+        // The boundary is announced once; the call after it may be written as
+        // several fragments, and only the first of them sees the flag.
+        let text = [
+            warm("m1", "2026-08-20T10:00:00.000Z", 300_000),
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual"}}"#.to_string(),
+            call_line("m2", "model-a", "1.0.0", "2026-08-20T10:00:30.000Z", 20, 0, 100_000),
+            call_line("m2", "model-a", "1.0.0", "2026-08-20T10:00:31.000Z", 20, 0, 300_000),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&text).unwrap();
+        assert_eq!(found.rebuilds.len(), 1);
+        assert_eq!(found.rebuilds[0].cause(), RebuildCause::Compaction);
+    }
+
+    #[test]
+    fn rebuild_attribution_refuses_unmeasurable_transcripts() {
+        // Majority non-JSON: the shared schema probe refuses the file.
+        let mut lines: Vec<String> = (0..12).map(|i| format!("garbage {i}")).collect();
+        for i in 0..8 {
+            lines.push(warm(&format!("m{i}"), "2026-08-20T10:00:00.000Z", 300_000));
+        }
+        assert!(cache_rebuilds_text(&lines.join("\n")).is_none());
+        // Parseable JSON with no per-call cache counters: unmeasurable, never
+        // a measured "the prefix held".
+        let no_usage = [r#"{"type":"progress","n":1}"#, r#"{"type":"user","message":{}}"#].join("\n");
+        assert!(cache_rebuilds_text(&no_usage).is_none());
+        assert!(cache_rebuilds_text("").is_none());
+        assert!(cache_rebuilds(Path::new("/nonexistent/cfetch-transcript.jsonl")).is_none());
+    }
+
+    #[test]
+    fn an_unusable_timestamp_drops_the_idle_signal_only() {
+        // A rebuild with no readable clock is still a rebuild; it simply
+        // cannot be blamed on expiry.
+        let text = [
+            r#"{"type":"assistant","version":"1.0.0","message":{"id":"m1","model":"model-a","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":299980,"cache_creation_input_tokens":0}}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"yesterday","version":"1.0.0","message":{"id":"m2","model":"model-a","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":300000}}}"#.to_string(),
+        ]
+        .join("\n");
+        let found = cache_rebuilds_text(&text).unwrap();
+        assert_eq!(found.rebuilds.len(), 1);
+        assert_eq!(found.rebuilds[0].idle_secs, None);
+        assert_eq!(found.rebuilds[0].cause(), RebuildCause::Unattributed);
+    }
+
+    #[test]
+    fn utc_stamps_parse_and_anything_else_is_refused() {
+        assert_eq!(epoch_secs("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(epoch_secs("2026-08-20T21:49:31.142Z"), Some(1_787_262_571));
+        // Leap day and year boundaries: the civil algorithm, not a 365-day
+        // approximation.
+        assert_eq!(epoch_secs("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+        assert_eq!(
+            epoch_secs("2027-01-01T00:00:00Z").unwrap() - epoch_secs("2026-01-01T00:00:00Z").unwrap(),
+            365 * 86_400
+        );
+        // An offset that is not UTC is refused rather than read as UTC: a
+        // silent hour would move a gap across the 65-minute threshold.
+        assert_eq!(epoch_secs("2026-08-20T21:49:31.142+02:00"), None);
+        assert_eq!(epoch_secs("2026-08-20"), None);
+        assert_eq!(epoch_secs("2026-13-01T00:00:00Z"), None);
+        assert_eq!(epoch_secs("2026-08-20T25:00:00Z"), None);
+        assert_eq!(epoch_secs("1969-12-31T23:59:59Z"), None, "pre-epoch has no unsigned answer");
     }
 
     #[test]
