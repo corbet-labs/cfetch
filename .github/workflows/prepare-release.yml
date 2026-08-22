@@ -1,0 +1,92 @@
+name: Prepare patch release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cfetch-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Require release token
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: test -n "$TOKEN" || { echo "::error::PACKAGES_TOKEN is not configured"; exit 1; }
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          # A PAT is intentional: pushes made with GITHUB_TOKEN do not start
+          # the CI and tag workflows this release transaction must await.
+          token: ${{ secrets.PACKAGES_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2.86.5
+        with:
+          tool: cargo-about@0.9.2
+          fallback: none
+      - name: Prepare next patch
+        id: version
+        shell: bash
+        run: |
+          version=$(bash scripts/prepare-patch-release.sh)
+          bash scripts/generate-third-party-licenses.sh THIRD-PARTY-LICENSES.txt
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          git diff --check
+      - name: Commit and push release preparation
+        id: commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock CHANGELOG.md packaging/arch/PKGBUILD THIRD-PARTY-LICENSES.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "release: prepare ${VERSION}"
+            git push origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Wait for blocking CI
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        shell: bash
+        run: |
+          for attempt in $(seq 1 160); do
+            row=$(gh run list --workflow CI --commit "$SHA" --event push --limit 5 \
+              --json databaseId,status,conclusion,headSha \
+              --jq '[.[] | select(.headSha == env.SHA)][0] // {}')
+            run_id=$(jq -r '.databaseId // empty' <<< "$row")
+            status=$(jq -r '.status // empty' <<< "$row")
+            conclusion=$(jq -r '.conclusion // empty' <<< "$row")
+            if [[ "$status" == completed ]]; then
+              [[ "$conclusion" == success ]] || {
+                echo "::error::Blocking CI run $run_id concluded $conclusion"
+                exit 1
+              }
+              echo "blocking CI run $run_id is green"
+              exit 0
+            fi
+            echo "waiting for CI on $SHA (${attempt}/160; ${status:-not started})"
+            sleep 15
+          done
+          echo "::error::Blocking CI did not finish within 40 minutes"
+          exit 1
+      - name: Tag the verified commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "::error::main moved after the verified release commit; refusing to tag"
+            exit 1
+          }
+          git tag -a "v${VERSION}" -m "cfetch ${VERSION}"
+          git push origin "v${VERSION}"
