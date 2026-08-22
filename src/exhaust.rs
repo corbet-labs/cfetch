@@ -879,10 +879,32 @@ mod tests {
 
         let all = f.records();
         assert_eq!(all.len(), 4, "one write record per distinct patch target");
-        assert_eq!(all[0].value("payload").unwrap()["file_path"], "/b/agents/knowledge/a.md");
+        let actual = all[0].value("payload").unwrap()["file_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expected = Path::new(BRAIN).join("knowledge/a.md");
+        assert_eq!(
+            Path::new(&actual).components().collect::<Vec<_>>(),
+            expected.components().collect::<Vec<_>>()
+        );
         assert_eq!(all[0].value("payload").unwrap()["ring"], 3);
-        assert_eq!(all[1].value("payload").unwrap()["file_path"], "/b/agents/knowledge/b.md");
-        assert_eq!(all[2].value("payload").unwrap()["file_path"], "/tmp/new.rs");
+        let actual = all[1].value("payload").unwrap()["file_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expected = Path::new(BRAIN).join("knowledge/b.md");
+        assert_eq!(
+            Path::new(&actual).components().collect::<Vec<_>>(),
+            expected.components().collect::<Vec<_>>()
+        );
+        let actual = all[2].value("payload").unwrap()["file_path"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            Path::new(actual).components().collect::<Vec<_>>(),
+            Path::new("/tmp/new.rs").components().collect::<Vec<_>>()
+        );
         assert_eq!(all[3].value("payload").unwrap()["file_path"], WITHHELD);
     }
 
@@ -894,7 +916,12 @@ mod tests {
             tool_input: Some(json!({"command": "*** Update File: src/lib.rs\n*** Update File: src/lib.rs\nnot a header"})),
             ..Default::default()
         };
-        assert_eq!(written_paths(&event), vec!["/work/src/lib.rs"]);
+        let paths = written_paths(&event);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            Path::new(&paths[0]).components().collect::<Vec<_>>(),
+            Path::new("/work").join("src/lib.rs").components().collect::<Vec<_>>()
+        );
 
         let missing = HookEvent {
             tool_name: Some("apply_patch".into()),
