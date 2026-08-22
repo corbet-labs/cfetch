@@ -16,7 +16,8 @@ listed here is a fix or an internal change with no effect on behavior.
 - **Codex output condensation.** Oversized Bash listings now use Codex's
   PostToolUse model-feedback replacement path instead of adding a second copy
   as context. The complete original is preserved in private local state and
-  linked from the condensed result; test and build output remains untouched.
+  linked from the condensed result under a 64 MiB retention cap; test and build
+  output remains untouched.
 
 - **Engine selection.** A variant is now a Cargo feature selection rather
   than a source fork: which engines are compiled in is a build-time fact,

@@ -14,6 +14,8 @@ use crate::{
 };
 
 const DAEMON_BUDGET: Duration = Duration::from_millis(250);
+/// Private full-output artifacts are a recovery path, not an unbounded log.
+const CONDENSED_OUTPUT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Where this host books its ledger lines: the tree's log directory, this
 /// host's identity, and the writer-side byte cap. Derived from the config,
@@ -225,6 +227,41 @@ fn post_tool_capture(cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
     exhaust::Exhaust::from_config(cfg).capture_post_tool(event, &cfg.brain_root, &cfg.rings())
 }
 
+fn prune_condensed_outputs(dir: &Path, keep: &Path, max_bytes: u64) -> anyhow::Result<()> {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("txt")
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        total = total.saturating_add(metadata.len());
+        files.push((
+            metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            entry.path(),
+            metadata.len(),
+        ));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, path, len) in files {
+        if total <= max_bytes {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => total = total.saturating_sub(len),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Condenses a completed Codex Bash result and preserves the full original in
 /// private local state. Current Codex PostToolUse input is identifiable by the
 /// required `turn_id` plus a string `tool_response`; Claude does not get the
@@ -247,6 +284,9 @@ fn codex_condensed_output(state_dir: &Path, event: &HookEvent) -> anyhow::Result
     let Some(output) = event.tool_response.as_ref().and_then(serde_json::Value::as_str) else {
         return Ok(None);
     };
+    if u64::try_from(output.len()).unwrap_or(u64::MAX) > CONDENSED_OUTPUT_MAX_BYTES {
+        return Ok(None);
+    }
     let condensed = condense::condense(command, output);
     if !condensed.was_condensed() {
         return Ok(None);
@@ -269,6 +309,11 @@ fn codex_condensed_output(state_dir: &Path, event: &HookEvent) -> anyhow::Result
         output
     );
     fsutil::atomic_write(&path, preserved)?;
+    prune_condensed_outputs(
+        path.parent().expect("condensed output has a parent"),
+        &path,
+        CONDENSED_OUTPUT_MAX_BYTES,
+    )?;
     Ok(Some(format!(
         "{}\n\n[cfetch: full uncondensed output preserved at {}]",
         condensed.text,
@@ -741,6 +786,26 @@ mod tests {
             "test output is never rewritten"
         );
         assert!(!state.path().join("condensed-output").exists());
+    }
+
+    #[test]
+    fn condensed_output_retention_keeps_the_current_pointer_and_caps_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_a = dir.path().join("a.txt");
+        let old_b = dir.path().join("b.txt");
+        let keep = dir.path().join("keep.txt");
+        std::fs::write(&old_a, "aaaaaaaaaa").unwrap();
+        std::fs::write(&old_b, "bbbbbbbbbb").unwrap();
+        std::fs::write(&keep, "kkkkkkkkkk").unwrap();
+
+        prune_condensed_outputs(dir.path(), &keep, 15).unwrap();
+
+        assert!(keep.exists(), "the path emitted to the model must survive pruning");
+        let bytes: u64 = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(bytes <= 15, "old artifacts must be removed until the cap holds");
     }
 
     #[test]

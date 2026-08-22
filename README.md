@@ -178,7 +178,8 @@ their result enters the next model turn. Build and test output is never
 rewritten. The full original is kept as a private file under
 `$CFETCH_STATE_DIR/condensed-output/` (or the default local state directory),
 with mode `0600` on Unix, and the condensed result carries its exact path.
-Claude events never receive Codex's `continue:false` replacement signal.
+The recovery directory is capped at 64 MiB. Claude events never receive
+Codex's `continue:false` replacement signal.
 
 ## Configuration
 
