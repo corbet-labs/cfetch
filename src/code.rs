@@ -3,9 +3,12 @@
 //! `cfetch find` with exact line ranges — read one function instead of a file.
 //!
 //! Symbol boundaries come from the syntax tree, never from regex line
-//! guessing (measured upstream: 97% of guessed end lines were wrong). Only
-//! whole-file parses; a file that fails to parse contributes no symbols
-//! rather than wrong ones.
+//! guessing (measured upstream: 97% of guessed end lines were wrong). Whole
+//! files only, no partial reparse. tree-sitter recovers from broken syntax
+//! instead of refusing it, so a damaged file still contributes symbols and
+//! there is no "failed to parse" to observe — what the file yields is
+//! recorded as an incomplete measurement instead, and re-measured until it
+//! reads cleanly.
 
 use std::path::{Path, PathBuf};
 
@@ -97,19 +100,85 @@ fn node_name(node: &Node, src: &[u8]) -> Option<String> {
     Some(name_node.utf8_text(src).ok()?.to_string())
 }
 
-/// Extracts named symbols from source text. Returns None when the language is
-/// unsupported or the parser fails — "not measured" is distinct from
-/// "measured, found nothing".
-pub fn extract(path: &Path, source: &str) -> Option<Vec<Symbol>> {
-    let lang = lang_of(path)?;
+/// Why a symbol list may be shorter than what the file actually declares.
+///
+/// The list and this reason are separate facts on purpose. An empty list with
+/// no gap is a MEASUREMENT — the file parsed and declares nothing — while an
+/// empty list with a gap means we do not know what the file declares. A caller
+/// that flattens the two reads "we could not look" as "there is nothing
+/// there", which is how a symbol that plainly exists on disk turns into an
+/// unexplained `no hits`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Gap {
+    /// No grammar ships for this extension; nothing was attempted.
+    UnsupportedLanguage,
+    /// The grammar would not load, or the parser returned no tree at all.
+    ParserUnavailable,
+    /// The tree came back carrying error nodes. tree-sitter recovers from
+    /// broken syntax rather than failing, so a list is still produced — but
+    /// any node spanning the damage has an extent the recovery guessed, and
+    /// symbols swallowed by it are missing from the list entirely.
+    SyntaxErrors,
+}
+
+impl Gap {
+    /// Stable short name, persisted per file so a later scan — and an operator
+    /// reading the cache — can tell why a file contributed what it did.
+    fn slug(self) -> &'static str {
+        match self {
+            Gap::UnsupportedLanguage => "unsupported-language",
+            Gap::ParserUnavailable => "parser-unavailable",
+            Gap::SyntaxErrors => "syntax-errors",
+        }
+    }
+}
+
+/// The outcome of looking at one file: what the tree proved, and what kept
+/// that list from being the whole truth.
+#[derive(Debug, PartialEq)]
+pub struct Extraction {
+    /// Every named symbol the tree yielded. On a clean parse each extent is
+    /// exact and the list is the file's whole symbol table; where `gap` is
+    /// set, neither holds — see [`Gap`].
+    pub symbols: Vec<Symbol>,
+    /// `None` when the list is complete; see [`Gap`].
+    pub gap: Option<Gap>,
+}
+
+impl Extraction {
+    fn unavailable(gap: Gap) -> Self {
+        Extraction { symbols: Vec::new(), gap: Some(gap) }
+    }
+}
+
+/// Extracts named symbols from source text.
+///
+/// Everything the recovery produced is reported, damaged file or not. Dropping
+/// the symbols under an error node was tried and rejected: measured on broken
+/// Rust, TypeScript and Python, `Node::has_error` flags an enclosing function
+/// or class whose own extent is exactly right just because something inside it
+/// is broken, so the rule costs more correct symbols than it catches wrong
+/// ones — and a symbol missing from `find` reads to an agent as an
+/// authoritative "no such thing", while an extent a few lines too long is
+/// visible the moment the lines are read. The damage is reported at the file
+/// level instead, where the caller can act on it.
+pub fn extract(path: &Path, source: &str) -> Extraction {
+    let Some(lang) = lang_of(path) else {
+        return Extraction::unavailable(Gap::UnsupportedLanguage);
+    };
     let mut parser = Parser::new();
-    parser.set_language(&language(&lang)).ok()?;
-    let tree = parser.parse(source, None)?;
+    if parser.set_language(&language(&lang)).is_err() {
+        return Extraction::unavailable(Gap::ParserUnavailable);
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Extraction::unavailable(Gap::ParserUnavailable);
+    };
     let kinds = symbol_kinds(&lang);
     let src = source.as_bytes();
     let mut out = Vec::new();
-    walk(tree.root_node(), kinds, src, &mut out);
-    Some(out)
+    let root = tree.root_node();
+    walk(root, kinds, src, &mut out);
+    Extraction { symbols: out, gap: root.has_error().then_some(Gap::SyntaxErrors) }
 }
 
 fn walk(node: Node, kinds: &[&str], src: &[u8], out: &mut Vec<Symbol>) {
@@ -150,6 +219,12 @@ pub(crate) fn is_indexable(path: &Path) -> bool {
     lang_of(path).is_some()
 }
 
+/// Cache key that no real file can present, written over rows whose symbols
+/// predate gap tracking so the next scan re-measures them. Invalidating the
+/// key rather than deleting the rows keeps `find` answering from the old
+/// snapshot until the replacement exists.
+const REMEASURE: i64 = -1;
+
 pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS code_files(
@@ -159,7 +234,8 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
            size INTEGER NOT NULL,
            rank_pct REAL,
            norm_stem TEXT NOT NULL DEFAULT '',
-           norm_path TEXT NOT NULL DEFAULT ''
+           norm_path TEXT NOT NULL DEFAULT '',
+           unmeasured TEXT
          );
          CREATE TABLE IF NOT EXISTS symbols(
            id INTEGER PRIMARY KEY,
@@ -173,6 +249,21 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
          CREATE INDEX IF NOT EXISTS symbols_norm ON symbols(norm);
          CREATE INDEX IF NOT EXISTS code_files_norm_stem ON code_files(norm_stem);",
     )?;
+    // A cache built before the column existed cannot say which of its rows
+    // are complete, and a row that merely LOOKS complete is the one thing the
+    // shortcut below must never trust — so the column arrives with every
+    // existing row's cache key invalidated, and one scan sorts them out. The
+    // guard matters because the read-only query connections reach
+    // ensure_schema too and must find nothing left to write.
+    let tracked = conn
+        .prepare("SELECT 1 FROM pragma_table_info('code_files') WHERE name='unmeasured'")?
+        .exists([])?;
+    if !tracked {
+        conn.execute_batch(&format!(
+            "ALTER TABLE code_files ADD COLUMN unmeasured TEXT;
+             UPDATE code_files SET mtime = {REMEASURE};"
+        ))?;
+    }
     crate::graph::ensure_schema(conn)?;
     Ok(())
 }
@@ -188,12 +279,14 @@ pub fn file_count(conn: &Connection) -> anyhow::Result<i64> {
 enum WalkMsg {
     /// (mtime, size) unchanged: rows kept, no parse.
     Unchanged(String),
-    /// Parsed (or unparseable — empty symbols) content to (re)insert.
+    /// Freshly measured content to (re)insert, with whatever kept the symbol
+    /// list from being complete.
     Parsed {
         path: String,
         mtime: i64,
         size: i64,
         symbols: Vec<Symbol>,
+        gap: Option<Gap>,
         edges: Vec<PathBuf>,
     },
 }
@@ -223,8 +316,17 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
     let mut report = CodeScanReport { files: 0, symbols: 0, edges: 0 };
     // Known (mtime, size) per path, read once — the walker threads make the
     // skip decision without touching the DB.
+    //
+    // Only rows with a complete measurement qualify. A file we could not fully
+    // read is left out on purpose: its gap may be OURS, not the file's — a
+    // grammar that gains the syntax it choked on completes the file without a
+    // byte of it changing — and the (mtime, size) shortcut would otherwise
+    // make that blindness permanent. The re-parse cost is bounded by the
+    // number of files that actually failed, which is near zero in a tree the
+    // grammars understand.
     let known: std::collections::HashMap<String, (i64, i64)> = {
-        let mut stmt = conn.prepare("SELECT path, mtime, size FROM code_files")?;
+        let mut stmt =
+            conn.prepare("SELECT path, mtime, size FROM code_files WHERE unmeasured IS NULL")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
         })?;
@@ -270,13 +372,19 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                             let Ok(source) = std::fs::read_to_string(entry.path()) else {
                                 return ignore::WalkState::Continue;
                             };
-                            let symbols = extract(entry.path(), &source).unwrap_or_default();
+                            let Extraction { symbols, gap } = extract(entry.path(), &source);
                             // Import edges refresh with the file that declares
                             // them; targets added later self-heal on the
                             // importer's next change.
                             let edges = crate::graph::extract_edges(entry.path(), &source, root);
-                            let _ = msg_tx
-                                .send(WalkMsg::Parsed { path, mtime, size, symbols, edges });
+                            let _ = msg_tx.send(WalkMsg::Parsed {
+                                path,
+                                mtime,
+                                size,
+                                symbols,
+                                gap,
+                                edges,
+                            });
                             ignore::WalkState::Continue
                         })
                     });
@@ -289,7 +397,7 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                         seen.insert(path);
                         report.files += 1;
                     }
-                    WalkMsg::Parsed { path, mtime, size, symbols, edges } => {
+                    WalkMsg::Parsed { path, mtime, size, symbols, gap, edges } => {
                         crate::graph::replace_file_edges(&tx, &path, &edges)?;
                         // prepare_cached: these two run once per changed file
                         // and once per symbol — re-preparing them would make
@@ -299,10 +407,18 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                             .execute([&path])?;
                         let (norm_stem, norm_path) = norm_keys(&path);
                         tx.prepare_cached(
-                            "INSERT INTO code_files(path, mtime, size, norm_stem, norm_path)
-                             VALUES(?1, ?2, ?3, ?4, ?5)",
+                            "INSERT INTO code_files(path, mtime, size, norm_stem, norm_path,
+                                                    unmeasured)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
                         )?
-                        .execute(rusqlite::params![path, mtime, size, norm_stem, norm_path])?;
+                        .execute(rusqlite::params![
+                            path,
+                            mtime,
+                            size,
+                            norm_stem,
+                            norm_path,
+                            gap.map(Gap::slug)
+                        ])?;
                         let file_id = tx.last_insert_rowid();
                         let mut ins = tx.prepare_cached(
                             "INSERT INTO symbols(file_id, name, kind, norm, start_line, end_line)
@@ -488,7 +604,7 @@ mod tests {
     #[test]
     fn rust_symbols_have_exact_tree_ranges() {
         let src = "pub fn alpha() {\n    let x = 1;\n}\n\nstruct Beta {\n    field: u8,\n}\n";
-        let syms = extract(Path::new("x.rs"), src).unwrap();
+        let syms = extract(Path::new("x.rs"), src).symbols;
         assert_eq!(
             syms,
             vec![
@@ -501,7 +617,7 @@ mod tests {
     #[test]
     fn typescript_exported_and_class_members() {
         let src = "export function gamma(): void {}\nclass Delta {\n  method_one() {\n    return 1;\n  }\n}\n";
-        let syms = extract(Path::new("x.ts"), src).unwrap();
+        let syms = extract(Path::new("x.ts"), src).symbols;
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"gamma"), "export wrapper must be descended: {names:?}");
         assert!(names.contains(&"Delta"));
@@ -512,11 +628,39 @@ mod tests {
 
     #[test]
     fn python_and_go_and_unsupported() {
-        let py = extract(Path::new("a.py"), "def foo():\n    pass\n\nclass Bar:\n    pass\n").unwrap();
-        assert_eq!(py.len(), 2);
-        let go = extract(Path::new("a.go"), "package m\n\nfunc Baz() {\n}\n").unwrap();
-        assert_eq!(go[0].name, "Baz");
-        assert!(extract(Path::new("a.zig"), "fn x() {}").is_none(), "unsupported = not measured");
+        let py = extract(Path::new("a.py"), "def foo():\n    pass\n\nclass Bar:\n    pass\n");
+        assert_eq!(py.symbols.len(), 2);
+        assert_eq!(py.gap, None);
+        let go = extract(Path::new("a.go"), "package m\n\nfunc Baz() {\n}\n");
+        assert_eq!(go.symbols[0].name, "Baz");
+    }
+
+    #[test]
+    fn nothing_to_look_with_is_not_the_same_as_nothing_there() {
+        // Both hand back an empty list; only the reason separates them, and
+        // without it a caller cannot tell an unreadable file from an empty one.
+        let unsupported = extract(Path::new("a.zig"), "fn x() {}");
+        assert_eq!(unsupported.gap, Some(Gap::UnsupportedLanguage), "unsupported = not measured");
+        assert!(unsupported.symbols.is_empty());
+        let empty = extract(Path::new("a.rs"), "// nothing but a comment\n");
+        assert_eq!(empty.gap, None, "a file that declares nothing IS a measurement");
+        assert!(empty.symbols.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_file_reports_short_instead_of_passing_as_complete() {
+        let names = |e: &Extraction| -> Vec<String> {
+            e.symbols.iter().map(|s| s.name.clone()).collect()
+        };
+        // `Alpha`'s brace never closes, so recovery folds `gamma` into the
+        // struct. The flag is not decoration: the list really is short of what
+        // the file declares, and nothing in the list itself shows that.
+        let broken = extract(Path::new("x.rs"), "struct Alpha {\n    a: u8,\n\nfn gamma() {}\n");
+        assert_eq!(broken.gap, Some(Gap::SyntaxErrors), "damage must be reported, not absorbed");
+        assert_eq!(names(&broken), ["Alpha"], "a swallowed symbol is simply gone");
+        let whole = extract(Path::new("x.rs"), "struct Alpha {\n    a: u8,\n}\nfn gamma() {}\n");
+        assert_eq!(whole.gap, None, "the same file, closed, is a complete measurement");
+        assert_eq!(names(&whole), ["Alpha", "gamma"]);
     }
 
     #[test]
@@ -546,6 +690,80 @@ mod tests {
         std::fs::remove_file(&f).unwrap();
         scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
         assert!(find(&conn, "resolve", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_we_could_not_fully_read_is_re_measured_even_when_nothing_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("broken.rs");
+        // Same length, same mtime: the incremental shortcut cannot tell these
+        // two revisions apart. That is deliberate — the real trigger is a
+        // grammar upgrade, where the file on disk does not change at all and
+        // only our ability to read it does.
+        let broken = "fn alpha() {\n    if q {    \n}\n";
+        let fixed = "fn alpha() {\n    let q = 1;\n}\n";
+        assert_eq!(broken.len(), fixed.len(), "the shortcut is keyed on (mtime, size)");
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let write_at = |body: &str| {
+            std::fs::write(&f, body).unwrap();
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(stamp).unwrap();
+        };
+        let unmeasured = |c: &Connection| {
+            c.query_row("SELECT unmeasured FROM code_files", [], |r| r.get::<_, Option<String>>(0))
+                .unwrap()
+        };
+
+        write_at(broken);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        assert!(
+            find(&conn, "alpha", 10).unwrap().iter().all(|h| h.name.is_none()),
+            "recovery salvaged no symbol from the damaged function"
+        );
+        assert_eq!(
+            unmeasured(&conn),
+            Some("syntax-errors".into()),
+            "why the file gave nothing travels with the file"
+        );
+
+        write_at(fixed);
+        scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        let hits = find(&conn, "alpha", 10).unwrap();
+        let top = hits.first().expect("a gap must not be permanent: the file was not re-measured");
+        assert_eq!(top.name.as_deref(), Some("alpha"));
+        assert_eq!((top.start_line, top.end_line), (1, 3));
+        assert_eq!(unmeasured(&conn), None, "a complete measurement clears the reason");
+    }
+
+    #[test]
+    fn a_cache_that_predates_gap_tracking_is_re_measured_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("m.rs"), "fn alpha() {}\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        let mtime: i64 = conn.query_row("SELECT mtime FROM code_files", [], |r| r.get(0)).unwrap();
+        assert!(mtime > 0);
+
+        // Rewind to the pre-gap schema: rows written by a binary that
+        // published error-recovered ranges and had nowhere to record it.
+        conn.execute_batch("ALTER TABLE code_files DROP COLUMN unmeasured").unwrap();
+        ensure_schema(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT mtime FROM code_files", [], |r| r.get::<_, i64>(0)).unwrap(),
+            REMEASURE,
+            "rows of unknown completeness must lose the shortcut"
+        );
+        // The old answers keep serving until the replacement exists.
+        assert_eq!(find(&conn, "alpha", 10).unwrap()[0].name.as_deref(), Some("alpha"));
+
+        scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT mtime FROM code_files", [], |r| r.get::<_, i64>(0)).unwrap(),
+            mtime,
+            "the next scan re-measures without the file having changed"
+        );
     }
 
     #[test]
