@@ -464,6 +464,12 @@ fn preflight_agent(
         } else {
             let plan = surface.plan_install_instruction(scope, &instruction_spec(agent)?)?;
             refused_install(agent, "instructions", &plan)?;
+            // agent-config plans an upsert without inspecting the fence it is
+            // about to replace, so a broken one is written over instead of
+            // reported. These are the operator's own instruction files.
+            for path in content_paths(&plan) {
+                crate::markers::ensure_no_broken_block(&path, INSTRUCTION_NAME)?;
+            }
         }
     }
     if selected.hooks
@@ -1192,6 +1198,52 @@ mod tests {
             std::fs::read_to_string(hooks.with_extension("json.bak")).unwrap(),
             r#"{"userSetting": true}"#
         );
+    }
+
+    #[test]
+    fn a_broken_instruction_fence_stops_the_whole_install() {
+        let root = tempfile::tempdir().unwrap();
+        let agents = root.path().join("AGENTS.md");
+        let block = "<!-- BEGIN AGENT-CONFIG-INSTR:CFETCH -->\nstale\n\
+             <!-- END AGENT-CONFIG-INSTR:CFETCH -->\n";
+        let broken = format!("# my notes\n\n{block}\n{block}");
+        std::fs::write(&agents, &broken).unwrap();
+
+        let error = match install_agent(
+            "codex",
+            &Scope::Local(root.path().to_path_buf()),
+            "/usr/bin/cfetch",
+        ) {
+            Ok(_) => panic!("a broken instruction fence must refuse the install"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("AGENTS.md"), "{error}");
+        assert!(error.contains("exactly one of each"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            broken,
+            "a refusal leaves the operator's file byte-identical"
+        );
+        assert!(
+            !root.path().join(".codex/config.toml").exists(),
+            "no surface is written once one of them is known to be unsafe"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_block_still_reinstalls_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope::Local(root.path().to_path_buf());
+        let agents = root.path().join("AGENTS.md");
+        std::fs::write(&agents, "# my notes\n\nkeep me\n").unwrap();
+
+        install_agent("codex", &scope, "/usr/bin/cfetch").unwrap();
+        let once = std::fs::read_to_string(&agents).unwrap();
+        install_agent("codex", &scope, "/usr/bin/cfetch").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), once);
+        assert_eq!(once.matches("BEGIN AGENT-CONFIG-INSTR:CFETCH").count(), 1);
+        assert!(once.contains("keep me"));
     }
 
     #[test]

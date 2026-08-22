@@ -1,7 +1,10 @@
-//! Recall-first doctrine plus removal of cfetch 0.9's instruction markers.
+//! Recall-first doctrine plus the marker-block guard for instruction files
+//! cfetch does not own (AGENTS.md, GEMINI.md, CLAUDE.md, ...).
 //!
-//! New instruction placement is owned by `agent-config`. The old marker parser
-//! remains only for the one-time conversion and refuses malformed delimiters.
+//! New instruction placement is owned by `agent-config`; the old marker parser
+//! remains only for the one-time conversion. Either way the delimiters are the
+//! whole safety property, so cfetch validates them before anything is written
+//! and refuses when they are broken.
 
 const BEGIN: &str = "<!-- cfetch:begin -->";
 const END: &str = "<!-- cfetch:end -->";
@@ -43,21 +46,80 @@ pub fn doctrine(surface: Surface) -> String {
     )
 }
 
+/// Every delimiter pair that can carry cfetch's block in a foreign file: the
+/// one cfetch 0.9 wrote, the one `agent-config` writes today, and the
+/// hook-prefixed form that pre-rename `agent-config` installs left behind.
+fn fences(instruction_name: &str) -> [(String, String); 3] {
+    [
+        (BEGIN.to_string(), END.to_string()),
+        (
+            format!("<!-- BEGIN AGENT-CONFIG-INSTR:{instruction_name} -->"),
+            format!("<!-- END AGENT-CONFIG-INSTR:{instruction_name} -->"),
+        ),
+        (
+            format!("<!-- BEGIN AGENT-CONFIG:{instruction_name} -->"),
+            format!("<!-- END AGENT-CONFIG:{instruction_name} -->"),
+        ),
+    ]
+}
+
+/// What is wrong with one fence in `content`, phrased for whoever has to open
+/// the file and repair it by hand. `None` = the fence is absent, or forms
+/// exactly one well-ordered block.
+fn fence_fault(content: &str, begin: &str, end: &str) -> Option<String> {
+    let begins: Vec<usize> = content.match_indices(begin).map(|(i, _)| i).collect();
+    let ends: Vec<usize> = content.match_indices(end).map(|(i, _)| i).collect();
+    match (begins.as_slice(), ends.as_slice()) {
+        ([], []) => None,
+        ([opened], [closed]) if opened < closed => None,
+        ([_], [_]) => Some(format!("{end} appears before {begin}")),
+        ([_], []) => Some(format!("{begin} is never closed by {end}")),
+        ([], [_]) => Some(format!("{end} has no matching {begin}")),
+        _ => Some(format!(
+            "{} {begin} and {} {end} markers; exactly one of each is expected",
+            begins.len(),
+            ends.len()
+        )),
+    }
+}
+
+/// Refuses when `path` already carries a cfetch block whose delimiters cannot
+/// be read unambiguously. `agent-config`'s instruction upsert replaces the
+/// first BEGIN..END it can find and appends a fresh block when it finds none,
+/// so a duplicated, unclosed or inverted fence is written over rather than
+/// reported — in a file cfetch does not own and every session loads. Which
+/// half of a broken fence is ours is not knowable, so the only safe move is to
+/// touch nothing and name both the file and the fault.
+pub fn ensure_no_broken_block(
+    path: &std::path::Path,
+    instruction_name: &str,
+) -> anyhow::Result<()> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(anyhow::anyhow!("read {}: {error}", path.display())),
+    };
+    let faults: Vec<String> = fences(instruction_name)
+        .iter()
+        .filter_map(|(begin, end)| fence_fault(&content, begin, end))
+        .collect();
+    if faults.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!("refusing to write {}: {}", path.display(), faults.join("; "))
+}
+
 /// The block's span in `content`, validated. `Ok(None)` = no block; `Err` =
 /// markers are broken (END before BEGIN, unclosed BEGIN, duplicates) — the
 /// caller must not write anything.
 fn block_span(content: &str) -> anyhow::Result<Option<(usize, usize)>> {
-    let begins: Vec<usize> = content.match_indices(BEGIN).map(|(i, _)| i).collect();
-    let ends: Vec<usize> = content.match_indices(END).map(|(i, _)| i).collect();
-    match (begins.len(), ends.len()) {
-        (0, 0) => Ok(None),
-        (1, 1) if begins[0] < ends[0] => Ok(Some((begins[0], ends[0] + END.len()))),
-        _ => anyhow::bail!(
-            "refusing to touch file with broken cfetch markers ({} begin, {} end)",
-            begins.len(),
-            ends.len()
-        ),
+    if let Some(fault) = fence_fault(content, BEGIN, END) {
+        anyhow::bail!("broken cfetch markers: {fault}");
     }
+    let (Some(begin), Some(end)) = (content.find(BEGIN), content.find(END)) else {
+        return Ok(None);
+    };
+    Ok(Some((begin, end + END.len())))
 }
 
 /// Removes the block from `content`. `Ok(None)` = no block present (nothing
@@ -91,7 +153,9 @@ pub fn remove_block_file(path: &std::path::Path) -> anyhow::Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
-    match remove_block(&current)? {
+    let removed = remove_block(&current)
+        .map_err(|error| anyhow::anyhow!("refusing to touch {}: {error}", path.display()))?;
+    match removed {
         None => Ok(false),
         Some(next) => {
             crate::fsutil::atomic_write(path, &next)?;
@@ -109,11 +173,79 @@ mod tests {
         format!("{BEGIN}\nold cfetch instructions\n{END}{separator}{tail}")
     }
 
+    // The fence agent-config writes into AGENTS.md for cfetch today.
+    const OPEN: &str = "<!-- BEGIN AGENT-CONFIG-INSTR:CFETCH -->";
+    const CLOSE: &str = "<!-- END AGENT-CONFIG-INSTR:CFETCH -->";
+
+    fn instruction_block(body: &str) -> String {
+        format!("{OPEN}\n{body}\n{CLOSE}\n")
+    }
+
+    fn refusal(content: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, content).unwrap();
+        let error = ensure_no_broken_block(&path, "CFETCH")
+            .expect_err("a broken fence must refuse")
+            .to_string();
+        assert!(error.contains(&path.display().to_string()), "names the file: {error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "a refusal leaves the foreign file byte-identical"
+        );
+        error
+    }
+
     #[test]
     fn broken_markers_are_refused() {
         assert!(remove_block(&format!("{END}\ntext\n{BEGIN}")).is_err());
         assert!(remove_block(&format!("{BEGIN}\nunclosed")).is_err());
         assert!(remove_block(&format!("{BEGIN}\nx\n{END}\n{BEGIN}\ny\n{END}")).is_err());
+    }
+
+    #[test]
+    fn every_malformed_shape_is_named_and_refused() {
+        let unclosed = refusal(&format!("# notes\n\n{OPEN}\nbody\n"));
+        assert!(unclosed.contains("never closed"), "{unclosed}");
+        let orphan_close = refusal(&format!("# notes\n\n{CLOSE}\n"));
+        assert!(orphan_close.contains("no matching"), "{orphan_close}");
+        let inverted = refusal(&format!("{CLOSE}\nbody\n{OPEN}\n"));
+        assert!(inverted.contains("appears before"), "{inverted}");
+        let duplicated = refusal(&format!(
+            "{}{}",
+            instruction_block("one"),
+            instruction_block("two")
+        ));
+        assert!(duplicated.contains("exactly one of each"), "{duplicated}");
+
+        // The 0.9 fence and the pre-rename hook-prefixed fence are upserted by
+        // the same code paths, so they get the same guard.
+        let legacy_09 = refusal(&format!("{BEGIN}\nold\n"));
+        assert!(legacy_09.contains(BEGIN) && legacy_09.contains("never closed"), "{legacy_09}");
+        let pre_rename = refusal("<!-- BEGIN AGENT-CONFIG:CFETCH -->\nold\n");
+        assert!(pre_rename.contains("AGENT-CONFIG:CFETCH"), "{pre_rename}");
+    }
+
+    #[test]
+    fn well_formed_and_absent_blocks_are_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        ensure_no_broken_block(&path, "CFETCH").expect("a file that does not exist yet is fine");
+        for content in [
+            "# my own notes\n".to_string(),
+            instruction_block("doctrine"),
+            format!("# notes\n\n{}", instruction_block("doctrine")),
+            legacy_block("# notes\n"),
+        ] {
+            std::fs::write(&path, &content).unwrap();
+            ensure_no_broken_block(&path, "CFETCH")
+                .unwrap_or_else(|error| panic!("well-formed content refused: {error}"));
+        }
+        // A foreign harness's block under a different name is none of our
+        // business, broken or not.
+        std::fs::write(&path, "<!-- BEGIN AGENT-CONFIG-INSTR:OTHER -->\n").unwrap();
+        ensure_no_broken_block(&path, "CFETCH").unwrap();
     }
 
     #[test]
@@ -146,6 +278,19 @@ mod tests {
     fn remove_block_refuses_broken_markers() {
         assert!(remove_block(&format!("{BEGIN}\nunclosed")).is_err());
         assert!(remove_block(&format!("{END}\n{BEGIN}")).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let broken = format!("{BEGIN}\nunclosed\n");
+        std::fs::write(&path, &broken).unwrap();
+        let error = remove_block_file(&path).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("never closed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            broken,
+            "a refusal leaves the foreign file byte-identical"
+        );
     }
 
     #[test]
