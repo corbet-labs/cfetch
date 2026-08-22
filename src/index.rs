@@ -2204,8 +2204,13 @@ mod tests {
         assert_eq!(default_ring("mind/memories/feedback_x.md", &r), 2);
         assert_eq!(default_ring("knowledge/hosts/example/storage.md", &r), 3);
         assert_eq!(default_ring("todo/active/task/STATUS.md", &r), 4);
+        assert_eq!(default_ring("todo/staging/hot-file-1234abcd.md", &r), 5);
+        assert_eq!(default_ring("todo/staging/dismissed/hot-file-1234abcd.md", &r), 5);
+        // An unmigrated tree must stay quarantined: falling through to the
+        // unmatched ring would promote candidates into recall on upgrade.
         assert_eq!(default_ring("staging/cfetch/hot-file-1234abcd.md", &r), 5);
-        assert_eq!(default_ring("staging/cfetch/dismissed/hot-file-1234abcd.md", &r), 5);
+        // Disposable working material is excluded outright, not ringed.
+        assert!(r.excluded("todo/scratch/dump.md"));
     }
 
     #[test]

@@ -232,3 +232,106 @@ mod tests {
         assert!(!marker(state.path()).exists());
     }
 }
+
+/// Moves ring-5 candidates from the pre-standard `staging/cfetch/` into
+/// `todo/staging/`.
+///
+/// A rename, not a copy, and never a merge that could lose one: a candidate is
+/// moved only when nothing of that name is already at the destination, and a
+/// collision leaves BOTH files where they are for a person to look at. Losing
+/// a staged candidate silently would destroy the one thing staging exists to
+/// hold — an observation that cannot be recomputed from the tree.
+///
+/// The legacy directory is left in place once empty rather than removed. It is
+/// the operator's directory, it may hold things cfetch never wrote, and an
+/// empty directory costs nothing next to deleting something we did not create.
+pub fn migrate_staging(brain_root: &Path) -> anyhow::Result<StagingMove> {
+    let from = crate::paths::legacy_staging_dir(brain_root);
+    let to = crate::paths::staging_dir(brain_root);
+    let mut moved = StagingMove::default();
+    if !from.is_dir() || from == to {
+        return Ok(moved);
+    }
+    for entry in walkdir(&from)? {
+        let Ok(rel) = entry.strip_prefix(&from) else { continue };
+        let target = to.join(rel);
+        if target.exists() {
+            moved.collisions.push(rel.display().to_string());
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&entry, &target)?;
+        moved.moved.push(rel.display().to_string());
+    }
+    Ok(moved)
+}
+
+#[derive(Debug, Default)]
+pub struct StagingMove {
+    pub moved: Vec<String>,
+    /// Names already present at the destination. Left untouched at BOTH ends:
+    /// two candidates with one name is a question, not something to resolve by
+    /// picking whichever was written second.
+    pub collisions: Vec<String>,
+}
+
+/// Every file under `root`, recursively. Small by construction — a staging
+/// directory holds candidates, not a corpus.
+fn walkdir(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => pending.push(path),
+                Ok(t) if t.is_file() => out.push(path),
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod staging_migration_tests {
+    use super::*;
+
+    #[test]
+    fn candidates_move_and_a_name_clash_leaves_both_alone() {
+        let brain = tempfile::tempdir().unwrap();
+        let from = crate::paths::legacy_staging_dir(brain.path());
+        let to = crate::paths::staging_dir(brain.path());
+        std::fs::create_dir_all(from.join("dismissed")).unwrap();
+        std::fs::write(from.join("hot-file-aaaa.md"), "candidate a").unwrap();
+        std::fs::write(from.join("dismissed/hot-file-bbbb.md"), "dismissed b").unwrap();
+        // Something of that name is already at the destination.
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("hot-file-cccc.md"), "destination c").unwrap();
+        std::fs::write(from.join("hot-file-cccc.md"), "legacy c").unwrap();
+
+        let out = migrate_staging(brain.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(to.join("hot-file-aaaa.md")).unwrap(), "candidate a");
+        assert_eq!(
+            std::fs::read_to_string(to.join("dismissed/hot-file-bbbb.md")).unwrap(),
+            "dismissed b",
+            "the dismissed record moves too — it is the audit trail of a decision"
+        );
+        assert_eq!(out.moved.len(), 2);
+        // The clash is reported and BOTH copies survive.
+        assert_eq!(out.collisions, vec!["hot-file-cccc.md".to_string()]);
+        assert_eq!(std::fs::read_to_string(to.join("hot-file-cccc.md")).unwrap(), "destination c");
+        assert_eq!(std::fs::read_to_string(from.join("hot-file-cccc.md")).unwrap(), "legacy c");
+    }
+
+    #[test]
+    fn a_tree_with_no_legacy_staging_is_untouched() {
+        let brain = tempfile::tempdir().unwrap();
+        let out = migrate_staging(brain.path()).unwrap();
+        assert!(out.moved.is_empty() && out.collisions.is_empty());
+        assert!(!crate::paths::staging_dir(brain.path()).exists(), "nothing is created for nothing");
+    }
+}

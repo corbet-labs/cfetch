@@ -1369,6 +1369,15 @@ fn init_cmd(path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let root = path.unwrap_or_else(paths::default_brain_root);
     let out = init::run(&root)?;
     println!("brain tree at {}", out.root.display());
+    // Getting an existing tree to spec is the same command as creating one:
+    // a standard nobody can migrate onto is a standard for new users only.
+    let moved = migrate::migrate_staging(&root)?;
+    if !moved.moved.is_empty() {
+        println!("  moved   {} staged candidate(s) into todo/staging/", moved.moved.len());
+    }
+    for name in &moved.collisions {
+        println!("  CLASH   {name} exists at both ends — left untouched, resolve by hand");
+    }
     for (name, fresh) in &out.dirs {
         println!("  {} {name}/", if *fresh { "created" } else { "present" });
     }

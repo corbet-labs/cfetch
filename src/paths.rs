@@ -171,8 +171,25 @@ pub fn logs_dir(brain_root: &Path) -> PathBuf {
 }
 
 /// Ring-5 staging: one markdown file per candidate, shared across hosts.
+/// A lane under `todo/`, because a queue of pending distillation IS work
+/// state — and because a reserved name already carries "never indexed"
+/// without needing a top-level directory of its own.
 pub fn staging_dir(brain_root: &Path) -> PathBuf {
+    brain_root.join("todo/staging")
+}
+
+/// Where staging lived before the tree was standardised. Read-only: it exists
+/// so an existing brain is migrated rather than silently orphaned.
+pub fn legacy_staging_dir(brain_root: &Path) -> PathBuf {
     brain_root.join("staging/cfetch")
+}
+
+/// Tool configuration inside the tree — shared by every host that mounts it,
+/// versioned with the content it describes. Hidden because it sits beside
+/// `.git/` and is machine-written, and because the walker skips hidden paths
+/// so no rule has to remember to exclude it.
+pub fn tree_config_path(brain_root: &Path) -> PathBuf {
+    brain_root.join(".cfetch/config.json")
 }
 
 /// Identity stamped into this host's stream file names and staged candidates.

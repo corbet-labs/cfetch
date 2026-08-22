@@ -243,12 +243,20 @@ fn default_ring_rules() -> Vec<RingRule> {
         RingRule { prefix: "mind/memories/MEMORY.md".into(), ring: 1 },
         // Distilled behavioral memories.
         RingRule { prefix: "mind/memories/".into(), ring: 2 },
+        // Ring-5 staging candidates. This MUST precede the `todo/` rule:
+        // `ring_for` takes the first match, so the general lane would
+        // otherwise claim the quarantined one and make candidates recallable.
+        RingRule { prefix: "todo/staging/".into(), ring: 5 },
+        // Where staging lived before the tree was standardised. Kept as a
+        // rule, not merely migrated: without it an unmigrated tree matches
+        // nothing on upgrade, falls through to the unmatched ring, and
+        // silently promotes quarantined candidates into recall.
+        RingRule { prefix: "staging/".into(), ring: 5 },
         // Working state: queues and task notes.
         RingRule { prefix: "todo/".into(), ring: 4 },
         // Ring-5 staging candidates. The LOCATION decides, so a candidate
         // whose frontmatter is stripped or hand-mangled is still never
         // recallable — this exclusion cannot be edited away file by file.
-        RingRule { prefix: "staging/".into(), ring: 5 },
         // Everything else is curated knowledge; see UNMATCHED_RING.
     ]
 }
@@ -257,7 +265,14 @@ fn default_ring_rules() -> Vec<RingRule> {
 /// code index, and the archive is retired knowledge nobody should recall by
 /// accident. Both are conventions, so both are configurable.
 fn default_exclude_prefixes() -> Vec<String> {
-    vec!["projects/".into(), "knowledge/archive/".into()]
+    vec![
+        "projects/".into(),
+        "knowledge/archive/".into(),
+        // Disposable working material. Without this a scratch lane drowns the
+        // ring it shares: a real tree measured 12,276 scratch files against 27
+        // files of live task state, and every query paid the ratio.
+        "todo/scratch/".into(),
+    ]
 }
 
 /// Where a resident entry may be injected. An entry with no scope at all is
@@ -851,7 +866,26 @@ impl Default for Config {
 impl Config {
     /// Loads the config file; a missing file yields defaults, a corrupt file is
     /// an error the caller surfaces (a half-applied config is worse than none).
+    /// Search order: an explicit `CFETCH_CONFIG`, then the TREE's own
+    /// `.cfetch/config.json`, then the machine-local file.
+    ///
+    /// The tree comes before the machine because the thing being configured
+    /// IS the tree: ring rules, slices and resident entries describe content
+    /// every host sees identically, so keeping them per-machine meant four
+    /// hosts free to disagree about what a path means, with no history of why
+    /// any of them said what it said. What genuinely differs per machine —
+    /// tier, ports, endpoints — is what the local file is still for.
+    ///
+    /// Finding the tree before reading its config is not circular: the root
+    /// comes from `CFETCH_BRAIN` or the default location, never from the file.
     pub fn load() -> anyhow::Result<Config> {
+        if let Some(explicit) = std::env::var_os("CFETCH_CONFIG") {
+            return Config::load_from(std::path::Path::new(&explicit));
+        }
+        let in_tree = paths::tree_config_path(&paths::default_brain_root());
+        if in_tree.is_file() {
+            return Config::load_from(&in_tree);
+        }
         Config::load_from(&paths::config_path())
     }
 
