@@ -44,6 +44,21 @@ impl LedgerSink {
     fn book_measured(&self, session: &str, usage: &ledger::MeasuredUsage) {
         ledger::book_measured(&self.dir, &self.host, self.cap, session, usage);
     }
+
+    fn book_self_read(&self, session: &str, chars: usize) {
+        ledger::book_self_read(&self.dir, &self.host, self.cap, session, chars);
+    }
+
+    fn book_condensation(&self, session: &str, original_chars: usize, entered_chars: usize) {
+        ledger::book_condensation(
+            &self.dir,
+            &self.host,
+            self.cap,
+            session,
+            original_chars,
+            entered_chars,
+        );
+    }
 }
 
 /// Files above this byte size get symbol-slice hints at pre-read. A
@@ -58,6 +73,10 @@ const MAX_SLICE_HINTS: usize = 5;
 /// The recap only earns its tokens while it stays cheaper than re-deriving the
 /// same facts, so a session that touched a hundred files gets a count instead.
 const COMPACT_RECAP_MAX_FILES: usize = 12;
+/// Once-per-session key for the redirect away from whole-file brain reads. It
+/// shares the reminder queue's shown-key set on purpose, so the same advice
+/// cannot arrive twice by two different routes.
+const SELF_READ_REDIRECT_KEY: &str = "self-read-redirect";
 
 /// Dispatches a hook event by name. Never returns an error to the harness.
 pub fn run(event_name: &str) {
@@ -299,6 +318,17 @@ fn prune_condensed_outputs(dir: &Path, keep: &Path, max_bytes: u64) -> anyhow::R
     Ok(())
 }
 
+/// A rewritten tool result, carried together with the size of the output it
+/// replaced. The pair is taken HERE because here is the only place both sides
+/// exist at once: once the replacement is emitted, the original is gone and
+/// any savings figure would have to be reconstructed from a ratio.
+struct Rewrite {
+    /// What enters the conversation instead of the tool result.
+    text: String,
+    /// Characters the untouched result would have entered with.
+    original_chars: usize,
+}
+
 /// Condenses a completed Bash result for a harness whose PostToolUse carries
 /// the tool response as an OBJECT — Claude Code and every client that copied
 /// its hook envelope (Gemini, Qwen). Codex is the exception: it sends a bare
@@ -312,7 +342,7 @@ fn prune_condensed_outputs(dir: &Path, keep: &Path, max_bytes: u64) -> anyhow::R
 fn object_condensed_output(
     state_dir: &Path,
     event: &HookEvent,
-) -> anyhow::Result<Option<serde_json::Value>> {
+) -> anyhow::Result<Option<(serde_json::Value, usize)>> {
     // Codex is identified by turn_id plus a string response; this path is for
     // everyone else, so both must be absent.
     if event.turn_id.is_some() || event.tool_name.as_deref() != Some("Bash") {
@@ -335,12 +365,15 @@ fn object_condensed_output(
     if u64::try_from(stdout.len()).unwrap_or(u64::MAX) > CONDENSED_OUTPUT_MAX_BYTES {
         return Ok(None);
     }
-    let Some(pointer) = preserve_full_output(state_dir, event, command, stdout)? else {
+    let Some(rewrite) = preserve_full_output(state_dir, event, command, stdout)? else {
         return Ok(None);
     };
     let mut replacement = response.clone();
-    replacement.insert("stdout".to_string(), serde_json::Value::String(pointer));
-    Ok(Some(serde_json::Value::Object(replacement)))
+    replacement.insert("stdout".to_string(), serde_json::Value::String(rewrite.text));
+    // The original size travels with the replacement: once emitted, the
+    // original is gone, and a savings figure reconstructed later is a ratio
+    // rather than a measurement.
+    Ok(Some((serde_json::Value::Object(replacement), rewrite.original_chars)))
 }
 
 /// Condenses a completed Codex Bash result and preserves the full original in
@@ -348,7 +381,7 @@ fn object_condensed_output(
 /// required `turn_id` plus a string `tool_response`; Claude does not get the
 /// `continue:false` replacement output because it interprets that universal
 /// field as an instruction to stop the agent.
-fn codex_condensed_output(state_dir: &Path, event: &HookEvent) -> anyhow::Result<Option<String>> {
+fn codex_condensed_output(state_dir: &Path, event: &HookEvent) -> anyhow::Result<Option<Rewrite>> {
     if event.turn_id.is_none() || event.tool_name.as_deref() != Some("Bash") {
         return Ok(None);
     }
@@ -381,7 +414,7 @@ fn preserve_full_output(
     event: &HookEvent,
     command: &str,
     output: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<Rewrite>> {
     use sha2::Digest as _;
 
     let condensed = condense::condense(command, output);
@@ -410,11 +443,23 @@ fn preserve_full_output(
         &path,
         CONDENSED_OUTPUT_MAX_BYTES,
     )?;
-    Ok(Some(format!(
-        "{}\n\n[cfetch: full uncondensed output preserved at {}]",
-        condensed.text,
-        path.display()
-    )))
+    Ok(Some(Rewrite {
+        text: format!(
+            "{}\n\n[cfetch: full uncondensed output preserved at {}]",
+            condensed.text,
+            path.display()
+        ),
+        original_chars: output.len(),
+    }))
+}
+
+/// Books one rewrite: the replacement's own cost as an injection, and — in the
+/// same call, from the same two measurements — what the rewrite avoided.
+/// Deliberately one function: a savings line that can outlive its cost line is
+/// how a memory system starts believing its own brochure.
+fn book_rewrite(sink: &LedgerSink, session: &str, original_chars: usize, entered_chars: usize) {
+    sink.book(session, "output-condensation", entered_chars);
+    sink.book_condensation(session, original_chars, entered_chars);
 }
 
 /// Turn summary + the 6->5 flagging traps (from wt/capture). Emits nothing —
@@ -615,6 +660,43 @@ fn remote_slices(
         .unwrap_or_default()
 }
 
+/// Meets a whole-file read of an oversized brain file with the cheap path,
+/// once per session. The threshold is the SAME budget the write side enforces
+/// (see [`post_tool_budget`]): a file too big to sit in every session is too
+/// big to slurp whole here, and one number governing both ends means an
+/// operator who tunes it tunes the whole policy. Once per session and not per
+/// file — this is a habit worth naming once; a hook that repeats itself gets
+/// switched off.
+fn brain_read_redirect(
+    cfg: Option<&Config>,
+    state_dir: &Path,
+    event: &HookEvent,
+    path: &str,
+) -> Option<String> {
+    let cfg = cfg?;
+    let budget = cfg.governance.state_file_budget_tokens;
+    if budget == 0 {
+        return None;
+    }
+    let name = Path::new(path).strip_prefix(&cfg.brain_root).ok()?.display().to_string();
+    let len = std::fs::metadata(path).ok()?.len();
+    let tokens = crate::hook_io::estimate_tokens(usize::try_from(len).unwrap_or(usize::MAX));
+    if tokens <= budget {
+        return None;
+    }
+    // Claim the key only once the read is genuinely worth redirecting, so a
+    // session's one shot is not spent on a file that was fine to read.
+    let claimed = session_state::update(state_dir, event.session(), |st| {
+        st.shown_keys.insert(SELF_READ_REDIRECT_KEY.to_string())
+    })?;
+    if !claimed {
+        return None;
+    }
+    Some(format!(
+        "[cfetch: {name} is a brain file of ~{tokens} tokens, over the {budget}-token budget for one file — `cfetch recall <terms>` answers out of the whole brain for a fraction of that and `cfetch recall --id <cite>` expands a single statement; read it whole only when you need all of it]"
+    ))
+}
+
 /// PreToolUse: read hygiene advice at the moment of spend. Repeat-read
 /// advisory (once per file per session, mtime-gated, disarmed by compaction)
 /// plus symbol-slice hints for large indexed files.
@@ -660,6 +742,9 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
             hints.join(", ")
         ));
     }
+    if let Some(redirect) = brain_read_redirect(cfg.as_ref(), &state_dir, event, &path) {
+        emit.add_context(redirect);
+    }
 
     let emitted = emit.finish();
     if emitted > 0 {
@@ -676,8 +761,8 @@ fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
 fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
     let mut first_err: Option<anyhow::Error> = None;
     let state_dir = paths::state_dir();
-    let replacement = match codex_condensed_output(&state_dir, event) {
-        Ok(replacement) => replacement,
+    let rewrite = match codex_condensed_output(&state_dir, event) {
+        Ok(rewrite) => rewrite,
         Err(e) => {
             first_err = Some(e);
             None
@@ -695,6 +780,7 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
                 if let Err(e) = post_tool_budget(&state_dir, &cfg, event) {
                     first_err.get_or_insert(e);
                 }
+                post_tool_self_read(&LedgerSink::of(Some(&cfg)), &cfg, event);
             }
             Err(e) => first_err = Some(e),
         }
@@ -704,25 +790,33 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
     }
     // Exactly one of these can apply: Codex is identified by turn_id plus a
     // string response and takes `continue:false`; every object-shaped harness
-    // takes hookSpecificOutput.updatedToolOutput instead.
-    let object_replacement = match object_condensed_output(&state_dir, event) {
+    // takes hookSpecificOutput.updatedToolOutput instead. Both are booked the
+    // same way — a saving is only defensible where both sides were seen.
+    let object_rewrite = match object_condensed_output(&state_dir, event) {
         Ok(v) => v,
         Err(e) => {
             first_err.get_or_insert(e);
             None
         }
     };
-    if replacement.is_some() || object_replacement.is_some() {
+    if rewrite.is_some() || object_rewrite.is_some() {
+        let original_chars = rewrite
+            .as_ref()
+            .map(|r| r.original_chars)
+            .or_else(|| object_rewrite.as_ref().map(|(_, chars)| *chars))
+            .unwrap_or(0);
         let mut emit = Emit::new("PostToolUse");
-        if let Some(replacement) = replacement {
-            emit.replace_tool_output(replacement);
+        if let Some(rewrite) = rewrite {
+            emit.replace_tool_output(rewrite.text);
         }
-        if let Some(value) = object_replacement {
+        if let Some((value, _)) = object_rewrite {
             emit.replace_claude_tool_output(value);
         }
-        let emitted = emit.finish();
+        // What the harness actually received, not what condensation produced:
+        // the pointer line rides along and is part of the bill.
+        let entered = emit.finish();
         let cfg = Config::load().ok();
-        LedgerSink::of(cfg.as_ref()).book(event.session(), "output-condensation", emitted);
+        book_rewrite(&LedgerSink::of(cfg.as_ref()), event.session(), original_chars, entered);
     }
     match first_err {
         Some(e) => Err(e),
@@ -790,6 +884,29 @@ fn post_tool_budget(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyhow
         });
     }
     Ok(())
+}
+
+/// Books what the agent spent reading brain files ITSELF. The ledger counted
+/// every byte cfetch injected and none of the ones the agent fetched by hand
+/// out of the same tree, which made the largest line item invisible precisely
+/// where the memory system claims to help.
+///
+/// Whole-file reads only: a ranged read is the behaviour the redirect asks
+/// for, and its true size is not knowable from a hook that must never read a
+/// file body. Subagents are skipped for the reason measured usage skips them —
+/// a fork's context is not this session's row.
+fn post_tool_self_read(sink: &LedgerSink, cfg: &Config, event: &HookEvent) {
+    if event.is_subagent() {
+        return;
+    }
+    let Some((path, ranged)) = read_invocation(event) else { return };
+    if ranged || !Path::new(&path).starts_with(&cfg.brain_root) {
+        return;
+    }
+    // The file's size at post-tool time, estimated the way every other ledger
+    // line is: a metadata stat, never a read.
+    let Ok(meta) = std::fs::metadata(&path) else { return };
+    sink.book_self_read(event.session(), usize::try_from(meta.len()).unwrap_or(usize::MAX));
 }
 
 fn post_tool_track(event: &HookEvent) -> anyhow::Result<()> {
@@ -998,7 +1115,8 @@ mod tests {
             }
         })).unwrap();
 
-        let out = object_condensed_output(state.path(), &event).unwrap().expect("condensed");
+        let (out, original) = object_condensed_output(state.path(), &event).unwrap().expect("condensed");
+        assert_eq!(original, flood.len(), "the original size travels with the replacement");
         let obj = out.as_object().unwrap();
         // Only stdout changed.
         assert_ne!(obj["stdout"].as_str().unwrap(), flood);
@@ -1392,13 +1510,17 @@ mod tests {
             ..Default::default()
         };
 
-        let feedback = codex_condensed_output(state.path(), &event)
+        let rewrite = codex_condensed_output(state.path(), &event)
             .unwrap()
             .expect("long listing should be condensed");
-        assert!(feedback.contains("line 0 with enough content"));
-        assert!(feedback.contains("line 199 with enough content"));
-        assert!(!feedback.contains("line 100 with enough content"));
-        assert!(feedback.contains("full uncondensed output preserved at"));
+        assert!(rewrite.text.contains("line 0 with enough content"));
+        assert!(rewrite.text.contains("line 199 with enough content"));
+        assert!(!rewrite.text.contains("line 100 with enough content"));
+        assert!(rewrite.text.contains("full uncondensed output preserved at"));
+        // The savings pair is only defensible if the original side is the
+        // actual result that was replaced, taken at the rewrite itself.
+        assert_eq!(rewrite.original_chars, output.len());
+        assert!(rewrite.text.len() < rewrite.original_chars);
 
         let files = std::fs::read_dir(state.path().join("condensed-output"))
             .unwrap()
@@ -1703,5 +1825,177 @@ mod tests {
         ] {
             assert_eq!(read_invocation(&event(unsafe_command)), None, "{unsafe_command}");
         }
+    }
+
+    #[test]
+    fn a_rewrite_books_what_it_saved_next_to_what_it_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        book_rewrite(&test_sink(dir.path()), "s1", 40_000, 1_500);
+        let l = ledger::load_from(dir.path());
+
+        // The injection line carries what ENTERED. Booking the original here
+        // would price the session for output it never received.
+        let booked = &l.sessions["s1"].by_source["output-condensation"];
+        assert_eq!(booked.count, 1);
+        assert_eq!(booked.chars, 1_500);
+
+        // ... and the pair sits in its own field, never inside the injection
+        // bill, where it would look like cfetch had injected 40k characters.
+        let c = l.condensation["s1"];
+        assert_eq!(c.rewrites, 1);
+        assert_eq!(c.original_tokens, crate::hook_io::estimate_tokens(40_000));
+        assert_eq!(c.entered_tokens, crate::hook_io::estimate_tokens(1_500));
+        assert!(!l.sessions["s1"].by_source.contains_key("condensed"));
+    }
+
+    /// Config whose brain tree is a tempdir, for the self-read paths.
+    fn brain_cfg(brain: &Path) -> Config {
+        Config { brain_root: brain.to_path_buf(), ..Config::default() }
+    }
+
+    fn read_event(session: &str, path: &Path) -> HookEvent {
+        HookEvent {
+            session_id: Some(session.into()),
+            tool_name: Some("Read".into()),
+            tool_input: Some(json!({"file_path": path.to_string_lossy()})),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_agents_own_brain_reads_are_booked_apart_from_the_injection_bill() {
+        let logs = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = brain_cfg(brain.path());
+        let sink = test_sink(logs.path());
+        let mine = brain.path().join("knowledge/topic.md");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::write(&mine, "x".repeat(7_000)).unwrap();
+
+        post_tool_self_read(&sink, &cfg, &read_event("s1", &mine));
+        let l = ledger::load_from(logs.path());
+        let sr = l.self_reads["s1"];
+        assert_eq!(sr.reads, 1);
+        assert_eq!(sr.chars, 7_000, "the file's own size is the spend");
+        assert_eq!(sr.tokens_estimated, crate::hook_io::estimate_tokens(7_000));
+        assert!(
+            l.sessions["s1"].by_source.is_empty(),
+            "a read the AGENT performed is not an injection by cfetch"
+        );
+
+        // A shell read of the same file counts the same — 140 of 144 measured
+        // duplicate reads upstream flowed through bash, not the Read tool.
+        let mut shell = read_event("s1", &mine);
+        shell.tool_name = Some("Bash".into());
+        shell.tool_input = Some(json!({"command": format!("cat {}", mine.display())}));
+        post_tool_self_read(&sink, &cfg, &shell);
+        assert_eq!(ledger::load_from(logs.path()).self_reads["s1"].reads, 2);
+    }
+
+    #[test]
+    fn self_read_booking_skips_narrow_reads_foreign_files_and_subagents() {
+        let logs = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = brain_cfg(brain.path());
+        let sink = test_sink(logs.path());
+        let mine = brain.path().join("big.md");
+        std::fs::write(&mine, "x".repeat(7_000)).unwrap();
+
+        // A ranged read is the behaviour the redirect asks for; charging for
+        // it would punish exactly the habit this mechanism is buying.
+        let mut ranged = read_event("s1", &mine);
+        ranged.tool_input = Some(json!({"file_path": mine.to_string_lossy(), "limit": 40}));
+        post_tool_self_read(&sink, &cfg, &ranged);
+
+        // Source files are the user's business, not the brain's bill.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let theirs = elsewhere.path().join("vendor.rs");
+        std::fs::write(&theirs, "x".repeat(7_000)).unwrap();
+        post_tool_self_read(&sink, &cfg, &read_event("s1", &theirs));
+
+        // A fork reads into its own context, not this session's row.
+        let mut sub = read_event("s1", &mine);
+        sub.agent_id = Some("a1".into());
+        post_tool_self_read(&sink, &cfg, &sub);
+
+        assert!(ledger::load_from(logs.path()).self_reads.is_empty());
+    }
+
+    #[test]
+    fn the_whole_file_redirect_names_the_cheap_path_once_per_session() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = brain_cfg(brain.path());
+        let big = brain.path().join("knowledge/huge.md");
+        std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+        std::fs::write(&big, "x".repeat(40_000)).unwrap();
+        let path = big.to_string_lossy().to_string();
+        let event = read_event("s1", &big);
+
+        let advice = brain_read_redirect(Some(&cfg), state.path(), &event, &path)
+            .expect("an oversized brain file must be redirected");
+        assert!(advice.contains("knowledge/huge.md"), "{advice}");
+        assert!(advice.contains("cfetch recall"), "the cheap path must be named: {advice}");
+        assert!(advice.contains("--id"), "expanding one statement is the other half: {advice}");
+
+        // Once per session, not per file: a second oversized file in the same
+        // session says nothing further.
+        let other = brain.path().join("other.md");
+        std::fs::write(&other, "x".repeat(40_000)).unwrap();
+        assert!(
+            brain_read_redirect(Some(&cfg), state.path(), &event, &other.to_string_lossy())
+                .is_none(),
+            "the redirect must not nag"
+        );
+        // A different session gets its own single shot.
+        assert!(
+            brain_read_redirect(Some(&cfg), state.path(), &read_event("s2", &big), &path)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_redirect_stays_silent_for_small_files_foreign_files_and_a_zero_budget() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = brain_cfg(brain.path());
+
+        let small = brain.path().join("small.md");
+        std::fs::write(&small, "x".repeat(100)).unwrap();
+        let event = read_event("s1", &small);
+        assert!(
+            brain_read_redirect(Some(&cfg), state.path(), &event, &small.to_string_lossy())
+                .is_none(),
+            "a file inside the budget is fine to read whole"
+        );
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let theirs = elsewhere.path().join("vendor.rs");
+        std::fs::write(&theirs, "x".repeat(40_000)).unwrap();
+        assert!(
+            brain_read_redirect(Some(&cfg), state.path(), &event, &theirs.to_string_lossy())
+                .is_none(),
+            "cfetch governs its own tree, not the user's source"
+        );
+
+        let big = brain.path().join("huge.md");
+        std::fs::write(&big, "x".repeat(40_000)).unwrap();
+        let off = Config {
+            governance: crate::config::GovernanceConfig {
+                state_file_budget_tokens: 0,
+                ..Default::default()
+            },
+            ..brain_cfg(brain.path())
+        };
+        assert!(
+            brain_read_redirect(Some(&off), state.path(), &event, &big.to_string_lossy())
+                .is_none(),
+            "zero budget is the off switch for both ends of the policy"
+        );
+        // The silent cases must not have burned the session's one shot.
+        assert!(
+            brain_read_redirect(Some(&cfg), state.path(), &event, &big.to_string_lossy())
+                .is_some()
+        );
     }
 }

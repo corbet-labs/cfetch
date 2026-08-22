@@ -17,6 +17,13 @@
 //! 1+2+…+N-fold (upstream shipped exactly that bug: 898M fake tokens), and a
 //! watermark that cannot be found is booked as ZERO rather than guessed —
 //! re-arming from the new baseline instead of inventing usage.
+//!
+//! Two further record kinds book costs cfetch did NOT inject, and they fold
+//! into their own fields rather than into the injection bill: `self-read`
+//! (whole-file reads of brain files the agent performed itself) and
+//! `condensed` (the original/entered token pair, measured where a tool result
+//! was rewritten). Adding either to `by_source` would answer "what did cfetch
+//! put into this session?" with tokens cfetch never put there.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -107,6 +114,37 @@ pub struct SourceTotals {
     pub tokens_estimated: u64,
 }
 
+/// Whole-file reads of brain files the AGENT performed. Kept apart from the
+/// injection totals in both directions: counting them as injections would
+/// inflate what cfetch costs with tokens the agent chose to spend, and not
+/// counting them at all leaves the spend the cheap paths exist to displace
+/// unmeasured — upstream carried ~147k tokens per session of exactly this,
+/// invisible to every accounting surface it had.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfReadTotals {
+    pub reads: u64,
+    pub chars: u64,
+    pub tokens_estimated: u64,
+}
+
+/// Output condensation as measured AT THE REWRITE: what the tool result would
+/// have cost, and what entered the conversation in its place. The pair is the
+/// whole point — a savings figure derived from a ratio, a floor or a bench run
+/// is the marketing number this project rejects by name, and only these two
+/// numbers, taken from the same rewrite, survive being asked where they came
+/// from.
+///
+/// There is deliberately no `saved` field and no helper that computes one: a
+/// difference cannot be quoted without both halves being in the caller's hand,
+/// which is the whole discipline — savings reported alone are the number every
+/// memory tool inflates.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CondensationTotals {
+    pub rewrites: u64,
+    pub original_tokens: u64,
+    pub entered_tokens: u64,
+}
+
 /// The DERIVED view: every host's ledger stream folded into per-session
 /// totals. Rebuildable from the tree at any moment; never a source of truth.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -114,6 +152,12 @@ pub struct Ledger {
     /// session_id -> injections. BTreeMap for deterministic serialization.
     #[serde(default)]
     pub sessions: BTreeMap<String, SessionInjections>,
+    /// session_id -> what the agent spent reading brain files itself.
+    #[serde(default)]
+    pub self_reads: BTreeMap<String, SelfReadTotals>,
+    /// session_id -> what rewriting oversized tool results cost and saved.
+    #[serde(default)]
+    pub condensation: BTreeMap<String, CondensationTotals>,
 }
 
 /// A folded ledger, the hosts whose lines went into it, and the stream files
@@ -150,6 +194,62 @@ pub fn book_injection(
             "source": source,
             "chars": chars as u64,
             "tokens_estimated": crate::hook_io::estimate_tokens(chars),
+        }),
+    );
+}
+
+/// Books a whole-file read of a brain file that the AGENT performed. Never an
+/// injection: this is the spend cfetch's recall paths exist to displace, and
+/// the ledger can only argue that case if it carries the number.
+/// Best-effort; never fails the calling hook.
+pub fn book_self_read(logs_dir: &Path, host: &str, max_bytes: u64, session_id: &str, chars: usize) {
+    if chars == 0 {
+        return;
+    }
+    let _ = jsonl::append(
+        logs_dir,
+        STREAM,
+        host,
+        max_bytes,
+        serde_json::json!({
+            "kind": "self-read",
+            "session": session_id,
+            "chars": chars as u64,
+            "tokens_estimated": crate::hook_io::estimate_tokens(chars),
+        }),
+    );
+}
+
+/// Books one output condensation as the PAIR it was measured as: the result
+/// that would have entered, and the replacement that did. Taking both sides in
+/// one call is deliberate — a caller cannot book the flattering half alone,
+/// which is exactly how unaudited savings claims get made.
+/// Best-effort; never fails the calling hook.
+pub fn book_condensation(
+    logs_dir: &Path,
+    host: &str,
+    max_bytes: u64,
+    session_id: &str,
+    original_chars: usize,
+    entered_chars: usize,
+) {
+    if original_chars == 0 {
+        return;
+    }
+    let _ = jsonl::append(
+        logs_dir,
+        STREAM,
+        host,
+        max_bytes,
+        serde_json::json!({
+            "kind": "condensed",
+            "session": session_id,
+            // Chars are the measurement, tokens the labeled estimate over it —
+            // both kept so a later, better tokenizer can re-fold the record.
+            "original_chars": original_chars as u64,
+            "entered_chars": entered_chars as u64,
+            "original_tokens": crate::hook_io::estimate_tokens(original_chars),
+            "entered_tokens": crate::hook_io::estimate_tokens(entered_chars),
         }),
     );
 }
@@ -272,6 +372,18 @@ pub fn read(logs_dir: &Path) -> Loaded {
                 totals.count += 1;
                 totals.chars += rec.i64("chars").max(0) as u64;
                 totals.tokens_estimated += rec.i64("tokens_estimated").max(0) as u64;
+            }
+            "self-read" => {
+                let totals = ledger.self_reads.entry(session.to_string()).or_default();
+                totals.reads += 1;
+                totals.chars += rec.i64("chars").max(0) as u64;
+                totals.tokens_estimated += rec.i64("tokens_estimated").max(0) as u64;
+            }
+            "condensed" => {
+                let totals = ledger.condensation.entry(session.to_string()).or_default();
+                totals.rewrites += 1;
+                totals.original_tokens += rec.i64("original_tokens").max(0) as u64;
+                totals.entered_tokens += rec.i64("entered_tokens").max(0) as u64;
             }
             "measured" => {
                 if let Some(delta) = rec
@@ -427,11 +539,62 @@ mod tests {
     fn zero_chars_books_nothing() {
         let dir = tempfile::tempdir().unwrap();
         book_injection(dir.path(), "h1", CAP, "s1", "resident", 0);
+        book_self_read(dir.path(), "h1", CAP, "s1", 0);
+        book_condensation(dir.path(), "h1", CAP, "s1", 0, 0);
         assert!(load_from(dir.path()).sessions.is_empty());
         assert!(
             jsonl::stream_paths(dir.path(), STREAM).is_empty(),
             "a no-op booking must not create a stream"
         );
+    }
+
+    #[test]
+    fn the_agents_own_reads_never_land_in_the_injection_bill() {
+        // The blind spot this field exists for: these tokens are real and
+        // must be visible, but they are NOT what cfetch put into the session.
+        let dir = tempfile::tempdir().unwrap();
+        book_injection(dir.path(), "h1", CAP, "s1", "resident", 700);
+        book_self_read(dir.path(), "h1", CAP, "s1", 7_000);
+        book_self_read(dir.path(), "h1", CAP, "s1", 3_500);
+
+        let l = load_from(dir.path());
+        let injected: u64 = l.sessions["s1"].by_source.values().map(|t| t.tokens_estimated).sum();
+        assert_eq!(injected, crate::hook_io::estimate_tokens(700), "unchanged by self-reads");
+        assert_eq!(l.sessions["s1"].by_source.len(), 1, "no source row was invented");
+
+        let sr = l.self_reads["s1"];
+        assert_eq!(sr.reads, 2);
+        assert_eq!(sr.chars, 10_500);
+        assert_eq!(sr.tokens_estimated, 2_000 + 1_000);
+        assert!(!l.self_reads.contains_key("s2"), "self-reads are per session");
+    }
+
+    #[test]
+    fn a_condensation_books_both_sides_of_the_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        book_condensation(dir.path(), "h1", CAP, "s1", 35_000, 3_500);
+        book_condensation(dir.path(), "h1", CAP, "s1", 7_000, 3_500);
+
+        let c = load_from(dir.path()).condensation["s1"];
+        assert_eq!(c.rewrites, 2);
+        assert_eq!(c.original_tokens, 10_000 + 2_000);
+        assert_eq!(c.entered_tokens, 1_000 + 1_000, "what entered is booked, not just what left");
+
+        // Chars survive in the record so a better tokenizer can re-fold it.
+        let raw = std::fs::read_to_string(jsonl::stream_path(dir.path(), STREAM, "h1")).unwrap();
+        assert!(raw.contains("\"original_chars\":35000"));
+        assert!(raw.contains("\"entered_chars\":3500"));
+    }
+
+    #[test]
+    fn a_rewrite_that_saved_nothing_stays_visible_as_itself() {
+        // Condensation declines below its own floor, so this should not
+        // happen — and if it ever does, the pair must show it rather than
+        // clamp to zero and quietly net off against real savings elsewhere.
+        let dir = tempfile::tempdir().unwrap();
+        book_condensation(dir.path(), "h1", CAP, "s1", 1_000, 4_000);
+        let c = load_from(dir.path()).condensation["s1"];
+        assert!(c.entered_tokens > c.original_tokens, "the loss stays visible in the pair");
     }
 
     #[test]
