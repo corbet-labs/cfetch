@@ -32,21 +32,16 @@ pub fn key_path(state_dir: &Path) -> PathBuf {
 /// there is nothing to version and nothing to misparse.
 pub fn load_or_create(state_dir: &Path) -> anyhow::Result<iroh::SecretKey> {
     let path = key_path(state_dir);
-    match read_key(&path) {
-        Ok(sk) => return Ok(sk),
-        Err(e) if e.downcast_ref::<std::io::Error>().is_none_or(|io| {
-            io.kind() != std::io::ErrorKind::NotFound
-        }) => return Err(e),
-        Err(_) => {}
-    }
-
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("create {}", state_dir.display()))?;
     let lock_path = state_dir.join("endpoint.lock");
     let _lock = crate::lockfile::acquire(&lock_path, 2_000, 0)
         .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", lock_path.display()))?;
 
-    // The winner may have created the key while this process waited.
+    // Read only while holding the creation lock. On Windows, a create-new
+    // writer's file is visible before its first bytes land; an unlocked fast
+    // read could therefore mistake another process's in-progress key for a
+    // damaged zero-byte identity.
     match read_key(&path) {
         Ok(sk) => return Ok(sk),
         Err(e) if e.downcast_ref::<std::io::Error>().is_none_or(|io| {

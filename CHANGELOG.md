@@ -18,6 +18,10 @@ listed here is a fix or an internal change with no effect on behavior.
   as context. The complete original is preserved in private local state and
   linked from the condensed result under a 64 MiB retention cap; test and build
   output remains untouched.
+- **Cross-platform state locking.** Identity creation now reads the key only
+  while holding its creation lock, so Windows cannot observe a winner's
+  zero-byte in-progress file. Lock retries honor their full deadline, and
+  concurrent session updates have enough bounded time on macOS and Windows.
 
 - **Engine selection.** A variant is now a Cargo feature selection rather
   than a source fork: which engines are compiled in is a build-time fact,

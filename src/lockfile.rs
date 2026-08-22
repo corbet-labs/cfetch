@@ -43,16 +43,18 @@ pub fn acquire(path: &Path, max_wait_ms: u64, _stale_secs: u64) -> Option<Lock> 
         .truncate(false)
         .open(path)
         .ok()?;
-    let attempts = (max_wait_ms / 50).max(1);
-    for attempt in 0..attempts {
+    let started = std::time::Instant::now();
+    let max_wait = Duration::from_millis(max_wait_ms);
+    loop {
         if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
             return Some(Lock { _file: file });
         }
-        if attempt + 1 < attempts {
-            std::thread::sleep(Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        if elapsed >= max_wait {
+            return None;
         }
+        std::thread::sleep((max_wait - elapsed).min(Duration::from_millis(50)));
     }
-    None
 }
 
 /// Windows counterpart of the unix `acquire`, with the identical contract:
@@ -71,8 +73,9 @@ pub fn acquire(path: &Path, max_wait_ms: u64, _stale_secs: u64) -> Option<Lock> 
     /// Its byte-range sibling, returned by some filesystem filters.
     const ERROR_LOCK_VIOLATION: i32 = 33;
 
-    let attempts = (max_wait_ms / 50).max(1);
-    for attempt in 0..attempts {
+    let started = std::time::Instant::now();
+    let max_wait = Duration::from_millis(max_wait_ms);
+    loop {
         match std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -88,11 +91,12 @@ pub fn acquire(path: &Path, max_wait_ms: u64, _stale_secs: u64) -> Option<Lock> 
                 ) => {}
             Err(_) => return None,
         }
-        if attempt + 1 < attempts {
-            std::thread::sleep(Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        if elapsed >= max_wait {
+            return None;
         }
+        std::thread::sleep((max_wait - elapsed).min(Duration::from_millis(50)));
     }
-    None
 }
 
 #[cfg(test)]
