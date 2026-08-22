@@ -98,6 +98,12 @@ storage: it is a network call away from the whole brain.
 
 ## Install
 
+Published archives are generated from [`release/variants.json`](release/variants.json),
+which contains only builds that exist. `cfetch variants` prints the same catalog
+embedded in the executable. Current archives are explicitly named `remote`
+because they use the configured embeddings endpoint; accelerator names are not
+published until their inference runtime is actually linked and tested.
+
 Prebuilt archives are attached to [GitHub releases](https://github.com/julian-corbet/cfetch/releases).
 Each archive contains the binary, `LICENSE.md`, and the generated
 `THIRD-PARTY-LICENSES.txt` attribution bundle.

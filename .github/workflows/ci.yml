@@ -13,6 +13,41 @@ on:
   pull_request:
 
 jobs:
+  catalog:
+    name: Variant catalog
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.catalog.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate and export matrix
+        id: catalog
+        shell: bash
+        run: |
+          echo "matrix=$(bash scripts/variant-matrix.sh)" >> "$GITHUB_OUTPUT"
+
+  variant-build:
+    name: Variant build (${{ matrix.id }})
+    needs: catalog
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.catalog.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check exact release build
+        shell: bash
+        run: |
+          export CFETCH_VARIANT='${{ matrix.id }}'
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo check --release --locked --target "${{ matrix.target }}" --features '${{ matrix.cargo_features }}'
+          else
+            cargo check --release --locked --features '${{ matrix.cargo_features }}'
+          fi
+
   licenses:
     name: Dependency licenses
     runs-on: ubuntu-latest

@@ -5,6 +5,16 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Executable release catalog.** `release/variants.json` is now the single
+  source for runtime advice, CI, release archives, and Homebrew. Artifact names
+  explicitly say `remote` while inference remains endpoint-only; the empty
+  backend Cargo features and nonexistent silicon recommendations are gone.
+  `cfetch variants` reports the embedded catalog, and `cfetch hardware` can no
+  longer recommend an artifact that does not exist.
+- **ARM release coverage.** Linux and Windows ARM64 join Linux, macOS, and
+  Windows x86_64 in the generated release matrix. Every catalog entry gets a
+  blocking compile job before a tag can become a complete release.
+
 ## 0.9.2
 
 - **Homebrew install.** `brew tap julian-corbet/cfetch && brew install cfetch`

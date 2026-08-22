@@ -85,13 +85,20 @@ jobs:
           sha_of() {
             awk -v want="$1" '$2 == want || $2 == "*" want {print $1}' /tmp/checksums_sha256.txt
           }
-          MAC_ARM="mac-cfetch-arm64-v${VERSION}.tar.gz"
-          MAC_X86="mac-cfetch-x86_64-v${VERSION}.tar.gz"
-          LNX_X86="linux-cfetch-x86_64-v${VERSION}.tar.gz"
+          variant_id() {
+            jq -er --arg os "$1" --arg arch "$2" \
+              '.variants[] | select(.os == $os and .arch == $arch and .backend == "endpoint") | .id' \
+              release/variants.json
+          }
+          MAC_ARM="$(variant_id mac aarch64)-v${VERSION}.tar.gz"
+          MAC_X86="$(variant_id mac x86_64)-v${VERSION}.tar.gz"
+          LNX_ARM="$(variant_id linux aarch64)-v${VERSION}.tar.gz"
+          LNX_X86="$(variant_id linux x86_64)-v${VERSION}.tar.gz"
           SHA_MAC_ARM=$(sha_of "$MAC_ARM")
           SHA_MAC_X86=$(sha_of "$MAC_X86")
+          SHA_LNX_ARM=$(sha_of "$LNX_ARM")
           SHA_LNX_X86=$(sha_of "$LNX_X86")
-          for pair in "$MAC_ARM:$SHA_MAC_ARM" "$MAC_X86:$SHA_MAC_X86" "$LNX_X86:$SHA_LNX_X86"; do
+          for pair in "$MAC_ARM:$SHA_MAC_ARM" "$MAC_X86:$SHA_MAC_X86" "$LNX_ARM:$SHA_LNX_ARM" "$LNX_X86:$SHA_LNX_X86"; do
             if [ -z "${pair#*:}" ]; then
               echo "::error::No checksum for ${pair%%:*}"
               cat /tmp/checksums_sha256.txt
@@ -118,12 +125,13 @@ jobs:
             end
 
             on_linux do
-              # cfetch publishes no linux-arm64 build yet. Saying so is better
-              # than resolving to an x86_64 tarball that cannot execute.
-              odie "cfetch has no linux-arm64 build; install from source" if Hardware::CPU.arm?
-
-              url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${LNX_X86}"
-              sha256 "${SHA_LNX_X86}"
+              if Hardware::CPU.arm?
+                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${LNX_ARM}"
+                sha256 "${SHA_LNX_ARM}"
+              else
+                url "https://github.com/julian-corbet/cfetch/releases/download/v${VERSION}/${LNX_X86}"
+                sha256 "${SHA_LNX_X86}"
+              end
             end
 
             def install

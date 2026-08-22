@@ -23,7 +23,9 @@ prepare() {
 
 build() {
   cd "$pkgname"
-  cargo build --release --locked
+  local variant_arch="$CARCH"
+  [[ "$variant_arch" == aarch64 ]] && variant_arch=arm64
+  CFETCH_VARIANT="linux-cfetch-remote-$variant_arch" cargo build --release --locked
 }
 
 check() {

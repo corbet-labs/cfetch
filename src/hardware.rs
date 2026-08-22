@@ -196,17 +196,6 @@ pub fn x86_64_level() -> Option<&'static str> {
     }
 }
 
-/// The OS token in the variant name.
-pub fn os_token() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "mac"
-    } else if cfg!(target_os = "windows") {
-        "win"
-    } else {
-        "linux"
-    }
-}
-
 /// Everything this machine offers, best first.
 ///
 /// The CPU is always last and always present — it is the floor, not a
@@ -344,32 +333,6 @@ fn read_trim(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_string())
 }
 
-/// The variant this machine should install, under the
-/// `<os>-cfetch-<silicon>[-<level>]` scheme.
-///
-/// The best USABLE device wins. A device that exists but cannot run this
-/// model class — an AMD gen-1 NPU, say — is reported by `detect` so an
-/// operator can see it, and skipped here so the installer never fetches a
-/// variant that could not run.
-pub fn recommended_variant(found: &[Found]) -> String {
-    let best = found
-        .iter()
-        .find(|f| f.usable().is_ok())
-        .map(|f| f.device)
-        .unwrap_or(Device::Cpu);
-    let mut name = format!("{}-cfetch-{}", os_token(), best.token());
-    // The microarchitecture level qualifies CPU builds only: it says which
-    // instructions the scalar code may use, which is meaningless once the
-    // work happens on an accelerator.
-    if best == Device::Cpu
-        && let Some(level) = x86_64_level()
-    {
-        name.push('-');
-        name.push_str(level);
-    }
-    name
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,24 +360,13 @@ mod tests {
     }
 
     #[test]
-    fn an_npu_outranks_a_gpu_in_the_recommended_variant() {
+    fn an_npu_outranks_a_gpu_in_detection_order() {
         let f = |device| Found { device, evidence: "test".into(), pci_device: None };
         let (npu, gpu, cpu) = (f(Device::IntelNpu), f(Device::AmdGpu), f(Device::Cpu));
-        assert!(recommended_variant(&[npu, gpu.clone(), cpu.clone()]).contains("npu-intel"));
-        assert!(recommended_variant(&[gpu, cpu.clone()]).contains("-amd"));
-        // A CPU-only machine gets a microarchitecture level; an accelerated
-        // one does not, because the level describes scalar code.
-        let only_cpu = recommended_variant(&[cpu]);
-        assert!(only_cpu.contains("-cpu"));
-        #[cfg(target_arch = "x86_64")]
-        assert!(only_cpu.ends_with("-v3") || only_cpu.ends_with("-v4") || only_cpu.ends_with("-legacy"));
-    }
-
-    #[test]
-    fn the_variant_name_carries_the_platform() {
-        let name = recommended_variant(&detect());
-        assert!(name.starts_with(os_token()), "{name}");
-        assert!(name.contains("-cfetch-"), "{name}");
+        let mut found = [gpu, cpu, npu];
+        found.sort_by_key(|f| std::cmp::Reverse(f.device.class()));
+        assert_eq!(found[0].device, Device::IntelNpu);
+        assert_eq!(found[1].device, Device::AmdGpu);
     }
 
     // ---- Linux probing, against synthetic sysfs trees ----
@@ -520,20 +472,12 @@ mod tests {
         found.extend(linux_gpus(&drm));
         found.sort_by_key(|f| std::cmp::Reverse(f.device.class()));
         assert_eq!(found[0].device, Device::IntelNpu);
-        assert!(recommended_variant(&found).ends_with("cfetch-npu-intel"), "{found:?}");
     }
 
     #[test]
-    fn a_device_that_cannot_run_the_model_class_is_never_recommended() {
-        // An AMD gen-1 NPU is real hardware that reports itself and cannot
-        // run a transformer encoder at all. Recommending its variant would
-        // send an installer after a binary that could not work.
-        let f = |device| Found { device, evidence: "test".into(), pci_device: None };
-        let found = vec![f(Device::AmdNpu), f(Device::AmdGpu), f(Device::Cpu)];
-        assert!(found[0].usable().is_err(), "the NPU must be marked unusable");
-        let variant = recommended_variant(&found);
-        assert!(!variant.contains("npu"), "skipped in favour of the GPU: {variant}");
-        assert!(variant.ends_with("-amd"), "{variant}");
+    fn a_device_that_cannot_run_the_model_class_is_marked_unusable() {
+        let found = Found { device: Device::AmdNpu, evidence: "test".into(), pci_device: None };
+        assert!(found.usable().is_err(), "the NPU must be marked unusable");
     }
 
     #[test]
@@ -556,7 +500,7 @@ mod tests {
         let gpu = Found { device: Device::IntelGpu, evidence: "test".into(), pci_device: None };
         assert!(npu.usable().is_ok());
         assert!(npu.caveat().unwrap().contains("Meteor Lake"));
-        assert!(recommended_variant(&[npu, gpu]).ends_with("npu-intel"));
+        assert!(npu.device.class() > gpu.device.class());
     }
 
     #[test]

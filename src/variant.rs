@@ -1,0 +1,151 @@
+//! The executable release catalog.
+//!
+//! This file deliberately knows only about artifacts that exist. Future
+//! accelerator work belongs in the design until its backend is linked, its
+//! build is green, and its archive is produced. That keeps runtime advice,
+//! release automation, and package generators from promising different
+//! products.
+
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
+
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
+
+const CATALOG_JSON: &str = include_str!("../release/variants.json");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Catalog {
+    pub schema_version: u32,
+    pub variants: Vec<ReleaseVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseVariant {
+    pub id: String,
+    pub os: String,
+    pub arch: String,
+    pub runner: String,
+    pub target: String,
+    pub binary: String,
+    pub archive: String,
+    pub backend: String,
+    pub cargo_features: String,
+}
+
+impl Catalog {
+    pub fn parse(input: &str) -> anyhow::Result<Self> {
+        let catalog: Catalog = serde_json::from_str(input).context("parse release/variants.json")?;
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.schema_version == 1, "unsupported variant catalog schema {}", self.schema_version);
+        anyhow::ensure!(!self.variants.is_empty(), "variant catalog is empty");
+
+        let mut ids = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        for variant in &self.variants {
+            anyhow::ensure!(ids.insert(&variant.id), "duplicate variant id {}", variant.id);
+            anyhow::ensure!(
+                variant.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'),
+                "variant id {} contains unsupported characters",
+                variant.id
+            );
+            anyhow::ensure!(["linux", "mac", "win"].contains(&variant.os.as_str()), "variant {} has unknown OS {}", variant.id, variant.os);
+            anyhow::ensure!(["x86_64", "aarch64"].contains(&variant.arch.as_str()), "variant {} has unknown architecture {}", variant.id, variant.arch);
+            anyhow::ensure!(!variant.runner.is_empty(), "variant {} has no CI runner", variant.id);
+            anyhow::ensure!(!variant.binary.is_empty(), "variant {} has no binary name", variant.id);
+            anyhow::ensure!(["tar.gz", "zip"].contains(&variant.archive.as_str()), "variant {} has unknown archive format {}", variant.id, variant.archive);
+            anyhow::ensure!(variant.backend == "endpoint", "variant {} claims unimplemented backend {}", variant.id, variant.backend);
+            anyhow::ensure!(variant.cargo_features.is_empty(), "endpoint-only variant {} must not claim Cargo features", variant.id);
+            anyhow::ensure!(variant.id.contains("-cfetch-remote-"), "endpoint-only variant {} must be named remote", variant.id);
+            anyhow::ensure!(
+                targets.insert((variant.os.clone(), variant.arch.clone(), variant.backend.clone())),
+                "multiple {} {} variants claim the same {} backend",
+                variant.os,
+                variant.arch,
+                variant.backend
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn catalog() -> &'static Catalog {
+    static CATALOG: OnceLock<Catalog> = OnceLock::new();
+    CATALOG.get_or_init(|| Catalog::parse(CATALOG_JSON).expect("embedded release variant catalog must be valid"))
+}
+
+pub fn os_token() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "mac"
+    } else if cfg!(target_os = "windows") {
+        "win"
+    } else {
+        "linux"
+    }
+}
+
+pub fn arch_token() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        std::env::consts::ARCH
+    }
+}
+
+/// The artifact an installer can truthfully offer for this target.
+pub fn recommended_release() -> Option<&'static ReleaseVariant> {
+    catalog().variants.iter().find(|v| v.os == os_token() && v.arch == arch_token())
+}
+
+/// Identity injected by the release/package build. A developer build remains
+/// unidentified instead of borrowing an artifact identity it may not match.
+pub fn build_id() -> Option<&'static str> {
+    option_env!("CFETCH_VARIANT")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_catalog_is_valid() {
+        catalog().validate().unwrap();
+    }
+
+    #[test]
+    fn every_catalog_entry_is_a_real_remote_build() {
+        for variant in &catalog().variants {
+            assert_eq!(variant.backend, "endpoint");
+            assert!(variant.id.contains("-remote-"));
+            assert!(variant.cargo_features.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_refuses_a_backend_that_is_only_a_name() {
+        let fake = CATALOG_JSON.replacen("\"backend\": \"endpoint\"", "\"backend\": \"coreml\"", 1);
+        assert!(Catalog::parse(&fake).unwrap_err().to_string().contains("unimplemented backend"));
+    }
+
+    #[test]
+    fn current_supported_target_has_exactly_one_release() {
+        if ["linux", "mac", "win"].contains(&os_token()) && ["x86_64", "aarch64"].contains(&arch_token()) {
+            let matches = catalog()
+                .variants
+                .iter()
+                .filter(|v| v.os == os_token() && v.arch == arch_token())
+                .count();
+            // linux-arm64 and windows-arm64 deliberately remain absent until
+            // their release legs exist.
+            assert!(matches <= 1);
+        }
+    }
+}

@@ -35,6 +35,11 @@
           inherit version;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
+          CFETCH_VARIANT =
+            if pkgs.stdenv.hostPlatform.isAarch64 then
+              "linux-cfetch-remote-arm64"
+            else
+              "linux-cfetch-remote-x86_64";
           postInstall = ''
             install -Dm644 LICENSE.md "$out/share/licenses/cfetch/LICENSE.md"
             install -Dm644 THIRD-PARTY-LICENSES.txt \

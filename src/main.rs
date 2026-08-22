@@ -5,7 +5,6 @@ mod config;
 mod daemon;
 mod dashboard;
 mod embed;
-mod engine;
 mod exhaust;
 mod fsutil;
 mod govern;
@@ -35,6 +34,7 @@ mod session_state;
 mod testhttp;
 mod staging;
 mod transcript;
+mod variant;
 mod vectors;
 
 use anyhow::Context as _;
@@ -152,6 +152,11 @@ enum Command {
     },
     /// Detect accelerators and name the variant this machine should run
     Hardware {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List release artifacts that actually exist
+    Variants {
         #[arg(long)]
         json: bool,
     },
@@ -1394,23 +1399,18 @@ fn main() {
         }
         Command::Hardware { json } => {
             let found = hardware::detect();
-            let variant = hardware::recommended_variant(&found);
-            let sel = engine::select(&found);
-            let selected = serde_json::json!({
-                "device": sel.device.describe(),
-                "backend": sel.backend.name(),
-                "format": sel.backend.format(),
-            });
+            let release = variant::recommended_release();
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "variant": variant,
-                        "os": hardware::os_token(),
+                        "build_variant": variant::build_id(),
+                        "recommended_release_variant": release,
+                        "os": variant::os_token(),
+                        "arch": variant::arch_token(),
                         "x86_64_level": hardware::x86_64_level(),
-                        "compiled_backends": engine::compiled_backends()
-                            .iter().map(|b| b.name()).collect::<Vec<_>>(),
-                        "selected": selected,
+                        "local_inference": false,
+                        "backend": "endpoint",
                         "devices": found.iter().map(|f| serde_json::json!({
                             "device": f.device.describe(),
                             "token": f.device.token(),
@@ -1434,16 +1434,32 @@ fn main() {
                         println!("    note: {note}");
                     }
                 }
-                let engines: Vec<&str> =
-                    engine::compiled_backends().iter().map(|b| b.name()).collect();
-                println!("\nthis build contains: {}", engines.join(", "));
+                println!("\nlocal inference:     not included");
+                println!("embeddings backend:   configured endpoint");
+                println!("build variant:        {}", variant::build_id().unwrap_or("unidentified source build"));
+                match release {
+                    Some(v) => println!("available release:    {}", v.id),
+                    None => println!("available release:    none for {} / {}", variant::os_token(), variant::arch_token()),
+                }
+            }
+        }
+        Command::Variants { json } => {
+            let catalog = variant::catalog();
+            if json {
                 println!(
-                    "it will use:        {} via {} ({})",
-                    sel.device.describe(),
-                    sel.backend.name(),
-                    sel.backend.format()
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": catalog.schema_version,
+                        "build_variant": variant::build_id(),
+                        "variants": catalog.variants,
+                    })
                 );
-                println!("recommended variant: {variant}");
+            } else {
+                println!("shipping release variants:");
+                for v in &catalog.variants {
+                    println!("  {:<36} {:<8} {:<8} {}", v.id, v.os, v.arch, v.backend);
+                }
+                println!("build variant: {}", variant::build_id().unwrap_or("unidentified source build"));
             }
         }
         Command::Identity { json } => {

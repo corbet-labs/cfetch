@@ -1,14 +1,12 @@
-# Tag v* -> GitHub release with an archive for every supported platform.
+# Tag v* -> GitHub release with every entry in release/variants.json.
 # Every archive contains the binary, cfetch's license and the generated
 # third-party license/NOTICE bundle. Uses only the workflow's own GITHUB_TOKEN
 # (via the contents: write permission) — no configured secrets.
 #
-# ARTIFACT NAMING: <os>-cfetch-<arch>-<tag>. The silicon and microarchitecture
-# axes of the full scheme (<os>-cfetch-<silicon>[-<level>][-bin]-<version>,
-# e.g. linux-cfetch-amd-v3-v1.2.3) describe which INFERENCE engine is linked
-# in. Nothing is linked in yet — these binaries call out to an endpoint — so
-# naming them by silicon would claim a capability they do not have. The axis
-# arrives with integrated inference, and these names extend into it.
+# The backend is part of every artifact name. Today every real build is the
+# endpoint-only `remote` flavor. Accelerator variants enter the manifest only
+# after their runtime is linked and tested; release automation cannot publish
+# a name which the executable catalog does not contain.
 name: Release
 
 on:
@@ -38,34 +36,29 @@ jobs:
             *) echo "cfetch 1.0+ is operator-blocked (requested $version)" >&2; exit 1 ;;
           esac
 
-  build:
-    name: Build (${{ matrix.artifact }})
+  catalog:
+    name: Load executable variant catalog
     needs: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.catalog.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate and export matrix
+        id: catalog
+        shell: bash
+        run: |
+          echo "matrix=$(bash scripts/variant-matrix.sh)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.id }})
+    needs: [preflight, catalog]
     strategy:
       # One platform failing must not silently ship a partial release; every
       # platform's result stays visible and the publish job gates on all.
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact: linux-cfetch-x86_64
-            bin: cfetch
-          - os: macos-latest
-            artifact: mac-cfetch-arm64
-            bin: cfetch
-          # Intel macOS is CROSS-BUILT on the arm64 runner rather than taken
-          # from a macos-13 runner: those are being wound down and a queued
-          # leg would block the whole release behind hardware we do not
-          # control. The Apple SDK ships both slices, so this needs no
-          # emulation and no second machine.
-          - os: macos-latest
-            artifact: mac-cfetch-x86_64
-            bin: cfetch
-            target: x86_64-apple-darwin
-          - os: windows-latest
-            artifact: win-cfetch-x86_64
-            bin: cfetch.exe
-    runs-on: ${{ matrix.os }}
+      matrix: ${{ fromJSON(needs.catalog.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -74,31 +67,32 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          export CFETCH_VARIANT='${{ matrix.id }}'
           if [ -n "${{ matrix.target }}" ]; then
-            cargo build --release --locked --target "${{ matrix.target }}"
+            cargo build --release --locked --target "${{ matrix.target }}" --features '${{ matrix.cargo_features }}'
           else
-            cargo build --release --locked
+            cargo build --release --locked --features '${{ matrix.cargo_features }}'
           fi
       - name: Stage artifact
         shell: bash
         run: |
-          package="${{ matrix.artifact }}-${GITHUB_REF_NAME}"
+          package="${{ matrix.id }}-${GITHUB_REF_NAME}"
           mkdir -p "dist/$package"
           if [ -n "${{ matrix.target }}" ]; then
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$package/${{ matrix.bin }}"
+            cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$package/${{ matrix.binary }}"
           else
-            cp "target/release/${{ matrix.bin }}" "dist/$package/${{ matrix.bin }}"
+            cp "target/release/${{ matrix.binary }}" "dist/$package/${{ matrix.binary }}"
           fi
-          cp LICENSE.md THIRD-PARTY-LICENSES.txt "dist/$package/"
-          if [ "${{ runner.os }}" = "Windows" ]; then
+          cp LICENSE.md THIRD-PARTY-LICENSES.txt release/variants.json "dist/$package/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
             (cd dist && 7z a "$package.zip" "$package" >/dev/null)
           else
             (cd dist && tar -czf "$package.tar.gz" "$package")
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}-${{ github.ref_name }}.*
+          name: ${{ matrix.id }}
+          path: dist/${{ matrix.id }}-${{ github.ref_name }}.*
           if-no-files-found: error
 
   publish:
@@ -117,6 +111,7 @@ jobs:
           find staged -type f -exec cp {} dist/ \;
           cp LICENSE.md dist/LICENSE.md
           cp THIRD-PARTY-LICENSES.txt dist/THIRD-PARTY-LICENSES.txt
+          cp release/variants.json dist/variants.json
           ls -la dist
       # Published as a release asset because downstream packaging consumes it
       # rather than re-hashing: the Homebrew tap regenerates its formula from
