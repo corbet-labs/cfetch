@@ -1296,13 +1296,23 @@ fn main() {
                             "token": f.device.token(),
                             "class": format!("{:?}", f.device.class()).to_lowercase(),
                             "evidence": f.evidence,
+                            "usable": f.usable().is_ok(),
+                            "unusable_reason": f.usable().err().map(|e| e.reason()),
+                            "caveat": f.caveat(),
                         })).collect::<Vec<_>>(),
                     })
                 );
             } else {
                 println!("detected, best first (policy: NPU > GPU > CPU):");
                 for f in &found {
-                    println!("  {:<26} {}", f.device.describe(), f.evidence);
+                    let mark = if f.usable().is_ok() { " " } else { "!" };
+                    println!("{mark} {:<26} {}", f.device.describe(), f.evidence);
+                    if let Err(why) = f.usable() {
+                        println!("    UNUSABLE: {}", why.reason());
+                    }
+                    if let Some(note) = f.caveat() {
+                        println!("    note: {note}");
+                    }
                 }
                 println!("\nrecommended variant: {variant}");
             }

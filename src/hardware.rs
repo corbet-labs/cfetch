@@ -97,6 +97,73 @@ pub struct Found {
     pub device: Device,
     /// What proved the hardware exists — a path, a device id. Never a guess.
     pub evidence: String,
+    /// PCI device id where we read one, e.g. `0x643e`. Some accelerators are
+    /// excluded or floored by GENERATION rather than by vendor, and the
+    /// device id is the only thing that distinguishes them.
+    pub pci_device: Option<String>,
+}
+
+/// Why an accelerator that EXISTS still cannot be used.
+///
+/// Deliberately NOT an enum of causes. The two AMD NPU generations fail for
+/// genuinely different reasons — gen 1 cannot run the model class at all,
+/// XDNA2's toolchain hangs — but they cannot be told apart from PCI data we
+/// can rely on, and inventing a classification we cannot determine would be
+/// worse than one honest sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unusable(&'static str);
+
+impl Unusable {
+    pub fn reason(&self) -> &'static str {
+        self.0
+    }
+}
+
+/// Intel NPU generations whose NPU is SLOWER than the same chip's integrated
+/// GPU on an encoder — measured by Intel: 9.97 ms vs 6.75 ms on Meteor Lake,
+/// 9.26 ms vs 3.95 ms on Arrow Lake. NPU4 (Lunar Lake, 48 TOPS) is where it
+/// inverts. These are still USABLE and still preferred, because the policy is
+/// power-first and the NPU wins on power at every generation — but an
+/// operator comparing wall-clock deserves to know.
+const INTEL_NPU_BELOW_IGPU: &[(&str, &str)] = &[
+    ("0x7d1d", "Meteor Lake"),
+    ("0xad1d", "Arrow Lake"),
+];
+
+impl Found {
+    /// Whether this accelerator can actually run a transformer encoder, and
+    /// why not when it cannot. Evidence for each exclusion is in the PRD.
+    pub fn usable(&self) -> Result<(), Unusable> {
+        match self.device {
+            // AMD's own compatibility table grants Ryzen AI gen 1 `CNN INT8`
+            // and nothing else — NLP and BF16 are Strix-only. This is not
+            // slowness, the model class cannot run.
+            //
+            // XDNA2 ships an embeddinggemma artifact, but BERT-base hangs
+            // indefinitely at session creation during VitisAI compilation
+            // (open upstream since 2025-12). We cannot tell the two apart
+            // from PCI alone, and both answers are "do not dispatch here".
+            Device::AmdNpu => Err(Unusable(
+                "AMD NPU: gen 1 (Phoenix/Hawk Point) supports CNN INT8 only, and XDNA2 \
+                 transformer compilation hangs upstream — no encoder path today",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// An advisory an operator should see, where the device works but will
+    /// surprise someone reading a benchmark.
+    pub fn caveat(&self) -> Option<String> {
+        if self.device == Device::IntelNpu
+            && let Some(id) = &self.pci_device
+            && let Some((_, family)) = INTEL_NPU_BELOW_IGPU.iter().find(|(k, _)| k == id)
+        {
+            return Some(format!(
+                "{family}-class NPU: slower than this chip's own iGPU on an encoder,                  still preferred because it draws far less power"
+            ));
+        }
+        None
+    }
 }
 
 /// The x86-64 microarchitecture level this CPU satisfies, for the `-v3`/`-v4`
@@ -149,7 +216,11 @@ pub fn detect() -> Vec<Found> {
     // Highest class first; within a class, detection order is preserved so
     // the answer is stable rather than dependent on hashing.
     found.sort_by_key(|f| std::cmp::Reverse(f.device.class()));
-    found.push(Found { device: Device::Cpu, evidence: "always available".into() });
+    found.push(Found {
+        device: Device::Cpu,
+        evidence: "always available".into(),
+        pci_device: None,
+    });
     found
 }
 
@@ -171,8 +242,13 @@ fn detect_platform() -> Vec<Found> {
             Found {
                 device: Device::AppleNeuralEngine,
                 evidence: "Apple silicon (ANE present on every arm64 Mac)".into(),
+                pci_device: None,
             },
-            Found { device: Device::AppleGpu, evidence: "Apple silicon (Metal)".into() },
+            Found {
+                device: Device::AppleGpu,
+                evidence: "Apple silicon (Metal)".into(),
+                pci_device: None,
+            },
         ]
     } else {
         Vec::new()
@@ -215,13 +291,16 @@ fn linux_accel_devices(dev: &Path, pci: &Path) -> Vec<Found> {
             "0x1022" | "0x1002" => Device::AmdNpu,
             _ => continue,
         };
+        let pci_device = read_trim(&p.join("device"));
         out.push(Found {
             device,
             evidence: format!(
-                "{} (PCI class 0x1200, vendor {vendor}) with {}",
+                "{} (PCI class 0x1200, vendor {vendor}{}) with {}",
                 p.file_name().unwrap_or_default().to_string_lossy(),
+                pci_device.as_deref().map(|d| format!(", device {d}")).unwrap_or_default(),
                 accel_dir.display()
             ),
+            pci_device,
         });
     }
     out
@@ -254,10 +333,8 @@ fn linux_gpus(drm: &Path) -> Vec<Found> {
         }
         out.push(Found {
             device,
-            evidence: format!(
-                "{} (PCI vendor {vendor})",
-                card.file_name().to_string_lossy()
-            ),
+            evidence: format!("{} (PCI vendor {vendor})", card.file_name().to_string_lossy()),
+            pci_device: read_trim(&card.path().join("device/device")),
         });
     }
     out
@@ -270,10 +347,16 @@ fn read_trim(p: &Path) -> Option<String> {
 /// The variant this machine should install, under the
 /// `<os>-cfetch-<silicon>[-<level>]` scheme.
 ///
-/// The best DETECTED device wins, whether or not this build can drive it —
-/// the point of the name is to tell an installer what to fetch.
+/// The best USABLE device wins. A device that exists but cannot run this
+/// model class — an AMD gen-1 NPU, say — is reported by `detect` so an
+/// operator can see it, and skipped here so the installer never fetches a
+/// variant that could not run.
 pub fn recommended_variant(found: &[Found]) -> String {
-    let best = found.first().map(|f| f.device).unwrap_or(Device::Cpu);
+    let best = found
+        .iter()
+        .find(|f| f.usable().is_ok())
+        .map(|f| f.device)
+        .unwrap_or(Device::Cpu);
     let mut name = format!("{}-cfetch-{}", os_token(), best.token());
     // The microarchitecture level qualifies CPU builds only: it says which
     // instructions the scalar code may use, which is meaningless once the
@@ -315,9 +398,8 @@ mod tests {
 
     #[test]
     fn an_npu_outranks_a_gpu_in_the_recommended_variant() {
-        let npu = Found { device: Device::IntelNpu, evidence: "test".into() };
-        let gpu = Found { device: Device::AmdGpu, evidence: "test".into() };
-        let cpu = Found { device: Device::Cpu, evidence: "test".into() };
+        let f = |device| Found { device, evidence: "test".into(), pci_device: None };
+        let (npu, gpu, cpu) = (f(Device::IntelNpu), f(Device::AmdGpu), f(Device::Cpu));
         assert!(recommended_variant(&[npu, gpu.clone(), cpu.clone()]).contains("npu-intel"));
         assert!(recommended_variant(&[gpu, cpu.clone()]).contains("-amd"));
         // A CPU-only machine gets a microarchitecture level; an accelerated
@@ -439,5 +521,53 @@ mod tests {
         found.sort_by_key(|f| std::cmp::Reverse(f.device.class()));
         assert_eq!(found[0].device, Device::IntelNpu);
         assert!(recommended_variant(&found).ends_with("cfetch-npu-intel"), "{found:?}");
+    }
+
+    #[test]
+    fn a_device_that_cannot_run_the_model_class_is_never_recommended() {
+        // An AMD gen-1 NPU is real hardware that reports itself and cannot
+        // run a transformer encoder at all. Recommending its variant would
+        // send an installer after a binary that could not work.
+        let f = |device| Found { device, evidence: "test".into(), pci_device: None };
+        let found = vec![f(Device::AmdNpu), f(Device::AmdGpu), f(Device::Cpu)];
+        assert!(found[0].usable().is_err(), "the NPU must be marked unusable");
+        let variant = recommended_variant(&found);
+        assert!(!variant.contains("npu"), "skipped in favour of the GPU: {variant}");
+        assert!(variant.ends_with("-amd"), "{variant}");
+    }
+
+    #[test]
+    fn an_unusable_device_still_explains_itself() {
+        let f = Found { device: Device::AmdNpu, evidence: "test".into(), pci_device: None };
+        let why = f.usable().unwrap_err();
+        assert!(why.reason().contains("CNN INT8"), "the evidence is in the message: {}", why.reason());
+    }
+
+    #[test]
+    fn an_older_intel_npu_is_flagged_but_still_preferred() {
+        // Policy is power-first: a Meteor Lake NPU loses to its own iGPU on
+        // wall-clock and still wins on power, so it stays the choice — with
+        // the surprise written down.
+        let npu = Found {
+            device: Device::IntelNpu,
+            evidence: "test".into(),
+            pci_device: Some("0x7d1d".into()),
+        };
+        let gpu = Found { device: Device::IntelGpu, evidence: "test".into(), pci_device: None };
+        assert!(npu.usable().is_ok());
+        assert!(npu.caveat().unwrap().contains("Meteor Lake"));
+        assert!(recommended_variant(&[npu, gpu]).ends_with("npu-intel"));
+    }
+
+    #[test]
+    fn a_current_intel_npu_carries_no_caveat() {
+        // 0x643e is NPU4 (Lunar Lake), the generation where the NPU also
+        // wins on wall-clock. Nothing to warn about.
+        let npu = Found {
+            device: Device::IntelNpu,
+            evidence: "test".into(),
+            pci_device: Some("0x643e".into()),
+        };
+        assert!(npu.caveat().is_none());
     }
 }
