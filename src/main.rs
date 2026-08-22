@@ -1,5 +1,6 @@
 mod audit;
 mod code;
+mod condense;
 mod config;
 mod daemon;
 mod dashboard;
