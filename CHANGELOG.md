@@ -5,6 +5,8 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+## 0.9.4
+
 - **Truthful Arch package identity.** The AUR build and check phases now use
   the same catalog variant, so `cargo test` cannot overwrite the packaged
   binary with an unidentified developer build. A CI contract ties both Arch
