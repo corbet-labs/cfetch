@@ -5,6 +5,17 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **crates.io distribution.** The verified v0.9.4 source release is available
+  as `cargo install cfetch --locked`; future tags publish through short-lived
+  GitHub OIDC credentials after the complete platform release succeeds, with
+  no registry token stored in GitHub.
+- **Platform-stable resident budgets.** Crowded resident indexes stop repeating
+  long absolute brain-root prefixes on every line, so macOS and Windows keep
+  the same hard digest cap as Linux without dropping configured files.
+- **Windows self-read accounting.** PowerShell drive paths retain their
+  backslash separators when cfetch recognizes safe whole-file shell reads,
+  keeping those reads in the self-read ledger instead of silently losing them.
+
 ## 0.9.4
 
 - **Ring-aware resident budgets.** Resident digest space is water-filled by

@@ -130,7 +130,13 @@ paru -S cfetch-agent
 nix profile install github:corbet-labs/cfetch
 ```
 
-From source, on any platform with Rust 1.95 or later:
+From crates.io, on any platform with Rust 1.95 or later:
+
+```console
+cargo install cfetch --locked
+```
+
+To install the current development branch instead:
 
 ```console
 cargo install --git https://github.com/corbet-labs/cfetch

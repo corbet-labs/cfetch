@@ -156,6 +156,12 @@ const SUMMARY_MAX_CHARS: usize = 80;
 /// entry cannot be mistaken for the whole of a file.
 const INDEX_HEADER: &str = "== index: not injected in full ==";
 
+/// Last-resort header for a crowded index. Resident labels already carry the
+/// configured brain-relative path, so repeating a long platform-specific
+/// absolute prefix on every line is pure overhead.
+const COMPACT_INDEX_HEADER: &str =
+    "== index: not injected in full; paths are relative to the configured brain root ==";
+
 /// One resident entry that reached this session, resolved and ready to be
 /// disclosed at one of the two levels below.
 struct Section {
@@ -306,15 +312,22 @@ fn build_in(cfg: &Config, scope: &SessionScope, state_dir: &Path) -> ResidentDig
     let budget = cfg.budget_chars.max(200);
     let tail = tail_line(&recallable_tail(cfg, state_dir, &sections));
 
-    // Two passes at most: the summaries on the index lines are the only part
-    // of the digest that is a convenience rather than a fact, so they are what
-    // gives way when even the index does not fit its own budget.
-    let (mut text, mut sources) = render(&sections, budget, &tail, true);
+    // Render progressively: summaries yield first, then repeated absolute
+    // brain-root prefixes yield to a single relative-path notice. The entry
+    // name and read price survive every pass.
+    let (mut text, mut sources) = render(&sections, budget, &tail, true, false);
     if text.len() > budget {
-        let (terse, terse_sources) = render(&sections, budget, &tail, false);
+        let (terse, terse_sources) = render(&sections, budget, &tail, false, false);
         if terse.len() < text.len() {
             text = terse;
             sources = terse_sources;
+        }
+    }
+    if text.len() > budget {
+        let (compact, compact_sources) = render(&sections, budget, &tail, false, true);
+        if compact.len() < text.len() {
+            text = compact;
+            sources = compact_sources;
         }
     }
     ResidentDigest { text: text.trim_end().to_string(), sources, skipped_by_scope }
@@ -332,17 +345,24 @@ fn render(
     budget: usize,
     tail: &str,
     summaries: bool,
+    compact_paths: bool,
 ) -> (String, Vec<(String, usize)>) {
     let mut indexed = vec![false; sections.len()];
     let (full, granted, lines, rules) = loop {
         let full: Vec<usize> = (0..sections.len()).filter(|i| !indexed[*i]).collect();
         let lines: Vec<(usize, String)> = (0..sections.len())
             .filter(|i| indexed[*i])
-            .map(|i| (i, index_line(&sections[i], summaries)))
+            .map(|i| (i, index_line(&sections[i], summaries, compact_paths)))
             .collect();
         let rules = hard_rules_block(sections, &indexed);
         let fixed: usize = lines.iter().map(|(_, l)| l.len() + 1).sum::<usize>()
-            + if lines.is_empty() { 0 } else { INDEX_HEADER.len() + 2 }
+            + if lines.is_empty() {
+                0
+            } else if compact_paths {
+                COMPACT_INDEX_HEADER.len() + 2
+            } else {
+                INDEX_HEADER.len() + 2
+            }
             + rules.len()
             + if tail.is_empty() { 0 } else { tail.len() + 1 };
         let headers: usize = full.iter().map(|i| sections[*i].label.len() + 8).sum();
@@ -382,7 +402,8 @@ fn render(
         sources.push((s.label.clone(), clipped.len()));
     }
     if !lines.is_empty() {
-        let _ = writeln!(text, "{INDEX_HEADER}");
+        let header = if compact_paths { COMPACT_INDEX_HEADER } else { INDEX_HEADER };
+        let _ = writeln!(text, "{header}");
         for (i, line) in &lines {
             let _ = writeln!(text, "{line}");
             sources.push((sections[*i].label.clone(), line.len()));
@@ -419,12 +440,16 @@ fn clip(body: &str, share: usize, label: &str) -> String {
 
 /// The one line that stands in for a whole file: what it is, what reading it
 /// costs, and where it is.
-fn index_line(s: &Section, summary: bool) -> String {
+fn index_line(s: &Section, summary: bool, compact_path: bool) -> String {
     let mut line = format!("- {}", s.label);
     if summary && let Some(what) = summarize(&s.body) {
         let _ = write!(line, " — {what}");
     }
-    let _ = write!(line, " — {} — read {}", fmt_tokens(s.body.len()), s.path.display());
+    if compact_path && s.doc.is_some() {
+        let _ = write!(line, " — {}", fmt_tokens(s.body.len()));
+    } else {
+        let _ = write!(line, " — {} — read {}", fmt_tokens(s.body.len()), s.path.display());
+    }
     line
 }
 
@@ -1197,18 +1222,22 @@ mod tests {
     #[test]
     fn a_crowded_index_drops_its_summaries_before_its_files() {
         let dir = tempfile::tempdir().unwrap();
+        let brain_root = dir
+            .path()
+            .join("a-deliberately-long-brain-root-that-is-stable-across-platforms");
+        std::fs::create_dir_all(&brain_root).unwrap();
         let mut resident = Vec::new();
         for i in 0..20 {
             let name = format!("file-{i:02}.md");
             std::fs::write(
-                dir.path().join(&name),
+                brain_root.join(&name),
                 format!("# a title long enough to matter for entry {i}\n{}", "x".repeat(4000)),
             )
             .unwrap();
             resident.push(entry(&name, 1, None));
         }
         let cfg = Config {
-            brain_root: dir.path().to_path_buf(),
+            brain_root,
             budget_chars: 1600,
             resident,
             ..Config::default()
@@ -1216,6 +1245,11 @@ mod tests {
         let d = build(&cfg, &SessionScope::from_cwd(None));
         assert!(d.text.len() <= 1600, "digest was {} chars for a 1600 budget", d.text.len());
         assert!(!d.text.contains("a title long enough"), "the summaries survived the squeeze");
+        assert!(
+            d.text.contains("paths are relative to the configured brain root"),
+            "the crowded index kept repeating its absolute root:\n{}",
+            d.text
+        );
         for i in 0..20 {
             let name = format!("file-{i:02}.md");
             assert!(index_line_for(&d, &name).is_some(), "{name} was dropped, not summarized");

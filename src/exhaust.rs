@@ -920,6 +920,27 @@ pub(crate) fn shell_words(command: &str) -> Vec<String> {
 }
 
 fn unquote_shell_word(word: &str) -> String {
+    // PowerShell accepts unquoted drive paths such as `C:\Users\me\file`.
+    // Treating their separators as POSIX escapes turns that real path into
+    // `C:Usersmefile`, so Windows hook reads can never be attributed. Strip a
+    // matching outer quote but otherwise preserve a drive-absolute word.
+    let inner = if word.len() >= 2
+        && ((word.starts_with('\'') && word.ends_with('\''))
+            || (word.starts_with('"') && word.ends_with('"')))
+    {
+        &word[1..word.len() - 1]
+    } else {
+        word
+    };
+    let bytes = inner.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return inner.to_string();
+    }
+
     let mut out = String::with_capacity(word.len());
     let mut quote = None;
     let mut escaped = false;
