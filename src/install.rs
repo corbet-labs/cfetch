@@ -1,4 +1,4 @@
-//! Registers cfetch's hooks in Claude Code's settings.json using the
+//! Registers cfetch's hooks in Claude Code and Codex using the
 //! managed-entry merge: only entries tagged `_managedBy: "cfetch"` are ever
 //! removed or replaced; everything else in the file — including a user hook
 //! that happens to invoke the same command — is preserved byte-for-byte at the
@@ -56,19 +56,20 @@ fn shell_quote(word: &str) -> String {
 /// The command embeds the absolute binary path: hooks run outside a login
 /// shell, so PATH is not a contract. Quoted for the platform's command
 /// processor, against spaces in the path.
-fn hook_command(subcommand: &str) -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "cfetch".to_string());
-    format!("{} hook {subcommand}", shell_quote(&exe))
+fn hook_command_for(exe: &str, subcommand: &str) -> String {
+    format!("{} hook {subcommand}", shell_quote(exe))
 }
 
-fn managed_entry(subcommand: &str) -> Value {
+#[cfg(test)]
+fn hook_command(subcommand: &str) -> String {
+    hook_command_for(&current_exe_str(), subcommand)
+}
+
+fn managed_entry_for(exe: &str, subcommand: &str) -> Value {
     json!({
         "hooks": [{
             "type": "command",
-            "command": hook_command(subcommand),
+            "command": hook_command_for(exe, subcommand),
             "timeout": 10,
             "_managedBy": MANAGED_BY,
         }]
@@ -88,8 +89,9 @@ fn strip_managed(entry: &mut Value) -> bool {
     }
 }
 
-/// Pure merge so it is testable: returns the new settings document.
-pub fn merge(settings: Value) -> anyhow::Result<Value> {
+/// Pure merge with an explicit executable so both agent installers and tests
+/// can key registration to the same binary path.
+fn merge_for_exe(settings: Value, exe: &str) -> anyhow::Result<Value> {
     let mut root = match settings {
         Value::Object(m) => m,
         Value::Null => Map::new(),
@@ -110,9 +112,14 @@ pub fn merge(settings: Value) -> anyhow::Result<Value> {
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("settings.json hooks.{event_key} is not an array"))?;
         list.retain_mut(strip_managed);
-        list.push(managed_entry(subcommand));
+        list.push(managed_entry_for(exe, subcommand));
     }
     Ok(Value::Object(root))
+}
+
+/// Pure merge so it is testable: returns the new settings document.
+pub fn merge(settings: Value) -> anyhow::Result<Value> {
+    merge_for_exe(settings, &current_exe_str())
 }
 
 /// Removes every managed entry (uninstall). Leaves empty arrays in place —
@@ -248,6 +255,97 @@ fn current_exe_str() -> String {
         .unwrap_or_else(|| "cfetch".to_string())
 }
 
+fn json_file(path: &Path) -> anyhow::Result<Value> {
+    let raw = read_or_empty(path)?;
+    if raw.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("refusing to touch unparseable {}: {e}", path.display()))
+}
+
+fn hooks_are_current(settings: &Value, exe: &str) -> bool {
+    let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    EVENTS.iter().all(|(event, subcommand)| {
+        let expected = hook_command_for(exe, subcommand);
+        hooks
+            .get(*event)
+            .and_then(Value::as_array)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|handlers| {
+                            handlers.iter().any(|handler| {
+                                handler.get("_managedBy").and_then(Value::as_str)
+                                    == Some(MANAGED_BY)
+                                    && handler.get("command").and_then(Value::as_str)
+                                        == Some(expected.as_str())
+                            })
+                        })
+                })
+            })
+    })
+}
+
+/// Reports drift in a detected Codex installation. `None` means Codex is not
+/// installed; an empty list means AGENTS.md, native hooks, and MCP all point
+/// at this executable. This is deliberately read-only for `selfcheck`.
+pub fn codex_registration_issues() -> Option<Vec<String>> {
+    codex_registration_issues_at(&paths::home(), &current_exe_str())
+}
+
+fn codex_registration_issues_at(home: &Path, exe: &str) -> Option<Vec<String>> {
+    let codex = home.join(".codex");
+    if !codex.is_dir() {
+        return None;
+    }
+    let mut issues = Vec::new();
+
+    let agents_md = codex.join("AGENTS.md");
+    match std::fs::read_to_string(&agents_md) {
+        Ok(content) => match crate::markers::upsert(&content) {
+            Ok((next, _)) if next == content => {}
+            Ok(_) => issues.push(format!("{} lacks the current cfetch block", agents_md.display())),
+            Err(e) => issues.push(format!("{}: {e}", agents_md.display())),
+        },
+        Err(e) => issues.push(format!("read {}: {e}", agents_md.display())),
+    }
+
+    let hooks_path = codex.join("hooks.json");
+    match json_file(&hooks_path) {
+        Ok(settings) if hooks_are_current(&settings, exe) => {}
+        Ok(_) => issues.push(format!(
+            "{} lacks current cfetch native hooks",
+            hooks_path.display()
+        )),
+        Err(e) => issues.push(e.to_string()),
+    }
+
+    let toml_path = codex.join("config.toml");
+    match read_or_empty(&toml_path).and_then(|content| {
+        content
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", toml_path.display()))
+    }) {
+        Ok(doc)
+            if doc
+                .get("mcp_servers")
+                .and_then(|servers| servers.as_table_like())
+                .and_then(|servers| servers.get("cfetch"))
+                .is_some_and(|entry| codex_entry_is_current(entry, exe)) => {}
+        Ok(_) => issues.push(format!(
+            "{} has no current cfetch MCP command",
+            toml_path.display()
+        )),
+        Err(e) => issues.push(e.to_string()),
+    }
+    Some(issues)
+}
+
 /// Reads a file that may legitimately not exist yet. Only NotFound maps to
 /// empty — an unreadable existing file must never be treated as absent and
 /// then overwritten.
@@ -289,6 +387,16 @@ pub fn install_agents() -> anyhow::Result<()> {
             write_atomic(&toml_path, &next)?;
             println!("codex: registered MCP server in {}", toml_path.display());
         }
+        let hooks_path = codex.join("hooks.json");
+        let current = json_file(&hooks_path)?;
+        let next = merge_for_exe(current.clone(), &exe)?;
+        if next != current {
+            write_atomic(&hooks_path, &serde_json::to_string_pretty(&next)?)?;
+            println!(
+                "codex: registered native hooks in {} (approve once with /hooks)",
+                hooks_path.display()
+            );
+        }
     }
     let gemini = paths::home().join(".gemini");
     if gemini.is_dir() {
@@ -313,9 +421,9 @@ pub fn install_agents() -> anyhow::Result<()> {
 }
 
 /// Symmetric uninstall: removes exactly what install_agents() creates — the
-/// AGENTS.md/GEMINI.md marker blocks, the Codex `mcp_servers.cfetch` table,
-/// and the Gemini `mcpServers.cfetch` entry. Feature-detected the same way;
-/// everything the user wrote stays.
+/// AGENTS.md/GEMINI.md marker blocks, Codex native hooks and
+/// `mcp_servers.cfetch`, and the Gemini `mcpServers.cfetch` entry.
+/// Feature-detected the same way; everything the user wrote stays.
 pub fn uninstall_agents() -> anyhow::Result<()> {
     let codex = paths::home().join(".codex");
     if codex.is_dir() {
@@ -331,6 +439,15 @@ pub fn uninstall_agents() -> anyhow::Result<()> {
             {
                 write_atomic(&toml_path, &next)?;
                 println!("codex: removed MCP server from {}", toml_path.display());
+            }
+        }
+        let hooks_path = codex.join("hooks.json");
+        if hooks_path.is_file() {
+            let current = json_file(&hooks_path)?;
+            let next = unmerge(current.clone())?;
+            if next != current {
+                write_atomic(&hooks_path, &serde_json::to_string_pretty(&next)?)?;
+                println!("codex: removed native hooks from {}", hooks_path.display());
             }
         }
     }
@@ -391,6 +508,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("session-start"));
+    }
+
+    #[test]
+    fn codex_hook_document_uses_the_native_schema_and_absolute_commands() {
+        let out = merge_for_exe(Value::Null, "/opt/cfetch/bin/cfetch").unwrap();
+        assert!(out.get("hooks").is_some(), "Codex requires the hooks wrapper");
+        for (event, subcommand) in EVENTS {
+            let handler = &out["hooks"][event][0]["hooks"][0];
+            assert_eq!(handler["type"], "command");
+            let command = handler["command"].as_str().unwrap();
+            assert!(command.contains("/opt/cfetch/bin/cfetch"));
+            assert!(command.ends_with(&format!(" hook {subcommand}")));
+        }
     }
 
     #[test]
@@ -497,6 +627,39 @@ mod tests {
         assert!(out.contains("# keep this comment"));
         assert!(codex_toml_without_mcp(&out).unwrap().is_none(), "second removal is a no-op");
         assert!(codex_toml_without_mcp("model = \"o5\"\n").unwrap().is_none(), "nothing of ours: no rewrite");
+    }
+
+    #[test]
+    fn codex_registration_check_covers_doctrine_hooks_and_mcp() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir(&codex).unwrap();
+        let exe = "/usr/bin/cfetch";
+
+        let initial = codex_registration_issues_at(home.path(), exe).unwrap();
+        assert_eq!(initial.len(), 3, "all three Codex surfaces are absent");
+
+        let (agents, _) = crate::markers::upsert("# user instructions\n").unwrap();
+        std::fs::write(codex.join("AGENTS.md"), agents).unwrap();
+        let hooks = merge_for_exe(Value::Null, exe).unwrap();
+        std::fs::write(codex.join("hooks.json"), serde_json::to_string(&hooks).unwrap()).unwrap();
+        let config = codex_toml_with_mcp("model = \"gpt-test\"\n", exe).unwrap().unwrap();
+        std::fs::write(codex.join("config.toml"), config).unwrap();
+
+        assert!(
+            codex_registration_issues_at(home.path(), exe).unwrap().is_empty(),
+            "fully registered Codex installation is current"
+        );
+
+        let stale_hooks = merge_for_exe(Value::Null, "/retired/cfetch").unwrap();
+        std::fs::write(
+            codex.join("hooks.json"),
+            serde_json::to_string(&stale_hooks).unwrap(),
+        )
+        .unwrap();
+        let issues = codex_registration_issues_at(home.path(), exe).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("native hooks"));
     }
 
     #[test]

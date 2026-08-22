@@ -1,4 +1,4 @@
-//! The Claude Code hook I/O contract, encoded in types.
+//! The shared Claude Code / Codex hook I/O contract, encoded in types.
 //!
 //! Hard-won rules (see DESIGN.md, "hooks contract"):
 //! - stdin is ONE JSON object; field names have drifted across harness versions,

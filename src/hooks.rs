@@ -413,7 +413,19 @@ fn post_tool_track(event: &HookEvent) -> anyhow::Result<()> {
             st.record_read(path, mtime);
             session_state::store(&state_dir, event.session(), &st);
         }
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch" => {
+            if tool == "apply_patch" {
+                let paths = exhaust::written_paths(event);
+                if paths.is_empty() {
+                    return Ok(());
+                }
+                let mut st = session_state::load(&state_dir, event.session());
+                for path in paths {
+                    st.record_write(&path);
+                }
+                session_state::store(&state_dir, event.session(), &st);
+                return Ok(());
+            }
             let target = input
                 .get("file_path")
                 .or_else(|| input.get("notebook_path"))

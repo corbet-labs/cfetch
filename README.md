@@ -22,8 +22,8 @@ the highest privilege, and when statements contradict, the lower ring wins:
 A file's ring defaults by location — the mapping is yours, see
 [Configuration](#configuration) — and can be overridden per file with
 `ring: N` frontmatter. Rings 0–1 are injected at session start through Claude
-Code hooks; a ring-2 file is injected too, but only into the sessions it is
-scoped to (a host, a repo). Rings 0–4 are searchable; every hit carries a
+Code or Codex hooks; a ring-2 file is injected too, but only into the sessions
+it is scoped to (a host, a repo). Rings 0–4 are searchable; every hit carries a
 ring-prefixed, content-addressed citation, so the id itself reveals how much to
 trust the statement. Rings 5–6 (automatic capture and its staging area) never
 reach an agent's context implicitly — captured exhaust is untrusted input by
@@ -80,8 +80,9 @@ storage: it is a network call away from the whole brain.
   (Rust, TypeScript/JavaScript, Python, Go): symbols with exact line ranges
   and token estimates, so agents read the 40 relevant lines instead of the
   whole file.
-- **Hooks** — `cfetch install` registers session-start injection in Claude
-  Code. Hooks are thin clients of a warm per-host daemon and always exit 0;
+- **Hooks** — `cfetch install` registers the same session lifecycle in Claude
+  Code and Codex: injection, capture, governance reminders and compaction.
+  Hooks are thin clients of a warm per-host daemon and always exit 0;
   a broken brain degrades to silence, never to a broken session.
 - **MCP** — `cfetch mcp` serves `cfetch_recall` / `cfetch_expand` /
   `cfetch_find` over stdio to any MCP client (Claude Desktop, Codex, Gemini
@@ -129,7 +130,7 @@ listener (`serve.bind`) uses.
 ## Quick start
 
 ```console
-$ cfetch install          # register hooks in ~/.claude/settings.json (+ Codex/Gemini MCP if present)
+$ cfetch install          # register Claude/Codex hooks and Codex/Gemini MCP when detected
 $ cfetch daemon start     # warm per-host daemon (optional but recommended)
 $ cfetch scan             # build the recall + code index
 indexed 412 docs, 3187 blocks (2 file(s) skipped as ring 5+)
@@ -163,10 +164,14 @@ server:
 { "mcpServers": { "cfetch": { "command": "cfetch", "args": ["mcp"] } } }
 ```
 
-`cfetch install` writes the equivalent entries for Codex (`~/.codex/config.toml`)
-and Gemini CLI (`~/.gemini/settings.json`) automatically when those are
-installed, using marker-fenced blocks and tagged entries — your own settings
-are never touched, and `cfetch install --remove` takes exactly ours back out.
+`cfetch install` writes Codex's instruction block (`~/.codex/AGENTS.md`), native
+hooks (`~/.codex/hooks.json`) and MCP server (`~/.codex/config.toml`), plus the
+equivalent Gemini CLI instruction/MCP entries, automatically when those agents
+are installed. Codex asks you to approve changed command hooks once in `/hooks`;
+cfetch never bypasses that trust gate. Marker-fenced blocks and tagged entries
+leave your own settings untouched, and `cfetch install --remove` takes exactly
+ours back out. Restart the agent after changing MCP configuration so its tool
+inventory is rebuilt.
 
 ## Configuration
 

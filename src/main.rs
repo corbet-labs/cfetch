@@ -294,6 +294,18 @@ fn selfcheck() -> anyhow::Result<()> {
         None => println!("warn  daemon not running — hooks fall back to direct reads"),
     }
 
+    if let Some(issues) = install::codex_registration_issues() {
+        if issues.is_empty() {
+            println!("ok    Codex integration current (AGENTS.md + native hooks + MCP)");
+            println!("note  Codex requires one-time hook approval in /hooks after changes");
+        } else {
+            for issue in issues {
+                println!("FAIL  Codex integration: {issue}");
+                hard_failures += 1;
+            }
+        }
+    }
+
     if let Some(cfg) = &cfg {
         if cfg.serve.enabled {
             println!("ok    serving mode: origin {}", serve::origin_of(cfg));
