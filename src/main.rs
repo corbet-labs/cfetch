@@ -29,6 +29,7 @@ macro_rules! eprintln {
 }
 
 mod audit;
+mod bench;
 mod code;
 mod condense;
 mod config;
@@ -225,6 +226,15 @@ enum Command {
         batch: usize,
     },
     /// Open the terminal dashboard: health, ledger, live recall
+    /// A/B bench: paired cfetch-on / cfetch-off sessions, read from
+    /// transcript ground truth — cache dimensions plus the bash re-run rate
+    Bench {
+        /// Only consider sessions the harness touched within this many days
+        #[arg(long, default_value_t = bench::DEFAULT_WINDOW_DAYS)]
+        since_days: u64,
+        #[arg(long)]
+        json: bool,
+    },
     Dashboard,
     /// Serve recall/find/expand over MCP (stdio) for any MCP client
     Mcp,
@@ -992,6 +1002,23 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The bench reads only what the harness recorded, so it needs neither the
+/// config nor a local index: a none-tier host can still answer whether cfetch
+/// paid for itself on the sessions it ran.
+fn bench_cmd(since_days: u64, json: bool) -> anyhow::Result<()> {
+    let report = bench::build(
+        &bench::BenchPaths::defaults(),
+        since_days,
+        std::time::SystemTime::now(),
+    );
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", bench::render(&report));
+    }
+    Ok(())
+}
+
 /// Coarse age of a unix timestamp. The failure history answers "just now or
 /// long ago"; a wall-clock date would need a calendar dependency to say less.
 fn age(now: i64, ts: i64) -> String {
@@ -1716,6 +1743,12 @@ fn main() {
         Command::Staging { action } => {
             if let Err(e) = staging_cmd(action) {
                 eprintln!("cfetch staging: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Bench { since_days, json } => {
+            if let Err(e) = bench_cmd(since_days, json) {
+                eprintln!("cfetch bench: {e}");
                 std::process::exit(1);
             }
         }
