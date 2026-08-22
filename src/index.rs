@@ -98,12 +98,37 @@ pub fn default_ring(rel: &str, rules: &RingRules) -> u8 {
     rules.ring_for(rel)
 }
 
+/// Directory names whose markdown is installed or generated, never authored.
+///
+/// Built in rather than configurable, because a file under one of these is
+/// machine output wherever the tree lives and nobody would choose to recall
+/// it. `exclude_prefixes` could not express it anyway: those prefixes anchor
+/// at the brain root, and a dependency tree appears at arbitrary depth — a
+/// documentation vault built with a static-site generator is an npm project,
+/// so one `npm install` inside it buries the operator's own notes under
+/// thousands of package READMEs that are prose-shaped, plausible, and enough
+/// to dominate FTS for ordinary words.
+///
+/// Deliberately NOT here: `build`, `dist`, `target`, `vendor`. Those are
+/// credible topic names in a knowledge tree, and a built-in nobody can switch
+/// off would make an operator's own notes silently unrecallable — a far worse
+/// failure than indexing a generated copy of prose that mirror dedup already
+/// collapses.
+const GENERATED_DIRS: &[&str] = &["node_modules", "__pycache__"];
+
+/// Whether any path component names a [`GENERATED_DIRS`] tree. Component-wise,
+/// not substring: `knowledge/node_modules-migration.md` is a real note.
+fn under_generated_dir(rel: &str) -> bool {
+    rel.trim_end_matches('/').split('/').any(|c| GENERATED_DIRS.contains(&c))
+}
+
 /// Paths that must never enter the index: the compiled-in boundary (secrets,
 /// logs, git internals) plus the operator's `exclude_prefixes` — by default
 /// `projects/` (repo clones, owned by the code index) and
-/// `knowledge/archive/` (retired knowledge, not recallable by accident).
+/// `knowledge/archive/` (retired knowledge, not recallable by accident) —
+/// plus the generated-directory built-ins.
 fn excluded(rel: &str, rules: &RingRules) -> bool {
-    rules.excluded(rel)
+    rules.excluded(rel) || under_generated_dir(rel)
 }
 
 /// Directory form of [`excluded`]: true when nothing under `rel` can ever be
@@ -111,7 +136,7 @@ fn excluded(rel: &str, rules: &RingRules) -> bool {
 /// serves both forms — the watch set is the index set by construction, never
 /// by two hand-maintained lists agreeing.
 pub(crate) fn excluded_dir(rel: &str, rules: &RingRules) -> bool {
-    rules.excluded_dir(rel)
+    rules.excluded_dir(rel) || under_generated_dir(rel)
 }
 
 /// Secret-shaped file names are refused even outside mind/secrets/ — capture
@@ -124,6 +149,29 @@ fn secret_shaped(rel: &str) -> bool {
         || base.starts_with(".env")
         || base.ends_with(".pem")
         || base.ends_with(".key")
+}
+
+/// Longest line, in bytes, that can still be something a person wrote.
+///
+/// Measured rather than guessed: across a real brain of thousands of files
+/// the longest hand-authored line was a wide memory-index table row at ~3 KB,
+/// and nothing came within a factor of two of this cap. The shapes on the
+/// other side — a minified bundle pasted into a page, a base64 data URI, a
+/// one-line data dump saved as `.md` — sit orders of magnitude above it.
+const MAX_PROSE_LINE: usize = 8 * 1024;
+
+/// Whether a statement is generated rather than written.
+///
+/// Such a statement is not merely useless in recall, it is corrosive: FTS5
+/// tokenizes it into thousands of terms, so it becomes a candidate for
+/// almost any query while carrying no meaning, and it would claim an
+/// embedding of its own. Bytes, not characters, because bytes are what the
+/// tokenizer and the embedder are charged for.
+///
+/// One pass over a body already in memory — the walk that reads the file
+/// pays nothing extra for this.
+fn generated_blob(body: &str) -> bool {
+    body.lines().any(|l| l.len() > MAX_PROSE_LINE)
 }
 
 /// Parses a leading `---` frontmatter for `ring: N`. Returns (ring override,
@@ -814,8 +862,10 @@ fn chain_text(chain: &[(u8, String)]) -> String {
 
 /// Inserts one source file's rows — doc, blocks (with heading-chain context),
 /// FTS rows, wikilink targets — or records it in `skipped_docs` when its ring
-/// is 5+. Shared by the full scan and the incremental rescan so both derive
-/// byte-identical catalogs from the same tree.
+/// is 5+. Generated statements ([`generated_blob`]) are dropped individually
+/// while the rest of their file is indexed normally. Shared by the full scan
+/// and the incremental rescan so both derive byte-identical catalogs from the
+/// same tree.
 fn insert_doc(
     tx: &rusqlite::Transaction<'_>,
     src: &SourceFile,
@@ -896,6 +946,14 @@ fn insert_doc(
             table_header = None;
             chain_key = chain_text(&chain);
             ctx = chain_key.clone();
+        }
+        // Refused AFTER the chain and table bookkeeping above, never before:
+        // every neighboring statement then keeps byte-identical context, so
+        // a blob appearing beside a paragraph can never move that
+        // paragraph's citation. Refusing the statement and not the file also
+        // keeps a knowledge page that embeds one data URI fully recallable.
+        if generated_blob(&body) {
+            continue;
         }
         let hash = content_hash(&body);
         let cite = cite_from_hash(ring, &hash);
@@ -2345,6 +2403,124 @@ mod tests {
         assert_eq!(report.docs, 1);
         assert!(recall(&conn, "tokens", 5).unwrap().is_empty());
         assert!(recall(&conn, "retired", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn installed_dependency_trees_are_never_indexed() {
+        // A documentation vault built with a static-site generator is an npm
+        // project: `npm install` inside the brain drops thousands of package
+        // READMEs into it, at arbitrary depth, and every one of them is
+        // markdown the extension gate happily takes.
+        let dir = brain(&[
+            ("node_modules/left-pad/README.md", "hurbeck pads a string\n"),
+            ("site/node_modules/dep/README.md", "hurbeck nested copy\n"),
+            ("scripts/__pycache__/notes.md", "quelber cached\n"),
+            ("knowledge/node_modules-migration.md", "vantrel dropping the dep tree\n"),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 2, "only the two authored knowledge files");
+        assert!(recall(&conn, "hurbeck", 5).unwrap().is_empty(), "at any depth");
+        assert!(recall(&conn, "quelber", 5).unwrap().is_empty());
+        assert_eq!(
+            recall(&conn, "vantrel", 5).unwrap().len(),
+            1,
+            "a note ABOUT the dep tree is not in it: components, not substrings"
+        );
+        // The watcher derives its subtrees from the directory form, so the
+        // two predicates must agree or the daemon watches what it cannot index.
+        assert!(excluded_dir("node_modules", &RingRules::default()));
+        assert!(excluded_dir("site/node_modules/", &RingRules::default()));
+    }
+
+    #[test]
+    fn build_output_directories_stay_indexable_on_purpose() {
+        // The names a code scanner blocklists are credible knowledge topics
+        // here, and a built-in nobody can switch off would make an operator's
+        // own notes silently unrecallable. Duplicated prose is mirror dedup's
+        // problem, not the walk's.
+        let dir = brain(&[
+            ("knowledge/build/pipeline.md", "shellac the build story\n"),
+            ("knowledge/vendor/terms.md", "shellac the vendor terms\n"),
+            ("knowledge/target/goals.md", "shellac this year's targets\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 3);
+        assert_eq!(recall(&conn, "shellac", 5).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn lockfiles_and_agent_config_directories_never_reach_the_walk() {
+        // Verification lock for the two hygiene classes this index gets for
+        // free: lockfiles are not markdown, and agent-config directories are
+        // hidden. Both are load-bearing — an agent's own instruction files
+        // outrank real knowledge on any importance signal — so pin them
+        // rather than trusting the walker's defaults to stay put.
+        let dir = brain(&[
+            ("package-lock.json", "{\"name\": \"gribbet\"}\n"),
+            ("Cargo.lock", "name = \"gribbet\"\n"),
+            (".claude/CLAUDE.md", "gribbet always do as told\n"),
+            (".codex/notes.md", "gribbet house rules\n"),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "only the knowledge file");
+        assert!(recall(&conn, "gribbet", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_generated_blob_is_refused_while_its_page_stays_recallable() {
+        // The realistic shape: a real page carrying one machine-made line —
+        // a pasted minified bundle, a base64 data URI. Indexing it hands FTS
+        // a statement that matches almost any query and means nothing; this
+        // fixture tokenizes, so without the refusal it is genuinely findable.
+        let blob = format!("<script>{}</script>", "function qk1(t){return t+1};".repeat(5_000));
+        let page = format!("# Notes\n\nkavender is the finding.\n\n{blob}\n\nvantrel follows.\n");
+        let dir = brain(&[("knowledge/page.md", page.as_str())]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "the page itself is knowledge and stays indexed");
+        assert_eq!(report.blocks, 3, "heading and both paragraphs, not the blob");
+        assert!(recall(&conn, "qk1", 5).unwrap().is_empty(), "the blob is unreachable");
+        assert_eq!(recall(&conn, "kavender", 5).unwrap().len(), 1);
+        assert_eq!(recall(&conn, "vantrel", 5).unwrap().len(), 1, "prose after it survives");
+    }
+
+    #[test]
+    fn a_wholly_generated_file_contributes_nothing() {
+        let dir = brain(&[
+            ("knowledge/bundle.md", &format!("hurbeck={};\n", "x".repeat(300_000))),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.blocks, 1, "only the real file's statement");
+        assert!(recall(&conn, "hurbeck", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_prose_cap_clears_the_widest_line_a_person_writes() {
+        // The measured ceiling of hand-authored markdown was a ~3 KB memory
+        // table row; the cap must sit above it with room, and below anything
+        // generated. A regression that tightened it would delete real rows
+        // from recall without a word.
+        let wide_row = format!("| kavender | {} |", "a note about the row ".repeat(150));
+        assert!(wide_row.len() > 3_000, "the fixture must reach the measured ceiling");
+        assert!(!generated_blob(&wide_row));
+        assert!(generated_blob(&"b".repeat(MAX_PROSE_LINE + 1)));
+        assert!(!generated_blob(&"b".repeat(MAX_PROSE_LINE)), "the cap itself is prose");
+        assert!(
+            !generated_blob(&format!("{}\n{}", "c".repeat(MAX_PROSE_LINE), "d".repeat(MAX_PROSE_LINE))),
+            "a long block of ordinary lines is prose; only a single long LINE is not"
+        );
     }
 
     #[test]
