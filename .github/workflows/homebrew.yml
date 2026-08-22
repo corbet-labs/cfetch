@@ -63,13 +63,13 @@ jobs:
           echo "::error::Release v${VERSION} assets never appeared"
           exit 1
 
-      - name: Download checksums
+      - name: Download release metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           gh release download "v${VERSION}" --repo julian-corbet/cfetch \
-            --pattern 'checksums_sha256.txt' --dir /tmp
+            --pattern 'checksums_sha256.txt' --pattern 'variants.json' --dir /tmp
 
       - name: Check out tap repo
         uses: actions/checkout@v7
@@ -88,7 +88,7 @@ jobs:
           variant_id() {
             jq -er --arg os "$1" --arg arch "$2" \
               '.variants[] | select(.os == $os and .arch == $arch and .backend == "endpoint") | .id' \
-              release/variants.json
+              /tmp/variants.json
           }
           MAC_ARM="$(variant_id mac aarch64)-v${VERSION}.tar.gz"
           MAC_X86="$(variant_id mac x86_64)-v${VERSION}.tar.gz"
