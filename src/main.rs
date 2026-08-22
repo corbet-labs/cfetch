@@ -208,6 +208,16 @@ enum Command {
         #[command(subcommand)]
         action: StagingAction,
     },
+    /// Ask the ring-6 exhaust whether a command has failed here before, how
+    /// often, on which hosts, and whether it ever recovered
+    Failures {
+        /// A command line or terms; empty ranks the whole failure history
+        query: Vec<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Embed index blocks lacking vectors (resumable; requires embeddings config)
     EmbedIndex {
         /// Blocks per embeddings request
@@ -982,6 +992,112 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Coarse age of a unix timestamp. The failure history answers "just now or
+/// long ago"; a wall-clock date would need a calendar dependency to say less.
+fn age(now: i64, ts: i64) -> String {
+    let secs = now.saturating_sub(ts).max(0);
+    match secs {
+        s if s < 90 => format!("{s}s ago"),
+        s if s < 5400 => format!("{}m ago", s / 60),
+        s if s < 172_800 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// The ring-6 query surface: the same normalized signature the traps key on,
+/// asked instead of acted on. Reads the shared tree directly, exactly like
+/// `staging` — there is no index to be stale about, and none-tier hosts hold
+/// no exhaust of their own to answer from.
+fn failures_cmd(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let ex = exhaust::Exhaust::from_config(&cfg);
+    let history = ex.failure_history(query, limit);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    if json {
+        let arr: Vec<_> = history
+            .matches
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "norm": m.norm, "failures": m.failures, "sessions": m.sessions,
+                    "recovered_sessions": m.recovered_sessions, "hosts": m.hosts,
+                    "first_ts": m.first_ts, "last_ts": m.last_ts,
+                    "last_command": m.last_command, "staged": m.staged,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "signatures": arr, "signatures_total": history.signatures,
+                "failures_total": history.failures, "unreadable": history.unreadable,
+            })
+        );
+        return Ok(());
+    }
+
+    // A partly-read tree must never look like a clean "never happened".
+    for note in &history.unreadable {
+        eprintln!("cfetch failures: skipped {note}");
+    }
+    if history.matches.is_empty() {
+        if history.signatures == 0 {
+            println!("no failing command captured yet in {}", ex.logs_dir.display());
+        } else if query.trim().is_empty() {
+            // Everything matches an empty query, so only --limit 0 lands here.
+            println!("{} failing signature(s) captured, none asked for", history.signatures);
+        } else {
+            println!(
+                "no match for \"{query}\" among {} failing signature(s)",
+                history.signatures
+            );
+        }
+        return Ok(());
+    }
+    for m in &history.matches {
+        println!("{}", m.norm);
+        // A hand-edited line can carry no host; say so rather than render a
+        // gap where the fleet answer belongs.
+        let hosts = if m.hosts.is_empty() {
+            "an unnamed host".to_string()
+        } else {
+            m.hosts.join(", ")
+        };
+        println!(
+            "  {} failure(s) in {} session(s) on {}; first {}, last {}",
+            m.failures,
+            m.sessions,
+            hosts,
+            age(now, m.first_ts),
+            age(now, m.last_ts),
+        );
+        if m.recovered_sessions > 0 {
+            println!(
+                "  recovered in {} session(s) — the same signature later succeeded",
+                m.recovered_sessions
+            );
+        }
+        if !m.last_command.is_empty() {
+            println!("  last: {}", m.last_command);
+        }
+        if m.staged {
+            println!("  already a ring-5 candidate (cfetch staging list)");
+        }
+        println!();
+    }
+    println!(
+        "{} of {} failing signature(s), {} failure(s) captured",
+        history.matches.len(),
+        history.signatures,
+        history.failures
+    );
+    Ok(())
+}
+
 fn audit_cmd(json: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     let now = std::time::SystemTime::now()
@@ -1647,6 +1763,12 @@ fn main() {
                 json,
             ) {
                 eprintln!("cfetch recall: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Failures { query, limit, json } => {
+            if let Err(e) = failures_cmd(&query.join(" "), limit, json) {
+                eprintln!("cfetch failures: {e}");
                 std::process::exit(1);
             }
         }

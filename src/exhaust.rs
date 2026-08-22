@@ -1,5 +1,6 @@
 //! Ring-6 exhaust: raw capture of what the agent actually did, the 6->5
-//! flagging traps, and the hand-off into ring-5 staging.
+//! flagging traps, the hand-off into ring-5 staging, and the failure query
+//! that ASKS the stream what the traps only ever decided.
 //!
 //! Exhaust is DATA OF RECORD, so it lives in the tree — one append-only JSONL
 //! stream per host at `<brain_root>/logs/cfetch/exhaust-<host>.jsonl` (see
@@ -33,6 +34,14 @@
 //! Bash payloads store the buglog-style normalized command (`norm`) at capture
 //! time, and write payloads store the file's resolved ring, so the traps stay
 //! cheap field lookups rather than re-derivations.
+//!
+//! That same signature also answers questions: [`Exhaust::failure_history`]
+//! aggregates every host's failing bash events by `norm`, so "has this failed
+//! here before, and did it ever recover" has an answer. It SCANS rather than
+//! indexes. A derived index would be cold exactly when it is asked — the
+//! stream grows on every turn — and a second copy of ring-6 data on one
+//! machine is what moving exhaust into the tree got rid of. The scan is a
+//! CLI-only cost, bounded by the writer's byte cap; no hook may pay it.
 
 use std::path::{Path, PathBuf};
 
@@ -281,6 +290,68 @@ impl Exhaust {
             bytes: jsonl::footprint(&self.logs_dir, STREAM),
         }
     }
+
+    /// Answers "has this failed here before" out of the streams themselves.
+    ///
+    /// The traps already key on [`normalize_command`], but only to DECIDE
+    /// something; nothing could ASK. This aggregates the failing bash events
+    /// of the whole shared tree — every host, every rotation — by signature,
+    /// so the query surface exists without a second store of ring-6 data: the
+    /// stream stays the only copy, exactly as the module header requires. The
+    /// cost is one linear pass over files the writer already caps by bytes,
+    /// and an explicit CLI query pays it — never a hook, which is why this
+    /// takes no window bound while the traps do.
+    ///
+    /// An empty query ranks the whole failure history, most recurrent first.
+    pub fn failure_history(&self, query: &str, limit: usize) -> FailureHistory {
+        let scan = scan_failures(&self.logs_dir);
+        // The query is normalized like a captured command, so a pasted
+        // failing command line meets the stored signatures in one alphabet
+        // instead of never matching over its own paths and digits.
+        let wanted = normalize_command(query);
+        let terms: Vec<&str> = wanted.split_whitespace().collect();
+        let mut matches: Vec<FailureSignature> = scan
+            .by_norm
+            .iter()
+            .filter(|(norm, _)| terms.iter().all(|t| norm.contains(t)))
+            .map(|(norm, agg)| FailureSignature {
+                norm: norm.clone(),
+                failures: agg.failures,
+                sessions: agg.sessions.len(),
+                recovered_sessions: agg.recovered_sessions,
+                hosts: agg.hosts.iter().cloned().collect(),
+                first_ts: agg.first_ts,
+                last_ts: agg.last_ts,
+                last_command: agg.last_command.clone(),
+                staged: false,
+            })
+            .collect();
+        matches.sort_by(|a, b| {
+            // An exact signature hit answers the question that was asked;
+            // everything else is context, ranked by how much of it there is
+            // and how recent it is.
+            (a.norm != wanted)
+                .cmp(&(b.norm != wanted))
+                .then(b.failures.cmp(&a.failures))
+                .then(b.last_ts.cmp(&a.last_ts))
+                .then(a.norm.cmp(&b.norm))
+        });
+        matches.truncate(limit);
+        for m in &mut matches {
+            // Only for what is returned: one stat per shown row, never one
+            // per signature in the tree.
+            m.staged = staging::exists(
+                &self.staging_dir,
+                &staging::id_for("recurring-failure", &m.norm),
+            );
+        }
+        FailureHistory {
+            matches,
+            signatures: scan.by_norm.len(),
+            failures: scan.failures,
+            unreadable: scan.unreadable,
+        }
+    }
 }
 
 /// Paths changed by the two hook dialects cfetch supports. Claude supplies a
@@ -342,6 +413,207 @@ pub struct ExhaustStats {
     /// Bytes of exhaust stream on disk — the store's footprint, without
     /// reading a line of it.
     pub bytes: u64,
+}
+
+/// One normalized command signature with everything the streams know about
+/// its failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureSignature {
+    /// The signature: [`normalize_command`] of the failing command lines.
+    pub norm: String,
+    /// Failing events carrying it.
+    pub failures: usize,
+    /// Distinct sessions that saw it fail.
+    pub sessions: usize,
+    /// Sessions where the same signature later SUCCEEDED. A signature that
+    /// always recovers is a flake; one that never does is a standing blocker,
+    /// and telling those apart is most of why the question gets asked.
+    pub recovered_sessions: usize,
+    /// Hosts whose exhaust holds one of the failures, sorted.
+    pub hosts: Vec<String>,
+    pub first_ts: i64,
+    pub last_ts: i64,
+    /// Redacted command text of the most recent failure. Signatures erase
+    /// paths, digits and case, so the concrete line is worth carrying back.
+    pub last_command: String,
+    /// A ring-5 candidate for this signature is already queued or was
+    /// dismissed — the recurring-failure trap saw the same pattern.
+    pub staged: bool,
+}
+
+/// The answer to one failure query, plus the corpus it was drawn from.
+#[derive(Debug, Default)]
+pub struct FailureHistory {
+    /// Matching signatures, best first, at most the requested limit.
+    pub matches: Vec<FailureSignature>,
+    /// Distinct failing signatures in the whole stream, matched or not — the
+    /// denominator that tells "nothing matched" apart from "nothing captured".
+    pub signatures: usize,
+    /// Failing events behind them.
+    pub failures: usize,
+    /// Stream files that could not be read, `"<path>: <reason>"`. Surfaced,
+    /// never swallowed: a pass that skipped half the tree must not read as a
+    /// clean "this never happened".
+    pub unreadable: Vec<String>,
+}
+
+/// Serialized value of the only record kind that carries a signature. Raw
+/// lines are pre-filtered on it and only what passes is parsed, which keeps a
+/// full-history pass bound by I/O instead of by JSON. The filter matches the
+/// VALUE rather than `"kind":"bash"` so it survives any change in the
+/// writer's key order — a pre-filter that silently stopped matching would
+/// report "never happened before" over a stream full of failures, and a query
+/// surface that lies that way is worse than none.
+const BASH_VALUE: &str = "\"bash\"";
+
+/// Per-signature accumulator of the scan.
+struct Agg {
+    failures: usize,
+    sessions: std::collections::BTreeSet<String>,
+    hosts: std::collections::BTreeSet<String>,
+    recovered_sessions: usize,
+    first_ts: i64,
+    last_ts: i64,
+    last_command: String,
+}
+
+impl Agg {
+    fn new(ts: i64) -> Agg {
+        Agg {
+            failures: 0,
+            sessions: std::collections::BTreeSet::new(),
+            hosts: std::collections::BTreeSet::new(),
+            recovered_sessions: 0,
+            first_ts: ts,
+            last_ts: ts,
+            last_command: String::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FailureScan {
+    by_norm: std::collections::BTreeMap<String, Agg>,
+    failures: usize,
+    unreadable: Vec<String>,
+}
+
+/// Stream files OLDEST first: rotation `.2` predates `.1`, which predates the
+/// live file. Recovery is a question about order ("it failed, then the same
+/// signature succeeded"), and plain name order reads a host's generations
+/// backwards, which would silently under-report it.
+fn chronological_streams(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = jsonl::stream_paths(dir, STREAM);
+    paths.sort_by_key(|p| {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stem = name.strip_suffix(".jsonl").unwrap_or(&name).to_string();
+        // `<stem>-<host>.<n>.jsonl` is generation n; anything else is a live
+        // file, which is the newest of its host by construction. A host id
+        // containing dots parses as live, which is what it is.
+        match stem
+            .rsplit_once('.')
+            .map(|(base, suffix)| (base.to_string(), suffix.parse::<u64>()))
+        {
+            Some((base, Ok(generation))) => (base, u64::MAX - generation),
+            _ => (stem, u64::MAX),
+        }
+    });
+    paths
+}
+
+/// One pass over the whole exhaust history, aggregating failures by
+/// signature. Line by line and pre-filtered: the streams are byte-capped per
+/// host, but nothing bounds how many hosts share a tree, so the pass must not
+/// hold the history in memory to answer a question about a fraction of it.
+fn scan_failures(logs_dir: &Path) -> FailureScan {
+    use std::io::BufRead as _;
+
+    let mut out = FailureScan::default();
+    // Pairs, not signatures: a command failing in one session and succeeding
+    // in another is not a recovery. Only sessions that FAILED are remembered,
+    // so the scan's memory tracks failures, not command volume.
+    let mut failed: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut recovered: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    for path in chronological_streams(logs_dir) {
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                out.unreadable.push(format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    out.unreadable.push(format!("{}: {e}", path.display()));
+                    break;
+                }
+            };
+            if !line.contains(BASH_VALUE) {
+                continue;
+            }
+            let Some(rec) = jsonl::decode_line(&line) else {
+                continue;
+            };
+            if rec.kind() != "bash" {
+                continue;
+            }
+            let Some(payload) = rec.value("payload").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let norm = payload
+                .get("norm")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if norm.is_empty() {
+                continue;
+            }
+            let session = rec.str("session").to_string();
+            let failed_now = payload
+                .get("failed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !failed_now {
+                let key = (session, norm.to_string());
+                if failed.contains(&key)
+                    && recovered.insert(key)
+                    && let Some(agg) = out.by_norm.get_mut(norm)
+                {
+                    agg.recovered_sessions += 1;
+                }
+                continue;
+            }
+            let agg = out
+                .by_norm
+                .entry(norm.to_string())
+                .or_insert_with(|| Agg::new(rec.ts));
+            agg.failures += 1;
+            out.failures += 1;
+            agg.sessions.insert(session.clone());
+            if !rec.host.is_empty() {
+                agg.hosts.insert(rec.host.clone());
+            }
+            agg.first_ts = agg.first_ts.min(rec.ts);
+            // Ties go to the later-scanned record: within a host that is the
+            // later append, and the newest concrete command is the useful one.
+            if rec.ts >= agg.last_ts {
+                agg.last_ts = rec.ts;
+                agg.last_command = payload
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            failed.insert((session, norm.to_string()));
+        }
+    }
+    out
 }
 
 fn now() -> i64 {
@@ -1723,5 +1995,157 @@ mod tests {
         ] {
             assert!(!secret_path(no), "must pass through: {no}");
         }
+    }
+
+    /// A captured bash event at an explicit moment, in the shape
+    /// `capture_post_tool` writes. The query surface is a question about
+    /// history, so its fixtures have to place events in time.
+    fn bash_at(ex: &Exhaust, ts: i64, session: &str, cmd: &str, failed: bool) {
+        ex.record_at(
+            ts,
+            session,
+            "bash",
+            &json!({"command": cmd, "norm": normalize_command(cmd), "failed": failed}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failure_history_aggregates_one_signature_across_hosts_and_sessions() {
+        let f = fixture("host-alpha");
+        let beta = peer(&f, "host-beta");
+        bash_at(&f.ex, 100, "s1", "cargo test --workspace", true);
+        bash_at(&f.ex, 200, "s2", "cargo test --workspace", true);
+        // Same signature from another machine's stream, spelled differently.
+        bash_at(&beta, 300, "s3", "CARGO test  --workspace", true);
+        bash_at(&f.ex, 400, "s2", "cargo build", true);
+        bash_at(&f.ex, 500, "s2", "ls", false);
+        f.ex.record_at(600, "s2", "write", &json!({"file_path": "/b/x.md", "ring": 3}))
+            .unwrap();
+
+        let h = f.ex.failure_history("cargo test", 8);
+        assert_eq!(h.signatures, 2, "successes and writes are not failures");
+        assert_eq!(h.failures, 4);
+        assert_eq!(h.matches.len(), 1);
+        let m = &h.matches[0];
+        assert_eq!(m.norm, "cargo test --workspace");
+        assert_eq!(m.failures, 3);
+        assert_eq!(m.sessions, 3);
+        assert_eq!(m.hosts, vec!["host-alpha", "host-beta"], "the tree is shared");
+        assert_eq!(m.first_ts, 100);
+        assert_eq!(m.last_ts, 300);
+        assert_eq!(
+            m.last_command, "CARGO test  --workspace",
+            "the concrete newest line, not the signature"
+        );
+        assert_eq!(m.recovered_sessions, 0);
+        assert!(!m.staged);
+
+        // A limit truncates the answer, never the denominator that says how
+        // much history it was drawn from.
+        let h = f.ex.failure_history("", 1);
+        assert_eq!(h.matches.len(), 1);
+        assert_eq!((h.signatures, h.failures), (2, 4));
+    }
+
+    #[test]
+    fn recovery_needs_a_success_after_the_failure_in_the_same_session() {
+        let f = fixture("h1");
+        bash_at(&f.ex, 100, "s1", "cargo test", true);
+        bash_at(&f.ex, 110, "s1", "cargo test", false);
+        bash_at(&f.ex, 120, "s1", "cargo test", false);
+        // Succeeded BEFORE it first failed here, then failed.
+        bash_at(&f.ex, 200, "s2", "make lint", false);
+        bash_at(&f.ex, 210, "s2", "make lint", true);
+        // Succeeded in a session that never saw it fail.
+        bash_at(&f.ex, 300, "s3", "make lint", false);
+
+        let h = f.ex.failure_history("", 8);
+        let recovered = |norm: &str| {
+            h.matches
+                .iter()
+                .find(|m| m.norm == norm)
+                .unwrap_or_else(|| panic!("{norm} missing"))
+                .recovered_sessions
+        };
+        assert_eq!(recovered("cargo test"), 1, "one session, counted once");
+        assert_eq!(
+            recovered("make lint"),
+            0,
+            "a success that did not follow a failure of the same signature in the \
+             same session is not a recovery"
+        );
+    }
+
+    #[test]
+    fn rotated_generations_are_read_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // A one-byte cap rotates on every append, so the three events land in
+        // three generations: the oldest in `.2`, the newest in the live file.
+        let ex = Exhaust::new(
+            dir.path().join("logs/cfetch"),
+            dir.path().join("staging/cfetch"),
+            "h1".into(),
+            1,
+        );
+        bash_at(&ex, 100, "s1", "cargo test", true);
+        bash_at(&ex, 200, "s1", "cargo test", false);
+        bash_at(&ex, 300, "s1", "ls", false);
+        assert!(
+            ex.logs_dir.join("exhaust-h1.2.jsonl").is_file(),
+            "the fixture must actually rotate"
+        );
+
+        let h = ex.failure_history("cargo test", 8);
+        assert_eq!(
+            h.matches[0].recovered_sessions, 1,
+            "name order reads a host's rotations newest-first and would see the \
+             success before the failure it followed"
+        );
+    }
+
+    #[test]
+    fn the_exact_signature_wins_and_the_query_is_normalized_like_a_command() {
+        let f = fixture("h1");
+        for (i, session) in ["s1", "s2", "s3", "s4", "s5"].iter().enumerate() {
+            bash_at(&f.ex, 100 + i as i64, session, "cargo test --all", true);
+        }
+        bash_at(&f.ex, 200, "s6", "cargo test", true);
+        bash_at(&f.ex, 300, "s7", "cargo test --jobs 8", true);
+
+        let h = f.ex.failure_history("cargo test", 8);
+        assert_eq!(h.matches.len(), 3);
+        assert_eq!(
+            h.matches[0].norm, "cargo test",
+            "the signature that was asked about outranks a more frequent one"
+        );
+        assert_eq!(h.matches[1].norm, "cargo test --all", "then by how often it failed");
+
+        // Case and digits are erased from a stored signature, so the query
+        // goes through the same normalizer before it is matched.
+        let h = f.ex.failure_history("CARGO TEST --jobs 4", 8);
+        assert_eq!(h.matches.len(), 1);
+        assert_eq!(h.matches[0].norm, "cargo test --jobs n");
+    }
+
+    #[test]
+    fn a_signature_the_trap_already_staged_says_so() {
+        let f = fixture("h1");
+        // The same command failing in two sessions is what the
+        // recurring-failure trap stages.
+        f.cap(&bash_event("s1", "cargo test", true));
+        f.cap(&bash_event("s2", "cargo test", true));
+        f.cap(&bash_event("s2", "cargo build", true));
+        f.stop("s2");
+        assert!(f.staged().iter().any(|c| c.reason == "recurring-failure"));
+
+        let h = f.ex.failure_history("cargo", 8);
+        let flags: Vec<(&str, bool)> =
+            h.matches.iter().map(|m| (m.norm.as_str(), m.staged)).collect();
+        assert!(flags.contains(&("cargo test", true)), "got {flags:?}");
+        assert!(
+            flags.contains(&("cargo build", false)),
+            "one failure in one session is not a staged pattern: {flags:?}"
+        );
     }
 }
