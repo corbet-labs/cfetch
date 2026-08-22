@@ -79,6 +79,29 @@ fn prefix_tag(prefix: &str) -> String {
 /// streaming the whole artifact file.
 const SEEK_UNTIL: usize = 64;
 
+/// Why a vector cannot be a real embedding, or `None` when it looks sane.
+///
+/// Deliberately cheap and total: this runs once per stored vector, and its
+/// job is to catch a backend producing garbage, not to judge embedding
+/// quality. Every check below is a thing a WORKING embedder cannot produce.
+pub(crate) fn degenerate(v: &[f32]) -> Option<String> {
+    if v.is_empty() {
+        return Some("it has no components".into());
+    }
+    if let Some(i) = v.iter().position(|x| !x.is_finite()) {
+        return Some(format!("component {i} is {}", v[i]));
+    }
+    // Embeddings are L2-normalized before storage, so a healthy norm is ~1.0.
+    // An all-zero vector is the specific shape a half-supported accelerator
+    // graph returns, and it carries no information at all: every cosine
+    // against it is 0, so it would rank identically against every query.
+    let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+    if norm < 1e-6 {
+        return Some(format!("its L2 norm is {norm:e} — the vector is all zeros"));
+    }
+    None
+}
+
 /// Filename-safe form of a model id. Model names carry slashes and colons
 /// (`sentence-transformers/all-MiniLM-L6-v2`), which are not filenames; the
 /// mapping is lossy on purpose (two models CAN collide here), and the exact
@@ -219,7 +242,7 @@ impl VectorStore {
 
     /// Bytes one vector occupies.
     fn stride(&self) -> usize {
-        self.spec.dim * self.spec.precision.width()
+        self.spec.precision.record_bytes(self.spec.dim)
     }
 
     pub fn len(&self) -> usize {
@@ -358,6 +381,22 @@ impl VectorWriter<'_> {
             vector.len(),
             self.store.spec.dim
         );
+        // A degenerate vector must never reach the store. An accelerator whose
+        // graph is only partly supported can return NaN or all zeros WITHOUT
+        // raising anything — measured: a CoreML provider covering 20% of an
+        // EmbeddingGemma graph produced norm-0.0 output and no error. Persist
+        // one of those and it is indistinguishable from a healthy vector
+        // afterwards; the corpus is quietly poisoned and only a full re-derive
+        // finds it. This is the cheapest place in the system to make that
+        // impossible, because everything funnels through here.
+        degenerate(vector).map_or(Ok(()), |why| {
+            Err(anyhow::anyhow!(
+                "refusing to store a degenerate vector for {hash}: {why}. \
+                 This usually means the inference backend cannot actually run this \
+                 model — a partly-supported graph can return zeros or NaN without \
+                 reporting an error."
+            ))
+        })?;
         if self.store.present.contains(hash) {
             return Ok(false);
         }
@@ -677,5 +716,46 @@ mod tests {
         let brain = tempfile::tempdir().unwrap();
         let e = VectorStore::open(brain.path(), &spec_pfx(2, "a\nb")).unwrap_err().to_string();
         assert!(e.contains("must not contain newlines"), "{e}");
+    }
+
+    // ---- the degenerate-vector guard
+
+    #[test]
+    fn a_healthy_normalized_vector_passes() {
+        assert!(degenerate(&[0.6, 0.8]).is_none());
+        assert!(degenerate(&[1.0, 0.0, 0.0, 0.0]).is_none());
+        // Un-normalized but real vectors are not this guard's business.
+        assert!(degenerate(&[3.0, 4.0]).is_none());
+    }
+
+    #[test]
+    fn the_shapes_a_broken_accelerator_produces_are_caught() {
+        // All zeros: what a partly-supported graph returns. Every cosine
+        // against it is 0, so it would rank the same against every query.
+        assert!(degenerate(&[0.0, 0.0, 0.0]).unwrap().contains("all zeros"));
+        assert!(degenerate(&[f32::NAN, 1.0]).unwrap().contains("component 0"));
+        assert!(degenerate(&[1.0, f32::INFINITY]).unwrap().contains("component 1"));
+        assert!(degenerate(&[1.0, f32::NEG_INFINITY]).unwrap().contains("component 1"));
+        assert!(degenerate(&[]).unwrap().contains("no components"));
+    }
+
+    #[test]
+    fn the_store_refuses_a_degenerate_vector_rather_than_persisting_it() {
+        // The whole point: once written, a zero vector looks exactly like a
+        // healthy one. It has to be stopped at the door.
+        let brain = tempfile::tempdir().unwrap();
+        let sp = spec(2, Precision::F16);
+        let mut store = VectorStore::open(brain.path(), &sp).unwrap();
+        {
+            let mut w = store.begin_write().unwrap();
+            let e = w.put("hash-zero", &[0.0, 0.0]).unwrap_err().to_string();
+            assert!(e.contains("degenerate"), "{e}");
+            assert!(e.contains("cannot actually run this model"), "the cause is named: {e}");
+            assert!(w.put("hash-nan", &[f32::NAN, 1.0]).is_err());
+            // A good vector still goes in, so the guard is not a blanket refusal.
+            assert!(w.put("hash-good", &[0.6, 0.8]).unwrap());
+        }
+        let reopened = VectorStore::open(brain.path(), &sp).unwrap();
+        assert_eq!(reopened.len(), 1, "only the healthy vector was stored");
     }
 }

@@ -1331,11 +1331,27 @@ fn f16_to_f32(bits: u16) -> f32 {
 /// Little-endian encoding at the configured width — the ONE codec, used by
 /// both the local cache and the shared artifact files.
 pub fn vec_to_blob(v: &[f32], precision: Precision) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * precision.width());
+    let mut out = Vec::with_capacity(precision.record_bytes(v.len()));
+    if precision == Precision::I8 {
+        // Per-vector scale: the largest magnitude in THIS vector maps to 127,
+        // so the full int8 range is used whatever the vector's spread. A
+        // global scale wastes most of the range — components of a normalized
+        // 1024-dim embedding peak around 0.3, not 1.0 — and measurably loses
+        // top-1 exactness.
+        let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let scale = if max > 0.0 { max } else { 1.0 };
+        for x in v {
+            let q = (x / scale * 127.0).round().clamp(-127.0, 127.0) as i8;
+            out.push(q as u8);
+        }
+        out.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
+        return out;
+    }
     for x in v {
         match precision {
             Precision::F16 => out.extend_from_slice(&f32_to_f16(*x).to_le_bytes()),
             Precision::F32 => out.extend_from_slice(&x.to_le_bytes()),
+            Precision::I8 => unreachable!("handled above"),
         }
     }
     out
@@ -1345,6 +1361,17 @@ pub fn vec_to_blob(v: &[f32], precision: Precision) -> Vec<u8> {
 /// partial component (corrupt blob) is dropped rather than misread.
 pub fn blob_to_vec(b: &[u8], precision: Precision) -> Vec<f32> {
     match precision {
+        Precision::I8 => {
+            // The last two bytes are the scale; a record too short to hold
+            // one cannot be decoded at all, so it reads as empty rather than
+            // as a vector of wrong magnitude.
+            if b.len() < 3 {
+                return Vec::new();
+            }
+            let (body, tail) = b.split_at(b.len() - 2);
+            let scale = f16_to_f32(u16::from_le_bytes([tail[0], tail[1]]));
+            body.iter().map(|q| (*q as i8) as f32 / 127.0 * scale).collect()
+        }
         Precision::F16 => {
             let (chunks, _remainder) = b.as_chunks::<2>();
             chunks.iter().map(|c| f16_to_f32(u16::from_le_bytes(*c))).collect()
@@ -1685,6 +1712,52 @@ mod path_shape_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn int8_round_trips_within_its_quantisation_step() {
+        // A per-vector scale means the largest component always maps to
+        // exactly 127, so the error is bounded by half a step of THIS
+        // vector's range rather than of an assumed [-1,1].
+        let v: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.017).sin() * 0.31).collect();
+        let blob = vec_to_blob(&v, Precision::I8);
+        assert_eq!(blob.len(), Precision::I8.record_bytes(256), "components + scale trailer");
+        let back = blob_to_vec(&blob, Precision::I8);
+        assert_eq!(back.len(), 256);
+        let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let step = max / 127.0;
+        for (a, b) in v.iter().zip(&back) {
+            assert!((a - b).abs() <= step, "{a} vs {b}, step {step}");
+        }
+    }
+
+    #[test]
+    fn int8_preserves_direction_which_is_all_cosine_uses() {
+        let v: Vec<f32> = (0..512).map(|i| ((i as f32) * 0.031).cos()).collect();
+        let mut n = v.clone();
+        l2_normalize(&mut n);
+        let back = blob_to_vec(&vec_to_blob(&n, Precision::I8), Precision::I8);
+        let dot: f32 = n.iter().zip(&back).map(|(a, b)| a * b).sum();
+        let nb: f32 = back.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Cosine between the original and its quantised self.
+        assert!(dot / nb > 0.9999, "direction drifted: cos = {}", dot / nb);
+    }
+
+    #[test]
+    fn an_int8_record_too_short_to_carry_a_scale_reads_as_empty() {
+        // Never as a vector of arbitrary magnitude: a truncated record with a
+        // misread scale would rank wildly and look plausible.
+        assert!(blob_to_vec(&[1, 2], Precision::I8).is_empty());
+        assert!(blob_to_vec(&[], Precision::I8).is_empty());
+    }
+
+    #[test]
+    fn each_precision_reports_the_bytes_it_actually_occupies() {
+        assert_eq!(Precision::F32.record_bytes(10), 40);
+        assert_eq!(Precision::F16.record_bytes(10), 20);
+        assert_eq!(Precision::I8.record_bytes(10), 12, "10 components + a 2-byte scale");
+        // The reason i8 is worth having: half of f16 on the scan path.
+        assert!(Precision::I8.record_bytes(1024) * 2 < Precision::F16.record_bytes(1024) * 2 + 8);
+    }
     use super::*;
     use crate::config::{Precision, RingRule, VectorSpec};
 
