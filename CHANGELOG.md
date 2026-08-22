@@ -5,6 +5,8 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+## 0.9.3
+
 - **Executable release catalog.** `release/variants.json` is now the single
   source for runtime advice, CI, release archives, and Homebrew. Artifact names
   explicitly say `remote` while inference remains endpoint-only; the empty
