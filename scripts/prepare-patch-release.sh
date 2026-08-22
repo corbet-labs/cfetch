@@ -26,6 +26,8 @@ if [[ "$current" == "$latest" ]]; then
   version="$major.$minor.$((patch + 1))"
   sed -i "0,/^version = \"$current\"/s//version = \"$version\"/" Cargo.toml
   sed -i "s/^pkgver=$current\$/pkgver=$version/" packaging/arch/PKGBUILD
+  sed -i "s/^[[:space:]]*pkgver = $current\$/\tpkgver = $version/" packaging/arch/.SRCINFO
+  sed -i "s/#tag=v$current\$/#tag=v$version/" packaging/arch/.SRCINFO
   OLD="$current" NEW="$version" perl -0pi \
     -e 's/(\[\[package\]\]\nname = "cfetch"\nversion = ")\Q$ENV{OLD}\E("\n)/$1$ENV{NEW}$2/' \
     Cargo.lock
@@ -45,5 +47,7 @@ esac
 
 grep -q "^version = \"$version\"\$" Cargo.toml
 grep -q "^pkgver=$version\$" packaging/arch/PKGBUILD
+grep -q "^[[:space:]]*pkgver = $version\$" packaging/arch/.SRCINFO
+grep -q "#tag=v$version\$" packaging/arch/.SRCINFO
 grep -A2 '^name = "cfetch"$' Cargo.lock | grep -q "^version = \"$version\"\$"
 printf '%s\n' "$version"

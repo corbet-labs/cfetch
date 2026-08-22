@@ -1,0 +1,102 @@
+name: Publish to AUR
+
+# AUR builds cfetch from the verified release tag. The checked-in PKGBUILD and
+# .SRCINFO are the single package definition; this workflow only publishes
+# those reviewed files after the complete GitHub release exists.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without v-prefix (e.g. 0.9.5)'
+        required: true
+        type: string
+
+permissions: read-all
+
+jobs:
+  aur:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require AUR key
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: test -n "$AUR_SSH_KEY" || { echo '::error::AUR_SSH_KEY is not configured'; exit 1; }
+
+      - name: Wait for complete GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          for attempt in $(seq 1 60); do
+            if gh release view "v${VERSION}" --repo corbet-labs/cfetch \
+                --json assets --jq '.assets[].name' 2>/dev/null \
+                | grep -q '^checksums_sha256.txt$'; then
+              echo "release assets ready"
+              exit 0
+            fi
+            echo "waiting for release v${VERSION} assets (${attempt}/60)"
+            sleep 15
+          done
+          echo "::error::Release v${VERSION} assets did not appear"
+          exit 1
+
+      - uses: actions/checkout@v7
+
+      - name: Verify package identity
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          grep -q "^pkgver=${VERSION}$" packaging/arch/PKGBUILD
+          grep -q "^[[:space:]]*pkgver = ${VERSION}$" packaging/arch/.SRCINFO
+          grep -Fq 'url="https://github.com/corbet-labs/cfetch"' packaging/arch/PKGBUILD
+          grep -Fq "#tag=v${VERSION}" packaging/arch/PKGBUILD packaging/arch/.SRCINFO
+
+      - name: Configure AUR SSH
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        shell: bash
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_key
+            User aur
+            StrictHostKeyChecking yes
+          EOF
+          git config --global user.name 'Julian Y. Richard Corbet'
+          git config --global user.email '48553615+julian-corbet@users.noreply.github.com'
+
+      - name: Publish cfetch-agent
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          aur_dir=$(mktemp -d "$RUNNER_TEMP/cfetch-aur.XXXXXX")
+          git clone ssh://aur@aur.archlinux.org/cfetch-agent.git "$aur_dir"
+          cp packaging/arch/PKGBUILD packaging/arch/.SRCINFO "$aur_dir/"
+          cd "$aur_dir"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "cfetch-agent is already at ${VERSION}"
+          else
+            git commit -m "Update to ${VERSION}"
+            git push origin master
+          fi

@@ -5,6 +5,11 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Automatic AUR publication.** Release tags publish the reviewed, checked-in
+  `cfetch-agent` package definition only after the complete GitHub release is
+  available; the AUR page no longer depends on a maintainer copying versions
+  and repository URLs by hand.
+
 ## 0.9.5
 
 - **crates.io distribution.** The verified v0.9.4 source release is available
