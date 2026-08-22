@@ -277,6 +277,15 @@ pub struct Scope {
     pub repos: Vec<String>,
     /// Inject regardless of host and repo — an explicit "everywhere" that
     /// survives someone later adding one host to the list.
+    ///
+    /// It answers "how much", not only "whether": the digest reduces an entry
+    /// it cannot carry whole to one index line, and an `always` entry is
+    /// exempt — it arrives in full, clipped at the budget rather than
+    /// summarized. That is the same claim in both directions ("this content
+    /// belongs in every session, entire"), which is why it is this flag and
+    /// not a second one; rings 0-1 may make it, ring 2 may not (see the load
+    /// check), because unconditional behavior memory is what scoping exists
+    /// to prevent.
     #[serde(default)]
     pub always: bool,
 }
