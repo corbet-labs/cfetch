@@ -609,6 +609,12 @@ fn default_rerank_candidates() -> usize {
 pub struct GovernanceConfig {
     #[serde(default = "default_governance_enabled")]
     pub enabled: bool,
+    /// Token ceiling for ONE brain file before the write site says so. A file
+    /// over it is not an error — it is a recurring bill, paid by every session
+    /// that loads it — so the response is one factual line naming the size and
+    /// the remedy, never a block. 0 disables the check entirely.
+    #[serde(default = "default_state_file_budget_tokens")]
+    pub state_file_budget_tokens: u64,
     /// Every N-th post-tool event re-queues the top ring-0 rules (compliance
     /// decays measurably with generated output; see DESIGN's instruction-decay
     /// study). Zero switches the cadence off while keeping the Stop producers.
@@ -619,6 +625,7 @@ pub struct GovernanceConfig {
 impl Default for GovernanceConfig {
     fn default() -> Self {
         GovernanceConfig {
+            state_file_budget_tokens: default_state_file_budget_tokens(),
             enabled: default_governance_enabled(),
             reinject_every: default_reinject_every(),
         }
@@ -748,6 +755,14 @@ pub struct Config {
 
 fn default_budget_chars() -> usize {
     6000
+}
+
+/// 4000 tokens (~14k chars). Deliberately well above `default_budget_chars`,
+/// which caps the WHOLE injected digest: this is not "too big to inject" but
+/// "big enough that loading it is a decision", which is the point at which
+/// splitting starts to pay.
+fn default_state_file_budget_tokens() -> u64 {
+    4000
 }
 
 /// 32 MiB of ring-6 exhaust per host before rotation — months of capture at

@@ -606,6 +606,9 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
                 if let Err(e) = post_tool_cadence(&state_dir, &cfg, event) {
                     first_err.get_or_insert(e);
                 }
+                if let Err(e) = post_tool_budget(&state_dir, &cfg, event) {
+                    first_err.get_or_insert(e);
+                }
             }
             Err(e) => first_err = Some(e),
         }
@@ -628,6 +631,66 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
 
 /// Session read/write tracking: full reads recorded with the file's mtime;
 /// writes clear the read record (post-edit content is new content).
+/// Paths this event wrote, across both shapes: Codex's `apply_patch` carries
+/// them inside the patch body, the write tools name one directly.
+fn written_targets(event: &HookEvent) -> Vec<String> {
+    match event.tool_name.as_deref() {
+        Some("apply_patch") => exhaust::written_paths(event),
+        Some("Write" | "Edit" | "MultiEdit" | "NotebookEdit") => event
+            .tool_input
+            .as_ref()
+            .and_then(|input| {
+                input
+                    .get("file_path")
+                    .or_else(|| input.get("notebook_path"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// A brain file that outgrew its token budget costs every session that loads
+/// it, for as long as it stays that size — so the warning belongs at the write,
+/// where the author is still holding the context to act on it. One line, once
+/// per file per session, never a block.
+fn post_tool_budget(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
+    if event.is_subagent() {
+        return Ok(());
+    }
+    let budget = cfg.governance.state_file_budget_tokens;
+    if budget == 0 {
+        return Ok(());
+    }
+    for path in written_targets(event) {
+        // Only the brain's own files: cfetch governs what it will be asked to
+        // load, not the size of the user's source tree.
+        if !Path::new(&path).starts_with(&cfg.brain_root) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let tokens = crate::hook_io::estimate_tokens(usize::try_from(meta.len()).unwrap_or(usize::MAX));
+        if tokens <= budget {
+            continue;
+        }
+        let name = Path::new(&path)
+            .strip_prefix(&cfg.brain_root)
+            .unwrap_or(Path::new(&path))
+            .display()
+            .to_string();
+        let _ = session_state::update(state_dir, event.session(), |st| {
+            st.queue_reminder(
+                &format!("budget:{path}"),
+                &format!(
+                    "[cfetch: {name} is ~{tokens} tokens, over the {budget}-token budget for one brain file — split it or distil it; every session that loads it pays this]"
+                ),
+            );
+        });
+    }
+    Ok(())
+}
+
 fn post_tool_track(event: &HookEvent) -> anyhow::Result<()> {
     if event.is_subagent() {
         return Ok(());
@@ -741,6 +804,84 @@ fn precompact(event: &HookEvent) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn budget_event(session: &str, path: &std::path::Path) -> HookEvent {
+        serde_json::from_value(serde_json::json!({
+            "session_id": session,
+            "tool_name": "Write",
+            "tool_input": {"file_path": path.to_string_lossy()},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_oversized_brain_file_is_named_once_with_its_size_and_a_remedy() {
+        let brain = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let big = brain.path().join("knowledge/huge.md");
+        std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+        std::fs::write(&big, "x".repeat(40_000)).unwrap();
+        let cfg = Config { brain_root: brain.path().to_path_buf(), ..Config::default() };
+        let event = budget_event("s-budget", &big);
+
+        post_tool_budget(state.path(), &cfg, &event).unwrap();
+        // Drain the way UserPromptSubmit does — through `update`, so the
+        // shown-key survives. Draining a loaded copy would throw it away and
+        // the once-per-file guarantee would look broken when it is not.
+        let mut texts = Vec::new();
+        let _ = crate::session_state::update(state.path(), "s-budget", |st| {
+            texts = st.drain_reminders();
+        });
+        assert_eq!(texts.len(), 1, "exactly one warning: {texts:?}");
+        assert!(texts[0].contains("knowledge/huge.md"), "{}", texts[0]);
+        assert!(texts[0].contains("tokens"), "the size must be stated: {}", texts[0]);
+        assert!(texts[0].contains("split it or distil it"), "a remedy is required: {}", texts[0]);
+
+        // Same file again in the same session must not warn twice.
+        post_tool_budget(state.path(), &cfg, &event).unwrap();
+        let mut again = Vec::new();
+        let _ = crate::session_state::update(state.path(), "s-budget", |st| {
+            again = st.drain_reminders();
+        });
+        assert!(again.is_empty(), "the warning fired twice for one file: {again:?}");
+    }
+
+    #[test]
+    fn a_small_file_and_a_file_outside_the_brain_are_both_silent() {
+        let brain = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let cfg = Config { brain_root: brain.path().to_path_buf(), ..Config::default() };
+
+        let small = brain.path().join("small.md");
+        std::fs::write(&small, "x".repeat(100)).unwrap();
+        post_tool_budget(state.path(), &cfg, &budget_event("s-small", &small)).unwrap();
+        assert!(crate::session_state::load(state.path(), "s-small").drain_reminders().is_empty());
+
+        // cfetch governs what it will be asked to load, not the user's source.
+        let outside = tempfile::tempdir().unwrap();
+        let theirs = outside.path().join("vendor.rs");
+        std::fs::write(&theirs, "x".repeat(40_000)).unwrap();
+        post_tool_budget(state.path(), &cfg, &budget_event("s-out", &theirs)).unwrap();
+        assert!(crate::session_state::load(state.path(), "s-out").drain_reminders().is_empty());
+    }
+
+    #[test]
+    fn a_zero_budget_disables_the_check() {
+        let brain = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let big = brain.path().join("huge.md");
+        std::fs::write(&big, "x".repeat(40_000)).unwrap();
+        let cfg = Config {
+            brain_root: brain.path().to_path_buf(),
+            governance: crate::config::GovernanceConfig {
+                state_file_budget_tokens: 0,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        post_tool_budget(state.path(), &cfg, &budget_event("s-zero", &big)).unwrap();
+        assert!(crate::session_state::load(state.path(), "s-zero").drain_reminders().is_empty());
+    }
+
     #[test]
     fn shell_writes_are_recognized_without_naming_the_target() {
         // Redirects, in either form.
@@ -975,7 +1116,7 @@ mod tests {
                 scope: crate::config::Scope::default(),
                 weight: None,
             }],
-            governance: crate::config::GovernanceConfig { enabled, reinject_every },
+            governance: crate::config::GovernanceConfig { enabled, reinject_every, ..Default::default() },
             ..Config::default()
         }
     }
