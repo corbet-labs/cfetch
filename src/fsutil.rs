@@ -119,11 +119,10 @@ fn sync_parent(parent: &Path) {
 #[cfg(not(unix))]
 fn sync_parent(_parent: &Path) {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn preserves_symlink_and_target_mode() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -149,7 +148,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn new_files_are_private_and_regular_modes_survive() {
         use std::os::unix::fs::PermissionsExt as _;

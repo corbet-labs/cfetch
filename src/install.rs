@@ -176,7 +176,10 @@ fn codex_toml_with_mcp(content: &str, exe: &str) -> anyhow::Result<Option<String
     let servers = doc["mcp_servers"]
         .as_table_like_mut()
         .ok_or_else(|| anyhow::anyhow!("config.toml `mcp_servers` is not a table"))?;
-    if !servers.get("cfetch").is_some_and(|e| e.as_table_like().is_some()) {
+    if servers
+        .get("cfetch")
+        .is_none_or(|e| e.as_table_like().is_none())
+    {
         servers.insert("cfetch", toml_edit::Item::Table(toml_edit::Table::new()));
     }
     let entry = servers

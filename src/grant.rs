@@ -238,7 +238,7 @@ pub fn redeem(
         "invite mode does not match the origin's grant"
     );
     anyhow::ensure!(
-        !g.expires_at.is_some_and(|e| now >= e),
+        g.expires_at.is_none_or(|e| now < e),
         "invite expired"
     );
     match &g.peer {
@@ -325,7 +325,7 @@ pub fn access(brain_root: &Path, slice: &str, peer: &str, now: u64) -> anyhow::R
     Ok(read(brain_root, slice)?
         .into_iter()
         .find(|g| {
-            g.peer.as_deref() == Some(peer) && !g.expires_at.is_some_and(|e| now >= e)
+            g.peer.as_deref() == Some(peer) && g.expires_at.is_none_or(|e| now < e)
         })
         .map(|g| g.mode))
 }
