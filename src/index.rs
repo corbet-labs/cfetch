@@ -81,6 +81,14 @@ pub(crate) fn rel_doc_path(rel: &Path) -> String {
     normalize_separators(&rel.to_string_lossy(), std::path::MAIN_SEPARATOR)
 }
 
+/// Whether a doc path names a file in Claude Code's native auto-memory store
+/// rather than the brain tree. The `native:` tag is the only thing that
+/// separates the two stores downstream of the scan, and each store has its
+/// own contract — a clamped ring, and its own link dialect.
+fn is_native(doc_path: &str) -> bool {
+    doc_path.starts_with("native:")
+}
+
 /// THE taxonomy entry point: the configured location default for a
 /// brain-root-relative path. Frontmatter `ring: N` still overrides it at
 /// scan time. Everything that needs a path's ring — the scan, the watcher,
@@ -183,6 +191,57 @@ pub fn wikilinks(text: &str) -> Vec<String> {
                 out.push(target.to_ascii_lowercase());
             }
             rest = &after[end + 2..];
+        }
+    }
+    out
+}
+
+/// Extracts `[label](target.md)` targets, in the same shape [`wikilinks`]
+/// returns them: link title and `#anchor` dropped, `./` prefix stripped,
+/// lowercased, fenced code skipped.
+///
+/// This is the NATIVE store's dialect, not the brain's. The brain is an
+/// Obsidian vault whose edges are wikilinks and whose resolution keeps
+/// brain-lint parity; Claude Code's memory store has no wikilinks at all —
+/// its index file points at its entries with ordinary markdown links. Reading
+/// one dialect per store is what keeps those pointers from being edges nobody
+/// can see, without inventing edges in the vault.
+///
+/// Only `.md` targets are taken: one rule that keeps images and web links out
+/// of the pointer set. Whatever survives it and still resolves to no indexed
+/// doc yields no edge, exactly as an unresolvable wikilink does.
+pub fn markdown_links(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        match fence {
+            Some(open) => {
+                if fence_closes(t, open) {
+                    fence = None;
+                }
+                continue;
+            }
+            None => {
+                if let Some(open) = fence_open(t) {
+                    fence = Some(open);
+                    continue;
+                }
+            }
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find("](") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(')') else { break };
+            let target = &after[..end];
+            rest = &after[end + 1..];
+            // `[a](b.md "Title")`: the title is not part of the target.
+            let target = target.split_whitespace().next().unwrap_or("");
+            let target = target.split('#').next().unwrap_or("");
+            let target = target.strip_prefix("./").unwrap_or(target);
+            if target.ends_with(".md") {
+                out.push(target.to_ascii_lowercase());
+            }
         }
     }
     out
@@ -765,9 +824,10 @@ fn insert_doc(
 ) -> anyhow::Result<()> {
     let (fm_ring, fm_lines) = frontmatter_ring(raw);
     let mut ring = fm_ring.unwrap_or(src.default_ring);
+    let native = is_native(&src.doc_path);
     // The native store's contract ring is 2: honor demotion to 5+ (skip),
     // never self-promotion into the resident/policy rings.
-    if src.doc_path.starts_with("native:") {
+    if native {
         ring = ring.max(2);
     }
     if ring > MAX_INDEXED_RING {
@@ -787,7 +847,8 @@ fn insert_doc(
         rusqlite::params![src.doc_path, ring, src.mtime as i64, src.size as i64],
     )?;
     let doc_id = tx.last_insert_rowid();
-    for target in wikilinks(&blanked) {
+    let targets = if native { markdown_links(&blanked) } else { wikilinks(&blanked) };
+    for target in targets {
         tx.execute(
             "INSERT INTO doc_links(doc_id, target) VALUES(?1, ?2)",
             rusqlite::params![doc_id, target],
@@ -856,8 +917,10 @@ fn insert_doc(
 /// is registered under ALL its path suffixes (stem, parent/stem, …, full
 /// path; `.md` stripped, lowercased) and a target resolves only when its key
 /// is unambiguous — a slash-qualified target resolves a stem collision
-/// (brain-lint parity). A pure function of (docs, doc_links): full and
-/// incremental scans converge on identical edges.
+/// (brain-lint parity). A native-store link is tried against its own
+/// project's directory first, because a markdown link is a relative path.
+/// A pure function of (docs, doc_links): full and incremental scans converge
+/// on identical edges.
 fn resolve_links(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
     tx.execute("DELETE FROM links", [])?;
     let mut by_suffix: std::collections::HashMap<String, Option<i64>> =
@@ -878,15 +941,32 @@ fn resolve_links(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
             }
         }
     }
-    let pending: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare("SELECT doc_id, target FROM doc_links")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let pending: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT dl.doc_id, d.path, dl.target FROM doc_links dl JOIN docs d ON d.id = dl.doc_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
         rows.filter_map(Result::ok).collect()
     };
-    for (from_doc, target) in pending {
+    for (from_doc, from_path, target) in pending {
         let key = target.strip_suffix(".md").unwrap_or(&target);
-        if let Some(Some(to_doc)) = by_suffix.get(key)
-            && *to_doc != from_doc
+        // A markdown link is a RELATIVE path by definition: `[x](y.md)` in
+        // one project's memory index means THAT project's y.md. Every project
+        // in the native store names the same generic files, so the vault-wide
+        // stem key is ambiguous exactly where the pointers matter, and the
+        // whole index would resolve to nothing on any host with more than one
+        // project. The vault keeps stem resolution untouched: there a name is
+        // global, and brain-lint reads the same edges from the same rule.
+        let sibling = is_native(&from_path)
+            .then(|| from_path.to_ascii_lowercase())
+            .and_then(|p| p.rsplit_once('/').map(|(dir, _)| format!("{dir}/{key}")));
+        let resolved = sibling
+            .and_then(|k| by_suffix.get(&k).copied().flatten())
+            .or_else(|| by_suffix.get(key).copied().flatten());
+        if let Some(to_doc) = resolved
+            && to_doc != from_doc
         {
             tx.execute(
                 "INSERT INTO links(from_doc, to_doc) VALUES(?1, ?2)",
@@ -2347,6 +2427,92 @@ mod tests {
         let hits = recall(&conn, "invariant", 5).unwrap();
         assert_eq!(hits[0].ring, 2, "promotion clamped to the store's contract ring");
         assert_eq!(report.skipped_high_ring, 1, "demotion to 5+ is honored");
+    }
+
+    #[test]
+    fn native_index_pointers_become_edges_in_both_directions() {
+        // The native store's index is a hook table: one line per entry,
+        // pointing at the file that explains it. The pointers are markdown
+        // links, which the vault's wikilink reader cannot see — so a hit on a
+        // hook used to be a dead end, with the hook itself all the reader got.
+        let brain = brain(&[("knowledge/a.md", "brain fact\n")]);
+        let native = tempfile::tempdir().unwrap();
+        let mem = native.path().join("proj-a/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("MEMORY.md"),
+            "# Memory\n\n- [zvol trap](feedback_zvol.md) nossd required\n",
+        )
+        .unwrap();
+        std::fs::write(mem.join("feedback_zvol.md"), "zvol on btrfs needs nossd\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
+
+        let index = "native:proj-a/MEMORY.md".to_string();
+        let entry = "native:proj-a/feedback_zvol.md".to_string();
+        assert_eq!(
+            linked_docs(&conn, std::slice::from_ref(&index), 8).unwrap(),
+            vec![(entry.clone(), 2)],
+            "the index descends to the file its pointer names"
+        );
+        assert_eq!(
+            linked_docs(&conn, &[entry], 8).unwrap(),
+            vec![(index, 2)],
+            "and an entry names the index it hangs under"
+        );
+    }
+
+    #[test]
+    fn a_native_pointer_resolves_inside_its_own_project() {
+        // Each project's store names the same generic files, so a vault-wide
+        // stem lookup sees two candidates and gives up: without relative
+        // resolution the pointers are dead on any host with more than one
+        // project, which is every host.
+        let brain = brain(&[("knowledge/a.md", "brain fact\n")]);
+        let native = tempfile::tempdir().unwrap();
+        for slug in ["proj-a", "proj-b"] {
+            let mem = native.path().join(slug).join("memory");
+            std::fs::create_dir_all(&mem).unwrap();
+            std::fs::write(mem.join("MEMORY.md"), "- [rule](feedback_rule.md)\n").unwrap();
+            std::fs::write(mem.join("feedback_rule.md"), format!("the rule of {slug}\n")).unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
+
+        assert_eq!(
+            linked_docs(&conn, &["native:proj-a/MEMORY.md".to_string()], 8).unwrap(),
+            vec![("native:proj-a/feedback_rule.md".to_string(), 2)],
+            "the sibling entry, never the other project's file of the same name"
+        );
+    }
+
+    #[test]
+    fn the_vault_graph_stays_wikilinks_only() {
+        // Reading markdown links in the brain too would silently add edges
+        // brain-lint does not see, to the graph this project trusts most.
+        let dir = brain(&[
+            ("knowledge/zfs.md", "see [the shares doc](hosts/shares.md)\n"),
+            ("knowledge/hosts/shares.md", "SMB share layout\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(
+            linked_docs(&conn, &["knowledge/zfs.md".to_string()], 8).unwrap().is_empty(),
+            "the vault's edges are its curated wikilinks, nothing else"
+        );
+    }
+
+    #[test]
+    fn markdown_link_extraction_keeps_only_doc_pointers() {
+        let links = markdown_links(concat!(
+            "- [Alias](Feedback_One.md \"title\") and [anchored](two.md#section)\n",
+            "- [relative](./three.md), [web](https://example.com/), ![shot](x.png)\n",
+            "```\n[fenced](never.md)\n```\n",
+        ));
+        assert_eq!(links, vec!["feedback_one.md", "two.md", "three.md"]);
     }
 
     #[test]
