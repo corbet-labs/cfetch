@@ -486,6 +486,129 @@ fn stat_of(meta: &std::fs::Metadata) -> (u64, u64) {
     (mtime, meta.len())
 }
 
+/// Per-directory overlay that scopes a subtree out of cfetch WITHOUT hiding
+/// it from git. Gitignore syntax, gitignore precedence, its own file name:
+/// until this existed `.gitignore` was the only file-based control the
+/// walkers read, so keeping generated markdown out of the brain index — or a
+/// vendored subtree out of the code index — meant untracking it first.
+pub const IGNORE_FILE: &str = ".cfetchignore";
+
+/// THE walker every enumeration of a tree is built from: the brain scan, the
+/// code scan, and the serving watcher alike.
+///
+/// The ignore policy lives here and nowhere else on purpose. The watch set
+/// must stay exactly the index set — a directory the watcher skips is a
+/// directory whose writes never wake the daemon, which is silent staleness,
+/// the one failure serving mode refuses — and an overlay honored by one
+/// walker but not another would reintroduce that drift one `.cfetchignore`
+/// at a time. Callers add their own traversal concerns (parallelism,
+/// `filter_entry`) on top of what is returned.
+pub fn tree_walker(root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        // Highest precedence of every ignore source, and read whether or not
+        // the tree is a git checkout — a brain that is not a repo can be
+        // scoped too.
+        .add_custom_ignore_filename(IGNORE_FILE)
+        .follow_links(false);
+    builder
+}
+
+/// Whether the indexer would actually READ this brain-relative path:
+/// markdown, past the exclusion boundary, not secret-shaped. The scan and
+/// the cost census below both come through here, so "what would be indexed"
+/// has one answer instead of two lists that agree until they don't.
+pub(crate) fn indexable_doc(rel: &str, rules: &RingRules) -> bool {
+    rel.ends_with(".md") && !excluded(rel, rules) && !secret_shaped(rel)
+}
+
+/// A directory holding at least 9/10 of everything the indexer reads IS the
+/// index, not a subtree of it: excluding it would not scope cfetch, it would
+/// switch it off. Such a directory is never offered as a candidate — on a
+/// tree whose whole corpus sits under one `knowledge/`, the only honest
+/// answer is that there is nothing to scope out.
+const WHOLE_TREE_NUM: usize = 9;
+const WHOLE_TREE_DEN: usize = 10;
+
+/// Where the index's cost actually sits: how many files the INDEXER would
+/// read under each directory of the tree.
+///
+/// The measure is deliberately neither bytes on disk nor directory size. A
+/// 40 GiB directory of build artifacts costs the index nothing — the walker
+/// passes over every file in it — while a 3 MiB directory of generated
+/// markdown costs a doc, a watch and a block set per file, and is what makes
+/// a tree outgrow the watch budget. Advice derived from `du` would name the
+/// first and never the second.
+#[derive(Debug, Default)]
+pub struct DocCensus {
+    total: usize,
+    /// Directory prefix (no trailing slash) -> indexable docs beneath it.
+    /// Keyed by directory rather than by file, so a tree of any size costs a
+    /// map the size of its directory count.
+    by_prefix: std::collections::HashMap<String, usize>,
+}
+
+impl DocCensus {
+    /// Counts one indexable doc against every directory that contains it.
+    pub fn record(&mut self, rel: &str) {
+        self.total += 1;
+        for (i, _) in rel.match_indices('/') {
+            *self.by_prefix.entry(rel[..i].to_string()).or_default() += 1;
+        }
+    }
+
+    /// Everything the indexer would read, tree-wide.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// The subtrees worth scoping out: DISJOINT directories, each holding at
+    /// least `min_share` of what the indexer reads, heaviest first.
+    ///
+    /// Depth decides whether an answer is useful at all. "`knowledge/` holds
+    /// 60%" is not advice — nobody can exclude their knowledge tree — while
+    /// "`knowledge/archive/2019/` holds 55% of everything" is something to
+    /// act on. So the deepest directory that clears the bar wins and its
+    /// ancestors are dropped, and a directory that already IS the index (see
+    /// [`WHOLE_TREE_NUM`]) is never named at all. Disjointness is what makes
+    /// the numbers readable: no doc is counted in two candidates.
+    pub fn concentrations(&self, min_share: f64) -> Vec<(String, usize)> {
+        let threshold = ((self.total as f64) * min_share).ceil().max(1.0) as usize;
+        // Deepest first, so a nested directory claims its cost before any
+        // ancestor is considered for the same docs.
+        let mut candidates: Vec<(&String, usize)> =
+            self.by_prefix.iter().map(|(p, &n)| (p, n)).collect();
+        candidates.sort_by(|a, b| depth_of(b.0).cmp(&depth_of(a.0)).then_with(|| a.0.cmp(b.0)));
+        let mut claimed: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for (prefix, count) in candidates {
+            let already_named = claimed.get(prefix.as_str()).copied().unwrap_or(0);
+            if already_named > 0
+                || count < threshold
+                || count * WHOLE_TREE_DEN >= self.total * WHOLE_TREE_NUM
+            {
+                continue;
+            }
+            out.push((prefix.clone(), count));
+            for (i, _) in prefix.match_indices('/') {
+                *claimed.entry(&prefix[..i]).or_default() += count;
+            }
+        }
+        // Count first, path second: the same tree must always yield the same
+        // advice, and a HashMap hands its entries back in no order at all.
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+}
+
+/// Directory nesting depth of a `/`-separated prefix; `knowledge` is 0.
+fn depth_of(prefix: &str) -> usize {
+    prefix.matches('/').count()
+}
+
 /// Brain tree + (optionally) Claude Code's native auto-memory stores.
 /// Native memory (`<native_root>/<project-slug>/memory/*.md`) is indexed as
 /// ring 2 with doc paths `native:<slug>/<file>` — cfetch reads and surfaces
@@ -496,11 +619,7 @@ fn collect_files(
     rules: &RingRules,
 ) -> Vec<SourceFile> {
     let mut out = Vec::new();
-    let walker = ignore::WalkBuilder::new(brain_root)
-        .hidden(true)
-        .git_ignore(true)
-        .follow_links(false)
-        .build();
+    let walker = tree_walker(brain_root).build();
     for entry in walker.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
@@ -508,7 +627,7 @@ fn collect_files(
         }
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
         let rel = rel_doc_path(rel);
-        if !rel.ends_with(".md") || excluded(&rel, rules) || secret_shaped(&rel) {
+        if !indexable_doc(&rel, rules) {
             continue;
         }
         let (mtime, size) = stat_of(&meta);
@@ -1728,6 +1847,150 @@ mod path_shape_tests {
     fn secret_shaped_names_are_caught_after_normalization() {
         assert!(secret_shaped(&normalize_separators(r"knowledge\hosts\my.pem", '\\')));
         assert!(secret_shaped(&normalize_separators(r"knowledge\hosts\password-notes.md", '\\')));
+    }
+}
+
+#[cfg(test)]
+mod scoping_tests {
+    use super::*;
+
+    #[test]
+    fn cfetchignore_scopes_a_subtree_out_of_the_brain_scan() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        std::fs::create_dir_all(root.join("knowledge/generated")).unwrap();
+        std::fs::write(root.join("knowledge/real.md"), "# real\n").unwrap();
+        std::fs::write(root.join("knowledge/generated/api.md"), "# generated\n").unwrap();
+        // Nothing here is gitignored, and nothing may become gitignored: the
+        // generated docs are committed on purpose. Before the overlay there
+        // was no way to express "index everything but this".
+        std::fs::write(root.join(".cfetchignore"), "knowledge/generated/\n").unwrap();
+
+        let docs: Vec<String> = collect_files(root, None, &RingRules::default())
+            .into_iter()
+            .map(|f| f.doc_path)
+            .collect();
+        assert_eq!(docs, vec!["knowledge/real.md".to_string()]);
+    }
+
+    #[test]
+    fn cfetchignore_cannot_reopen_the_hard_exclusion_boundary() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        std::fs::create_dir_all(root.join("mind/secrets")).unwrap();
+        std::fs::create_dir_all(root.join("mind/memories")).unwrap();
+        std::fs::write(root.join("mind/secrets/token.md"), "# token\n").unwrap();
+        std::fs::write(root.join("mind/memories/how.md"), "# how\n").unwrap();
+        std::fs::write(root.join("keep.md"), "# keep\n").unwrap();
+        // Gitignore syntax carries negation, so the overlay can be written to
+        // ASK for secrets back. It gets `mind/` excluded and nothing else:
+        // the boundary is applied after the walk, not by it.
+        std::fs::write(root.join(".cfetchignore"), "mind/\n!mind/secrets/\n").unwrap();
+
+        let docs: Vec<String> = collect_files(root, None, &RingRules::default())
+            .into_iter()
+            .map(|f| f.doc_path)
+            .collect();
+        assert_eq!(docs, vec!["keep.md".to_string()]);
+    }
+
+    #[test]
+    fn writes_under_a_scoped_out_subtree_do_not_churn_the_index() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        std::fs::create_dir_all(root.join("scratch")).unwrap();
+        std::fs::write(root.join("keep.md"), "# keep\n").unwrap();
+        std::fs::write(root.join(".cfetchignore"), "scratch/\n").unwrap();
+        let rules = RingRules::default();
+        let before = tree_fingerprint(root, None, &rules);
+
+        // The staleness basis is the same file list, so scoping a subtree out
+        // buys more than a smaller catalog: a directory that churns every few
+        // seconds stops forcing rebuilds of everything else.
+        std::fs::write(root.join("scratch/churn.md"), "# churn\n").unwrap();
+        assert_eq!(
+            tree_fingerprint(root, None, &rules),
+            before,
+            "a write under a scoped-out subtree must not make the catalog stale"
+        );
+        std::fs::write(root.join("keep.md"), "# keep, expanded\n").unwrap();
+        assert_ne!(tree_fingerprint(root, None, &rules), before, "an indexed write still must");
+    }
+
+    /// Fixture: 20 generated API docs, a real knowledge subtree, some
+    /// memories, and a directory of binaries that outweighs all of it on
+    /// disk by three orders of magnitude.
+    fn mixed_census() -> DocCensus {
+        let rules = RingRules::default();
+        let mut census = DocCensus::default();
+        // The heavy directory the index never opens: not one entry of it is
+        // recordable, whatever it weighs.
+        for i in 0..4 {
+            assert!(!indexable_doc(&format!("bulk/blob{i}.bin"), &rules));
+        }
+        for i in 0..20 {
+            let rel = format!("knowledge/generated/api/p{i}.md");
+            assert!(indexable_doc(&rel, &rules));
+            census.record(&rel);
+        }
+        for i in 0..5 {
+            census.record(&format!("knowledge/hosts/h{i}.md"));
+        }
+        for i in 0..4 {
+            census.record(&format!("mind/memories/m{i}.md"));
+        }
+        census.record("AGENT.md");
+        census
+    }
+
+    #[test]
+    fn census_ranks_by_what_the_indexer_reads_not_by_bytes_on_disk() {
+        let census = mixed_census();
+        assert_eq!(census.total(), 30);
+        let hits = census.concentrations(0.15);
+        // Disjoint and deepest: the generated docs are named where they sit,
+        // and no candidate contains another.
+        assert_eq!(
+            hits,
+            vec![
+                ("knowledge/generated/api".to_string(), 20),
+                ("knowledge/hosts".to_string(), 5),
+            ]
+        );
+        // `knowledge/` holds 25 of 30 and is still not the answer: naming it
+        // would tell the operator to exclude their whole knowledge tree.
+        assert!(hits.iter().all(|(p, _)| p != "knowledge"));
+        // Nothing on the ranking came from disk usage.
+        assert!(hits.iter().all(|(p, _)| !p.starts_with("bulk")));
+    }
+
+    #[test]
+    fn census_names_the_parent_when_the_cost_is_spread_across_it() {
+        let mut census = DocCensus::default();
+        for quarter in 0..4 {
+            for note in 0..5 {
+                census.record(&format!("todo/done/q{quarter}/n{note}.md"));
+            }
+        }
+        for i in 0..10 {
+            census.record(&format!("knowledge/hosts/h{i}.md"));
+        }
+        // No child of `todo/done` clears the bar alone, so `todo/done` is the
+        // deepest honest name — descending further would advise excluding one
+        // quarter and leaving three behind.
+        assert_eq!(census.concentrations(0.5), vec![("todo/done".to_string(), 20)]);
+    }
+
+    #[test]
+    fn a_tree_that_is_all_one_subtree_yields_no_advice_at_all() {
+        let mut census = DocCensus::default();
+        for area in ["hosts", "world", "projects", "coding", "health", "finance", "career"] {
+            census.record(&format!("knowledge/{area}/one.md"));
+        }
+        // `knowledge/` holds everything and every child is equal. There is
+        // nothing to scope out, and "exclude your entire brain" is worse than
+        // saying nothing at all.
+        assert!(census.concentrations(0.15).is_empty(), "{:?}", census.concentrations(0.15));
     }
 }
 

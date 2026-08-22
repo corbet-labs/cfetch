@@ -339,10 +339,7 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
         let known = &known;
         std::thread::scope(|s| -> anyhow::Result<()> {
             s.spawn(move || {
-                ignore::WalkBuilder::new(root)
-                    .hidden(true)
-                    .git_ignore(true)
-                    .follow_links(false)
+                crate::index::tree_walker(root)
                     .filter_entry(|e| {
                         e.file_name().to_str().map(|n| !skip_dir(n)).unwrap_or(true)
                     })
@@ -860,6 +857,26 @@ mod tests {
         assert_eq!(r3.files, 55);
         assert!(find(&conn, "sym_0_2", 5).unwrap().iter().all(|h| h.name.is_none()));
         assert_eq!(file_count(&conn).unwrap(), 55);
+    }
+
+    /// Generated or vendored sources a repo tracks on purpose: the overlay
+    /// keeps them out of the code index without untracking them, which
+    /// `.gitignore` — the only file-based control this walker read before —
+    /// could not do.
+    #[test]
+    fn cfetchignore_scopes_a_subtree_out_of_the_code_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("generated")).unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn kept_symbol() {}\n").unwrap();
+        std::fs::write(dir.path().join("generated/api.rs"), "fn scoped_out_symbol() {}\n").unwrap();
+        std::fs::write(dir.path().join(".cfetchignore"), "generated/\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+
+        let report = scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(report.files, 1);
+        assert!(find(&conn, "scoped_out_symbol", 5).unwrap().is_empty());
+        assert_eq!(find(&conn, "kept_symbol", 5).unwrap()[0].score, 100);
     }
 
     #[test]

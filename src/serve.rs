@@ -702,28 +702,76 @@ pub struct ServeHandle {
 /// set, never a byte more. 3 is settled by registering in the background
 /// (see `start`), with `settled` withheld until registration completes so no
 /// answer claims freshness it cannot have.
-fn watchable_dirs(brain_root: &Path, rules: &crate::config::RingRules) -> Vec<PathBuf> {
-    let mut dirs = vec![brain_root.to_path_buf()];
-    let walker = ignore::WalkBuilder::new(brain_root)
-        .hidden(true)
-        .git_ignore(true)
-        .follow_links(false)
-        .build();
+///
+/// The same walk also tallies what the indexer would READ, because defect 2
+/// is a recurring condition and not a one-time bug: a tree keeps growing.
+/// When registration fails anyway, [`scoping_advice`] names the subtrees to
+/// scope out — measured, not guessed at from disk usage.
+fn watchable_dirs(brain_root: &Path, rules: &crate::config::RingRules) -> WatchScope {
+    let mut scope =
+        WatchScope { dirs: vec![brain_root.to_path_buf()], census: index::DocCensus::default() };
+    let walker = crate::index::tree_walker(brain_root).build();
     for entry in walker.flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_dir()) {
-            continue;
-        }
+        let Some(kind) = entry.file_type() else { continue };
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
         // Same canonical `/`-separated form the indexer derives, so the watch
         // set stays EXACTLY the index set on every platform — a
         // backslash-separated `mind\secrets` would match no exclusion.
         let rel = crate::index::rel_doc_path(rel);
+        if !kind.is_dir() {
+            // The census rides along on the walk the watcher has to do
+            // anyway. File entries carry their kind from the directory read,
+            // so counting them costs no stat — and a stat per file is the one
+            // thing that must not be added to a startup already slow enough
+            // to need this advice.
+            if kind.is_file() && crate::index::indexable_doc(&rel, rules) {
+                scope.census.record(&rel);
+            }
+            continue;
+        }
         if rel.is_empty() || crate::index::excluded_dir(&rel, rules) {
             continue;
         }
-        dirs.push(entry.path().to_path_buf());
+        scope.dirs.push(entry.path().to_path_buf());
     }
-    dirs
+    scope
+}
+
+/// The watch enumeration's two products: the directories to register, and
+/// what the indexer would read under each of them.
+struct WatchScope {
+    dirs: Vec<PathBuf>,
+    census: index::DocCensus,
+}
+
+/// A subtree holding this much of everything the indexer reads is worth
+/// naming as a scoping candidate. Low enough that several can be named at
+/// once, high enough that a healthy tree yields nothing.
+const SCOPE_MIN_SHARE: f64 = 0.15;
+
+/// Turns "watch registration failed" into something to do about it.
+///
+/// This is the one moment a tree's size becomes a correctness problem the
+/// operator can see: writes in unwatched directories now wait for the 60s
+/// backstop instead of waking the daemon. The candidates are ranked by what
+/// the indexer READS (see [`index::DocCensus`]) rather than by bytes on disk,
+/// because those two orders disagree exactly where it matters — the directory
+/// that exhausts a watch table is full of small markdown files, which is the
+/// directory `du` ranks last.
+fn scoping_advice(census: &index::DocCensus) -> Option<String> {
+    let hits = census.concentrations(SCOPE_MIN_SHARE);
+    if hits.is_empty() {
+        return None;
+    }
+    let total = census.total();
+    let named: Vec<String> =
+        hits.iter().map(|(prefix, n)| format!("{prefix}/ ({n} of {total})")).collect();
+    Some(format!(
+        "cfetch serve: most of what is indexed sits under {} — a `{}` naming those scopes them \
+         out of cfetch without hiding them from git",
+        named.join(", "),
+        index::IGNORE_FILE
+    ))
 }
 
 /// Registers one non-recursive watch per indexable directory. Non-recursive
@@ -771,7 +819,7 @@ mod watch_scope_tests {
             outside
         };
 
-        let dirs = watchable_dirs(brain.path(), &crate::config::RingRules::default());
+        let dirs = watchable_dirs(brain.path(), &crate::config::RingRules::default()).dirs;
         let rel: Vec<String> = dirs
             .iter()
             .map(|d| crate::index::rel_doc_path(d.strip_prefix(brain.path()).unwrap()))
@@ -790,12 +838,64 @@ mod watch_scope_tests {
         );
     }
 
+    /// The overlay has to reach the watcher, not only the indexer: a subtree
+    /// scoped out of cfetch must be neither indexed nor watched, or the watch
+    /// set and the index set part ways again.
+    ///
+    /// And the advice that names such a subtree is measured from what the
+    /// indexer READS. The binary dump here outweighs every markdown file in
+    /// the tree by three orders of magnitude and must not appear anywhere in
+    /// the ranking.
+    #[test]
+    fn watch_scope_honors_the_overlay_and_ranks_by_what_the_indexer_reads() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        let dirs =
+            ["knowledge/hosts", "knowledge/generated/api", "mind/memories", "bulk", "scratch/deep"];
+        for d in dirs {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for i in 0..20 {
+            std::fs::write(root.join(format!("knowledge/generated/api/p{i}.md")), "# p\n").unwrap();
+        }
+        for i in 0..5 {
+            std::fs::write(root.join(format!("knowledge/hosts/h{i}.md")), "# h\n").unwrap();
+        }
+        for i in 0..4 {
+            std::fs::write(root.join(format!("mind/memories/m{i}.md")), "# m\n").unwrap();
+        }
+        std::fs::write(root.join("AGENT.md"), "# agent\n").unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join(format!("bulk/blob{i}.bin")), vec![0u8; 64 * 1024]).unwrap();
+        }
+        std::fs::write(root.join("scratch/deep/notes.md"), "# scratch\n").unwrap();
+        std::fs::write(root.join(".cfetchignore"), "scratch/\n").unwrap();
+
+        let scope = watchable_dirs(root, &crate::config::RingRules::default());
+        let rel: Vec<String> = scope
+            .dirs
+            .iter()
+            .map(|d| crate::index::rel_doc_path(d.strip_prefix(root).unwrap()))
+            .collect();
+        assert!(rel.iter().any(|r| r == "knowledge/hosts"));
+        assert!(
+            !rel.iter().any(|r| r.starts_with("scratch")),
+            "the overlay must reach the watcher too: {rel:?}"
+        );
+
+        assert_eq!(scope.census.total(), 30, "only markdown the indexer would read is counted");
+        let advice = scoping_advice(&scope.census).expect("one subtree dominates this tree");
+        assert!(advice.contains("knowledge/generated/api/ (20 of 30)"), "{advice}");
+        assert!(!advice.contains("bulk"), "bytes on disk must not enter the ranking: {advice}");
+        assert!(advice.contains(".cfetchignore"), "the advice must name the lever: {advice}");
+    }
+
     #[test]
     fn every_watchable_dir_is_a_real_directory() {
         let brain = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
         std::fs::write(brain.path().join("knowledge/a.md"), "x\n").unwrap();
-        for d in watchable_dirs(brain.path(), &crate::config::RingRules::default()) {
+        for d in watchable_dirs(brain.path(), &crate::config::RingRules::default()).dirs {
             assert!(d.is_dir(), "{d:?} is not a directory");
         }
     }
@@ -898,13 +998,16 @@ pub fn start(cfg: &Config) -> anyhow::Result<ServeHandle> {
         let rules = cfg.rings();
         let wake_tx = wake_tx.clone();
         move || {
-            let dirs = watchable_dirs(&brain_root, &rules);
-            let (ok, failed) = register_watches(&watcher, &dirs);
+            let scope = watchable_dirs(&brain_root, &rules);
+            let (ok, failed) = register_watches(&watcher, &scope.dirs);
             if failed > 0 {
                 eprintln!(
                     "cfetch serve: watching {ok} director(ies); {failed} could not be watched \
                      (the 60s fingerprint backstop still covers them)"
                 );
+                if let Some(advice) = scoping_advice(&scope.census) {
+                    eprintln!("{advice}");
+                }
             }
             state.mark_watches_ready();
             // A directory may have appeared while we were registering.
@@ -968,7 +1071,7 @@ fn worker(
             // Re-enumerating on the backstop cadence keeps the watch set
             // convergent without ever following a symlink.
             if state.watches_ready() {
-                let dirs = watchable_dirs(&cfg.brain_root, &cfg.rings());
+                let dirs = watchable_dirs(&cfg.brain_root, &cfg.rings()).dirs;
                 if watched.is_empty() {
                     watched = dirs.iter().cloned().collect();
                 } else {
@@ -1554,7 +1657,7 @@ mod tests {
         let Ok(root) = std::env::var("CFETCH_FINGERPRINT_BENCH") else { return };
         let root = PathBuf::from(root);
         let rules = crate::config::RingRules::default();
-        let dirs = watchable_dirs(&root, &rules).len();
+        let dirs = watchable_dirs(&root, &rules).dirs.len();
         let mut times = Vec::new();
         let mut previous: Option<String> = None;
         for _ in 0..10 {
