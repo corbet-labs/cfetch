@@ -509,6 +509,15 @@ fn hot_files(session: &str, host: &str, writes: &[WriteRow<'_>], out: &mut Vec<C
 pub fn redact_secrets(cmd: &str) -> String {
     let mut out = String::with_capacity(cmd.len() + 16);
     let mut redact_next = false;
+    // How many more words to look through for the VALUE of a name we already
+    // decided is secret-shaped. Only `-flags` are looked through, and only a
+    // couple of them, so an armed redaction cannot wander into the next
+    // command.
+    let mut seeking_value = 0u8;
+    // The word before this one was a setter (`set`, `export`, `Set-Item`, …),
+    // possibly with flags in between.
+    let mut after_setter = false;
+    let mut prev_keyish = false;
     let mut rest = cmd;
     while !rest.is_empty() {
         let ws_end = rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len());
@@ -520,14 +529,70 @@ pub fn redact_secrets(cmd: &str) -> String {
         let w_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let word = &rest[..w_end];
         rest = &rest[w_end..];
+
         if redact_next {
             out.push_str(REDACTED);
             redact_next = false;
-        } else {
-            out.push_str(&redact_word(word, &mut redact_next));
+            seeking_value = 0;
+            after_setter = false;
+            prev_keyish = false;
+            continue;
         }
+        // Looking for the value of a name already judged secret-shaped: step
+        // over flags, redact the first real word.
+        if seeking_value > 0 {
+            if word.starts_with('-') {
+                seeking_value -= 1;
+                out.push_str(word);
+                continue;
+            }
+            out.push_str(REDACTED);
+            seeking_value = 0;
+            after_setter = false;
+            prev_keyish = false;
+            continue;
+        }
+        // `NAME = value` — the spaced assignment every shell but POSIX uses.
+        if word == "=" && prev_keyish {
+            out.push_str(word);
+            redact_next = true;
+            continue;
+        }
+        // A secret-shaped NAME introduced by a setter: fish's
+        // `set -x api_token …`, PowerShell's `Set-Item Env:\API_TOKEN -Value …`.
+        // Without this, every shell that assigns with SPACES walks straight
+        // through the KEY=value rule.
+        if after_setter && !word.contains('=') && keyish(word) {
+            out.push_str(word);
+            seeking_value = 3;
+            continue;
+        }
+        if is_setter(word) {
+            after_setter = true;
+            out.push_str(word);
+            continue;
+        }
+        // Flags do not end a setter clause: `set -gx NAME value`.
+        if after_setter && word.starts_with('-') {
+            out.push_str(word);
+            continue;
+        }
+        after_setter = false;
+        prev_keyish = !word.contains('=') && keyish(word);
+        out.push_str(&redact_word(word, &mut redact_next));
     }
     out
+}
+
+/// Commands that introduce `NAME value` rather than `NAME=value`. Covers
+/// fish (`set`), POSIX (`export`, `declare`, `typeset`, `env`) and PowerShell
+/// (`Set-Item`, `Set-Variable`, `New-Variable`).
+fn is_setter(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "set" | "setenv" | "export" | "declare" | "typeset" | "env" | "local"
+            | "set-item" | "set-variable" | "new-variable" | "si" | "sv"
+    )
 }
 
 /// Does this look like the NAME of a secret? Deliberately over-approximate:
@@ -751,6 +816,63 @@ fn tool_failed(event: &HookEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every shell but POSIX assigns with SPACES, and the KEY=value rule
+    /// walks straight past that. These are the forms that leaked before the
+    /// setter-aware pass — verified by running the old code, not assumed.
+    #[test]
+    fn secrets_assigned_with_spaces_are_redacted_in_every_shell() {
+        for (shell, cmd) in [
+            ("fish", "set -x api_token sk-live-abc"),
+            ("fish", "set -gx OPENAI_API_KEY sk-live-abc"),
+            ("fish", "set --export ANTHROPIC_AUTH_TOKEN sk-live-abc"),
+            ("powershell", "$env:API_TOKEN = \"sk-live-abc\""),
+            ("powershell", "Set-Item Env:\\API_TOKEN -Value sk-live-abc"),
+            ("powershell", "Set-Variable -Name api_secret -Value sk-live-abc"),
+            ("posix", "export api_token sk-live-abc"),
+            ("posix", "declare -x DB_PASSWORD hunter2"),
+        ] {
+            let got = redact_secrets(cmd);
+            assert!(!got.contains("sk-live-abc"), "{shell}: leaked in {got:?}");
+            assert!(!got.contains("hunter2"), "{shell}: leaked in {got:?}");
+        }
+    }
+
+    #[test]
+    fn the_forms_that_already_worked_still_work() {
+        for cmd in [
+            "export API_TOKEN=sk-live-abc",
+            "$env:API_TOKEN=\"sk-live-abc\"",
+            "curl --header \"x\" --api-key sk-live-abc",
+        ] {
+            assert!(!redact_secrets(cmd).contains("sk-live-abc"), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn setting_a_harmless_variable_is_left_alone() {
+        // Over-redaction makes the exhaust useless for diagnosis, so the
+        // setter rule must fire on the NAME being secret-shaped, not on the
+        // setter itself.
+        for cmd in [
+            "set -x PATH /usr/local/bin",
+            "set -gx EDITOR nvim",
+            "export RUST_LOG=debug",
+            "env TZ=UTC date",
+        ] {
+            let got = redact_secrets(cmd);
+            assert_eq!(got, cmd, "needlessly redacted: {got:?}");
+        }
+    }
+
+    #[test]
+    fn an_armed_redaction_cannot_wander_into_the_next_command() {
+        // Only a couple of flags are stepped over; a name with no value must
+        // not swallow something far away.
+        let got = redact_secrets("set -x api_token -a -b -c -d -e echo hello");
+        assert!(got.contains("hello"), "wandered too far: {got:?}");
+    }
+
     use super::*;
     use serde_json::json;
 
