@@ -94,7 +94,11 @@ storage: it is a network call away from the whole brain.
   injection ledger, live recall.
 - **`cfetch selfcheck` / `cfetch status`** — verify the installation end to
   end; surface silently-failing hooks instead of letting the brain die
-  unnoticed for weeks.
+  unnoticed for weeks. Every reporting surface compares the hooks cfetch
+  registered at install time against the ones that have actually reported, so
+  a hook that has never fired reads as UNOBSERVED rather than as healthy — and
+  an index nobody has scanned, a ledger nobody has written and a staging queue
+  nothing has ever examined all say so instead of printing a zero.
 
 ## Install
 

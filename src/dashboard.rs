@@ -91,7 +91,9 @@ enum IndexView {
 
 struct Stats {
     daemon_version: Option<String>,
-    hooks: Vec<(String, u32, Option<u64>)>, // name, consecutive_failures, last_ok
+    /// Expected-versus-observed, never a bare failure count: a hook that has
+    /// never fired must not share a rendering with one that runs cleanly.
+    hooks: heartbeat::Liveness,
     sessions: usize,
     injected_tokens: u64,
     /// Ledger streams this binary refused to read (a future format version).
@@ -139,7 +141,6 @@ fn index_view(source: &Source) -> IndexView {
 }
 
 fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
-    let hb = heartbeat::load_from(state);
     // The ledger and ring-5/6 figures come from the TREE, so this pane shows
     // the whole fleet's numbers, not just this machine's.
     let loaded = ledger::read(&paths::logs_dir(&cfg.brain_root));
@@ -148,11 +149,7 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
     let staging = exhaust::Exhaust::from_config(cfg).stats();
     Stats {
         daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
-        hooks: hb
-            .hooks
-            .into_iter()
-            .map(|(n, h)| (n, h.consecutive_failures, h.last_ok))
-            .collect(),
+        hooks: heartbeat::liveness_in(state),
         sessions: l.sessions.len(),
         injected_tokens: l
             .sessions
@@ -172,6 +169,13 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
 /// much to trust it.
 fn index_span(v: &IndexView) -> Span<'static> {
     match v {
+        // Generation 0 means no scan has ever committed here, so every count
+        // beside it would be an unmeasured zero. An empty brain and an index
+        // nobody has built must not print the same "0 blocks".
+        IndexView::Local { generation: 0, .. } => Span::styled(
+            format!("   {}", heartbeat::IndexLiveness::NeverScanned.describe()),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
         IndexView::Local { docs_by_ring, blocks, code_files, symbols, origin, generation } => {
             let rings = docs_by_ring
                 .iter()
@@ -236,29 +240,31 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             format!("staging: {} candidate(s) [{reasons}]", s.staging_total),
             Style::default().fg(Color::Yellow),
         ))
+    } else if s.exhaust_bytes == 0 {
+        // Staging is fed by the ring-6 capture hooks. With not one byte of
+        // exhaust anywhere in the tree, nothing has ever run the flagging
+        // traps, so this zero is the absence of a measurement.
+        Line::from(Span::styled(
+            "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust has ever been written, so nothing has been examined"
+                .to_string(),
+            Style::default().fg(Color::Yellow),
+        ))
     } else {
         Line::from(Span::styled(
-            "staging: 0 candidates".to_string(),
+            "staging: 0 candidates (measured)".to_string(),
             Style::default().fg(Color::DarkGray),
         ))
     });
-    let failing: Vec<String> = s
-        .hooks
-        .iter()
-        .filter(|(_, fails, _)| *fails >= 3)
-        .map(|(n, fails, _)| format!("{n} ({fails}×)"))
-        .collect();
-    if failing.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("hooks: {} tracked, all healthy", s.hooks.len()),
-            Style::default().fg(Color::Green),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("hooks FAILING: {}", failing.join(", ")),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )));
-    }
+    lines.push(Line::from(Span::styled(
+        s.hooks.summary(),
+        match s.hooks.severity() {
+            heartbeat::Severity::Healthy => Style::default().fg(Color::Green),
+            heartbeat::Severity::Unobserved => Style::default().fg(Color::Yellow),
+            heartbeat::Severity::Failing => {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            }
+        },
+    )));
     lines
 }
 
@@ -427,6 +433,31 @@ mod tests {
         }
     }
 
+    fn liveness(states: &[(&str, heartbeat::HookState)]) -> heartbeat::Liveness {
+        heartbeat::Liveness {
+            hooks: heartbeat::REGISTERED_HOOKS
+                .iter()
+                .map(|name| heartbeat::HookLiveness {
+                    name: (*name).to_string(),
+                    registered: true,
+                    state: states
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or(heartbeat::HookState::Unobserved),
+                })
+                .collect(),
+        }
+    }
+
+    fn all_reporting() -> heartbeat::Liveness {
+        let states: Vec<(&str, heartbeat::HookState)> = heartbeat::REGISTERED_HOOKS
+            .iter()
+            .map(|n| (*n, heartbeat::HookState::Healthy { last_ok: 1 }))
+            .collect();
+        liveness(&states)
+    }
+
     #[test]
     fn none_tier_dashboard_never_opens_a_local_index() {
         // The defect: the dashboard opened a LOCAL index unconditionally, so a
@@ -476,7 +507,7 @@ mod tests {
     fn header_shows_the_serving_origin_and_generation() {
         let s = Stats {
             daemon_version: Some("0.5.0".into()),
-            hooks: Vec::new(),
+            hooks: all_reporting(),
             sessions: 0,
             injected_tokens: 0,
             unreadable_streams: 0,
@@ -504,7 +535,17 @@ mod tests {
     fn header_reports_failing_hooks_and_unreadable_streams() {
         let s = Stats {
             daemon_version: None,
-            hooks: vec![("stop".into(), 5, None), ("session-start".into(), 0, Some(1))],
+            hooks: liveness(&[
+                (
+                    "stop",
+                    heartbeat::HookState::Failing {
+                        consecutive: 5,
+                        last_error: Some("boom".into()),
+                        last_ok: None,
+                    },
+                ),
+                ("session-start", heartbeat::HookState::Healthy { last_ok: 1 }),
+            ]),
             sessions: 2,
             injected_tokens: 1234,
             unreadable_streams: 1,
@@ -519,13 +560,61 @@ mod tests {
         assert!(text.contains("unreadable ledger stream(s)"));
         assert!(text.contains("r1:2 r3:400"));
         assert!(text.contains("staging: 0 candidates"), "empty staging still renders");
+        // Four hooks in that heartbeat have no record at all, and the failing
+        // one must not hide them.
+        assert!(text.contains("NEVER OBSERVED: user-prompt"), "{text}");
     }
 
     #[test]
-    fn header_shows_staging_counts_and_exhaust_footprint() {
-        let s = Stats {
+    fn silent_hooks_never_render_as_all_healthy() {
+        // The defect: the header counted the heartbeat's own entries and
+        // called the lot healthy, so a hook that had never fired since
+        // install was indistinguishable from one that had just succeeded.
+        let base = Stats {
             daemon_version: Some("0.5.0".into()),
-            hooks: Vec::new(),
+            hooks: liveness(&[("session-start", heartbeat::HookState::Healthy { last_ok: 1 })]),
+            sessions: 0,
+            injected_tokens: 0,
+            unreadable_streams: 0,
+            index: local_index(),
+            staging_total: 0,
+            staging_by_reason: Vec::new(),
+            exhaust_bytes: 12,
+        };
+        let lines = header_lines(&base);
+        let text = flat_text(&lines);
+        assert!(!text.contains("all healthy"), "one reporting hook is not a healthy set: {text}");
+        assert!(text.contains("1 of 6 registered hook(s) reporting"), "{text}");
+        assert!(text.contains("NEVER OBSERVED: user-prompt, pre-tool, post-tool, stop"), "{text}");
+        let hook_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("NEVER OBSERVED")))
+            .unwrap();
+        assert_eq!(
+            hook_line.spans[0].style.fg,
+            Some(Color::Yellow),
+            "unobserved is neither green nor red"
+        );
+
+        // Only a complete set earns the green line.
+        let healthy = Stats { hooks: all_reporting(), ..base };
+        let lines = header_lines(&healthy);
+        let text = flat_text(&lines);
+        assert!(text.contains("all 6 registered hook(s) reporting, healthy"), "{text}");
+        let hook_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("hooks:")))
+            .unwrap();
+        assert_eq!(hook_line.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn an_index_nobody_has_scanned_is_not_an_empty_one() {
+        // Generation 0 is "never scanned". Rendering its counts would print
+        // "0 blocks", which reads as a brain with nothing in it.
+        let never = Stats {
+            daemon_version: Some("0.5.0".into()),
+            hooks: all_reporting(),
             sessions: 0,
             injected_tokens: 0,
             unreadable_streams: 0,
@@ -536,6 +625,70 @@ mod tests {
                 symbols: 0,
                 origin: None,
                 generation: 0,
+            },
+            staging_total: 0,
+            staging_by_reason: Vec::new(),
+            exhaust_bytes: 4096,
+        };
+        let text = flat_text(&header_lines(&never));
+        assert!(text.contains("NEVER SCANNED"), "{text}");
+        assert!(!text.contains("0 blocks"), "an unbuilt catalog must not print counts: {text}");
+
+        // A scanned but genuinely empty tree keeps its zeros: that one IS a
+        // measurement.
+        let empty = Stats {
+            index: IndexView::Local {
+                docs_by_ring: Vec::new(),
+                blocks: 0,
+                code_files: 0,
+                symbols: 0,
+                origin: None,
+                generation: 2,
+            },
+            ..never
+        };
+        let text = flat_text(&header_lines(&empty));
+        assert!(text.contains("0 blocks"), "{text}");
+        assert!(!text.contains("NEVER SCANNED"), "{text}");
+    }
+
+    #[test]
+    fn zero_staging_with_no_exhaust_on_disk_is_unobserved() {
+        let base = Stats {
+            daemon_version: Some("0.5.0".into()),
+            hooks: all_reporting(),
+            sessions: 0,
+            injected_tokens: 0,
+            unreadable_streams: 0,
+            index: local_index(),
+            staging_total: 0,
+            staging_by_reason: Vec::new(),
+            exhaust_bytes: 0,
+        };
+        let text = flat_text(&header_lines(&base));
+        assert!(text.contains("UNOBSERVED"), "no capture stream means no examined turns: {text}");
+
+        let captured = Stats { exhaust_bytes: 8192, ..base };
+        let text = flat_text(&header_lines(&captured));
+        assert!(text.contains("staging: 0 candidates (measured)"), "{text}");
+        assert!(!text.contains("UNOBSERVED"), "{text}");
+    }
+
+    #[test]
+    fn header_shows_staging_counts_and_exhaust_footprint() {
+        let s = Stats {
+            daemon_version: Some("0.5.0".into()),
+            hooks: all_reporting(),
+            sessions: 0,
+            injected_tokens: 0,
+            unreadable_streams: 0,
+            index: IndexView::Local {
+                docs_by_ring: Vec::new(),
+                blocks: 0,
+                code_files: 0,
+                symbols: 0,
+                origin: None,
+                generation: 2,
             },
             staging_total: 6,
             staging_by_reason: vec![

@@ -333,6 +333,18 @@ fn selfcheck() -> anyhow::Result<()> {
             println!("warn  ledger stream unreadable: {note}");
         }
     }
+    // The derived catalog is a measurement too: an installation that has
+    // never scanned answers every recall from nothing, and one lagging the
+    // tree answers from a version of it that no longer exists.
+    if let Some(cfg) = &cfg {
+        let (severity, line) =
+            index_liveness_line(cfg, &state, Some(&paths::native_projects_root()));
+        match severity {
+            heartbeat::Severity::Healthy => println!("ok    {line}"),
+            _ => println!("warn  {line}"),
+        }
+    }
+
     if let Some(note) = migrate::legacy_note(&state) {
         println!("warn  {note}");
     }
@@ -387,12 +399,28 @@ fn selfcheck() -> anyhow::Result<()> {
         }
     }
 
-    let degraded = heartbeat::degraded();
-    if degraded.is_empty() {
-        println!("ok    no degraded hooks");
-    } else {
-        for (name, h) in &degraded {
-            println!("warn  hook {name} failing ({} consecutive)", h.consecutive_failures);
+    // "No degraded hooks" was the answer whether the hooks were fine or had
+    // never run at all — the one check meant to prove the installation works
+    // could not tell a clean result from a dead one.
+    let liveness = heartbeat::liveness();
+    match liveness.severity() {
+        heartbeat::Severity::Healthy => println!("ok    {}", liveness.summary()),
+        heartbeat::Severity::Unobserved => {
+            println!("warn  {}", liveness.summary());
+            println!("        a hook that has never fired reports nothing to fail on; start a session, then re-run");
+        }
+        // Still a warning, not a hard failure: a repeatedly failing hook is
+        // loud but recoverable, and selfcheck's nonzero exit is reserved for
+        // an installation that cannot work at all.
+        heartbeat::Severity::Failing => println!("warn  {}", liveness.summary()),
+    }
+    for h in liveness.degraded() {
+        if let heartbeat::HookState::Failing { consecutive, last_error, .. } = &h.state {
+            println!(
+                "warn  hook {} failing ({consecutive} consecutive; last: {})",
+                h.name,
+                last_error.as_deref().unwrap_or("no message recorded")
+            );
         }
     }
 
@@ -961,13 +989,54 @@ fn audit_cmd(json: bool) -> anyhow::Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let ledger = ledger::load_from(&paths::logs_dir(&cfg.brain_root));
-    let report = audit::build(&audit::AuditPaths::defaults(), &ledger, cfg.budget_chars, now);
+    let report = audit::build(
+        &audit::AuditPaths::defaults(),
+        &ledger,
+        &heartbeat::liveness(),
+        cfg.budget_chars,
+        now,
+    );
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", audit::render(&report));
     }
     Ok(())
+}
+
+/// What this host can honestly say about its derived catalog.
+///
+/// A boolean staleness flag ages into meaninglessness: an index a minute
+/// behind the tree and one nine days behind print the same word, and the
+/// catalog carries no build timestamp to recover the difference from. The
+/// heartbeat records when the disagreement started, so the age here is
+/// measured rather than guessed.
+fn index_liveness_line(
+    cfg: &config::Config,
+    state: &std::path::Path,
+    native: Option<&std::path::Path>,
+) -> (heartbeat::Severity, String) {
+    if let Some(cs) = &cfg.client.serving {
+        // Opening a local index here would build the second, silently stale
+        // truth a none-tier host exists to avoid. Whether that host answers
+        // is the client-mode check's business, not this line's.
+        return (
+            heartbeat::Severity::Healthy,
+            format!("index: served by {} — this host holds no local catalog", cs.addr),
+        );
+    }
+    let conn = match index::open(state) {
+        Ok(c) => c,
+        Err(e) => return (heartbeat::Severity::Failing, format!("index: unavailable ({e})")),
+    };
+    let tree = index::tree_fingerprint(&cfg.brain_root, native, &cfg.rings());
+    let verdict =
+        heartbeat::observe_index_in(state, index::stored_fingerprint(&conn).as_deref(), &tree);
+    let line = match verdict {
+        heartbeat::IndexLiveness::NeverScanned => verdict.describe(),
+        _ => format!("{} (generation {})", verdict.describe(), index::generation(&conn)),
+    };
+    (verdict.severity(), line)
 }
 
 fn status() -> anyhow::Result<()> {
@@ -995,13 +1064,23 @@ fn status() -> anyhow::Result<()> {
         .flat_map(|s| s.by_source.values())
         .map(|t| t.tokens_estimated)
         .sum();
-    println!(
-        "ledger: {sessions} session(s) from {} host(s){} in {}",
-        hosts.len(),
-        if hosts.is_empty() { String::new() } else { format!(" ({})", hosts.join(", ")) },
-        logs.display()
-    );
-    println!("  estimated: ~{injected} tokens injected by cfetch (chars/3.5 heuristic)");
+    // A ledger nobody has written to is not a ledger of zero cost. Printing
+    // "0 session(s), ~0 tokens" for it would answer a question that was never
+    // asked of the disk.
+    if sessions == 0 && hosts.is_empty() {
+        println!(
+            "ledger: NEVER WRITTEN in {} — no host has booked an injection here, so there is nothing to count (unmeasured, not zero)",
+            logs.display()
+        );
+    } else {
+        println!(
+            "ledger: {sessions} session(s) from {} host(s){} in {}",
+            hosts.len(),
+            if hosts.is_empty() { String::new() } else { format!(" ({})", hosts.join(", ")) },
+            logs.display()
+        );
+        println!("  estimated: ~{injected} tokens injected by cfetch (chars/3.5 heuristic)");
+    }
     // Measured truth from transcripts, side by side with the estimate — and
     // clearly labeled absent when the transcript could not be parsed.
     let mut measured = ledger::MeasuredUsage::default();
@@ -1060,8 +1139,15 @@ fn status() -> anyhow::Result<()> {
             ring56.staged_total,
             ex.staging_dir.display()
         );
+    } else if ring56.bytes == 0 {
+        // Staging is fed by the ring-6 capture traps. With no exhaust stream
+        // anywhere in the tree, no turn has ever been examined, so an empty
+        // queue says nothing about whether anything was worth flagging.
+        println!(
+            "staging: 0 ring-5 candidates — UNOBSERVED: no ring-6 exhaust has ever been written, so no turn has been examined"
+        );
     } else {
-        println!("staging: no ring-5 candidates awaiting distillation");
+        println!("staging: no ring-5 candidates awaiting distillation (measured)");
     }
     println!(
         "exhaust: {} of ring-6 stream in {}",
@@ -1091,6 +1177,7 @@ fn status() -> anyhow::Result<()> {
         }
     }
     let state = paths::state_dir();
+    println!("{}", index_liveness_line(&cfg, &state, Some(&paths::native_projects_root())).1);
     // The identity is what a peer grants a slice TO, so an operator needs to
     // be able to read it off the machine it belongs to.
     match net::endpoint_id(&state) {
@@ -1588,5 +1675,66 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unbuilt_catalog_reports_absence_and_a_lagging_one_reports_its_age() {
+        // The status line used to be a boolean at best: an index nobody had
+        // built and one describing the tree exactly both printed counts, and
+        // a stale one never said for how long.
+        let dir = tempfile::tempdir().unwrap();
+        let brain = dir.path().join("brain");
+        std::fs::create_dir_all(&brain).unwrap();
+        std::fs::write(brain.join("note.md"), "# note\n\nbody\n").unwrap();
+        let state = dir.path().join("state");
+        let cfg = config::Config { brain_root: brain.clone(), ..config::Config::default() };
+
+        let (severity, line) = index_liveness_line(&cfg, &state, None);
+        assert_eq!(severity, heartbeat::Severity::Unobserved);
+        assert!(line.contains("NEVER SCANNED"), "{line}");
+        assert!(
+            !line.contains("generation"),
+            "an unbuilt catalog has no generation to quote: {line}"
+        );
+
+        {
+            let mut conn = index::open(&state).unwrap();
+            index::scan(&mut conn, &brain, None, &cfg.rings()).unwrap();
+        }
+        let (severity, line) = index_liveness_line(&cfg, &state, None);
+        assert_eq!(severity, heartbeat::Severity::Healthy);
+        assert!(line.contains("index: current"), "{line}");
+        assert!(line.contains("generation 1"), "{line}");
+
+        // Change the tree and the same call must report the lag, with an age.
+        std::fs::write(brain.join("second.md"), "# second\n\nmore\n").unwrap();
+        let (_, line) = index_liveness_line(&cfg, &state, None);
+        assert!(line.contains("stale for"), "{line}");
+        // And the onset is now on record, which is the only way the age can
+        // later grow past the warning threshold.
+        assert!(heartbeat::load_from(&state).index.unwrap().stale_since.is_some());
+    }
+
+    #[test]
+    fn a_none_tier_host_reports_its_serving_host_instead_of_a_local_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let mut cfg =
+            config::Config { brain_root: dir.path().join("brain"), ..config::Config::default() };
+        cfg.client.serving = Some(config::ClientServingConfig {
+            addr: "198.51.100.7:9737".to_string(),
+            token_file: dir.path().join("absent-token"),
+        });
+        let (_, line) = index_liveness_line(&cfg, &state, None);
+        assert!(line.contains("198.51.100.7:9737"), "{line}");
+        assert!(
+            !state.join("index.db").exists(),
+            "a none-tier host must not create a second, silently stale catalog"
+        );
     }
 }

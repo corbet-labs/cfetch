@@ -1236,16 +1236,18 @@ pub fn status() -> anyhow::Result<()> {
         }
         None => println!("daemon: not running ({})", ipc::describe()),
     }
-    let degraded = heartbeat::degraded();
-    if degraded.is_empty() {
-        println!("hooks: healthy");
-    } else {
-        for (name, h) in degraded {
+    // "healthy" used to mean "nothing has failed", which is also what a host
+    // where no hook has ever run reports. The liveness picture compares the
+    // registered set against what actually reported, so silence reads as
+    // silence.
+    let liveness = heartbeat::liveness();
+    println!("{}", liveness.summary());
+    for h in liveness.degraded() {
+        if let heartbeat::HookState::Failing { consecutive, last_error, .. } = &h.state {
             println!(
-                "hooks: {} failing ({} consecutive; last: {})",
-                name,
-                h.consecutive_failures,
-                h.last_error.unwrap_or_default()
+                "hooks: {} failing ({consecutive} consecutive; last: {})",
+                h.name,
+                last_error.as_deref().unwrap_or_default()
             );
         }
     }

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::paths;
+use crate::{heartbeat, paths};
 
 /// Ledger sessions older than this are outside the audit window.
 pub const WINDOW_DAYS: u64 = 14;
@@ -131,6 +131,11 @@ pub struct AuditReport {
     pub measured_sessions: usize,
     pub measured_api_calls: u64,
     pub recurring: Option<RecurringCost>,
+    /// Registered hooks that have never reported. The reason an empty
+    /// injection table may mean "nobody looked" rather than "nothing was
+    /// injected" — a bill of zero is only credible while the meter runs.
+    pub hooks_unobserved: Vec<String>,
+    pub hooks_registered: usize,
     /// Explicit measurement gaps — what this audit could NOT see.
     pub gaps: Vec<String>,
 }
@@ -228,11 +233,14 @@ struct SourceAgg {
 
 /// Builds the report. The `ledger` is the DERIVED fleet view folded from the
 /// tree's ledger streams (see [`crate::ledger::read`]) — the audit prices what
-/// it is handed and never reaches for a store of its own. `now` is a parameter
-/// so window math is testable.
+/// it is handed and never reaches for a store of its own. `hooks` is the
+/// liveness picture of the machinery that fills that ledger: without it an
+/// audit cannot tell a session that cost nothing from a session nothing
+/// watched. `now` is a parameter so window math is testable.
 pub fn build(
     paths: &AuditPaths,
     ledger: &crate::ledger::Ledger,
+    hooks: &heartbeat::Liveness,
     budget_chars: usize,
     now: u64,
 ) -> AuditReport {
@@ -317,6 +325,18 @@ pub fn build(
             "no measured usage booked in the last {WINDOW_DAYS} days — every token figure here is a chars/3.5 estimate"
         ));
     }
+    // The hooks are the meter. One that has never fired books nothing, and an
+    // unbooked injection is priced here at exactly what an absent one is:
+    // nothing. Name the blind spot before anyone reads the bill as a total.
+    let hooks_unobserved: Vec<String> =
+        hooks.unobserved().into_iter().map(str::to_string).collect();
+    if !hooks_unobserved.is_empty() {
+        gaps.push(format!(
+            "{} registered hook(s) have never reported on this host ({}) — whatever they would have booked is missing from every figure above, and reads here as zero",
+            hooks_unobserved.len(),
+            hooks_unobserved.join(", ")
+        ));
+    }
 
     AuditReport {
         window_days: WINDOW_DAYS,
@@ -328,6 +348,8 @@ pub fn build(
         measured_sessions,
         measured_api_calls,
         recurring,
+        hooks_unobserved,
+        hooks_registered: hooks.registered_count(),
         gaps,
     }
 }
@@ -392,7 +414,23 @@ pub fn render(r: &AuditReport) -> String {
 
     let _ = writeln!(w, "\ninjections by source (ledger, last {} days):", r.window_days);
     if r.sources.is_empty() {
-        let _ = writeln!(w, "  no injections booked in the window");
+        // An empty table is a claim about cost, and it is only true while the
+        // hooks that would fill it are alive.
+        if r.hooks_unobserved.is_empty() {
+            let _ = writeln!(
+                w,
+                "  no injections booked in the window — all {} registered hook(s) are reporting, so this is a measured zero",
+                r.hooks_registered
+            );
+        } else {
+            let _ = writeln!(
+                w,
+                "  no injections booked in the window — UNOBSERVED, not zero: {} of {} registered hook(s) have never reported ({})",
+                r.hooks_unobserved.len(),
+                r.hooks_registered,
+                r.hooks_unobserved.join(", ")
+            );
+        }
     }
     for s in &r.sources {
         let _ = writeln!(
@@ -497,6 +535,29 @@ mod tests {
 
     const NOW: u64 = 100_000_000;
 
+    /// Every registered hook reporting — the only state in which an empty
+    /// ledger is a statement about cost rather than about visibility.
+    fn all_reporting() -> heartbeat::Liveness {
+        liveness_missing(&[])
+    }
+
+    fn liveness_missing(silent: &[&str]) -> heartbeat::Liveness {
+        heartbeat::Liveness {
+            hooks: heartbeat::REGISTERED_HOOKS
+                .iter()
+                .map(|name| heartbeat::HookLiveness {
+                    name: (*name).to_string(),
+                    registered: true,
+                    state: if silent.contains(name) {
+                        heartbeat::HookState::Unobserved
+                    } else {
+                        heartbeat::HookState::Healthy { last_ok: 1 }
+                    },
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn cost_weight_matches_the_dossier_formula() {
         assert_eq!(cost_weight(100, 0, 50), 5000, "call-0 bytes are re-read ~total_calls times");
@@ -510,7 +571,7 @@ mod tests {
     fn fabricated_home_prices_claude_md_imports_and_mcp() {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
-        let r = build(&p, &Ledger::default(), 6000, NOW);
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
 
         let md = r.claude_md.as_ref().expect("CLAUDE.md exists in the fabricated home");
         assert_eq!(md.lines, 5);
@@ -547,9 +608,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
         std::fs::write(&p.claude_md, "x\n".repeat(CLAUDE_MD_WARN_LINES + 1)).unwrap();
-        let r = build(&p, &Ledger::default(), 6000, NOW);
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
         assert!(r.claude_md.unwrap().over_line_warning);
-        let r = build(&p, &Ledger::default(), 6000, NOW);
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
         assert!(render(&r).contains("WARN"), "the line warning must reach the rendered report");
     }
 
@@ -558,12 +619,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
         std::fs::remove_file(&p.claude_md).unwrap();
-        let r = build(&p, &Ledger::default(), 6000, NOW);
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
         assert!(r.claude_md.is_none());
         assert!(render(&r).contains("not found"), "absence is a line, never silence");
         // Absent MCP files are labeled too.
         std::fs::remove_file(&p.mcp_json).unwrap();
-        let r = build(&p, &Ledger::default(), 6000, NOW);
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
         assert!(!r.mcp[1].present);
         assert!(render(&r).contains("not present"));
     }
@@ -581,7 +642,7 @@ mod tests {
             "s2".into(),
             session(NOW - 200, &[("read-advisory", 2, 400, 115)], MeasuredUsage::default()),
         );
-        let r = build(&p, &l, 6000, NOW);
+        let r = build(&p, &l, &all_reporting(), 6000, NOW);
         let digest = r.sources.iter().find(|s| s.source == "resident-digest").unwrap();
         assert!(digest.over_budget_warning, "13000 chars > 2x 6000 budget");
         assert_eq!(digest.max_session_chars, 13_000);
@@ -607,7 +668,7 @@ mod tests {
             "fresh".into(),
             session(NOW - 3600, &[("read-advisory", 1, 50, 15)], MeasuredUsage::default()),
         );
-        let r = build(&p, &l, 6000, NOW);
+        let r = build(&p, &l, &all_reporting(), 6000, NOW);
         assert_eq!(r.sources.len(), 1, "only the in-window session's sources appear");
         assert_eq!(r.sources[0].source, "read-advisory");
         assert_eq!(r.measured_api_calls, 0, "out-of-window measured usage is excluded too");
@@ -618,7 +679,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = fab(dir.path());
         // Empty transcripts root, empty ledger: BOTH gaps must be named.
-        let r = build(&p, &Ledger::default(), 6000, NOW);
+        let r = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
         assert!(r.gaps.iter().any(|g| g.contains("no supported transcripts found")), "gaps: {:?}", r.gaps);
         assert!(r.gaps.iter().any(|g| g.contains("no measured usage")), "gaps: {:?}", r.gaps);
         let text = render(&r);
@@ -638,9 +699,36 @@ mod tests {
                 MeasuredUsage { api_calls: 4, input_tokens: 10, ..Default::default() },
             ),
         );
-        let r = build(&p, &l, 6000, NOW);
+        let r = build(&p, &l, &all_reporting(), 6000, NOW);
         assert!(r.gaps.is_empty(), "gaps must close when data exists: {:?}", r.gaps);
         assert!(render(&r).contains("none"));
+    }
+
+    #[test]
+    fn an_empty_bill_is_only_a_zero_while_the_hooks_report() {
+        // The defect: an empty injection table read as "cfetch costs you
+        // nothing" whether the hooks were booking honestly or had never run.
+        let dir = tempfile::tempdir().unwrap();
+        let p = fab(dir.path());
+
+        let blind = build(&p, &Ledger::default(), &liveness_missing(&["stop", "post-tool"]), 6000, NOW);
+        assert_eq!(blind.hooks_unobserved, vec!["post-tool".to_string(), "stop".to_string()]);
+        assert_eq!(blind.hooks_registered, heartbeat::REGISTERED_HOOKS.len());
+        assert!(
+            blind.gaps.iter().any(|g| g.contains("never reported on this host")),
+            "gaps: {:?}",
+            blind.gaps
+        );
+        let text = render(&blind);
+        assert!(text.contains("UNOBSERVED, not zero"), "{text}");
+        assert!(text.contains("post-tool, stop"), "name the silent meters: {text}");
+
+        // Same empty ledger, every hook alive: now the zero is a measurement.
+        let measured = build(&p, &Ledger::default(), &all_reporting(), 6000, NOW);
+        assert!(measured.hooks_unobserved.is_empty());
+        let text = render(&measured);
+        assert!(text.contains("this is a measured zero"), "{text}");
+        assert!(!text.contains("UNOBSERVED"), "{text}");
     }
 
     #[test]
@@ -664,7 +752,7 @@ mod tests {
                 MeasuredUsage { api_calls: 20, input_tokens: 5, ..Default::default() },
             ),
         );
-        let r = build(&p, &l, 6000, NOW);
+        let r = build(&p, &l, &all_reporting(), 6000, NOW);
         let rec = r.recurring.as_ref().expect("digest bookings + measured calls => recurring cost");
         assert_eq!(rec.digest_tokens_estimated, 900, "mean digest tokens per session");
         assert_eq!(rec.api_calls_per_session, 30, "mean api calls per measured session");
@@ -677,7 +765,7 @@ mod tests {
             "s1".into(),
             session(NOW - 100, &[("resident-digest", 1, 2800, 800)], MeasuredUsage::default()),
         );
-        let r = build(&p, &l, 6000, NOW);
+        let r = build(&p, &l, &all_reporting(), 6000, NOW);
         assert!(r.recurring.is_none());
         assert!(render(&r).contains("unavailable"));
     }
