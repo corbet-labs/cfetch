@@ -1825,6 +1825,16 @@ mod tests {
         ] {
             assert_eq!(read_invocation(&event(unsafe_command)), None, "{unsafe_command}");
         }
+
+        let windows = HookEvent {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(json!({"command": r"cat C:\Users\agent\brain\topic.md"})),
+            ..Default::default()
+        };
+        assert_eq!(
+            read_invocation(&windows),
+            Some((r"C:\Users\agent\brain\topic.md".to_string(), false))
+        );
     }
 
     #[test]
