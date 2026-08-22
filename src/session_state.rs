@@ -7,7 +7,9 @@
 //! - mtime gates every warning — a changed file is a legitimate re-read;
 //! - writes clear the read record — post-edit content is new content;
 //! - at most one advisory per file per session;
-//! - compaction disarms warnings — the model lost the earlier read;
+//! - compaction disarms warnings — the model lost the earlier read, and
+//!   [`SessionState::written`] is what the hook layer hands back in their
+//!   place, so this file outlives the conversation on purpose;
 //! - subagents are never warned (enforced by the hook layer: they run in
 //!   fresh context where the "earlier content" does not exist);
 //! - only a start that begins a NEW conversation clears the file — see

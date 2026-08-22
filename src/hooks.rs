@@ -54,6 +54,10 @@ impl LedgerSink {
 const LARGE_FILE_BYTES: u64 = 16 * 1024;
 /// At most this many slice hints per advisory — an index dump is not a hint.
 const MAX_SLICE_HINTS: usize = 5;
+/// At most this many modified paths are named in the post-compaction recap.
+/// The recap only earns its tokens while it stays cheaper than re-deriving the
+/// same facts, so a session that touched a hundred files gets a count instead.
+const COMPACT_RECAP_MAX_FILES: usize = 12;
 
 /// Dispatches a hook event by name. Never returns an error to the harness.
 pub fn run(event_name: &str) {
@@ -112,7 +116,8 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     // Before anything is injected: a session start that begins a new
     // conversation must not leave the previous one's read history and spent
     // reminder caps standing for the rest of this session.
-    let start = session_start_state(&paths::state_dir(), event);
+    let state_dir = paths::state_dir();
+    let start = session_start_state(&state_dir, event);
 
     let mut emit = Emit::new("SessionStart");
 
@@ -148,6 +153,16 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
         }
     }
 
+    // After the digest, never before it: rings 0-1 outrank anything a single
+    // session did. Its length is kept so the ledger can book it as itself —
+    // a block this size hidden inside the digest's line would make the
+    // digest look like it grew.
+    let recap = compact_recap_for(&state_dir, event, start);
+    let recap_chars = recap.as_ref().map_or(0, String::len);
+    if let Some(recap) = recap {
+        emit.add_context(recap);
+    }
+
     if let Err(e) = &cfg {
         emit.add_context(format!(
             "[cfetch degraded: config unusable ({e}) — memory injection disabled; run `cfetch selfcheck`]"
@@ -163,7 +178,9 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     }
 
     let emitted = emit.finish();
-    LedgerSink::of(cfg.as_ref().ok()).book(event.session(), "resident-digest", emitted);
+    let sink = LedgerSink::of(cfg.as_ref().ok());
+    sink.book(event.session(), "compact-recap", recap_chars);
+    sink.book(event.session(), "resident-digest", emitted.saturating_sub(recap_chars));
     // The config failure still counts as a hook failure for the heartbeat.
     cfg.map(|_| ())
 }
@@ -873,17 +890,88 @@ fn stop_measure(sink: &LedgerSink, event: &HookEvent) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Paths in the recap are shown relative to the session's directory when they
+/// live under it: the same absolute prefix repeated on every line is context
+/// the model already holds.
+fn relative_to_cwd(path: &str, cwd: Option<&str>) -> String {
+    cwd.map(Path::new)
+        .and_then(|cwd| Path::new(path).strip_prefix(cwd).ok())
+        .map_or_else(|| path.to_string(), |rel| rel.display().to_string())
+}
+
+/// What this session changed, for a conversation that has just lost its memory
+/// of changing it.
+///
+/// Compaction is the one start where the repeat-read advisory is deliberately
+/// switched OFF (`SessionState::compacted`) — the model no longer holds the
+/// earlier reads, so warning it about them would be nonsense. That leaves the
+/// summarized conversation with nothing standing between it and re-doing work
+/// it already did, exactly when it is least able to notice. The written set is
+/// the hook layer's own record, so this can be stated as fact rather than left
+/// to the summary's recollection of it.
+///
+/// No snapshot is taken at PreCompact, because there is nothing to snapshot:
+/// the session file already outlives the conversation (the harness keeps one
+/// id across compaction, and `StartKind::Compact` deliberately does not reset),
+/// so a copy would only be a staler second source for the same set.
+///
+/// Writes only, never reads: a repeated read costs tokens, a forgotten edit
+/// costs correctness. Shell writes are COUNTED and not named, the same way
+/// `record_shell_write` books them — a half-parsed redirect target asserted
+/// here as a modified file would be worse than the bare tally.
+fn compact_recap(st: &session_state::SessionState, cwd: Option<&str>) -> Option<String> {
+    if st.written.is_empty() && st.shell_writes == 0 {
+        return None;
+    }
+    let mut text = String::from(
+        "[cfetch: what this session changed before compaction — the hook record, not the summary's recollection]",
+    );
+    for path in st.written.iter().take(COMPACT_RECAP_MAX_FILES) {
+        text.push_str("\n- ");
+        text.push_str(&relative_to_cwd(path, cwd));
+    }
+    let over_cap = st.written.len().saturating_sub(COMPACT_RECAP_MAX_FILES);
+    if over_cap > 0 {
+        text.push_str(&format!("\n- (+{over_cap} more)"));
+    }
+    if st.shell_writes > 0 {
+        let shell = st.shell_writes;
+        text.push_str(&format!("\n- plus {shell} shell write(s), targets not recorded"));
+    }
+    Some(text)
+}
+
+/// The recap, but only for the start that is owed one. Every other reason gets
+/// nothing and pays no read: a start that begins a new conversation has just
+/// had its records cleared, and a resume got the turns themselves back.
+fn compact_recap_for(
+    state_dir: &Path,
+    event: &HookEvent,
+    start: session_state::StartKind,
+) -> Option<String> {
+    if start != session_state::StartKind::Compact {
+        return None;
+    }
+    compact_recap(&session_state::load(state_dir, event.session()), event.cwd.as_deref())
+}
+
 /// PreCompact: after compaction the model no longer remembers its earlier
 /// reads, so repeat-read warnings are disarmed for the rest of the session.
 fn precompact(event: &HookEvent) -> anyhow::Result<()> {
     if event.is_subagent() {
         return Ok(());
     }
-    let state_dir = paths::state_dir();
-    let _ = session_state::update(&state_dir, event.session(), |st| {
+    precompact_state(&paths::state_dir(), event);
+    Ok(())
+}
+
+/// The state half of PreCompact, split out the way SessionStart's is, so the
+/// two ends of the compaction contract — disarm here, hand the record back at
+/// the next start — can be exercised together without the real state dir.
+fn precompact_state(state_dir: &Path, event: &HookEvent) {
+    let _ = session_state::update(state_dir, event.session(), |st| {
         st.compacted = true;
     });
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1101,6 +1189,90 @@ mod tests {
             assert!(st.compacted, "{reason} must not re-arm what compaction disarmed");
             assert!(!st.queue_reminder("status", "nudge"), "{reason} keeps spent caps spent");
         }
+    }
+
+    #[test]
+    fn compaction_hands_back_the_record_the_advisory_stops_covering() {
+        let state = tempfile::tempdir().unwrap();
+        let event = HookEvent {
+            session_id: Some("s-recap".into()),
+            reason: Some("compact".into()),
+            cwd: Some("/work/repo".into()),
+            ..Default::default()
+        };
+        let _ = session_state::update(state.path(), "s-recap", |st| {
+            st.record_write("/work/repo/src/a.rs");
+            st.record_write("/elsewhere/vendored.rs");
+            st.record_shell_write();
+        });
+
+        precompact_state(state.path(), &event);
+        let start = session_start_state(state.path(), &event);
+
+        // The premise: from here on the repeat-read advisory says nothing, so
+        // the file list is the only thing left that can.
+        let mut st = session_state::load(state.path(), "s-recap");
+        st.record_read("/work/repo/src/a.rs", 100);
+        assert!(!st.should_warn_repeat_read("/work/repo/src/a.rs", 100), "compaction disarms it");
+
+        let recap = compact_recap_for(state.path(), &event, start).expect("compaction is recapped");
+        assert!(recap.contains("src/a.rs"), "the written file must be named: {recap}");
+        assert!(!recap.contains("/work/repo/src/a.rs"), "the shared prefix is not repeated");
+        assert!(recap.contains("/elsewhere/vendored.rs"), "outside cwd stays absolute: {recap}");
+        assert!(recap.contains("1 shell write"), "unnamed writes are counted: {recap}");
+    }
+
+    #[test]
+    fn no_other_start_reason_receives_the_recap() {
+        let state = tempfile::tempdir().unwrap();
+        for reason in ["startup", "clear", "resume", "rewound"] {
+            let event = HookEvent {
+                session_id: Some(format!("s-{reason}")),
+                reason: Some(reason.into()),
+                cwd: Some("/work/repo".into()),
+                ..Default::default()
+            };
+            let _ = session_state::update(state.path(), event.session(), |st| {
+                st.record_write("/work/repo/src/a.rs");
+            });
+            let start = session_start_state(state.path(), &event);
+            assert!(
+                compact_recap_for(state.path(), &event, start).is_none(),
+                "{reason} did not summarize the conversation away, so nothing is owed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recap_names_a_bounded_prefix_and_counts_the_rest() {
+        let mut st = session_state::SessionState::default();
+        for i in 0..COMPACT_RECAP_MAX_FILES + 3 {
+            st.record_write(&format!("/repo/f{i:02}.rs"));
+        }
+        let recap = compact_recap(&st, Some("/repo")).unwrap();
+        assert_eq!(
+            recap.lines().count(),
+            COMPACT_RECAP_MAX_FILES + 2,
+            "one header, the capped names, one overflow line: {recap}"
+        );
+        assert!(recap.contains("f00.rs") && recap.contains("f11.rs"));
+        assert!(!recap.contains("f12.rs"), "past the cap the count carries the rest");
+        assert!(recap.contains("(+3 more)"), "{recap}");
+    }
+
+    #[test]
+    fn a_session_that_changed_nothing_is_recapped_with_silence() {
+        assert!(compact_recap(&session_state::SessionState::default(), Some("/repo")).is_none());
+    }
+
+    #[test]
+    fn a_shell_only_session_is_recapped_as_a_count_it_can_stand_behind() {
+        let mut st = session_state::SessionState::default();
+        st.record_shell_write();
+        st.record_shell_write();
+        let recap = compact_recap(&st, None).expect("unnamed activity is still activity");
+        assert!(recap.contains("2 shell write(s)"), "{recap}");
+        assert!(recap.contains("targets not recorded"), "the gap is stated, not papered over");
     }
 
     #[test]
