@@ -118,11 +118,20 @@ fn verified_injections_text(text: &str) -> Option<(u64, u64)> {
     let mut delivered = 0u64;
     for line in &lines {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if is_user_record(&v) || !has_cfetch_hook_record(&v) {
+        if is_user_record(&v) {
+            continue;
+        }
+        // The harness writes exactly ONE attachment per firing and encodes the
+        // outcome in its type, so a delivery record stands alone and never
+        // names the command that produced it. Both kinds are therefore a
+        // firing, and only one of them is also a delivery.
+        let named = has_cfetch_hook_record(&v);
+        let injected = has_cfetch_injection(&v);
+        if !named && !injected {
             continue;
         }
         fired += 1;
-        if has_nonempty_additional_context(&v) {
+        if injected || (named && has_nonempty_additional_context(&v)) {
             delivered += 1;
         }
     }
@@ -132,6 +141,39 @@ fn verified_injections_text(text: &str) -> Option<(u64, u64)> {
         return None;
     }
     Some((fired, delivered))
+}
+
+/// Every string cfetch injects begins with this. It is the ONLY link between a
+/// standalone `hook_additional_context` record and us: that record carries the
+/// content and the event name, never the command, and several tools can be
+/// registered on one event. Injection sites must keep the prefix.
+const INJECTION_SIGNATURE: &str = "[cfetch";
+
+/// A delivery record carrying OUR injection. Deliberately narrow: it matches
+/// the harness's structured content field, not a mention anywhere in a message.
+fn has_cfetch_injection(v: &serde_json::Value) -> bool {
+    fn ours(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::String(s) => s.trim_start().starts_with(INJECTION_SIGNATURE),
+            serde_json::Value::Array(a) => a.iter().any(ours),
+            _ => false,
+        }
+    }
+    match v {
+        serde_json::Value::Object(m) => {
+            if m.get("type").and_then(serde_json::Value::as_str) == Some("hook_additional_context")
+                && m.get("content").is_some_and(ours)
+            {
+                return true;
+            }
+            if m.get("hookAdditionalContext").is_some_and(ours) {
+                return true;
+            }
+            m.values().any(has_cfetch_injection)
+        }
+        serde_json::Value::Array(a) => a.iter().any(has_cfetch_injection),
+        _ => false,
+    }
 }
 
 fn is_user_record(v: &serde_json::Value) -> bool {
@@ -151,36 +193,100 @@ fn is_cfetch_hook_command(command: &str) -> bool {
         .is_some_and(|name| name == "cfetch" || name == "cfetch.exe")
 }
 
-/// Recognizes only harness hook fields, never a raw prose mention. Supported
-/// shapes are `hookCommand: <command>` and `hook: { command: <command> }`, at
-/// any nesting depth used by the harness.
+/// Recognizes only harness hook fields, never a raw prose mention or an
+/// agent's own shell command. The shapes below were captured from real Claude
+/// Code 2.1.233 transcripts; the two legacy spellings are kept because a
+/// harness that emits them must not read as unverifiable.
+///
+/// - `attachment: { type: "hook_success" | "hook_cancelled", command }` — the
+///   per-hook record. A cancelled hook FIRED; it simply delivered nothing,
+///   which is the distinction that makes a timing-out hook visible at all.
+/// - `hookInfos: [ { command } ]` — inside `stop_hook_summary`, which is where
+///   a Stop hook is actually recorded.
+/// - `hookCommand`, `hook: { command }` — tolerated spellings.
+///
+/// The container is always part of the match. A Bash tool_use record also
+/// carries a bare `command`, so keying on that alone would count an agent
+/// typing `cfetch` by hand as a hook firing.
 fn has_cfetch_hook_record(v: &serde_json::Value) -> bool {
     match v {
-        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
-            (key == "hookCommand"
-                && value.as_str().is_some_and(is_cfetch_hook_command))
-                || (key == "hook"
-                    && value
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(is_cfetch_hook_command))
-                || has_cfetch_hook_record(value)
-        }),
+        serde_json::Value::Object(map) => {
+            let is_hook_attachment = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t == "hook_success" || t == "hook_cancelled");
+            if is_hook_attachment
+                && map
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_cfetch_hook_command)
+            {
+                return true;
+            }
+            if map
+                .get("hookInfos")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|infos| {
+                    infos.iter().any(|i| {
+                        i.get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(is_cfetch_hook_command)
+                    })
+                })
+            {
+                return true;
+            }
+            map.iter().any(|(key, value)| {
+                (key == "hookCommand" && value.as_str().is_some_and(is_cfetch_hook_command))
+                    || (key == "hook"
+                        && value
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(is_cfetch_hook_command))
+                    || has_cfetch_hook_record(value)
+            })
+        }
         serde_json::Value::Array(values) => values.iter().any(has_cfetch_hook_record),
         _ => false,
     }
 }
 
-/// Recursive search for a non-empty `additionalContext` (either harness
-/// spelling) anywhere in the record — the exact nesting has drifted across
-/// versions, the key name is the stable part.
+/// Did this record carry injected context INTO the conversation? Real shapes,
+/// captured from Claude Code 2.1.233:
+///
+/// - `attachment: { type: "hook_additional_context", content: [..] }` — the
+///   delivery record proper. `content` is an array of injected strings.
+/// - `hookAdditionalContext: [..]` on `stop_hook_summary` — empty array means
+///   the hooks ran and injected nothing.
+/// - `additionalContext` / `additional_context` as a plain string — the
+///   documented spelling, kept because the nesting has drifted across versions.
+///
+/// A `hook_cancelled` record matches none of these, which is the point: a hook
+/// that timed out is counted as fired and NOT delivered, so the gap between the
+/// two numbers is exactly the breakage the health check exists to surface.
 fn has_nonempty_additional_context(v: &serde_json::Value) -> bool {
+    fn nonempty(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::String(s) => !s.trim().is_empty(),
+            serde_json::Value::Array(a) => a.iter().any(nonempty),
+            _ => false,
+        }
+    }
     match v {
-        serde_json::Value::Object(m) => m.iter().any(|(k, val)| {
-            ((k == "additionalContext" || k == "additional_context")
-                && val.as_str().is_some_and(|s| !s.trim().is_empty()))
-                || has_nonempty_additional_context(val)
-        }),
+        serde_json::Value::Object(m) => {
+            if m.get("type").and_then(serde_json::Value::as_str) == Some("hook_additional_context")
+                && m.get("content").is_some_and(nonempty)
+            {
+                return true;
+            }
+            m.iter().any(|(k, val)| {
+                ((k == "additionalContext"
+                    || k == "additional_context"
+                    || k == "hookAdditionalContext")
+                    && nonempty(val))
+                    || has_nonempty_additional_context(val)
+            })
+        }
         serde_json::Value::Array(a) => a.iter().any(has_nonempty_additional_context),
         _ => false,
     }
@@ -404,6 +510,39 @@ mod tests {
         let structured_but_user = r#"{"type":"user","message":{"role":"user","hookCommand":"'/usr/bin/cfetch' hook stop"}}"#;
         assert_eq!(verified_injections_text(user), None);
         assert_eq!(verified_injections_text(structured_but_user), None);
+    }
+
+    /// The shapes below are transcribed from real Claude Code 2.1.233
+    /// transcripts. The previous tests used an invented `hookCommand` envelope,
+    /// so they passed while the matcher recognized nothing the harness actually
+    /// writes — the tests validated the bug.
+    #[test]
+    fn real_harness_shapes_are_recognized() {
+        let success = r#"{"type":"attachment","attachment":{"type":"hook_success","hookName":"PostToolUse:Bash","hookEvent":"PostToolUse","content":"","stdout":"","stderr":"","exitCode":0,"command":"'/usr/bin/cfetch' hook post-tool","durationMs":5}}"#;
+        assert_eq!(verified_injections_text(success), Some((1, 0)));
+
+        let delivered = r#"{"type":"attachment","attachment":{"type":"hook_additional_context","content":["[cfetch: 11 staged candidate(s) await distillation]"],"hookName":"UserPromptSubmit","hookEvent":"UserPromptSubmit"}}"#;
+        let fired = r#"{"type":"attachment","attachment":{"type":"hook_success","hookName":"UserPromptSubmit","hookEvent":"UserPromptSubmit","command":"'/usr/bin/cfetch' hook user-prompt","durationMs":7}}"#;
+        assert_eq!(verified_injections_text(&format!("{fired}\n{delivered}")), Some((2, 1)));
+
+        let stop_summary = r#"{"type":"system","subtype":"stop_hook_summary","hookCount":2,"hookInfos":[{"command":"bash ~/.claude/hooks/notify.sh","durationMs":17},{"command":"'/usr/bin/cfetch' hook stop","durationMs":21}],"hookErrors":[],"hookAdditionalContext":[]}"#;
+        assert_eq!(verified_injections_text(stop_summary), Some((1, 0)));
+    }
+
+    /// A hook the harness cancelled FIRED and delivered nothing. Counting it as
+    /// a non-firing would hide exactly the breakage this measurement exists for:
+    /// the gap between fired and delivered is the health signal.
+    #[test]
+    fn a_timed_out_hook_counts_as_fired_but_not_delivered() {
+        let cancelled = r#"{"type":"attachment","attachment":{"type":"hook_cancelled","hookName":"Stop","hookEvent":"Stop","command":"'/usr/bin/cfetch' hook stop","durationMs":10020,"timedOut":true,"timeoutMs":10000}}"#;
+        assert_eq!(verified_injections_text(cancelled), Some((1, 0)));
+    }
+
+    /// A foreign hook in the same summary must not be attributed to us.
+    #[test]
+    fn another_tools_hook_in_the_stop_summary_is_not_ours() {
+        let only_foreign = r#"{"type":"system","subtype":"stop_hook_summary","hookInfos":[{"command":"bash ~/.claude/hooks/notify.sh","durationMs":17}],"hookAdditionalContext":["something"]}"#;
+        assert_eq!(verified_injections_text(only_foreign), None);
     }
 
     #[test]
