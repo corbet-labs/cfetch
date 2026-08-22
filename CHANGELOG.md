@@ -7,6 +7,10 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## 0.9.4
 
+- **Ring-aware resident budgets.** Resident digest space is water-filled by
+  ring-derived or explicit entry weight. Short entries return unused space to
+  longer ones, ring-0 invariants outrank less load-bearing material, and the
+  configured digest budget remains a hard cap.
 - **Truthful Arch package identity.** The AUR build and check phases now use
   the same catalog variant, so `cargo test` cannot overwrite the packaged
   binary with an unidentified developer build. A CI contract ties both Arch
