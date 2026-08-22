@@ -1,3 +1,33 @@
+// Rust's standard print macros panic when a downstream pipe closes normally
+// (for example `cfetch status | head`). Keep test-harness capture unchanged,
+// but make every production CLI write treat BrokenPipe as a clean early exit.
+#[cfg(not(test))]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::output::stdout(format_args!($($arg)*))
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! println {
+    () => {
+        $crate::output::stdout_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::stdout_line(format_args!($($arg)*))
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! eprintln {
+    () => {
+        $crate::output::stderr_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::stderr_line(format_args!($($arg)*))
+    };
+}
+
 mod audit;
 mod code;
 mod condense;
@@ -24,6 +54,8 @@ mod markers;
 mod mcp;
 mod migrate;
 mod net;
+#[cfg(not(test))]
+mod output;
 mod paths;
 mod pipeline;
 mod rerank;
