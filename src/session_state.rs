@@ -66,6 +66,14 @@ pub struct SessionState {
     /// Post-tool events seen this session, for cadence re-injection.
     #[serde(default)]
     pub tool_events: u64,
+    /// Writes performed by a shell command rather than a write tool. COUNTED,
+    /// never named: a redirect's target is only reliably knowable for the
+    /// simplest commands, and a half-parsed path asserted as fact is worse
+    /// than an honest tally. Activity truth flows up, paths do not — without
+    /// this, a session that edits only through the shell looks idle and every
+    /// activity-gated reminder stays silent.
+    #[serde(default)]
+    pub shell_writes: u64,
 }
 
 impl SessionState {
@@ -79,6 +87,11 @@ impl SessionState {
     pub fn record_write(&mut self, path: &str) {
         self.reads.remove(path);
         self.written.insert(path.to_string());
+    }
+
+    /// One shell-performed write. The path is deliberately not taken.
+    pub fn record_shell_write(&mut self) {
+        self.shell_writes = self.shell_writes.saturating_add(1);
     }
 
     /// Decides — and books — a repeat-read advisory for `path`. Returns true

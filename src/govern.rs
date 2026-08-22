@@ -27,20 +27,49 @@ const STATUS_NUDGE_MIN_WRITES: usize = 3;
 /// reminder to update the task STATUS. Returns whether anything was queued.
 pub fn queue_status_nudge(st: &mut SessionState, brain_root: &Path) -> bool {
     let mut brain_writes = 0usize;
+    let mut out_of_tree = 0usize;
     let mut touched_status = false;
     for p in &st.written {
         let path = Path::new(p);
-        let Ok(rel) = path.strip_prefix(brain_root) else { continue };
-        brain_writes += 1;
-        touched_status |= is_active_status(rel);
+        match path.strip_prefix(brain_root) {
+            Ok(rel) => {
+                brain_writes += 1;
+                touched_status |= is_active_status(rel);
+            }
+            // Counted, not named: a write outside the tree is still evidence
+            // the session did work, and dropping it was what made a session
+            // that edits elsewhere look idle.
+            Err(_) => out_of_tree += 1,
+        }
     }
-    if brain_writes < STATUS_NUDGE_MIN_WRITES || touched_status {
+    if touched_status {
         return false;
     }
+    let shell = usize::try_from(st.shell_writes).unwrap_or(usize::MAX);
+    let unnamed = out_of_tree.saturating_add(shell);
+    // Unnamed activity is a FALLBACK, never a booster. A session with named
+    // brain writes is judged on those alone — a write to /elsewhere must not
+    // push a two-file session over a three-file threshold. But a session that
+    // edits only through the shell names nothing at all, and arming on named
+    // writes alone left that case permanently silent.
+    let armed = if brain_writes > 0 {
+        brain_writes >= STATUS_NUDGE_MIN_WRITES
+    } else {
+        unnamed >= STATUS_NUDGE_MIN_WRITES
+    };
+    if !armed {
+        return false;
+    }
+    let seen = if brain_writes > 0 {
+        format!("{brain_writes} brain file(s) written this session")
+    } else {
+        // Nothing nameable was seen, so the count is all this may claim.
+        format!("{unnamed} write(s) this session, none of them nameable")
+    };
     st.queue_reminder(
         "status",
         &format!(
-            "[cfetch: {brain_writes} brain file(s) written this session, but no todo/active/*/STATUS.md among them — update the task STATUS]"
+            "[cfetch: {seen}, but no todo/active/*/STATUS.md among them — update the task STATUS]"
         ),
     )
 }
@@ -241,6 +270,42 @@ mod tests {
         }
         ex.record_stop("s2").unwrap();
         ex.staging_dir
+    }
+
+    /// A session that edits only through the shell names nothing, so the
+    /// nudge used to stay silent no matter how much work it did.
+    #[test]
+    fn shell_only_sessions_still_arm_the_nudge() {
+        let brain = Path::new("/b/agents");
+        let mut st = SessionState::default();
+        for _ in 0..3 {
+            st.record_shell_write();
+        }
+        assert!(queue_status_nudge(&mut st, brain));
+        let texts = st.drain_reminders();
+        assert!(texts[0].contains("none of them nameable"), "{}", texts[0]);
+        // The STATUS pattern is a hint, not a path — what must never appear is
+        // anything the session actually touched.
+        assert!(!texts[0].contains("/b/agents"), "a real path leaked: {}", texts[0]);
+        assert!(!texts[0].contains("/tmp"), "a real path leaked: {}", texts[0]);
+    }
+
+    /// Unnamed activity is a fallback, not a booster: it must never top up a
+    /// named brain count that is short of the threshold.
+    #[test]
+    fn unnamed_writes_do_not_inflate_a_named_brain_count() {
+        let brain = Path::new("/b/agents");
+        let mut st = SessionState::default();
+        st.record_write("/b/agents/knowledge/a.md");
+        st.record_write("/b/agents/knowledge/b.md");
+        for _ in 0..9 {
+            st.record_shell_write();
+        }
+        st.record_write("/elsewhere/c.md");
+        assert!(
+            !queue_status_nudge(&mut st, brain),
+            "two brain writes stay below the threshold however much unnamed activity there was"
+        );
     }
 
     #[test]
