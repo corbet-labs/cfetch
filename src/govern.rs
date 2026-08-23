@@ -690,7 +690,7 @@ fn unquote(s: &str) -> Vec<String> {
 
 fn push_expanded(out: &mut Vec<String>, span: &str) {
     for alt in expand_alternation(span) {
-        if alt.len() >= MIN_PATTERN && !out.iter().any(|p| *p == alt) {
+        if alt.len() >= MIN_PATTERN && !out.contains(&alt) {
             out.push(alt);
         }
     }
