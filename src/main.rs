@@ -58,6 +58,10 @@ mod maintenance;
 mod maintenance_inbox;
 mod mcp;
 mod migrate;
+#[cfg(any(feature = "inference-ort", test))]
+mod model_artifact;
+#[cfg(feature = "inference-ort")]
+mod local_embed;
 mod net;
 #[cfg(not(test))]
 mod output;
@@ -2364,6 +2368,8 @@ fn main() {
         Command::Hardware { json } => {
             let found = hardware::detect();
             let release = variant::recommended_release();
+            let local_inference = cfg!(feature = "inference-ort");
+            let packaged_backend = if local_inference { "ort" } else { "endpoint" };
             if json {
                 println!(
                     "{}",
@@ -2373,15 +2379,14 @@ fn main() {
                         "os": variant::os_token(),
                         "arch": variant::arch_token(),
                         "x86_64_level": hardware::x86_64_level(),
-                        "local_inference": false,
-                        "backend": "endpoint",
+                        "local_inference": local_inference,
+                        "backend": packaged_backend,
                         "devices": found.iter().map(|f| serde_json::json!({
                             "device": f.device.describe(),
                             "token": f.device.token(),
                             "class": format!("{:?}", f.device.class()).to_lowercase(),
                             "evidence": f.evidence,
-                            "usable": f.usable().is_ok(),
-                            "unusable_reason": f.usable().err().map(|e| e.reason()),
+                            "evidence_level": "discovery",
                             "caveat": f.caveat(),
                         })).collect::<Vec<_>>(),
                     })
@@ -2389,17 +2394,14 @@ fn main() {
             } else {
                 println!("detected, best first (policy: NPU > GPU > CPU):");
                 for f in &found {
-                    let mark = if f.usable().is_ok() { " " } else { "!" };
-                    println!("{mark} {:<26} {}", f.device.describe(), f.evidence);
-                    if let Err(why) = f.usable() {
-                        println!("    UNUSABLE: {}", why.reason());
-                    }
+                    println!("  {:<26} {}", f.device.describe(), f.evidence);
                     if let Some(note) = f.caveat() {
                         println!("    note: {note}");
                     }
                 }
-                println!("\nlocal inference:     not included");
-                println!("embeddings backend:   configured endpoint");
+                println!("  discovery is not execution or producer certification");
+                println!("\nlocal inference:     {}", if local_inference { "included" } else { "not included" });
+                println!("embeddings backend:   {packaged_backend}");
                 println!("build variant:        {}", variant::build_id().unwrap_or("unidentified source build"));
                 match release {
                     Some(v) => println!("available release:    {}", v.id),
@@ -2443,7 +2445,8 @@ fn main() {
                 );
                 println!("query prefix: {:?}", profile.query_prefix);
                 println!("document prefix: {:?}", profile.document_prefix);
-                println!("pooling: {}; normalization: {}", profile.pooling, profile.normalization);
+                println!("pooling: {}; graph optimization: {}", profile.pooling, profile.graph_optimization);
+                println!("normalization: {}", profile.normalization);
             }
         }
         Command::Identity { json } => {

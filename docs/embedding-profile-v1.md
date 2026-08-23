@@ -23,9 +23,14 @@ Run `cfetch embedding-profile` (or `--json`) to read the executable contract.
 | Canonical artifact | `cfetch-embeddinggemma-300m-xint8-v1` |
 | Tokenizer | tokenizer at the same pinned source revision |
 | Context | at most 2,048 tokens |
+| Sequence shapes | fixed next-power-of-two buckets: 32, 64, 128, 256, 512, 1,024, 2,048 |
+| Inference batch | exactly one input per model execution |
+| ORT CPU intra-op threads | exactly one |
+| ORT execution mode | sequential |
 | Query input | `task: search result \| query: {content}` |
 | Document input | `title: none \| text: {content}` |
 | Pooling | attention-mask-weighted mean, prompt included |
+| Runtime graph optimization | ONNX Runtime Level 3 (FastEmbed default) |
 | Output normalization | L2, then canonical INT8 vector encoding |
 | Dimensions | full 768; no Matryoshka truncation |
 | Interchange vector | exactly 768 signed INT8 components / 768 bytes |
@@ -78,11 +83,22 @@ feature named “INT8” is not sufficient. Until a backend has that proof, it m
 consume shared vectors and request remote inference, but it is not a v1
 producer.
 
+Batch composition is not an input to the vector. After tokenization and
+truncation, each text is padded to the smallest v1 sequence bucket that holds
+it and executed individually. Batch-longest padding is forbidden because ORT integer fusion was observed to change
+canonical bytes when an unrelated longer text changed the tensor shape.
+Network-major-1 producers also execute one input at a time. This deliberately
+trades bulk throughput for a batch dimension that cannot vary across hosts;
+future majors may change that transaction only with new vectors and a full
+re-embedding. ORT uses sequential execution and CPU reductions use one
+intra-op thread so the host's core count cannot select another accumulation
+order.
+
 The endpoint path enforces the same admission boundary. A successful OpenAI-
 shaped response must also return `cfetch_profile`, `cfetch_model_revision`,
-`cfetch_model_quantization`, and `cfetch_model_artifact` fields equal to the
-executable manifest, plus the requested `model`. An unattested generic
-endpoint cannot publish v1 data.
+`cfetch_profile_manifest_sha256`, `cfetch_model_quantization`, and
+`cfetch_model_artifact` fields equal to the executable manifest, plus the
+requested `model`. An unattested generic endpoint cannot publish v1 data.
 
 ## Compatibility enforcement
 

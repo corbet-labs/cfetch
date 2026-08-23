@@ -16,11 +16,46 @@ include = [
   "/Cargo.toml",
   "/Cargo.lock",
   "/README.md",
+  "/docs/accelerator-certification.md",
   "/docs/ai-maintenance.md",
+  "/docs/embedding-profile-v1.md",
   "/LICENSE.md",
   "/THIRD-PARTY-LICENSES.txt",
   "/release/variants.json",
 ]
+
+[features]
+default = []
+# FastEmbed owns tokenization and the common embedding API; ORT owns graph
+# execution. Accelerator packages enable exactly the provider they ship.
+inference-ort = [
+  "dep:fastembed",
+  "dep:ort",
+  "dep:tokenizers",
+  "ort/load-dynamic",
+]
+# Convenience build for Cargo/GitHub archives. Nix and vendor-runtime packages
+# use `inference-ort` with their own immutable ORT library instead.
+inference-ort-bundled = [
+  "inference-ort",
+  "ort/copy-dylibs",
+  "ort/download-binaries",
+  "ort/tls-rustls",
+]
+inference-coreml = ["inference-ort", "ort/coreml"]
+inference-directml = ["inference-ort", "ort/directml"]
+inference-openvino = ["inference-ort", "ort/openvino"]
+inference-qnn = ["inference-ort", "ort/qnn"]
+inference-vitis = ["inference-ort", "ort/vitis"]
+inference-cuda = ["inference-ort", "ort/cuda"]
+inference-tensorrt = ["inference-ort", "ort/tensorrt"]
+# MIGraphX is the maintained ONNX Runtime path for AMD GPUs.  It receives the
+# already-quantized v1 Q/DQ graph; cfetch deliberately does not enable
+# MIGraphX's calibration-table quantizer, which would create incompatible
+# scales.
+inference-migraphx = ["inference-ort", "ort/migraphx"]
+inference-rocm = ["inference-ort", "ort/rocm"]
+inference-webgpu = ["inference-ort", "ort/webgpu"]
 
 [dependencies]
 # Exact-pinned harness configuration adapter. cfetch decides which surfaces
@@ -33,10 +68,20 @@ agent-session = "=0.5.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
+# No built-in model catalog or network fetch: cfetch supplies and verifies the
+# exact user-defined v1 artifact bytes.
+# Pinned to the public FastEmbed session-controls change proposed upstream in
+# https://github.com/Anush008/fastembed-rs/pull/280. This preserves FastEmbed's
+# pipeline while allowing cfetch to prohibit CPU fallback and specialize QNN
+# sessions to the profile's fixed shapes.
+fastembed = { version = "=6.0.0", git = "https://github.com/corbet-labs/fastembed-rs", rev = "ba8f8361ed81ff718edbadd26e23eecf202ecd1d", default-features = false, optional = true }
 ignore = "0.4"
 iroh = "1.0.3"
 notify = "8"
+# Kept exact with FastEmbed's own pin so provider features unify onto one ORT.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["api-24", "ndarray", "std"], optional = true }
 ratatui = "0.30.2"
+tokenizers = { version = "=0.22.2", default-features = false, optional = true }
 # Exact-pinned official MCP SDK. cfetch owns its tools; rmcp owns JSON-RPC,
 # protocol negotiation, capability discovery, schemas, and stdio framing.
 rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }

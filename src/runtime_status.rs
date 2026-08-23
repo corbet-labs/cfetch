@@ -269,13 +269,20 @@ fn apply_config(status: &mut RuntimeStatusV1, cfg: &Config) {
             ServiceState::Ready
         };
     }
-    let configured = if cfg.embeddings.enabled || cfg.rerank.enabled {
+    let embedding_local = cfg.embeddings.enabled && !cfg.embeddings.model_dir.trim().is_empty();
+    let configured = if embedding_local {
+        InferenceMode::Local
+    } else if cfg.embeddings.enabled || cfg.rerank.enabled {
         InferenceMode::Endpoint
     } else {
         InferenceMode::Disabled
     };
-    let embedding_route = (cfg.embeddings.enabled && !cfg.embeddings.endpoint.is_empty())
-        .then(|| endpoint_route(&cfg.embeddings.endpoint));
+    let embedding_route = if embedding_local {
+        Some(InferenceRoute::Local)
+    } else {
+        (cfg.embeddings.enabled && !cfg.embeddings.endpoint.is_empty())
+            .then(|| endpoint_route(&cfg.embeddings.endpoint))
+    };
     let rerank_route = (cfg.rerank.enabled && !cfg.rerank.endpoint.is_empty())
         .then(|| endpoint_route(&cfg.rerank.endpoint));
     let configured_route = match (embedding_route, rerank_route) {
@@ -305,7 +312,8 @@ fn apply_config(status: &mut RuntimeStatusV1, cfg: &Config) {
     }
     remove_failure(status, "inference_misconfigured");
     if (cfg.embeddings.enabled
-        && (cfg.embeddings.endpoint.is_empty() || cfg.embeddings.model.is_empty()))
+        && ((cfg.embeddings.endpoint.is_empty() && cfg.embeddings.model_dir.is_empty())
+            || cfg.embeddings.model.is_empty()))
         || (cfg.rerank.enabled && (cfg.rerank.endpoint.is_empty() || cfg.rerank.model.is_empty()))
     {
         upsert_failure(
@@ -1181,6 +1189,19 @@ mod tests {
                 .iter()
                 .any(|failure| failure.code == "inference_misconfigured")
         );
+    }
+
+    #[test]
+    fn model_directory_is_local_inference_intent() {
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = true;
+        cfg.embeddings.model_dir = "/public/model-bundle".into();
+        let mut status = RuntimeStatusV1::default();
+        apply_config(&mut status, &cfg);
+        normalize(&mut status);
+        assert_eq!(status.inference.configured, InferenceMode::Local);
+        assert_eq!(status.inference.configured_route, Some(InferenceRoute::Local));
+        assert!(!status.failures.iter().any(|failure| failure.code == "inference_misconfigured"));
     }
 
     #[test]

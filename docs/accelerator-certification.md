@@ -10,7 +10,9 @@ There are three distinct levels of evidence:
 
 1. **Discovery** proves that an operating system exposes a device and runtime.
 2. **Execution** proves that the released model actually runs on that device,
-   without silently falling back to CPU.
+   without silently falling back to CPU and with the learned W8A8 regions
+   placed on INT8-capable kernels rather than dequantized high-precision
+   substitutes.
 3. **Conformance** proves that every known-answer input produces the exact
    released 768-byte vector and records the artifact, runtime, driver, device,
    operating system, provider placement, and timing.
@@ -31,6 +33,14 @@ is exposed to the virtual machine. A runner whose CPU architecture is Apple
 silicon does not, by itself, prove that Metal or the Neural Engine is exposed.
 The final Core ML package must still be run and its compute plan inspected.
 
+The first public probe ([run 32645084687](https://github.com/corbet-labs/cfetch/actions/runs/32645084687))
+established that boundary on both hosted labels. `macos-15` ran in an arm64 M1
+virtual machine and `macos-15-intel` ran on x86-64; both exposed CPU plus an
+`Apple Paravirtual device` through Core ML and Metal. Neither exposed a Neural
+Engine. These standard public runners can therefore exercise the Metal/
+paravirtual-GPU path without consuming Actions minutes, but ANE certification
+requires a physical Apple-silicon tester.
+
 ## Physical tester matrix
 
 The release matrix requires physical-device reports for accelerator classes
@@ -42,7 +52,7 @@ artifact digest and runtime/driver combination they name.
 | CPU | x86-64 legacy, v3, v4, and arm64 reference runs |
 | Apple | Apple silicon generations supported by the package; ANE and Metal placement separately |
 | Intel | OpenVINO CPU, GPU, and NPU with per-node placement/fallback evidence |
-| AMD GPU | ROCm where supported and the portable fallback on an older consumer GPU |
+| AMD GPU | MIGraphX on Linux and DirectML on Windows; ROCm only for legacy runtime comparison |
 | AMD NPU | Physical XDNA2 execution through Ryzen AI; conversion on a CPU is not evidence |
 | NVIDIA | CUDA and TensorRT on both the oldest supported and current architecture |
 | Qualcomm | Windows arm64 QNN HTP execution on a Snapdragon X-class device |
@@ -65,6 +75,7 @@ other deployment context. The required fields are:
   one public;
 - operating system, architecture, driver version, and fixed sequence bucket;
 - provider placement/coverage evidence;
+- kernel/input precision evidence for every learned W8A8 region;
 - every known-answer vector digest and exact pass/fail result;
 - cold-load, warm-load, latency, throughput, and peak-memory measurements.
 

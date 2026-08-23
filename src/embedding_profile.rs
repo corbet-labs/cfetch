@@ -22,11 +22,34 @@ pub const MODEL_REVISION: &str = "7b5b24595322ab0ea4d08827066860a6df8cb0aa";
 /// native container, but not another numerical scheme.
 pub const MODEL_QUANTIZATION: &str = "xint8-w8a8-symmetric-power-of-two-scales";
 pub const MODEL_ARTIFACT_ID: &str = "cfetch-embeddinggemma-300m-xint8-v1";
+/// Filled only after the calibrated graph passes semantic quality and byte
+/// conformance. An ID without immutable bytes is not a released artifact.
+pub const MODEL_ARTIFACT_SHA256: Option<&str> = None;
+pub const TOKENIZER_JSON_SHA256: &str =
+    "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e";
+pub const TOKENIZER_CONFIG_SHA256: &str =
+    "9076840490613047bc9115963ee96b7702018b0d26ba644240bf856efda93118";
+pub const MODEL_CONFIG_SHA256: &str =
+    "8f863f76e2d9c710cc833dc92efa898c9adfd41031c786507cc6b0e49c2e3e68";
+pub const SPECIAL_TOKENS_MAP_SHA256: &str =
+    "2f7b0adf4fb469770bb1490e3e35df87b1dc578246c5e7e6fc76ecf33213a397";
 pub const DIMENSIONS: usize = 768;
 pub const MAX_TOKENS: usize = 2048;
+/// Fixed token shapes make one input independent of the other texts sharing a
+/// batch and give accelerator compilers a bounded set of graphs to cache.
+pub const SEQUENCE_BUCKETS: &[usize] = &[32, 64, 128, 256, 512, 1024, 2048];
+/// v1 chooses interchangeability over bulk throughput: every published vector
+/// is inferred with batch dimension one, so an unrelated neighbor cannot
+/// select a different accelerator kernel or alter rounding.
+pub const INFERENCE_BATCH_SIZE: usize = 1;
+/// CPU reductions are single-threaded so core count cannot alter accumulation
+/// order. Accelerator providers may schedule their own certified kernels.
+pub const ORT_INTRA_THREADS: usize = 1;
+pub const ORT_EXECUTION_MODE: &str = "sequential";
 pub const QUERY_PREFIX: &str = "task: search result | query: ";
 pub const DOCUMENT_PREFIX: &str = "title: none | text: ";
 pub const POOLING: &str = "attention-mask-weighted-mean-include-prompt";
+pub const GRAPH_OPTIMIZATION: &str = "ort-level3";
 pub const NORMALIZATION: &str = "l2-then-i8-maxabs-rne";
 pub const VECTOR_ENCODING: &str = "signed-int8x768";
 
@@ -39,11 +62,21 @@ pub struct Manifest {
     pub model_revision: &'static str,
     pub model_quantization: &'static str,
     pub model_artifact_id: &'static str,
+    pub model_artifact_sha256: Option<&'static str>,
     pub tokenizer_revision: &'static str,
+    pub tokenizer_json_sha256: &'static str,
+    pub tokenizer_config_sha256: &'static str,
+    pub model_config_sha256: &'static str,
+    pub special_tokens_map_sha256: &'static str,
     pub max_tokens: usize,
+    pub sequence_buckets: &'static [usize],
+    pub inference_batch_size: usize,
+    pub ort_intra_threads: usize,
+    pub ort_execution_mode: &'static str,
     pub query_prefix: &'static str,
     pub document_prefix: &'static str,
     pub pooling: &'static str,
+    pub graph_optimization: &'static str,
     pub normalization: &'static str,
     pub dimensions: usize,
     pub vector_encoding: &'static str,
@@ -58,16 +91,47 @@ pub const fn manifest() -> Manifest {
         model_revision: MODEL_REVISION,
         model_quantization: MODEL_QUANTIZATION,
         model_artifact_id: MODEL_ARTIFACT_ID,
+        model_artifact_sha256: MODEL_ARTIFACT_SHA256,
         tokenizer_revision: MODEL_REVISION,
+        tokenizer_json_sha256: TOKENIZER_JSON_SHA256,
+        tokenizer_config_sha256: TOKENIZER_CONFIG_SHA256,
+        model_config_sha256: MODEL_CONFIG_SHA256,
+        special_tokens_map_sha256: SPECIAL_TOKENS_MAP_SHA256,
         max_tokens: MAX_TOKENS,
+        sequence_buckets: SEQUENCE_BUCKETS,
+        inference_batch_size: INFERENCE_BATCH_SIZE,
+        ort_intra_threads: ORT_INTRA_THREADS,
+        ort_execution_mode: ORT_EXECUTION_MODE,
         query_prefix: QUERY_PREFIX,
         document_prefix: DOCUMENT_PREFIX,
         pooling: POOLING,
+        graph_optimization: GRAPH_OPTIMIZATION,
         normalization: NORMALIZATION,
         dimensions: DIMENSIONS,
         vector_encoding: VECTOR_ENCODING,
         vector_bytes: DIMENSIONS,
     }
+}
+
+/// The sole sequence shape admitted for a tokenized input. Inputs longer than
+/// v1's context are truncated to the final bucket by the tokenizer.
+#[cfg_attr(not(any(feature = "inference-ort", test)), allow(dead_code))]
+pub fn sequence_bucket(token_count: usize) -> usize {
+    SEQUENCE_BUCKETS
+        .iter()
+        .copied()
+        .find(|bucket| token_count <= *bucket)
+        .unwrap_or(MAX_TOKENS)
+}
+
+/// Digest of the complete executable profile, used by stores, endpoint
+/// certificates, and accelerator conformance reports. The struct's field
+/// order makes the JSON input stable.
+pub fn manifest_sha256() -> String {
+    use sha2::Digest as _;
+
+    let bytes = serde_json::to_vec(&manifest()).expect("embedding manifest serializes");
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 /// Refuse configuration drift instead of creating plausible but incompatible
@@ -113,11 +177,32 @@ mod tests {
         assert_eq!(m.dimensions, 768);
         assert_eq!(m.vector_bytes, 768);
         assert_eq!(m.vector_encoding, "signed-int8x768");
+        assert_eq!(m.sequence_buckets, &[32, 64, 128, 256, 512, 1024, 2048]);
+        assert_eq!(m.inference_batch_size, 1);
+        assert_eq!(m.ort_intra_threads, 1);
+        assert_eq!(m.ort_execution_mode, "sequential");
         assert!(m.model.contains("embeddinggemma-300m"));
+        assert!(m.model_artifact_sha256.is_none());
         assert_eq!(
             m.model_quantization,
             "xint8-w8a8-symmetric-power-of-two-scales"
         );
+    }
+
+    #[test]
+    fn sequence_shape_depends_only_on_that_inputs_token_count() {
+        assert_eq!(sequence_bucket(0), 32);
+        assert_eq!(sequence_bucket(32), 32);
+        assert_eq!(sequence_bucket(33), 64);
+        assert_eq!(sequence_bucket(2048), 2048);
+        assert_eq!(sequence_bucket(9999), 2048);
+    }
+
+    #[test]
+    fn profile_digest_is_stable_sha256() {
+        let digest = manifest_sha256();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]

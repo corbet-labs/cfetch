@@ -145,14 +145,22 @@ pub(crate) fn resolve_auth(api_key_env: &str, field: &str) -> anyhow::Result<Opt
     Ok(Some(format!("Bearer {}", key.trim())))
 }
 
+enum EmbedBackend {
+    Endpoint {
+        agent: ureq::Agent,
+        /// Full `…/embeddings` URL, endpoint trailing slashes normalized away.
+        url: String,
+        /// Ready `Bearer …` header value, resolved from `api_key_env` at
+        /// construction (a missing variable fails fast, not mid-batch).
+        auth: Option<String>,
+    },
+    #[cfg(feature = "inference-ort")]
+    Local(Box<crate::local_embed::LocalEmbedder>),
+}
+
 pub struct EmbedClient {
-    agent: ureq::Agent,
-    /// Full `…/embeddings` URL, endpoint trailing slashes normalized away.
-    url: String,
+    backend: EmbedBackend,
     model: String,
-    /// Ready `Bearer …` header value, resolved from `api_key_env` at
-    /// construction (a missing variable fails fast, not mid-batch).
-    auth: Option<String>,
     /// One interactive request's bound; the batch path scales it.
     base_timeout: std::time::Duration,
     /// Stored/queried vector width. Sent to the endpoint as `dimensions` and
@@ -170,8 +178,13 @@ impl std::fmt::Debug for EmbedClient {
     // Manual impl: ureq::Agent's Debug is not part of our contract, and the
     // interesting identity is (url, model) anyway.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backend = match &self.backend {
+            EmbedBackend::Endpoint { url, .. } => url.as_str(),
+            #[cfg(feature = "inference-ort")]
+            EmbedBackend::Local(local) => local.provider(),
+        };
         f.debug_struct("EmbedClient")
-            .field("url", &self.url)
+            .field("backend", &backend)
             .field("model", &self.model)
             .finish_non_exhaustive()
     }
@@ -183,24 +196,42 @@ impl EmbedClient {
     /// single clear line.
     pub fn new(cfg: &EmbeddingsConfig) -> anyhow::Result<EmbedClient> {
         anyhow::ensure!(cfg.enabled, "embeddings disabled (set embeddings.enabled=true in config)");
-        anyhow::ensure!(
-            !cfg.endpoint.is_empty() && !cfg.model.is_empty(),
-            "embeddings not configured (embeddings.endpoint and embeddings.model required)"
-        );
-        check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
-        let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
+        anyhow::ensure!(!cfg.model.is_empty(), "embeddings.model is required");
         let base_timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
-            .timeout_global(Some(base_timeout))
-            .http_status_as_error(false) // status checked explicitly below
-            .build()
-            .new_agent();
+        let backend = if cfg.model_dir.trim().is_empty() {
+            anyhow::ensure!(
+                !cfg.endpoint.is_empty(),
+                "embeddings not configured (embeddings.model_dir or embeddings.endpoint required)"
+            );
+            check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
+            let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
+                .timeout_global(Some(base_timeout))
+                .http_status_as_error(false) // status checked explicitly below
+                .build()
+                .new_agent();
+            EmbedBackend::Endpoint {
+                agent,
+                url: format!("{}/embeddings", cfg.endpoint.trim_end_matches('/')),
+                auth,
+            }
+        } else {
+            #[cfg(feature = "inference-ort")]
+            {
+                EmbedBackend::Local(Box::new(crate::local_embed::LocalEmbedder::load(
+                    std::path::Path::new(&cfg.model_dir),
+                    &cfg.execution_provider,
+                )?))
+            }
+            #[cfg(not(feature = "inference-ort"))]
+            {
+                anyhow::bail!("embeddings.model_dir requires a cfetch package built with local ORT inference")
+            }
+        };
         Ok(EmbedClient {
-            agent,
-            url: format!("{}/embeddings", cfg.endpoint.trim_end_matches('/')),
+            backend,
             model: cfg.model.clone(),
-            auth,
             base_timeout,
             dimensions: cfg.dimensions,
             query_prefix: cfg.query_prefix.clone(),
@@ -285,15 +316,33 @@ impl EmbedClient {
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let result = self.embed_request(texts, timeout);
-        crate::runtime_status::record_inference_attempt(
-            crate::runtime_status::InferenceMode::Endpoint,
-            crate::runtime_status::endpoint_route(&self.url),
-            "endpoint",
-            None,
-            result.is_ok(),
-        );
-        result
+        match &self.backend {
+            EmbedBackend::Endpoint { url, .. } => {
+                let result = self.embed_request(texts, timeout);
+                crate::runtime_status::record_inference_attempt(
+                    crate::runtime_status::InferenceMode::Endpoint,
+                    crate::runtime_status::endpoint_route(url),
+                    "endpoint",
+                    None,
+                    result.is_ok(),
+                );
+                result
+            }
+            #[cfg(feature = "inference-ort")]
+            EmbedBackend::Local(local) => {
+                let result = local
+                    .embed(texts)
+                    .and_then(|vectors| vectors.into_iter().map(|v| self.fit(v)).collect());
+                crate::runtime_status::record_inference_attempt(
+                    crate::runtime_status::InferenceMode::Local,
+                    crate::runtime_status::InferenceRoute::Local,
+                    local.provider(),
+                    Some(local.device_class()),
+                    result.is_ok(),
+                );
+                result
+            }
+        }
     }
 
     fn embed_request(
@@ -301,6 +350,13 @@ impl EmbedClient {
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let (agent, url, auth) = match &self.backend {
+            EmbedBackend::Endpoint { agent, url, auth } => (agent, url, auth),
+            #[cfg(feature = "inference-ort")]
+            EmbedBackend::Local(_) => {
+                anyhow::bail!("internal error: endpoint request dispatched to local embeddings")
+            }
+        };
         #[derive(serde::Deserialize)]
         struct Response {
             data: Vec<Row>,
@@ -308,6 +364,8 @@ impl EmbedClient {
             model: String,
             #[serde(default)]
             cfetch_profile: String,
+            #[serde(default)]
+            cfetch_profile_manifest_sha256: String,
             #[serde(default)]
             cfetch_model_revision: String,
             #[serde(default)]
@@ -326,24 +384,23 @@ impl EmbedClient {
             request["dimensions"] = serde_json::json!(self.dimensions);
         }
         let body = request.to_string();
-        let mut req = self
-            .agent
-            .post(&self.url)
+        let mut req = agent
+            .post(url)
             .config()
             .timeout_global(Some(timeout)) // per-request override of the agent bound
             .build()
             .header("content-type", "application/json");
-        if let Some(auth) = &self.auth {
+        if let Some(auth) = auth {
             req = req.header("authorization", auth);
         }
         let mut resp = req
             .send(body.as_bytes())
-            .with_context(|| format!("POST {}", self.url))?;
+            .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         let text = resp
             .body_mut()
             .read_to_string()
-            .with_context(|| format!("read response from {}", self.url))?;
+            .with_context(|| format!("read response from {url}"))?;
         anyhow::ensure!(
             status.is_success(),
             "embeddings endpoint returned {status}: {}",
@@ -353,6 +410,7 @@ impl EmbedClient {
             .with_context(|| format!("unparseable embeddings response: {}", snippet(&text)))?;
         anyhow::ensure!(
             parsed.cfetch_profile == crate::embedding_profile::PROFILE_ID
+                && parsed.cfetch_profile_manifest_sha256 == crate::embedding_profile::manifest_sha256()
                 && parsed.cfetch_model_revision == crate::embedding_profile::MODEL_REVISION
                 && parsed.cfetch_model_quantization
                     == crate::embedding_profile::MODEL_QUANTIZATION
@@ -372,17 +430,25 @@ impl EmbedClient {
             parsed.data.len(),
             texts.len()
         );
-        // Order by the response's `index` field where present — the spec does
-        // not promise array order, and a mis-aligned vector silently attaches
-        // the WRONG meaning to a block.
-        let mut rows: Vec<(usize, Vec<f32>)> = parsed
-            .data
+        // Every index is explicit, unique and in range. Merely sorting rows is
+        // insufficient: duplicates can otherwise attach one semantic meaning
+        // to two different blocks while still returning the expected count.
+        let mut ordered = vec![None; texts.len()];
+        for row in parsed.data {
+            let index = row.index.context("embeddings response row has no index")?;
+            anyhow::ensure!(
+                index < texts.len(),
+                "embeddings endpoint returned out-of-range index {index} for {} input(s)",
+                texts.len()
+            );
+            anyhow::ensure!(ordered[index].is_none(), "embeddings endpoint returned duplicate index {index}");
+            ordered[index] = Some(self.fit(row.embedding)?);
+        }
+        ordered
             .into_iter()
             .enumerate()
-            .map(|(pos, row)| (row.index.unwrap_or(pos), row.embedding))
-            .collect();
-        rows.sort_by_key(|(i, _)| *i);
-        rows.into_iter().map(|(_, v)| self.fit(v)).collect()
+            .map(|(index, row)| row.with_context(|| format!("embeddings endpoint omitted index {index}")))
+            .collect()
     }
 }
 
@@ -618,9 +684,10 @@ mod tests {
         http_response(
             200,
             &format!(
-                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
+                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
                 v["model"],
                 crate::embedding_profile::PROFILE_ID,
+                crate::embedding_profile::manifest_sha256(),
                 crate::embedding_profile::MODEL_REVISION,
                 crate::embedding_profile::MODEL_QUANTIZATION,
                 crate::embedding_profile::MODEL_ARTIFACT_ID,
@@ -640,6 +707,20 @@ mod tests {
         .unwrap()
     }
 
+    fn attested_rows(model: &str, rows: &str) -> String {
+        http_response(
+            200,
+            &format!(
+                r#"{{"object":"list","model":{model:?},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{rows}]}}"#,
+                crate::embedding_profile::PROFILE_ID,
+                crate::embedding_profile::manifest_sha256(),
+                crate::embedding_profile::MODEL_REVISION,
+                crate::embedding_profile::MODEL_QUANTIZATION,
+                crate::embedding_profile::MODEL_ARTIFACT_ID,
+            ),
+        )
+    }
+
     /// Response whose vectors are `width` long regardless of the requested
     /// `dimensions` — the endpoint that ignores the parameter.
     fn canned_width(body: &str, width: usize) -> String {
@@ -654,9 +735,10 @@ mod tests {
         http_response(
             200,
             &format!(
-                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
+                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
                 v["model"],
                 crate::embedding_profile::PROFILE_ID,
+                crate::embedding_profile::manifest_sha256(),
                 crate::embedding_profile::MODEL_REVISION,
                 crate::embedding_profile::MODEL_QUANTIZATION,
                 crate::embedding_profile::MODEL_ARTIFACT_ID,
@@ -875,6 +957,33 @@ mod tests {
         });
         let client = client_for(&url);
         assert!(client.embed_documents_batch(&["a", "b"]).is_err());
+    }
+
+    #[test]
+    fn duplicate_missing_and_out_of_range_indices_are_refused() {
+        let cases = [
+            (
+                r#"{"index":0,"embedding":[1.0,0.0]},{"index":0,"embedding":[0.0,1.0]}"#,
+                "duplicate index",
+            ),
+            (
+                r#"{"index":0,"embedding":[1.0,0.0]},{"index":2,"embedding":[0.0,1.0]}"#,
+                "out-of-range index",
+            ),
+            (
+                r#"{"index":0,"embedding":[1.0,0.0]},{"embedding":[0.0,1.0]}"#,
+                "has no index",
+            ),
+        ];
+        for (rows, expected) in cases {
+            let rows = rows.to_string();
+            let (url, _, _) = spawn_server(move |_, _| attested_rows("test-model", &rows));
+            let error = client_for(&url)
+                .embed_documents_batch(&["a", "b"])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error:?}");
+        }
     }
 
     #[test]

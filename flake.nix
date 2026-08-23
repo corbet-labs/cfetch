@@ -12,6 +12,7 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
+        "aarch64-darwin"
       ];
       forAllSystems =
         f:
@@ -23,27 +24,64 @@
             # free = false — but without this predicate every consumer of this
             # flake would need NIXPKGS_ALLOW_UNFREE=1 just to install cfetch
             # from cfetch's own flake. Scoped to exactly this package.
-            config.allowUnfreePredicate = pkg: nixpkgs.lib.getName pkg == "cfetch";
+            config.allowUnfreePredicate = pkg:
+              builtins.elem (nixpkgs.lib.getName pkg) [ "cfetch" "cfetch-local-cpu" ];
           })
         );
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     in
     {
-      packages = forAllSystems (pkgs: rec {
-        cfetch = pkgs.rustPlatform.buildRustPackage {
-          pname = "cfetch";
+      packages = forAllSystems (pkgs:
+        let
+        mkCfetch =
+          {
+            pname,
+            localInference ? false,
+          }:
+          pkgs.rustPlatform.buildRustPackage {
+          inherit pname;
           inherit version;
           src = self;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # Cargo pins FastEmbed to the exact public session-controls commit;
+            # Nix additionally requires a content hash before it will vendor a
+            # Git dependency inside the sandbox.
+            outputHashes = {
+              "fastembed-6.0.0" =
+                "sha256-uDLesOjegkXWUzjOlGFUdoAO2m/p85PGSl2zuC89eHM=";
+            };
+          };
+          buildFeatures = pkgs.lib.optionals localInference [ "inference-ort" ];
           CFETCH_VARIANT =
-            if pkgs.stdenv.hostPlatform.isAarch64 then
+            if localInference then
+              null
+            else if pkgs.stdenv.hostPlatform.isDarwin then
+              if pkgs.stdenv.hostPlatform.isAarch64 then
+                "mac-cfetch-remote-arm64"
+              else
+                "mac-cfetch-remote-x86_64"
+            else if pkgs.stdenv.hostPlatform.isAarch64 then
               "linux-cfetch-remote-arm64"
             else
               "linux-cfetch-remote-x86_64";
+          # One governance test creates and commits a temporary Git repository;
+          # Nix build sandboxes do not otherwise put `git` on PATH.
+          nativeBuildInputs = [ pkgs.git ]
+            ++ pkgs.lib.optionals localInference [ pkgs.makeWrapper ];
           postInstall = ''
             install -Dm644 LICENSE.md "$out/share/licenses/cfetch/LICENSE.md"
             install -Dm644 THIRD-PARTY-LICENSES.txt \
               "$out/share/licenses/cfetch/THIRD-PARTY-LICENSES.txt"
+          '' + pkgs.lib.optionalString localInference ''
+            wrapProgram "$out/bin/cfetch" \
+              --set-default ORT_DYLIB_PATH \
+              "${pkgs.onnxruntime}/lib/${
+                if pkgs.stdenv.hostPlatform.isDarwin then
+                  "libonnxruntime.dylib"
+                else
+                  "libonnxruntime.so"
+              }"
           '';
 
           meta = {
@@ -61,12 +99,20 @@
             mainProgram = "cfetch";
           };
         };
+        in
+        rec {
+        cfetch = mkCfetch { pname = "cfetch"; };
+        cfetch-local-cpu = mkCfetch {
+          pname = "cfetch-local-cpu";
+          localInference = true;
+        };
         default = cfetch;
       });
 
       checks = forAllSystems (pkgs: {
         # buildRustPackage already runs `cargo test` in checkPhase.
         cfetch = self.packages.${pkgs.stdenv.hostPlatform.system}.cfetch;
+        cfetch-local-cpu = self.packages.${pkgs.stdenv.hostPlatform.system}.cfetch-local-cpu;
       });
     };
 }

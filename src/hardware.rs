@@ -9,17 +9,10 @@
 //! inference off both is the point, and on a laptop it is the difference
 //! between a search that costs battery and one that does not.
 //!
-//! Two independent facts decide whether an accelerator is usable, and both
-//! must hold:
-//!
-//! 1. the DEVICE is present, and
-//! 2. this build can actually drive it — a binary compiled without the
-//!    vendor runtime cannot use a device just because it exists.
-//!
-//! Detection therefore reports evidence rather than a verdict: what was found
-//! and what proved it. An operator who disagrees with the choice can see why
-//! it was made, and a machine that reports nothing is telling us something
-//! real rather than failing silently.
+//! Detection reports evidence rather than a runtime or certification verdict:
+//! what was found and what proved it. Provider initialization, graph placement,
+//! INT8 kernel coverage, and byte-level conformance are separate gates. A
+//! device being present therefore never makes it a producer by itself.
 
 use std::path::Path;
 
@@ -103,22 +96,6 @@ pub struct Found {
     pub pci_device: Option<String>,
 }
 
-/// Why an accelerator that EXISTS still cannot be used.
-///
-/// Deliberately NOT an enum of causes. The two AMD NPU generations fail for
-/// genuinely different reasons — gen 1 cannot run the model class at all,
-/// XDNA2's toolchain hangs — but they cannot be told apart from PCI data we
-/// can rely on, and inventing a classification we cannot determine would be
-/// worse than one honest sentence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unusable(&'static str);
-
-impl Unusable {
-    pub fn reason(&self) -> &'static str {
-        self.0
-    }
-}
-
 /// Intel NPU generations whose NPU is SLOWER than the same chip's integrated
 /// GPU on an encoder — measured by Intel: 9.97 ms vs 6.75 ms on Meteor Lake,
 /// 9.26 ms vs 3.95 ms on Arrow Lake. NPU4 (Lunar Lake, 48 TOPS) is where it
@@ -131,26 +108,6 @@ const INTEL_NPU_BELOW_IGPU: &[(&str, &str)] = &[
 ];
 
 impl Found {
-    /// Whether this accelerator can actually run a transformer encoder, and
-    /// why not when it cannot. Evidence for each exclusion is in the PRD.
-    pub fn usable(&self) -> Result<(), Unusable> {
-        match self.device {
-            // AMD's own compatibility table grants Ryzen AI gen 1 `CNN INT8`
-            // and nothing else — NLP and BF16 are Strix-only. This is not
-            // slowness, the model class cannot run.
-            //
-            // XDNA2 ships an embeddinggemma artifact, but BERT-base hangs
-            // indefinitely at session creation during VitisAI compilation
-            // (open upstream since 2025-12). We cannot tell the two apart
-            // from PCI alone, and both answers are "do not dispatch here".
-            Device::AmdNpu => Err(Unusable(
-                "AMD NPU: gen 1 (Phoenix/Hawk Point) supports CNN INT8 only, and XDNA2 \
-                 transformer compilation hangs upstream — no encoder path today",
-            )),
-            _ => Ok(()),
-        }
-    }
-
     /// An advisory an operator should see, where the device works but will
     /// surprise someone reading a benchmark.
     pub fn caveat(&self) -> Option<String> {
@@ -475,16 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn a_device_that_cannot_run_the_model_class_is_marked_unusable() {
+    fn amd_npu_discovery_remains_evidence_not_a_certification_verdict() {
         let found = Found { device: Device::AmdNpu, evidence: "test".into(), pci_device: None };
-        assert!(found.usable().is_err(), "the NPU must be marked unusable");
-    }
-
-    #[test]
-    fn an_unusable_device_still_explains_itself() {
-        let f = Found { device: Device::AmdNpu, evidence: "test".into(), pci_device: None };
-        let why = f.usable().unwrap_err();
-        assert!(why.reason().contains("CNN INT8"), "the evidence is in the message: {}", why.reason());
+        assert_eq!(found.device, Device::AmdNpu);
+        assert_eq!(found.evidence, "test");
     }
 
     #[test]
@@ -498,7 +449,6 @@ mod tests {
             pci_device: Some("0x7d1d".into()),
         };
         let gpu = Found { device: Device::IntelGpu, evidence: "test".into(), pci_device: None };
-        assert!(npu.usable().is_ok());
         assert!(npu.caveat().unwrap().contains("Meteor Lake"));
         assert!(npu.device.class() > gpu.device.class());
     }

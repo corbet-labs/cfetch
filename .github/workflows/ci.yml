@@ -90,5 +90,10 @@ jobs:
           components: clippy
       - name: Test
         run: cargo test --locked
+      - name: Check every inference-provider feature
+        # Compile-time coverage is not accelerator certification, but it stops
+        # an Apple/Windows/Linux provider API from rotting between physical
+        # conformance runs. Standard runners in a public repo are free.
+        run: cargo check --all-features --locked
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
