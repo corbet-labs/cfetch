@@ -52,6 +52,7 @@ mod init;
 mod install;
 mod ipc;
 mod jsonl;
+mod knowledge_graph;
 mod ledger;
 mod lockfile;
 mod markers;
@@ -150,6 +151,17 @@ enum Command {
         /// Token budget the rendered map must fit
         #[arg(long, default_value_t = graph::DEFAULT_MAP_BUDGET_TOKENS)]
         budget_tokens: u64,
+    },
+    /// Inspect the Obsidian knowledge graph derived from curated Markdown links
+    Graph {
+        /// Center the view on a Markdown path or note name
+        #[arg(long)]
+        focus: Option<String>,
+        /// Maximum documents to return (1-200)
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
     Recall {
@@ -1053,6 +1065,91 @@ fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     let conn = index::open(&paths::state_dir())?;
     let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
     print_map(&m.into(), focus, None);
+    Ok(())
+}
+
+fn print_knowledge_graph(graph: &knowledge_graph::KnowledgeGraph) {
+    println!(
+        "knowledge graph: {} of {} document(s), {} curated link(s), {} unresolved reference(s), generation {}",
+        graph.nodes.len(),
+        graph.total_nodes,
+        graph.total_edges,
+        graph.unresolved_references,
+        graph.generation,
+    );
+    if let Some(requested) = &graph.requested_focus {
+        match &graph.resolved_focus {
+            Some(path) => println!("focus: {requested:?} → {path}"),
+            None => println!(
+                "focus: {requested:?} matched no document — showing the connected overview"
+            ),
+        }
+    }
+    if graph.nodes.is_empty() {
+        println!("no indexed Markdown documents — run `cfetch scan`");
+        return;
+    }
+    println!("\ndocuments:");
+    for node in &graph.nodes {
+        println!(
+            "{} r{}  ←{:<3} →{:<3} {:<12} {}",
+            if node.focused { "●" } else { " " },
+            node.ring,
+            node.inbound,
+            node.outbound,
+            node.kind,
+            node.path,
+        );
+    }
+    if !graph.edges.is_empty() {
+        println!("\ncurated links:");
+        for edge in &graph.edges {
+            println!("{} → {}", edge.from, edge.to);
+        }
+        if graph.omitted_edges > 0 {
+            println!("… {} more link(s) omitted from this bounded view", graph.omitted_edges);
+        }
+    }
+}
+
+fn graph_cmd(focus: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
+    anyhow::ensure!((1..=200).contains(&limit), "--limit must be between 1 and 200");
+    let cfg = config::Config::load()?;
+    if let Some(cs) = &cfg.client.serving {
+        let body = serde_json::json!({"op": "graph", "focus": focus, "limit": limit});
+        let response = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
+        let graph = response.knowledge_graph.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("serving host {} returned no knowledge graph", cs.addr)
+        })?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "graph": graph,
+                    "origin": response.origin,
+                    "generation": response.generation,
+                    "fresh": response.fresh,
+                    "stale_note": response.stale_note,
+                }))?
+            );
+        } else {
+            print_knowledge_graph(graph);
+            print_served_by(&response);
+        }
+        return Ok(());
+    }
+    let conn = index::ensure_fresh(
+        &paths::state_dir(),
+        &cfg.brain_root,
+        Some(&paths::native_projects_root()),
+        &cfg.rings(),
+    )?;
+    let graph = knowledge_graph::build(&conn, focus, limit)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&graph)?);
+    } else {
+        print_knowledge_graph(&graph);
+    }
     Ok(())
 }
 
@@ -2648,6 +2745,12 @@ fn main() {
         Command::Map { focus, budget_tokens } => {
             if let Err(e) = map_cmd(focus.as_deref(), budget_tokens) {
                 eprintln!("cfetch map: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Graph { focus, limit, json } => {
+            if let Err(e) = graph_cmd(focus.as_deref(), limit, json) {
+                eprintln!("cfetch graph: {e}");
                 std::process::exit(1);
             }
         }
