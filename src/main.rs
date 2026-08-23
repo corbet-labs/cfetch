@@ -57,6 +57,7 @@ mod lockfile;
 mod markers;
 mod maintenance;
 mod maintenance_inbox;
+mod maintenance_model;
 mod mcp;
 mod migrate;
 mod net;
@@ -233,8 +234,7 @@ enum Command {
         #[command(subcommand)]
         action: StagingAction,
     },
-    /// Supervised AI maintenance: evidence packets, quarantined proposals,
-    /// deterministic verification, and explicit promotion into rings 2-3
+    /// Continuous second-brain maintenance, history, exceptions, and debugging
     Maintain {
         #[command(subcommand)]
         action: MaintainAction,
@@ -320,6 +320,24 @@ enum StagingAction {
 
 #[derive(Subcommand)]
 enum MaintainAction {
+    /// Run one bounded autonomous propose → review → verify → apply cycle
+    Run {
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause background and manual autonomous cycles with a visible reason
+    Pause { reason: Vec<String> },
+    /// Resume autonomous maintenance after debugging or an intervention
+    Resume,
+    /// Show immutable automatic activity and exception history
+    History {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Build a bounded evidence packet for an agent to analyze
     Packet {
         candidate_id: String,
@@ -364,6 +382,8 @@ enum MaintainAction {
         #[arg(long, value_name = "TOKEN")]
         approval_token: String,
     },
+    /// Apply a passing independent review through the autonomous policy gates
+    AutoApply { id: String },
     /// Restore the captured bytes of an applied, unfinalized proposal
     Revert { id: String },
     /// Reject a proposal without dismissing its source candidate
@@ -1461,6 +1481,58 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
 fn maintain_cmd(action: MaintainAction) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     match action {
+        MaintainAction::Run { limit, json } => {
+            let mut model = maintenance_model::MaintenanceClient::new(&cfg.maintenance)?;
+            let report = maintenance::run_once_with(
+                &cfg,
+                &mut model,
+                limit.unwrap_or(cfg.maintenance.max_candidates),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else if report.paused {
+                println!(
+                    "maintenance paused: {}",
+                    maintenance::pause_reason(&cfg).unwrap_or_else(|| "pause marker present".into())
+                );
+            } else {
+                println!(
+                    "maintenance cycle: {} examined, {} applied, {} dismissed, {} noop, {} exception(s)",
+                    report.examined,
+                    report.applied,
+                    report.dismissed,
+                    report.noops,
+                    report.exceptions
+                );
+            }
+        }
+        MaintainAction::Pause { reason } => {
+            let reason = reason.join(" ");
+            maintenance::pause(&cfg, &reason)?;
+            println!("maintenance paused: {reason}");
+        }
+        MaintainAction::Resume => {
+            maintenance::resume(&cfg)?;
+            println!("maintenance resumed");
+        }
+        MaintainAction::History { limit, json } => {
+            let events: Vec<_> = maintenance::history(&cfg).into_iter().take(limit).collect();
+            if json {
+                println!("{}", serde_json::to_string(&events)?);
+            } else if events.is_empty() {
+                println!("no automatic maintenance activity recorded");
+            } else {
+                for event in events {
+                    println!(
+                        "{}  {:<10}  {}  {}",
+                        event.id,
+                        format!("{:?}", event.outcome).to_ascii_lowercase(),
+                        event.target.as_deref().unwrap_or("no memory write"),
+                        event.detail
+                    );
+                }
+            }
+        }
         MaintainAction::Packet { candidate_id, json } => {
             let packet = maintenance::packet(&cfg, &candidate_id)?;
             if json {
@@ -1643,6 +1715,15 @@ fn maintain_cmd(action: MaintainAction) -> anyhow::Result<()> {
                 println!("applied decision {}", proposal.id);
                 println!("finalize it: cfetch maintain finalize {}", proposal.id);
             }
+        }
+        MaintainAction::AutoApply { id } => {
+            let proposal = maintenance::automatic_apply(&cfg, &id)?;
+            println!(
+                "automatically finalized {} ({})",
+                proposal.id,
+                proposal.target.as_deref().unwrap_or("no memory write")
+            );
+            println!("reversible while exact bytes remain: cfetch maintain revert {}", proposal.id);
         }
         MaintainAction::Revert { id } => {
             let proposal = maintenance::revert(&cfg, &id)?;
