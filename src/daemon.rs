@@ -91,6 +91,11 @@ struct Request {
     target: Option<iroh::EndpointAddr>,
     #[serde(default)]
     request: Option<Box<Request>>,
+    /// Local forwarding envelope only: bound a diagnostic probe without
+    /// weakening the ordinary query deadline. Never trusted from a remote
+    /// request and never copied into its nested payload.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -148,6 +153,11 @@ pub struct Response {
     /// Present only on successful invite redemption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant: Option<WireGrant>,
+    /// Local forwarding diagnostics only. `Some(true)` means QUIC completed
+    /// and returned a valid cfetch response, even when that response refused
+    /// the slice or operation. Absent means no transport claim can be made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iroh_connected: Option<bool>,
 }
 
 impl Response {
@@ -412,6 +422,37 @@ pub fn call_iroh(
     target: &iroh::EndpointAddr,
     body: serde_json::Value,
 ) -> anyhow::Result<Response> {
+    call_iroh_with_timeout(target, body, None, true)
+}
+
+/// A short, read-only reachability check for a previously joined slice.
+/// This is deliberately stronger than a transport-only ping: a peer counts as
+/// usable only when the authenticated endpoint still accepts this host's
+/// grant and has an active serving path. It does not drain the watcher or open
+/// the remote index, so diagnostics remain observation-only.
+pub fn probe_iroh(
+    target: &iroh::EndpointAddr,
+    slice: &str,
+    timeout: Duration,
+) -> anyhow::Result<Response> {
+    anyhow::ensure!(
+        timeout >= Duration::from_millis(100) && timeout <= Duration::from_secs(5),
+        "diagnostic probe timeout must be between 100 ms and 5 s"
+    );
+    call_iroh_with_timeout(
+        target,
+        serde_json::json!({"op": "diagnose", "slice": slice}),
+        Some(timeout),
+        false,
+    )
+}
+
+fn call_iroh_with_timeout(
+    target: &iroh::EndpointAddr,
+    body: serde_json::Value,
+    timeout: Option<Duration>,
+    require_ok: bool,
+) -> anyhow::Result<Response> {
     // Validate the nested request here so malformed locally constructed JSON
     // never reaches the network.
     let mut request: Request = serde_json::from_value(body).context("invalid iroh request")?;
@@ -420,11 +461,21 @@ pub fn call_iroh(
         op: "iroh-forward".to_string(),
         target: Some(target.clone()),
         request: Some(Box::new(request)),
+        timeout_ms: timeout.map(|value| value.as_millis().min(u64::MAX as u128) as u64),
         ..Request::default()
     })?;
-    let resp = call_req(&envelope, IROH_REQUEST_TIMEOUT + Duration::from_secs(2))
+    let local_timeout = timeout.unwrap_or(IROH_REQUEST_TIMEOUT) + Duration::from_secs(2);
+    let resp = call_req(&envelope, local_timeout)
         .context("local daemon is not running — start it before using a remote slice")?;
-    anyhow::ensure!(resp.ok, "{}", resp.error.clone().unwrap_or_else(|| "iroh request failed".into()));
+    if require_ok {
+        anyhow::ensure!(
+            resp.ok,
+            "{}",
+            resp.error
+                .clone()
+                .unwrap_or_else(|| "iroh request failed".into())
+        );
+    }
     Ok(resp)
 }
 
@@ -567,32 +618,47 @@ async fn iroh_exchange(
     endpoint: &iroh::Endpoint,
     target: iroh::EndpointAddr,
     req: &Request,
+    connect_timeout: Duration,
+    response_timeout: Duration,
 ) -> anyhow::Result<Response> {
     let mut body = serde_json::to_vec(req)?;
     body.push(b'\n');
     anyhow::ensure!(body.len() <= IROH_MAX_REQUEST, "iroh request is too large");
 
     let conn = tokio::time::timeout(
-        IROH_CONNECT_TIMEOUT,
+        connect_timeout,
         endpoint.connect(target, IROH_ALPN),
     )
     .await
     .context("timed out connecting to the invite origin")??;
-    let (mut send, mut recv) = tokio::time::timeout(IROH_CONNECT_TIMEOUT, conn.open_bi())
+    let (mut send, mut recv) = tokio::time::timeout(connect_timeout, conn.open_bi())
         .await
         .context("timed out opening an iroh request stream")??;
     send.write_all(&body).await.context("send iroh request")?;
     send.finish().context("finish iroh request")?;
-    let raw = tokio::time::timeout(IROH_REQUEST_TIMEOUT, recv.read_to_end(IROH_MAX_RESPONSE))
+    let raw = tokio::time::timeout(response_timeout, recv.read_to_end(IROH_MAX_RESPONSE))
         .await
         .context("timed out reading the iroh response")??;
     conn.close(0u32.into(), b"request complete");
     serde_json::from_slice(&raw).context("origin returned an invalid response")
 }
 
-fn forward_iroh(ctx: &Ctx, target: iroh::EndpointAddr, req: &Request) -> anyhow::Result<Response> {
+fn forward_iroh(
+    ctx: &Ctx,
+    target: iroh::EndpointAddr,
+    req: &Request,
+    diagnostic_timeout: Option<Duration>,
+) -> anyhow::Result<Response> {
     let client = iroh_client(ctx)?;
-    client.runtime.block_on(iroh_exchange(&client.endpoint, target, req))
+    let connect_timeout = diagnostic_timeout.unwrap_or(IROH_CONNECT_TIMEOUT);
+    let response_timeout = diagnostic_timeout.unwrap_or(IROH_REQUEST_TIMEOUT);
+    client.runtime.block_on(iroh_exchange(
+        &client.endpoint,
+        target,
+        req,
+        connect_timeout,
+        response_timeout,
+    ))
 }
 
 /// Handles a request after QUIC has authenticated `peer` as the remote
@@ -639,6 +705,18 @@ fn handle_iroh(req: &Request, peer: &str, ctx: &Ctx) -> Response {
     }
 
     match req.op.as_str() {
+        "diagnose" => match &ctx.serve {
+            Some(state) => Response {
+                ok: true,
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                origin: Some(state.origin.clone()),
+                generation: Some(state.generation.load(Ordering::Relaxed)),
+                ..Response::default()
+            },
+            None => Response::err(
+                "authenticated endpoint is reachable, but serving is not enabled on this daemon",
+            ),
+        },
         "recall" | "generation" => handle(req, ctx).0,
         "checksum" => {
             let model = match ctx.cfg.slice_model() {
@@ -857,8 +935,14 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
             let Some(remote) = req.request.as_deref() else {
                 return (Response::err("iroh forward request has no payload"), false);
             };
-            match forward_iroh(ctx, target, remote) {
-                Ok(resp) => (resp, false),
+            let diagnostic_timeout = req
+                .timeout_ms
+                .map(|ms| Duration::from_millis(ms.clamp(100, 5_000)));
+            match forward_iroh(ctx, target, remote, diagnostic_timeout) {
+                Ok(mut resp) => {
+                    resp.iroh_connected = Some(true);
+                    (resp, false)
+                }
                 Err(e) => (Response::err(e.to_string()), false),
             }
         }

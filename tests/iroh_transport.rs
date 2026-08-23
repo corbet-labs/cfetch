@@ -123,7 +123,7 @@ fn two_daemons_redeem_and_serve_a_slice_over_iroh() {
     std::fs::write(&doc, "# Shared fact\n\n- networkneedle crosses iroh\n").unwrap();
     origin.run_ok(&["scan"]);
 
-    let _origin_daemon = origin.daemon();
+    let origin_daemon = origin.daemon();
     let _peer_daemon = peer.daemon();
     let ticket = text(&origin.run_ok(&["invite", "shared", "--mode", "ro"]));
     assert!(ticket.starts_with("cfetch-network1-invite-3:"), "{ticket}");
@@ -138,6 +138,16 @@ fn two_daemons_redeem_and_serve_a_slice_over_iroh() {
     assert!(recalled.contains("networkneedle"), "{recalled}");
     assert!(recalled.contains("served by iroh-origin"), "{recalled}");
 
+    let diagnosis = peer.run_ok(&["doctor", "--json"]);
+    let diagnosis: serde_json::Value = serde_json::from_slice(&diagnosis.stdout).unwrap();
+    assert_eq!(diagnosis["topology"]["joined_origins"][0]["slice"], "shared");
+    assert_eq!(
+        diagnosis["topology"]["joined_origins"][0]["reachability"],
+        "reachable",
+        "doctor must prove the authorized serving path, not just list remembered state: {diagnosis}"
+    );
+    assert!(diagnosis["topology"]["joined_origins"][0]["generation"].is_number());
+
     let membership = std::fs::read_to_string(peer.state.join("memberships.json")).unwrap();
     let secret = grant_secret(&ticket);
     assert!(!membership.contains(&secret), "one-time invite secret was persisted");
@@ -145,6 +155,15 @@ fn two_daemons_redeem_and_serve_a_slice_over_iroh() {
     let grants = origin.run_ok(&["grants", "--json"]);
     let grants: serde_json::Value = serde_json::from_slice(&grants.stdout).unwrap();
     assert_eq!(grants["grants"][0]["state"], "redeemed");
+
+    drop(origin_daemon);
+    let diagnosis = peer.run_ok(&["doctor", "--json"]);
+    let diagnosis: serde_json::Value = serde_json::from_slice(&diagnosis.stdout).unwrap();
+    assert_eq!(
+        diagnosis["topology"]["joined_origins"][0]["reachability"],
+        "unreachable",
+        "remembered membership must not be rendered as a live connection: {diagnosis}"
+    );
 }
 
 fn grant_secret(ticket: &str) -> String {

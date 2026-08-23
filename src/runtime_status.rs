@@ -325,7 +325,7 @@ pub fn load_cached() -> RuntimeStatusV1 {
     load_cached_in(&paths::state_dir())
 }
 
-fn load_cached_in(state_dir: &Path) -> RuntimeStatusV1 {
+pub(crate) fn load_cached_in(state_dir: &Path) -> RuntimeStatusV1 {
     let mut status = std::fs::read_to_string(snapshot_path_in(state_dir))
         .ok()
         .and_then(|raw| serde_json::from_str::<RuntimeStatusV1>(&raw).ok())

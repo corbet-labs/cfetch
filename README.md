@@ -19,6 +19,7 @@
 
 <p align="center">
   <a href="#terminal-dashboard">Dashboard</a> ·
+  <a href="#system-diagnostics-and-hardware-visibility">Diagnostics</a> ·
   <a href="#feature-map">Feature map</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="#openwolf-openwolf-enhanced-and-cfetch">OpenWolf comparison</a> ·
@@ -46,7 +47,7 @@ proprietary database, or a change to how you edit your notes.
 | Finding one function can pull an entire file into context | `cfetch find` returns the exact symbol range and an estimated token cost |
 | Large command output occupies every later model turn | Safe output families are condensed; the complete original remains available |
 | Context compaction drops in-flight knowledge | cfetch restores the session's modified-file record and relevant reminders |
-| Hooks can fail silently | Heartbeats, transcript verification, `status`, and `selfcheck` expose the gap |
+| Hooks, hardware, or remote routes can fail silently | Heartbeats, transcript verification, `status`, `doctor`, and `selfcheck` expose the exact gap |
 | Every machine builds a private, potentially stale copy | A storage machine can serve fresh, generation-stamped answers to thin clients |
 
 ## Terminal dashboard
@@ -61,7 +62,9 @@ The screenshot is the shipped v0.9.9 dashboard indexing this repository, not a
 UI mockup. On `main`, a read-only maintenance inbox also shows captured
 candidates, proposal lifecycles, semantic review gates, deterministic failures,
 bounded diff previews, and the exact revision-bound CLI command for the next
-step. The dashboard never calls a model or applies a proposal.
+step. A live System pane adds detected hardware, build binding, model identity,
+peer reachability, grants, artifact coverage, and actionable findings. The
+dashboard never calls a model or applies a proposal.
 
 ## Feature map
 
@@ -83,7 +86,7 @@ measurement do not.
 | Supervised AI maintenance | **Main — next release** | Evidence packets become typed, independently reviewed proposals with exact diffs, deterministic gates, reversible apply, and commit-gated finalization | `maintain`, maintenance MCP tools, dashboard |
 | Honest measurement | v0.9.9 | Transcript-derived usage, cfetch's own injection cost, rewrite-point savings, cache-rebuild attribution, and paired A/B analysis | `audit`, `bench`, dashboard |
 | Reliability | v0.9.9 | A warm daemon, incremental scanning, hook heartbeats, delivery verification, and fail-open hook behavior | `daemon`, `status`, `selfcheck` |
-| Runtime visibility | **Main — next release** | One privacy-bounded status shows whether memory is local, served, or remote; whether inference is merely configured, successfully selected, or actually used; vector coverage; freshness history; and maintenance work | dashboard, `status --line`, `status --json`, `cfetch_runtime_status`, Claude status line, Codex hooks |
+| Runtime visibility and diagnostics | **Main — next release** | Compact agent-safe status plus an evidence-rich doctor distinguish detected, supported, selected, last-used, reachable, and unmeasured state | dashboard System pane, `doctor`, `doctor --json`, `status`, `cfetch_runtime_status`, Claude status line, Codex hooks |
 | Agent integrations | v0.9.9 | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
 | Multi-machine access | v0.9.9 | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
 | Selective sharing | v0.9.9 | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
@@ -143,7 +146,7 @@ features in the feature map are not part of the v0.9.9 binaries.
 | Context reduction | Repeat-read awareness, file-size hints, and Bash output governor | Same 1.x family plus bounded storage controls | Repeat-read guidance, slice hints, answer budgets, precision gate, and output condensation |
 | Memory capture | Corrections, bug fixes, action log, and handoff files | Optional activity capture, bug memory, lint, and distillation | Redacted exhaust → deterministic flags → quarantined staging → deliberate promotion |
 | Measurement | Real transcript usage, verified delivery, cache attribution, and A/B bench | Estimated ledger including its own injection cost | Transcript usage, rewrite deltas, injection cost, cache attribution, audit, and paired bench |
-| Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Doctor, health checks, and expanded web dashboard | Heartbeats, truthful delivery state, selfcheck, status, and terminal dashboard |
+| Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Project health/size doctor, cleanup checks, and expanded web dashboard | Evidence-rich system doctor, truthful delivery state, selfcheck, status, and terminal dashboard |
 | Agent reach | Full integration for Claude Code, Codex, and OpenCode; context for several others | Hooks for four agents plus MCP clients | Confirmed configuration surfaces across 25 harnesses; native hooks only where the payload contract is understood |
 | Sharing | Git carries useful project state | Optional explicit push to a linked workspace | Authenticated serving and per-slice grants over iroh |
 | Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Supervised AI evidence review, typed proposals, exact diffs, reversible apply, and commit-gated promotion |
@@ -335,6 +338,44 @@ The v0.9.9 server exposes read-only `cfetch_recall`, `cfetch_expand`, and
 `cfetch_maintenance_propose` and `cfetch_maintenance_review` can write only
 idempotent ring-5 records; apply, revert, reject, and finalize remain CLI-only
 approval surfaces.
+
+## System diagnostics and hardware visibility
+
+`cfetch doctor` is the evidence-rich debugging surface behind the dashboard's
+System pane. It answers the practical questions that a compact agent status
+line should not try to fit:
+
+- which CPU, GPU, and NPU devices the operating system exposed, including the
+  evidence used to identify them;
+- whether each device is architecturally usable, supported by this binary,
+  selected by the runtime, or merely present;
+- which embedding profile, model revision, artifact, vector encoding, endpoint
+  route, and optional reranker are configured;
+- which backend was successfully selected and which inference route was last
+  attempted;
+- whether the daemon and its authenticated network endpoint are running, and
+  whether joined origins currently answer through the granted serving path;
+- vector coverage, shared artifact count, hook liveness, outbound grants, and
+  concrete repair actions.
+
+```console
+$ cfetch doctor               # one read-only diagnostic report with bounded peer probes
+$ cfetch doctor --json        # stable, machine-readable DoctorReportV1
+$ cfetch doctor --no-network  # inspect local state without contacting peers
+$ cfetch doctor --tui         # open the live, scrollable System pane
+```
+
+The wording is deliberately strict. Hardware **detected** is not hardware
+**selected**. A remembered membership is not called reachable until an
+authenticated, slice-authorized request answers. A completed inference attempt
+is not presented as current utilization. Until a backend exposes a real device
+counter, utilization is shown as `not_reported` instead of an invented
+percentage.
+
+Doctor does not compact files, repair configuration, call an inference model,
+or apply maintenance. `cfetch selfcheck` remains the installation verifier with
+a nonzero exit on hard failures; doctor is the wider read-only evidence report
+for debugging and support.
 
 ## Installation
 

@@ -35,6 +35,7 @@ mod condense;
 mod config;
 mod daemon;
 mod dashboard;
+mod doctor;
 mod embed;
 mod embedding_profile;
 mod exhaust;
@@ -254,7 +255,6 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         batch: usize,
     },
-    /// Open the terminal dashboard: health, recall, and maintenance inbox
     /// A/B bench: paired cfetch-on / cfetch-off sessions, read from
     /// transcript ground truth — cache dimensions plus the bash re-run rate
     Bench {
@@ -270,7 +270,20 @@ enum Command {
         /// Where to create it. Defaults to the configured brain root
         path: Option<std::path::PathBuf>,
     },
+    /// Open the terminal dashboard: health, system diagnostics, recall, and maintenance
     Dashboard,
+    /// Explain hardware, inference, peers, artifacts, hooks, and daemon health
+    Doctor {
+        /// Print the stable DoctorReportV1 diagnostic contract
+        #[arg(long, conflicts_with = "tui")]
+        json: bool,
+        /// Open the live System pane in the terminal dashboard
+        #[arg(long, conflicts_with = "json")]
+        tui: bool,
+        /// Do not contact joined remote origins
+        #[arg(long)]
+        no_network: bool,
+    },
     /// Serve recall/find/expand over MCP (stdio) for any MCP client
     Mcp,
     /// Verify the installation end to end; nonzero exit on hard failures
@@ -2507,6 +2520,25 @@ fn main() {
             // like the rest of the read path.
             if let Err(e) = dashboard::run() {
                 eprintln!("cfetch dashboard: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Doctor { json, tui, no_network } => {
+            let result = if tui {
+                dashboard::run_system(!no_network)
+            } else {
+                let report = doctor::gather(!no_network);
+                if json {
+                    serde_json::to_string_pretty(&report)
+                        .map(|body| println!("{body}"))
+                        .map_err(Into::into)
+                } else {
+                    println!("{}", doctor::render_text(&report));
+                    Ok(())
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("cfetch doctor: {e:#}");
                 std::process::exit(1);
             }
         }
