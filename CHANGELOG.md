@@ -5,6 +5,11 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Unified contributor stewardship.** Accepted contributions now assign
+  copyright to the project steward while preserving authorship attribution and
+  granting contributors a broad license back to their own work. This keeps the
+  whole project under one coherent FSL-to-Apache release promise.
+
 ## 0.9.9
 
 ## 0.9.8

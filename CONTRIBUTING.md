@@ -2,18 +2,22 @@
 
 Contributions are welcome. Three things to know before your first pull request:
 
-## 1. License and CLA
+## 1. License and contributor agreement
 
 The project is licensed under [FSL-1.1-ALv2](LICENSE.md) (each release becomes
-Apache-2.0 after two years). To keep the project relicensable as a single-owner
-work, every contributor must sign the [Contributor License Agreement](CLA.md) —
-a license grant (you keep your copyright), based on the Apache Individual CLA.
+Apache-2.0 after two years). To keep that promise coherent across the whole
+project, every contributor signs the
+[Contributor Copyright Assignment Agreement](CLA.md) once. Assignment happens
+only when a contribution is accepted. You keep attribution and receive a broad,
+permanent license back to your own contribution.
 
 Signing is automated: on your first pull request, the CLA bot asks you to post
 
-> I have read the CLA Document and I hereby sign the CLA
+> I have read the Contributor Agreement and assign accepted Contributions as described in it
 
-as a PR comment. One signature covers all your future contributions.
+as a pull-request comment. One signature covers future contributions until you
+withdraw from the agreement for future work. Forking the repository to prepare a
+pull request is expected and welcome.
 
 ## 2. Clean-room rule
 
@@ -36,7 +40,8 @@ request must identify, for every copied part:
 - any required NOTICE text; and
 - what was modified after copying.
 
-This record is how the contribution satisfies section 5(c) of the CLA. Copied
+This record is how the contribution satisfies section 6(3) of the contributor
+agreement. Copied
 material remains under its upstream license and is not treated as the
 contributor's original work. Missing provenance is a merge blocker.
 

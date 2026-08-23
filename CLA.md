@@ -1,126 +1,123 @@
-# cfetch Contributor License Agreement (Version 1.0)
+# cfetch Contributor Copyright Assignment Agreement (Version 2.0)
 
-Thank you for your interest in contributing to **cfetch** (the "Project"), owned and
-maintained by **Julian Y. Richard Corbet** (the "Licensor").
+Thank you for contributing to **cfetch**, a Corbet Labs project maintained by
+**Julian Y. Richard Corbet** (the "Project Steward").
 
-This Contributor License Agreement ("Agreement") clarifies the intellectual property
-rights granted with Contributions from any person or entity. It protects you as a
-contributor as well as the Licensor and the Project's users; it does not change your
-right to use your own Contributions for any other purpose.
+cfetch accepts copyright assignments so every accepted contribution becomes part
+of one coherently stewarded project, under one license, with the same guaranteed
+path to Apache-2.0. This agreement is not a claim to authorship: your contribution
+remains attributed to you, and you receive a broad license back to your own work.
 
-By signing this Agreement (including electronically, e.g. by posting the signing
-statement in a pull request as instructed in CONTRIBUTING.md), You accept and agree
-to the following terms for Your present and future Contributions submitted to the
-Project.
+By posting the signing statement described in `CONTRIBUTING.md`, You agree to these
+terms for Contributions You submit after signing.
 
 ## 1. Definitions
 
-**"You"** (or **"Your"**) means the copyright owner or legal entity authorized by
-the copyright owner that is entering into this Agreement with the Licensor. For
-legal entities, the entity making a Contribution and all other entities that
-control, are controlled by, or are under common control with that entity are
-considered to be a single Contributor.
+**"You"** (or **"Your"**) means the copyright owner, or the legal entity authorized
+by the copyright owner, entering into this Agreement. If You are an entity, You
+include entities that control, are controlled by, or are under common control with
+You.
 
-**"Contribution"** means any original work of authorship, including any
-modifications or additions to an existing work, that is intentionally submitted by
-You to the Licensor for inclusion in, or documentation of, the Project. "Submitted"
-means any form of electronic, verbal, or written communication sent to the Licensor
-or its representatives, including but not limited to pull requests, patches, issues,
-and communication on mailing lists or issue trackers, excluding communication that
-is conspicuously marked or otherwise designated in writing by You as "Not a
+**"Contribution"** means an original work of authorship, modification, or addition
+that You intentionally submit for inclusion in the Project. Submission includes a
+pull request, patch, issue attachment, or other communication to the Project
+Steward or the Project's repositories, unless You clearly mark it "Not a
 Contribution."
 
-## 2. Grant of Copyright License
+**"Accepted Contribution"** means a Contribution that the Project Steward merges
+or otherwise commits to an official Project repository.
 
-Subject to the terms and conditions of this Agreement, You hereby grant to the
-Licensor and to recipients of software distributed by the Licensor a **perpetual,
-worldwide, non-exclusive, no-charge, royalty-free, irrevocable** copyright license
-to reproduce, prepare derivative works of, publicly display, publicly perform,
-**sublicense** (through multiple tiers of sublicensees), and distribute Your
-Contributions and such derivative works.
+## 2. Copyright assignment
 
-**For the avoidance of doubt, this grant includes the right for the Licensor to
-license and distribute Your Contributions, alone or as part of the Project, under
-any license terms of the Licensor's choosing — including copyleft, permissive,
-source-available, commercial, or proprietary terms — and to change such license
-terms over time.** This is what enables the Project's licensing model (currently
-FSL-1.1-ALv2, in which each release automatically becomes Apache-2.0 after two
-years) and any future relicensing or dual licensing.
+When a Contribution becomes an Accepted Contribution, You assign to the Project
+Steward all transferable right, title, and interest in it, including all economic
+copyright and related rights, for their full duration and throughout the world.
+The assignment includes the rights to use, reproduce, modify, create derivative
+works, publicly display and perform, distribute, sublicense, enforce, and license
+the Accepted Contribution under any terms.
 
-## 3. Grant of Patent License
+If any such right cannot legally be assigned, You grant the Project Steward an
+exclusive, perpetual, irrevocable, worldwide, transferable, sublicensable,
+royalty-free license to exercise that right and authorize others to exercise it,
+to the fullest extent the law permits.
 
-Subject to the terms and conditions of this Agreement, You hereby grant to the
-Licensor and to recipients of software distributed by the Licensor a perpetual,
-worldwide, non-exclusive, no-charge, royalty-free, irrevocable (except as stated in
-this section) patent license to make, have made, use, offer to sell, sell, import,
-and otherwise transfer the Project, where such license applies only to those patent
-claims licensable by You that are necessarily infringed by Your Contribution(s)
-alone or by combination of Your Contribution(s) with the Project. If any entity
-institutes patent litigation against You or any other entity (including a
-cross-claim or counterclaim in a lawsuit) alleging that Your Contribution, or the
-Project to which You have contributed, constitutes direct or contributory patent
-infringement, then any patent licenses granted to that entity under this Agreement
-for that Contribution or the Project shall terminate as of the date such litigation
-is filed.
+The assignment takes effect only when the Contribution is accepted. You may
+withdraw an unaccepted Contribution at any time.
 
-## 4. Moral Rights
+## 3. Contributor license-back and project stewardship
 
-To the maximum extent permitted by applicable law, You waive, and agree not to
-assert, all of Your "moral rights" in or relating to Your Contributions for the
-benefit of the Licensor, its assigns, and their respective direct and indirect
-sublicensees. Where such rights cannot be waived under applicable law (for example
-under German Urheberrecht), You agree not to enforce them against the Licensor or
-its sublicensees in connection with any use of the Contributions permitted by this
-Agreement.
+The Project Steward grants You a perpetual, irrevocable, worldwide, non-exclusive,
+transferable, sublicensable, royalty-free license to use, reproduce, modify,
+distribute, and otherwise exploit Your Accepted Contributions for any purpose.
+This license-back covers only material You contributed; it does not license other
+Project code or Project names and branding.
 
-## 5. Your Representations
+Accepted Contributions are released as part of cfetch under the Project's public
+license. cfetch is currently released under **FSL-1.1-ALv2**, under which every
+version automatically becomes available under Apache-2.0 two years after it is
+made available. The assignment exists so that this licensing promise applies
+coherently to the whole Project and so the official project can evolve without a
+fragmented copyright ledger.
+
+Every public cfetch version containing an Accepted Contribution will be offered
+either under an OSI-approved open-source license immediately or under terms that
+irrevocably convert to an OSI-approved open-source license within at most two
+years. The Project Steward may offer additional licenses, but cannot remove this
+public path to open source from a version already made available.
+
+The Project will preserve authorship attribution in Git history where reasonably
+practicable.
+
+## 4. Patent license
+
+You grant the Project Steward and recipients of the Project a perpetual,
+worldwide, non-exclusive, no-charge, royalty-free, irrevocable patent license to
+make, have made, use, offer to sell, sell, import, and otherwise transfer the
+Project, but only for patent claims necessarily infringed by Your Accepted
+Contribution alone or together with the Project.
+
+If an entity institutes patent litigation alleging that an Accepted Contribution
+or the Project infringes a patent, the patent licenses granted to that entity under
+this Agreement terminate as of the filing date.
+
+## 5. Moral rights
+
+To the maximum extent permitted by law, You waive and agree not to assert moral
+rights in Accepted Contributions against the Project Steward, the Project, its
+users, or their licensees. Where waiver is not permitted, You grant the broadest
+consent available for uses authorized by this Agreement.
+
+## 6. Your representations
 
 You represent that:
 
-a. You are legally entitled to grant the above licenses. If You are entering into
-   this Agreement as an individual and Your employer(s) has rights to intellectual
-   property that You create that includes Your Contributions, You represent that
-   You have received permission to make Contributions on behalf of that employer,
-   that Your employer has waived such rights for Your Contributions to the Project,
-   or that Your employer has executed this Agreement as an entity covering You.
+1. You have the legal right to make this assignment and these grants. If an
+   employer or another party may own Your work, You have obtained its permission
+   or it has signed this Agreement.
+2. Your Contributions are Your original work and do not copy, translate, or
+   closely paraphrase third-party code, including code from the AGPL-licensed
+   `cytostack/openwolf` and `bassprofressor-lab/openwolf-enhanced` projects.
+3. You will identify any third-party material completely in the submission,
+   including its source, exact revision, license, copyright holder, destination,
+   and modifications.
+4. You will notify the Project Steward if any of these statements becomes
+   inaccurate.
 
-b. Each of Your Contributions is Your original creation. In particular, You
-   represent that Your Contributions do **not** contain, and are not derived from,
-   code You copied, translated, or closely paraphrased from any third-party work —
-   including, without limitation, the AGPL-licensed projects `cytostack/openwolf`
-   and `bassprofressor-lab/openwolf-enhanced`, whose *mechanisms* the Project
-   deliberately reimplements clean-room. Studying behavior and documentation is
-   fine; contributing their expression is not.
+## 7. No obligation and no warranty
 
-c. If any part of Your Contribution is not Your original creation, or is subject
-   to any third-party license or other restriction (including from Your employer,
-   or generated with material reproduced from an identifiable third-party source),
-   You will identify it completely, including its source and any license or
-   restriction, in the submission itself.
+The Project Steward does not have to accept a Contribution. You do not have to
+provide support. Contributions are provided **AS IS**, without warranties or
+conditions of any kind, to the maximum extent permitted by law.
 
-d. You will notify the Licensor if You become aware of any facts or circumstances
-   that would make these representations inaccurate in any respect.
+## 8. Term and governing law
 
-## 6. No Obligation and No Warranty
+This Agreement covers Contributions You submit after signing. You may end it for
+future Contributions by notifying the Project Steward in writing. Ending it does
+not affect an assignment, license, or consent already made for an Accepted
+Contribution.
 
-You are not expected to provide support for Your Contributions, except to the
-extent You desire to provide support. Unless required by applicable law or agreed
-to in writing, You provide Your Contributions on an **"AS IS" BASIS, WITHOUT
-WARRANTIES OR CONDITIONS OF ANY KIND**, either express or implied, including,
-without limitation, any warranties or conditions of title, non-infringement,
-merchantability, or fitness for a particular purpose.
-
-The Licensor is under no obligation to accept, use, or retain any Contribution.
-
-## 7. Miscellaneous
-
-This Agreement is governed by the substantive laws of **Switzerland**, excluding
-its conflict-of-law rules; exclusive place of jurisdiction is **Zürich,
-Switzerland**, to the extent permitted by mandatory applicable law. If any
-provision of this Agreement is held invalid or unenforceable, the remaining
-provisions remain in full force, and the invalid provision shall be replaced by a
-valid one that most closely reflects its intent. This Agreement covers all of Your
-Contributions to the Project, past and future, unless and until You notify the
-Licensor in writing that You terminate it for future Contributions; licenses
-already granted for Contributions submitted before such termination remain
-irrevocable and unaffected.
+This Agreement is governed by the substantive laws of Switzerland, excluding its
+conflict-of-law rules. The exclusive place of jurisdiction is Zürich, Switzerland,
+to the extent permitted by mandatory law. If a provision is unenforceable, the
+remaining provisions stay effective and the invalid provision will be replaced by
+an enforceable one that most closely preserves its purpose.

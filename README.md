@@ -441,9 +441,12 @@ Report suspected vulnerabilities through the private process in
 purpose except offering a competing commercial product or service. Each
 release converts automatically to Apache-2.0 two years after publication.
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), sign the
-[CLA](CLA.md) once on your first pull request, and follow the clean-room rule:
-do not copy or closely paraphrase code from OpenWolf, OpenWolf Enhanced, or
-other incompatibly licensed projects.
+Contributions are welcome. Fork cfetch, send a focused pull request, and sign the
+[Contributor Agreement](CLA.md) once. Accepted contributions join the coherently
+licensed project through copyright assignment; contributors keep attribution and
+a broad license back to their own work. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) and follow the clean-room rule: do not copy or
+closely paraphrase code from OpenWolf, OpenWolf Enhanced, or other incompatibly
+licensed projects.
 
 Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).

@@ -16,8 +16,8 @@ jobs:
   cla:
     runs-on: ubuntu-latest
     steps:
-      - name: CLA assistant
-        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+      - name: Contributor agreement assistant
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the Contributor Agreement and assign accepted Contributions as described in it') || github.event_name == 'pull_request_target'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -28,8 +28,8 @@ jobs:
           allowlist: 'julian-corbet,dependabot[bot],*[bot]'
           custom-notsigned-prcomment: >
             Thank you for the contribution. Before it can be merged, please sign the
-            [Contributor License Agreement](https://github.com/corbet-labs/cfetch/blob/main/CLA.md)
+            [Contributor Copyright Assignment Agreement](https://github.com/corbet-labs/cfetch/blob/main/CLA.md)
             by posting the sentence below as a comment on this pull request.
-          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
-          custom-allsigned-prcomment: 'All contributors have signed the CLA.'
+          custom-pr-sign-comment: 'I have read the Contributor Agreement and assign accepted Contributions as described in it'
+          custom-allsigned-prcomment: 'All contributors have signed the Contributor Agreement.'
           lock-pullrequest-aftermerge: false
