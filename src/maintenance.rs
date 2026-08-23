@@ -1568,7 +1568,7 @@ pub fn pause(cfg: &Config, reason: &str) -> anyhow::Result<()> {
     let _lock = lock(cfg)?;
     fsutil::atomic_write(
         &pause_path(&cfg.brain_root),
-        &format!(
+        format!(
             "---\nring: 5\ntype: cfetch-maintenance-pause\n---\n\n# Maintenance paused\n\n{reason}\n"
         ),
     )

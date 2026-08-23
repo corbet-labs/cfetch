@@ -78,14 +78,6 @@ impl MaintenanceClient {
         })
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
-    pub fn review_model(&self) -> &str {
-        &self.review_model
-    }
-
     fn complete<T: DeserializeOwned>(
         &self,
         model: &str,
