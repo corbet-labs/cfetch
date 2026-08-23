@@ -940,18 +940,36 @@ fn unquote_shell_word(word: &str) -> String {
     {
         return inner.to_string();
     }
+    // A UNC share is all separators and no escapes. POSIX unescaping reads the
+    // leading pair as one escaped backslash and silently demotes
+    // \\\\server\\share to \\server\\share, which resolves to a different
+    // place or to nothing.
+    if inner.starts_with("\\\\") {
+        return inner.to_string();
+    }
 
     let mut out = String::with_capacity(word.len());
     let mut quote = None;
     let mut escaped = false;
-    for ch in word.chars() {
+    let mut chars = word.chars().peekable();
+    while let Some(ch) = chars.next() {
         if escaped {
             out.push(ch);
             escaped = false;
             continue;
         }
+        // Only a shell-meaningful escape consumes its backslash. A relative
+        // Windows path has no drive letter to recognise it by, so `src\main.rs`
+        // is otherwise read as an escaped `m` and recorded as `srcmain.rs` — a
+        // read that can never be attributed to the file it touched. No shell
+        // escapes an ordinary letter, so keeping the pair costs nothing.
         if ch == '\\' && quote != Some('\'') {
-            escaped = true;
+            let next = chars.peek().copied();
+            if next.is_none_or(|c| matches!(c, ' ' | '\'' | '"' | '\\' | '$' | '`' | '\n')) {
+                escaped = true;
+                continue;
+            }
+            out.push('\\');
             continue;
         }
         match quote {
@@ -1199,7 +1217,17 @@ fn write_payload(path: &str, brain_root: &Path, rules: &RingRules) -> serde_json
 /// brain — code files carry no ring and are churn by contract.
 fn brain_ring(brain_root: &Path, path: &str, rules: &RingRules) -> Option<u8> {
     let rel = Path::new(path).strip_prefix(brain_root).ok()?;
-    let by_location = crate::index::default_ring(&crate::index::rel_doc_path(rel), rules);
+    let rel = crate::index::rel_doc_path(rel);
+    // An EXCLUDED path is not brain content, whatever ring its prefix would
+    // otherwise imply. Without this the unmatched ring makes every excluded
+    // path look like knowledge: `projects/` is code by contract, and a churn
+    // trap fired on it stages candidates about throwaway build trees. Six of
+    // one operator's sixteen staged candidates pointed inside ephemeral agent
+    // worktrees, and five of those at directories already deleted.
+    if rules.excluded(&rel) {
+        return None;
+    }
+    let by_location = crate::index::default_ring(&rel, rules);
     Some(frontmatter_ring_bounded(Path::new(path)).unwrap_or(by_location))
 }
 
@@ -1248,6 +1276,45 @@ fn tool_failed(event: &HookEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Windows is a first-class platform, and a corrupted path is a read that
+    /// can never be attributed to the file it touched.
+    #[test]
+    fn windows_paths_survive_unquoting_in_every_shape() {
+        // Drive-absolute, quoted and bare.
+        assert_eq!(unquote_shell_word(r"C:\Users\me\notes.md"), r"C:\Users\me\notes.md");
+        assert_eq!(unquote_shell_word("\"C:\\Users\\me\\a b.md\""), r"C:\Users\me\a b.md");
+        // Relative: no drive letter to recognise it by.
+        assert_eq!(unquote_shell_word(r"src\main.rs"), r"src\main.rs");
+        // UNC: all separators, no escapes.
+        assert_eq!(unquote_shell_word(r"\\server\share\file.md"), r"\\server\share\file.md");
+        // POSIX escaping still works, or every unix path breaks instead.
+        assert_eq!(unquote_shell_word(r"my\ file.md"), "my file.md");
+        assert_eq!(unquote_shell_word(r"a\'b"), "a'b");
+        assert_eq!(unquote_shell_word("'/tmp/x y.md'"), "/tmp/x y.md");
+    }
+
+    /// The failure this prevents was real: an operator's staging queue held
+    /// candidates about files inside throwaway agent worktrees, five of them
+    /// pointing at directories that had already been deleted.
+    #[test]
+    fn an_excluded_path_carries_no_ring_and_so_never_reaches_a_trap() {
+        let brain = tempfile::tempdir().unwrap();
+        let rules = RingRules::default();
+        let ring = |rel: &str| {
+            let p = brain.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+            brain_ring(brain.path(), &p.to_string_lossy(), &rules)
+        };
+        // Excluded by default: code, retired knowledge, disposable material.
+        assert_eq!(ring("projects/github/x/.claude/worktrees/w1/src/main.rs"), None);
+        assert_eq!(ring("knowledge/archive/old.md"), None);
+        assert_eq!(ring("todo/scratch/dump.md"), None);
+        // Real brain content still resolves, or the trap would never fire.
+        assert_eq!(ring("knowledge/hosts/server/zfs.md"), Some(3));
+        assert_eq!(ring("mind/memories/feedback_x.md"), Some(2));
+    }
+
     use super::*;
     use serde_json::json;
 
