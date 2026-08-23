@@ -1,0 +1,40 @@
+# Public-repository standard runners only. GitHub documents these labels as
+# free and unlimited for public repositories. Do not replace them with a
+# -large or -xlarge label: larger runners are billed separately.
+name: Accelerator discovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/accelerator-discovery.yml
+      - experiments/accelerators/apple_compute_probe.swift
+
+permissions:
+  contents: read
+
+jobs:
+  apple-compute-devices:
+    name: Apple compute devices (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile discovery probe
+        run: |
+          xcrun swiftc \
+            experiments/accelerators/apple_compute_probe.swift \
+            -o "$RUNNER_TEMP/apple-compute-probe"
+      - name: Report accessible devices
+        run: |
+          "$RUNNER_TEMP/apple-compute-probe" | tee "$RUNNER_TEMP/apple-compute-devices.json"
+          {
+            echo '```json'
+            cat "$RUNNER_TEMP/apple-compute-devices.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
