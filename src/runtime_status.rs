@@ -592,6 +592,24 @@ pub fn record_service(state: ServiceState, failure_code: Option<&str>) {
     });
 }
 
+/// Applies a live daemon probe to a snapshot for immediate display without
+/// persisting it. Cached surfaces remain observation-only and daemon lifecycle
+/// events continue to own the durable service state.
+pub fn apply_daemon_observation(status: &mut RuntimeStatusV1, running: bool) {
+    remove_failure(status, "daemon_unavailable");
+    if running {
+        recover_if_clean(status);
+    } else {
+        upsert_failure(
+            status,
+            "daemon_unavailable",
+            FailureSeverity::Warning,
+            "run cfetch daemon start or cfetch selfcheck",
+        );
+    }
+    normalize(status);
+}
+
 pub fn record_generation(route: MemoryRoute, generation: u64) {
     let _ = update(|status| {
         status.memory_route.mode = route;
@@ -1148,6 +1166,34 @@ mod tests {
         );
         normalize(&mut status);
         assert_eq!(status.service.state, ServiceState::Degraded);
+    }
+
+    #[test]
+    fn live_daemon_observation_updates_display_without_masking_critical_failures() {
+        let mut status = RuntimeStatusV1::default();
+        apply_daemon_observation(&mut status, false);
+        assert_eq!(status.service.state, ServiceState::Degraded);
+        assert!(
+            status
+                .failures
+                .iter()
+                .any(|failure| failure.code == "daemon_unavailable")
+        );
+
+        upsert_failure(
+            &mut status,
+            "memory_unavailable",
+            FailureSeverity::Critical,
+            "ignored",
+        );
+        apply_daemon_observation(&mut status, true);
+        assert_eq!(status.service.state, ServiceState::Unavailable);
+        assert!(
+            !status
+                .failures
+                .iter()
+                .any(|failure| failure.code == "daemon_unavailable")
+        );
     }
 
     #[test]

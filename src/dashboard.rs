@@ -151,9 +151,15 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
     let l = loaded.ledger;
     // Read-only, fail-silent: an absent tree simply reports zeros.
     let staging = exhaust::Exhaust::from_config(cfg).stats();
+    let daemon_probe = daemon::call("ping", Duration::from_millis(200));
+    let daemon_running = daemon_probe.is_some();
+    let daemon_version = daemon_probe.and_then(|response| response.version);
+    let mut runtime =
+        runtime_status::refresh_static().unwrap_or_else(|_| runtime_status::load_cached());
+    runtime_status::apply_daemon_observation(&mut runtime, daemon_running);
     Stats {
-        runtime: runtime_status::refresh_static().unwrap_or_else(|_| runtime_status::load_cached()),
-        daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
+        runtime,
+        daemon_version,
         hooks: heartbeat::liveness_in(state),
         sessions: l.sessions.len(),
         injected_tokens: l

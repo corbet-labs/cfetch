@@ -1879,7 +1879,9 @@ fn delivery_status_line(agent: &str, verification: Option<(u64, u64)>) -> String
 }
 
 fn status() -> anyhow::Result<()> {
-    let runtime = runtime_status::refresh_static()?;
+    let mut runtime = runtime_status::refresh_static()?;
+    let daemon_running = daemon::call("ping", std::time::Duration::from_millis(300)).is_some();
+    runtime_status::apply_daemon_observation(&mut runtime, daemon_running);
     println!("{}", runtime_status::render_line(&runtime));
     daemon::status()?;
     // Diagnostics must survive a broken config: the paths below fall back to
