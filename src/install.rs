@@ -152,11 +152,52 @@ fn legacy_managed_entry(exe: &str, subcommand: &str) -> Value {
     })
 }
 
-fn strip_legacy_managed(entry: &mut Value) -> bool {
+/// Exact historical cfetch hook invocations are safe to adopt during an
+/// explicit cfetch install. Older settings writers sometimes retained the
+/// command while dropping cfetch's private ownership key; treating those as
+/// foreign creates one more invocation on every upgrade. Shell wrappers stay
+/// foreign because cfetch cannot prove what else they do.
+fn exact_cfetch_hook(command: &str, expected_subcommand: Option<&str>) -> bool {
+    let command = command.trim();
+    let matches_subcommand = |subcommand: &str| {
+        let suffix = format!(" hook {subcommand}");
+        let Some(program) = command.strip_suffix(&suffix).map(str::trim) else {
+            return false;
+        };
+        let program = match (program.as_bytes().first(), program.as_bytes().last()) {
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"')) if program.len() >= 2 => {
+                &program[1..program.len() - 1]
+            }
+            _ if !program.chars().any(char::is_whitespace) => program,
+            _ => return false,
+        };
+        matches!(
+            program.rsplit(['/', '\\']).next(),
+            Some(name) if name.eq_ignore_ascii_case("cfetch")
+                || name.eq_ignore_ascii_case("cfetch.exe")
+        )
+    };
+    expected_subcommand.map_or_else(
+        || {
+            FULL_HOOKS
+                .iter()
+                .any(|registration| matches_subcommand(registration.subcommand))
+        },
+        matches_subcommand,
+    )
+}
+
+fn strip_legacy_managed(entry: &mut Value, expected_subcommand: Option<&str>) -> bool {
     match entry.get_mut("hooks").and_then(Value::as_array_mut) {
         Some(hooks) => {
             hooks.retain(|hook| {
-                hook.get("_managedBy").and_then(Value::as_str) != Some(LEGACY_MANAGED_BY)
+                let tagged =
+                    hook.get("_managedBy").and_then(Value::as_str) == Some(LEGACY_MANAGED_BY);
+                let orphaned = hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| exact_cfetch_hook(command, expected_subcommand));
+                !tagged && !orphaned
             });
             !hooks.is_empty()
         }
@@ -186,7 +227,7 @@ fn merge_claude_for_exe(settings: Value, exe: &str) -> anyhow::Result<Value> {
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .ok_or_else(|| anyhow::anyhow!("settings.json hooks.{event} is not an array"))?;
-        entries.retain_mut(strip_legacy_managed);
+        entries.retain_mut(|entry| strip_legacy_managed(entry, Some(registration.subcommand)));
         entries.push(legacy_managed_entry(exe, registration.subcommand));
     }
     Ok(Value::Object(root))
@@ -199,7 +240,7 @@ fn unmerge_legacy(settings: Value) -> anyhow::Result<Value> {
     };
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
-            entries.retain_mut(strip_legacy_managed);
+            entries.retain_mut(|entry| strip_legacy_managed(entry, None));
         }
     }
     Ok(Value::Object(root))
@@ -856,6 +897,40 @@ fn install_lock(agent: &str) -> anyhow::Result<crate::lockfile::Lock> {
         .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", path.display()))
 }
 
+/// Runs the one-time capture-store conversion outside every hook deadline.
+/// The database is per-host local state, so each machine performs its own
+/// conversion while the shared tree receives host-keyed records.
+fn migrate_legacy_capture(
+    state_dir: &Path,
+    cfg: &crate::config::Config,
+) -> anyhow::Result<Option<crate::migrate::Report>> {
+    if !cfg.capture.enabled || !crate::migrate::legacy_exhaust_pending(state_dir) {
+        return Ok(None);
+    }
+    let locks = state_dir.join("locks");
+    std::fs::create_dir_all(&locks)?;
+    let lock_path = locks.join("migrate-legacy-exhaust.lock");
+    let _lock = crate::lockfile::acquire(&lock_path, 2_000, 0)
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", lock_path.display()))?;
+    // Another installer may have completed while this process waited.
+    if !crate::migrate::legacy_exhaust_pending(state_dir) {
+        return Ok(None);
+    }
+    crate::migrate::import_legacy_exhaust(
+        state_dir,
+        &crate::exhaust::Exhaust::from_config(cfg),
+    )
+}
+
+fn migrate_legacy_capture_from_config() -> anyhow::Result<Option<crate::migrate::Report>> {
+    let state_dir = paths::state_dir();
+    if !crate::migrate::legacy_exhaust_pending(&state_dir) {
+        return Ok(None);
+    }
+    let cfg = crate::config::Config::load()?;
+    migrate_legacy_capture(&state_dir, &cfg)
+}
+
 fn codex_toml_without_mcp(content: &str) -> anyhow::Result<Option<String>> {
     let mut document: toml_edit::DocumentMut = content
         .parse()
@@ -1001,6 +1076,17 @@ pub fn configure(
             );
         }
     }
+    if scope.local_root().is_none()
+        && !remove
+        && let Some(report) = migrate_legacy_capture_from_config()?
+    {
+        println!(
+            "cfetch: imported {} legacy capture event(s) and {} staged candidate(s) from {}",
+            report.events,
+            report.staged,
+            report.db.display()
+        );
+    }
     Ok(())
 }
 
@@ -1092,6 +1178,91 @@ mod tests {
         );
         assert_eq!(twice["permissions"]["allow"][0], "Bash(ls:*)");
         assert_eq!(twice["hooks"].as_object().unwrap().len(), FULL_HOOKS.len());
+    }
+
+    #[test]
+    fn claude_merge_collapses_orphaned_cfetch_hook_duplicates() {
+        let existing = json!({
+            "hooks": {"Stop": [
+                {"hooks": [{
+                    "type": "command",
+                    "command": "'/old/bin/cfetch' hook stop",
+                    "timeout": 10
+                }]},
+                {"hooks": [
+                    {
+                        "type": "command",
+                        "command": r#""C:\Program Files\cfetch.exe" hook stop"#,
+                        "timeout": 10
+                    },
+                    {"type": "command", "command": "keep-me"}
+                ]},
+                {"hooks": [{
+                    "type": "command",
+                    "command": "bash -lc 'cfetch hook stop'"
+                }]}
+            ]}
+        });
+
+        let merged = merge_claude_for_exe(existing, "/usr/bin/cfetch").unwrap();
+        let stop = merged["hooks"]["Stop"].as_array().unwrap();
+        let commands: Vec<&str> = stop
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| exact_cfetch_hook(command, Some("stop")))
+                .count(),
+            1,
+            "the event has exactly one direct cfetch invocation"
+        );
+        let desired = hook_command_for("/usr/bin/cfetch", "stop");
+        assert!(commands.contains(&desired.as_str()));
+        assert!(commands.contains(&"bash -lc 'cfetch hook stop'"));
+        assert!(commands.contains(&"keep-me"));
+        assert!(!commands.contains(&"'/old/bin/cfetch' hook stop"));
+        assert!(!commands.contains(&r#""C:\Program Files\cfetch.exe" hook stop"#));
+    }
+
+    #[test]
+    fn install_time_capture_migration_is_idempotent() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let legacy = state.path().join("exhaust.db");
+        let conn = rusqlite::Connection::open(&legacy).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events(
+               id INTEGER PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               ts INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               payload TEXT NOT NULL,
+               flag INTEGER NOT NULL DEFAULT 0,
+               flag_reason TEXT,
+               consumed INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO events(session_id, ts, kind, payload)
+             VALUES ('old-session', 1000, 'bash', '{\"command\":\"old\"}');",
+        )
+        .unwrap();
+        drop(conn);
+        let cfg = crate::config::Config {
+            brain_root: brain.path().to_path_buf(),
+            capture: crate::config::CaptureConfig { enabled: true },
+            ..Default::default()
+        };
+
+        let report = migrate_legacy_capture(state.path(), &cfg)
+            .unwrap()
+            .expect("the explicit install imports pending state");
+        assert_eq!(report.events, 1);
+        assert!(state.path().join("exhaust-db-imported").is_file());
+        assert!(
+            migrate_legacy_capture(state.path(), &cfg).unwrap().is_none(),
+            "the completion marker makes every later install a no-op"
+        );
     }
 
     #[test]

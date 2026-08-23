@@ -9,8 +9,8 @@ use crate::config::Config;
 use crate::hook_io::{Emit, HookEvent};
 use crate::resident::SessionScope;
 use crate::{
-    condense, daemon, exhaust, fsutil, govern, heartbeat, ledger, migrate, paths, resident,
-    session_state, transcript,
+    condense, daemon, exhaust, fsutil, govern, heartbeat, ledger, paths, resident, session_state,
+    transcript,
 };
 
 const DAEMON_BUDGET: Duration = Duration::from_millis(250);
@@ -465,16 +465,15 @@ fn book_rewrite(sink: &LedgerSink, session: &str, original_chars: usize, entered
 /// Turn summary + the 6->5 flagging traps (from wt/capture). Emits nothing —
 /// Stop-level additionalContext would force an extra model turn, and ring
 /// 5/6 content is never injected anyway.
-fn stop_capture(state_dir: &std::path::Path, cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
+fn stop_capture(cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
     if !cfg.capture.enabled {
         return Ok(());
     }
-    let ex = exhaust::Exhaust::from_config(cfg);
-    // A legacy per-host exhaust.db moves into the tree once, silently: a hook
-    // emits nothing, so the CLI is where the note about it is printed.
-    let imported = migrate::import_legacy_exhaust(state_dir, &ex);
-    ex.record_stop(event.session())?;
-    imported.map(|_| ())
+    // Upgrade work is forbidden here. A migration can legitimately take
+    // longer than the harness deadline; if the harness kills it before its
+    // completion marker, every later Stop retries from zero and the hook
+    // livelocks. `cfetch install` owns one-time state conversion instead.
+    exhaust::Exhaust::from_config(cfg).record_stop(event.session())
 }
 
 /// The Read tool's target file, if this is a Read invocation we track.
@@ -1034,7 +1033,7 @@ fn stop(event: &HookEvent) -> anyhow::Result<()> {
     let cfg = Config::load();
     match &cfg {
         Ok(cfg) => {
-            if let Err(e) = stop_capture(&state_dir, cfg, event) {
+            if let Err(e) = stop_capture(cfg, event) {
                 first_err = Some(e);
             }
             if let Err(e) = stop_govern(&state_dir, cfg, event) {
@@ -1530,11 +1529,10 @@ mod tests {
 
     #[test]
     fn capture_disabled_writes_nothing() {
-        let state = tempfile::tempdir().unwrap();
         let brain = tempfile::tempdir().unwrap();
         let cfg = tree_cfg(brain.path(), false);
         post_tool_capture(&cfg, &bash_event("ls")).unwrap();
-        stop_capture(state.path(), &cfg, &bash_event("ls")).unwrap();
+        stop_capture(&cfg, &bash_event("ls")).unwrap();
         assert!(
             !paths::logs_dir(brain.path()).exists(),
             "disabled capture must not even create the exhaust stream"
@@ -1640,7 +1638,6 @@ mod tests {
 
     #[test]
     fn stop_capture_stages_into_the_shared_tree() {
-        let state = tempfile::tempdir().unwrap();
         let brain = tempfile::tempdir().unwrap();
         let cfg = tree_cfg(brain.path(), true);
         let hot = brain.path().join("knowledge/hot.md");
@@ -1653,10 +1650,55 @@ mod tests {
             };
             post_tool_capture(&cfg, &event).unwrap();
         }
-        stop_capture(state.path(), &cfg, &bash_event("done")).unwrap();
+        stop_capture(&cfg, &bash_event("done")).unwrap();
         let staged = crate::staging::list(&paths::staging_dir(brain.path()));
         assert_eq!(staged.len(), 1, "the hot-file trap staged a ring-5 candidate");
         assert_eq!(staged[0].reason, "hot-file");
+    }
+
+    #[test]
+    fn stop_capture_never_runs_legacy_state_migrations() {
+        let state = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        let cfg = tree_cfg(brain.path(), true);
+        let legacy = state.path().join("exhaust.db");
+        let conn = rusqlite::Connection::open(&legacy).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events(
+               id INTEGER PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               ts INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               payload TEXT NOT NULL,
+               flag INTEGER NOT NULL DEFAULT 0,
+               flag_reason TEXT,
+               consumed INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO events(session_id, ts, kind, payload)
+             VALUES ('old-session', 1000, 'bash', '{\"command\":\"old\"}');",
+        )
+        .unwrap();
+        drop(conn);
+
+        stop_capture(&cfg, &bash_event("done")).unwrap();
+
+        assert!(legacy.is_file(), "the old database remains operator data");
+        assert!(
+            !state.path().join("exhaust-db-imported").exists(),
+            "a latency-critical Stop hook must never start an upgrade migration"
+        );
+        let records = crate::jsonl::read_all(
+            &paths::logs_dir(brain.path()),
+            crate::exhaust::STREAM,
+        )
+        .records;
+        assert!(
+            records.iter().all(|record| record.str("session") != "old-session"),
+            "legacy rows must be absent from the Stop-side append"
+        );
+        assert!(
+            records.iter().any(|record| record.kind() == "turn"),
+            "normal bounded Stop capture still runs"
+        );
     }
 
     #[test]
