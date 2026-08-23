@@ -91,6 +91,9 @@ enum Command {
     Hook {
         /// session-start | user-prompt | pre-tool | post-tool | stop | precompact
         event: String,
+        /// Coding-agent adapter invoking the hook
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
     },
     /// Manage the per-host daemon
     Daemon {
@@ -2302,14 +2305,22 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("hook") {
         let event = argv.get(2).cloned().unwrap_or_default();
-        hooks::run(&event);
+        let agent = argv
+            .windows(2)
+            .find(|pair| pair[0] == "--agent")
+            .map(|pair| pair[1].as_str())
+            .or_else(|| {
+                argv.iter()
+                    .find_map(|arg| arg.strip_prefix("--agent="))
+            });
+        hooks::run(&event, agent);
         return;
     }
     let cli = Cli::parse();
     match cli.command {
-        Command::Hook { event } => {
+        Command::Hook { event, agent } => {
             // Unreachable in practice (pre-dispatch above), kept for --help.
-            hooks::run(&event);
+            hooks::run(&event, agent.as_deref());
         }
         Command::Daemon { action } => {
             let result = match action {
