@@ -57,9 +57,10 @@ proprietary database, or a change to how you edit your notes.
 health, catalog generation, statements by trust ring, indexed code, captured
 exhaust, staged maintenance candidates, injected context, and live cited recall.
 The screenshot is the shipped v0.9.9 dashboard indexing this repository, not a
-UI mockup. On `main`, the dashboard also reports pending and applied supervised
-maintenance proposals. It remains read-only; the CLI and MCP surfaces perform
-the underlying actions.
+UI mockup. On `main`, a read-only maintenance inbox also shows captured
+candidates, proposal lifecycles, semantic review gates, deterministic failures,
+bounded diff previews, and the exact revision-bound CLI command for the next
+step. The dashboard never calls a model or applies a proposal.
 
 ## Feature map
 
@@ -208,7 +209,8 @@ maintenance targets, unendorsed model claims cannot cross inward, and an
 attested observation may enter ring 3 but not behavioral ring 2. No daemon or
 hook calls a model in the background; the active agent supplies the analysis
 under the operator's existing model and approval policy. The terminal dashboard
-shows pending and applied maintenance proposals alongside staging.
+provides a read-only inbox for candidate evidence, proposal state, review gates,
+verification failures, bounded diff previews, and revision-bound next commands.
 
 See [Supervised AI maintenance](docs/ai-maintenance.md) for the proposal schema,
 lifecycle, failure behavior, and agent integration.

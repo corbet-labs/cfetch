@@ -11,7 +11,9 @@ listed here is a fix or an internal change with no effect on behavior.
   and stale-file gates protect apply; changes are reversible, and the candidate
   is finalized only after git contains the approved bytes. MCP may inspect and
   write ring-5 proposal/review records, but apply and finalization remain
-  explicit CLI actions. The dashboard reports pending and applied proposals.
+  explicit CLI actions. A read-only dashboard inbox shows candidates, proposal
+  lifecycles, review gates, verification failures, bounded diff previews, and
+  revision-bound next commands without calling a model or applying a proposal.
 - **One embedding/network ABI for v1.** The v1 profile freezes the pinned
   EmbeddingGemma-300M Q8-QAT source, XINT8 W8A8 execution, official
   retrieval prompts, full 768 dimensions, pooling/normalization, and an exact

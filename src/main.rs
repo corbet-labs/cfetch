@@ -55,6 +55,7 @@ mod ledger;
 mod lockfile;
 mod markers;
 mod maintenance;
+mod maintenance_inbox;
 mod mcp;
 mod migrate;
 mod net;
@@ -246,7 +247,7 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         batch: usize,
     },
-    /// Open the terminal dashboard: health, ledger, live recall
+    /// Open the terminal dashboard: health, recall, and maintenance inbox
     /// A/B bench: paired cfetch-on / cfetch-off sessions, read from
     /// transcript ground truth — cache dimensions plus the bash re-run rate
     Bench {

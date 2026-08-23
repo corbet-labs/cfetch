@@ -1204,6 +1204,31 @@ pub fn verify(cfg: &Config, id: &str) -> anyhow::Result<Verification> {
     Ok(verify_proposal(cfg, &proposal, false, true))
 }
 
+/// Re-run the deterministic gates that still have meaning for an active
+/// proposal without granting the caller any mutation authority. Pending
+/// proposals are checked against their captured before bytes; applied ones
+/// are checked against their exact after bytes. Terminal lifecycle records
+/// remain inspectable, but are not misleadingly presented as currently
+/// actionable.
+pub fn inspect_verification(cfg: &Config, id: &str) -> anyhow::Result<Option<Verification>> {
+    let (state, _, proposal) = locate(
+        &cfg.brain_root,
+        id,
+        &[PENDING, APPLIED, FINALIZED, REJECTED, REVERTED],
+    )?;
+    match state.as_str() {
+        PENDING => Ok(Some(verify_proposal(cfg, &proposal, false, true))),
+        APPLIED => Ok(Some(verify_proposal(cfg, &proposal, true, true))),
+        _ => Ok(None),
+    }
+}
+
+/// Exact full-file diff captured by a proposal. Decision-only transitions
+/// return no diff because they can never write trusted memory.
+pub fn exact_diff(proposal: &Proposal) -> Option<String> {
+    whole_file_diff(proposal)
+}
+
 fn move_proposal(brain_root: &Path, id: &str, from: &str, to: &str) -> anyhow::Result<()> {
     let source = proposal_path(brain_root, from, id);
     let target = proposal_path(brain_root, to, id);
@@ -1513,9 +1538,19 @@ mod tests {
             "---\nring: 3\n---\n\n# Known failure\n"
         );
         assert!(proposal_path(fixture.brain.path(), APPLIED, &submitted.proposal.id).is_file());
+        let applied = inspect_verification(&fixture.cfg, &submitted.proposal.id)
+            .unwrap()
+            .expect("an applied proposal still has live target-boundary checks");
+        assert!(applied.valid, "{:?}", applied.checks);
         revert(&fixture.cfg, &submitted.proposal.id).unwrap();
         assert!(!fixture.brain.path().join("knowledge/failures.md").exists());
         assert!(proposal_path(fixture.brain.path(), REVERTED, &submitted.proposal.id).is_file());
+        assert!(
+            inspect_verification(&fixture.cfg, &submitted.proposal.id)
+                .unwrap()
+                .is_none(),
+            "terminal lifecycle records remain inspectable without looking actionable"
+        );
         assert!(staging::path_of(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id).is_file());
     }
 
