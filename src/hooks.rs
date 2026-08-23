@@ -700,10 +700,70 @@ fn brain_read_redirect(
 /// PreToolUse: read hygiene advice at the moment of spend. Repeat-read
 /// advisory (once per file per session, mtime-gated, disarmed by compaction)
 /// plus symbol-slice hints for large indexed files.
+/// The content a pending tool call would put into the world: a write's body,
+/// or a shell command. Both are checked against declared prohibitions, because
+/// a standing constraint is usually broken by a COMMAND rather than by prose —
+/// `zfs set dedup=on` is typed, not written into a document.
+fn pending_content(event: &HookEvent) -> Option<String> {
+    let input = event.tool_input.as_ref()?;
+    let field = match event.tool_name.as_deref()? {
+        "Bash" => "command",
+        "Write" => "content",
+        "Edit" | "MultiEdit" | "NotebookEdit" => "new_string",
+        "apply_patch" => "command",
+        _ => return None,
+    };
+    input.get(field).and_then(serde_json::Value::as_str).map(str::to_string)
+}
+
+/// Names a declared prohibition the pending call would violate, at the moment
+/// it would be violated. Advisory, never a block: the rules are the operator's
+/// and so is the decision to override one — but silence at the write site is
+/// how a standing constraint gets broken by an agent that read it 200 messages
+/// ago. At most once per rule per session, keyed through the reminder set so
+/// the same advice cannot arrive twice by two routes.
+fn prohibition_warning(
+    cfg: Option<&Config>,
+    state_dir: &Path,
+    event: &HookEvent,
+) -> Option<String> {
+    let cfg = cfg?;
+    let content = pending_content(event)?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let rules = govern::prohibitions(cfg, &SessionScope::from_event(event));
+    let (hit, pattern) = govern::first_violation(&content, &rules)?;
+    let key = format!("forbids:{}", hit.rule);
+    let text = format!(
+        "[cfetch: this would use `{pattern}`, which {} forbids — read that rule before proceeding]",
+        hit.rule
+    );
+    let mut fired = false;
+    let _ = session_state::update(state_dir, event.session(), |st| {
+        fired = st.queue_reminder(&key, &text);
+    });
+    // The queue delivers at the next prompt; the write is happening NOW, so the
+    // text is returned for immediate emission and the queue entry only holds
+    // the once-per-rule key.
+    fired.then_some(text)
+}
+
 fn pre_tool(event: &HookEvent) -> anyhow::Result<()> {
     // Subagents run in fresh context: the "earlier content" a warning points
     // at does not exist there. Never warn subagents.
     if event.is_subagent() {
+        return Ok(());
+    }
+    let cfg_for_rules = Config::load().ok();
+    let state_dir_for_rules = paths::state_dir();
+    if let Some(warning) =
+        prohibition_warning(cfg_for_rules.as_ref(), &state_dir_for_rules, event)
+    {
+        let mut emit = Emit::new("PreToolUse");
+        emit.add_context(warning);
+        let emitted = emit.finish();
+        LedgerSink::of(cfg_for_rules.as_ref()).book(event.session(), "prohibition", emitted);
         return Ok(());
     }
     let Some((path, ranged)) = read_invocation(event) else { return Ok(()) };

@@ -226,6 +226,70 @@ fn frontmatter_value(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// End-to-end discovery, in the shape a real brain has: no resident config,
+    /// rules found by walking the ring-2 behaviour directory.
+    #[test]
+    fn prohibitions_are_discovered_from_the_behaviour_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path().join("mind/memories");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("feedback_never_enable_dedup.md"),
+            "---\nname: feedback_never_enable_dedup\ndescription: \"Never set dedup=\"\nring: 0\n\
+forbids:\n  - \"dedup=on|sha256|blake3|edonr\"\nmetadata: \n  type: feedback\n---\n\nbody\n",
+        )
+        .unwrap();
+        // A rule that declares nothing must contribute nothing.
+        std::fs::write(mem.join("feedback_other.md"), "---\nring: 2\n---\n\nprose\n").unwrap();
+
+        let cfg = Config { brain_root: dir.path().to_path_buf(), ..Config::default() };
+        let found = prohibitions(&cfg, &SessionScope::from_cwd(None));
+        assert_eq!(found.len(), 1, "exactly the declaring rule: {found:?}");
+        assert_eq!(found[0].rule, "feedback_never_enable_dedup");
+        assert!(first_violation("zfs set dedup=on tank", &found).is_some());
+        assert!(first_violation("ls -la", &found).is_none());
+    }
+
+    /// The rule this mechanism exists for, in the declared form.
+    #[test]
+    fn a_declared_prohibition_expands_its_alternation_with_the_shared_prefix() {
+        let raw = "---\nname: feedback_never_enable_dedup\nring: 0\n\
+forbids:\n  - \"dedup=on|sha256|blake3|edonr\"\nmetadata:\n  type: feedback\n---\n\nbody\n";
+        let p = prohibitions_in(raw, "feedback_never_enable_dedup").expect("a prohibition");
+        assert!(p.patterns.contains(&"dedup=on".to_string()), "{:?}", p.patterns);
+        assert!(p.patterns.contains(&"dedup=sha256".to_string()), "{:?}", p.patterns);
+        // The bare algorithm name must never become a pattern: it appears in
+        // ordinary code constantly and would fire on almost every write.
+        assert!(!p.patterns.contains(&"sha256".to_string()), "bare sha256 leaked in");
+        // The list ends at the next key.
+        assert!(!p.patterns.iter().any(|x| x.contains("feedback")), "{:?}", p.patterns);
+    }
+
+    #[test]
+    fn a_violation_names_the_rule_that_forbade_it() {
+        let rules = vec![Prohibition {
+            rule: "feedback_never_enable_dedup".into(),
+            patterns: vec!["dedup=on".into(), "dedup=sha256".into()],
+        }];
+        let (hit, pat) = first_violation("zfs set dedup=on solid/agents", &rules).expect("caught");
+        assert_eq!(hit.rule, "feedback_never_enable_dedup");
+        assert_eq!(pat, "dedup=on");
+        assert!(first_violation("ZFS SET DEDUP=ON tank", &rules).is_some(), "case is no excuse");
+        // Ordinary work is left alone — this is the property that decides
+        // whether the mechanism survives contact with a real session.
+        assert!(first_violation("zfs set compression=zstd tank", &rules).is_none());
+        assert!(first_violation("let h = sha256(bytes);", &rules).is_none());
+        assert!(first_violation("ls -la && zfs list", &rules).is_none());
+    }
+
+    /// A rule that declares nothing contributes nothing. Inferring
+    /// prohibitions from prose was tried and rejected: see prohibitions_in.
+    #[test]
+    fn a_rule_without_a_forbids_key_is_skipped() {
+        let raw = "---\nring: 0\n---\n\nNever enable ZFS dedup (`dedup=on`) on any pool.\n";
+        assert!(prohibitions_in(raw, "feedback_never_enable_dedup").is_none());
+    }
+
     use super::*;
 
     /// A session matching no particular host or repo — enough for every
@@ -546,4 +610,183 @@ mod tests {
         assert!(g.enabled);
         assert_eq!(g.reinject_every, 25);
     }
+}
+
+/// A prohibition lifted out of a rule, with the rule that stated it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prohibition {
+    /// Rule file stem, so a violation can be traced back to its source.
+    pub rule: String,
+    /// Literal fragments, any one of which matching means the rule is in play.
+    pub patterns: Vec<String>,
+}
+
+/// Shortest fragment worth matching. Below this a pattern is a common word and
+/// every write trips it; a hook that cries wolf gets switched off, which costs
+/// more than the warnings were ever worth.
+const MIN_PATTERN: usize = 4;
+
+/// Patterns a rule DECLARES it forbids, from a `forbids:` frontmatter list.
+///
+/// Declared, never inferred. Extracting prohibitions from prose was tried
+/// against the operator's real 203-rule corpus and failed on a specific shape:
+/// "don't guess — run `zfs list`" is a negated sentence whose quoted token is
+/// the REMEDY. The heuristic could not separate those from prohibitions, and
+/// the surviving false positives were `ls -la`, `zfs list`, `stat -c` — the
+/// commands an agent runs most. A hook that objects to `ls -la` is a hook
+/// switched off within a day, and then the real guards go unenforced too.
+///
+/// So a rule opts in:
+///
+/// ```text
+/// forbids:
+///   - "dedup=on|sha256|blake3|edonr"
+///   - "systemd-cryptenroll --tpm2-device"
+/// ```
+///
+/// `|` is alternation sharing the prefix before `=`, because that is how the
+/// rules already write it: `dedup=on|sha256` means two prohibitions, not a
+/// prohibition on the bare word `sha256`.
+pub fn prohibitions_in(raw: &str, rule: &str) -> Option<Prohibition> {
+    let mut patterns = Vec::new();
+    let mut in_list = false;
+    for line in frontmatter(raw).lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("forbids:") {
+            in_list = true;
+            // Inline form: `forbids: "a|b"`.
+            for span in unquote(rest.trim()) {
+                push_expanded(&mut patterns, &span);
+            }
+            continue;
+        }
+        if in_list {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                for span in unquote(item.trim()) {
+                    push_expanded(&mut patterns, &span);
+                }
+                continue;
+            }
+            // Any other key ends the list.
+            if !trimmed.is_empty() && !trimmed.starts_with('-') {
+                in_list = false;
+            }
+        }
+    }
+    (!patterns.is_empty()).then(|| Prohibition { rule: rule.to_string(), patterns })
+}
+
+/// The frontmatter block, or the empty string when a file has none.
+fn frontmatter(raw: &str) -> &str {
+    let rest = raw.strip_prefix("---").unwrap_or("");
+    rest.split_once("\n---").map_or("", |(fm, _)| fm)
+}
+
+/// One YAML scalar, minus surrounding quotes. Empty input yields nothing.
+fn unquote(s: &str) -> Vec<String> {
+    let s = s.trim().trim_matches('"').trim_matches('\'').trim();
+    if s.is_empty() { Vec::new() } else { vec![s.to_string()] }
+}
+
+fn push_expanded(out: &mut Vec<String>, span: &str) {
+    for alt in expand_alternation(span) {
+        if alt.len() >= MIN_PATTERN && !out.iter().any(|p| *p == alt) {
+            out.push(alt);
+        }
+    }
+}
+
+/// Expands `dedup=on|sha256|blake3|edonr` into patterns that each keep the
+/// `dedup=` prefix.
+///
+/// Splitting on `|` alone would yield `sha256`, `blake3` and `edonr` as
+/// standalone patterns — tokens that appear in ordinary code constantly, so the
+/// rule would fire on almost every write. The prefix is what makes the match
+/// specific, and the rules write it once and share it across alternatives.
+fn expand_alternation(span: &str) -> Vec<String> {
+    let Some((head, tail)) = span.split_once('|') else {
+        return vec![span.trim().to_string()];
+    };
+    let prefix = head.rfind('=').map(|i| &head[..=i]).unwrap_or("");
+    let mut out = vec![head.trim().to_string()];
+    for alt in tail.split('|') {
+        let alt = alt.trim();
+        if alt.is_empty() {
+            continue;
+        }
+        out.push(if alt.contains('=') || prefix.is_empty() {
+            alt.to_string()
+        } else {
+            format!("{prefix}{alt}")
+        });
+    }
+    out
+}
+
+/// Every prohibition declared by the rules this session is entitled to.
+/// Ring 0-2: invariants, policy and distilled behaviour — the rings that carry
+/// standing constraints. Ring 3+ is knowledge, which describes rather than
+/// forbids.
+pub fn prohibitions(cfg: &Config, scope: &SessionScope) -> Vec<Prohibition> {
+    let mut out: Vec<Prohibition> = Vec::new();
+    let mut take = |raw: &str, stem: &str| {
+        if let Some(p) = prohibitions_in(raw, stem)
+            && !out.iter().any(|existing| existing.rule == p.rule)
+        {
+            out.push(p);
+        }
+    };
+
+    // Resident entries AND the behaviour directories. Both, never one or the
+    // other: a brain has a resident set naming a handful of entry points and a
+    // directory of distilled rules, and the constraints live in the second.
+    // Returning early on a non-empty resident list meant the default config —
+    // which names AGENT.md and nothing else — hid every declared prohibition.
+    for entry in cfg
+        .resident
+        .iter()
+        .filter(|e| e.ring <= 2 && e.scope.matches(&scope.host, scope.repo.as_deref()))
+    {
+        let path = cfg.resolve(&entry.path);
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let stem = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into());
+        take(&raw, &stem);
+    }
+
+    for dir in behavior_dirs(cfg) {
+        let Ok(rd) = std::fs::read_dir(cfg.brain_root.join(&dir)) else { continue };
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+            .collect();
+        files.sort();
+        for f in files {
+            let Ok(raw) = std::fs::read_to_string(&f) else { continue };
+            let ring = frontmatter_value(&raw, "ring")
+                .and_then(|v| v.split_whitespace().next()?.parse::<u8>().ok())
+                .unwrap_or(2);
+            if ring > 2 {
+                continue;
+            }
+            let stem = f.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into());
+            take(&raw, &stem);
+        }
+    }
+    out
+}
+
+/// The first rule this content violates, if any. Case-insensitive: a rule about
+/// `dedup=on` means the same shouted.
+pub fn first_violation<'a>(
+    content: &str,
+    rules: &'a [Prohibition],
+) -> Option<(&'a Prohibition, &'a str)> {
+    let hay = content.to_ascii_lowercase();
+    rules.iter().find_map(|r| {
+        r.patterns
+            .iter()
+            .find(|p| hay.contains(&p.to_ascii_lowercase()))
+            .map(|p| (r, p.as_str()))
+    })
 }
