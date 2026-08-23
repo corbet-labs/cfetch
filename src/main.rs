@@ -35,6 +35,7 @@ mod condense;
 mod config;
 mod daemon;
 mod dashboard;
+mod doctor;
 mod embed;
 mod embedding_profile;
 mod exhaust;
@@ -95,6 +96,9 @@ enum Command {
     Hook {
         /// session-start | user-prompt | pre-tool | post-tool | stop | precompact
         event: String,
+        /// Coding-agent adapter invoking the hook
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
     },
     /// Manage the per-host daemon
     Daemon {
@@ -255,7 +259,6 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         batch: usize,
     },
-    /// Open the terminal dashboard: health, recall, and maintenance inbox
     /// A/B bench: paired cfetch-on / cfetch-off sessions, read from
     /// transcript ground truth — cache dimensions plus the bash re-run rate
     Bench {
@@ -271,7 +274,20 @@ enum Command {
         /// Where to create it. Defaults to the configured brain root
         path: Option<std::path::PathBuf>,
     },
+    /// Open the terminal dashboard: health, system diagnostics, recall, and maintenance
     Dashboard,
+    /// Explain hardware, inference, peers, artifacts, hooks, and daemon health
+    Doctor {
+        /// Print the stable DoctorReportV1 diagnostic contract
+        #[arg(long, conflicts_with = "tui")]
+        json: bool,
+        /// Open the live System pane in the terminal dashboard
+        #[arg(long, conflicts_with = "json")]
+        tui: bool,
+        /// Do not contact joined remote origins
+        #[arg(long)]
+        no_network: bool,
+    },
     /// Serve recall/find/expand over MCP (stdio) for any MCP client
     Mcp,
     /// Verify the installation end to end; nonzero exit on hard failures
@@ -1880,7 +1896,9 @@ fn delivery_status_line(agent: &str, verification: Option<(u64, u64)>) -> String
 }
 
 fn status() -> anyhow::Result<()> {
-    let runtime = runtime_status::refresh_static()?;
+    let mut runtime = runtime_status::refresh_static()?;
+    let daemon_running = daemon::call("ping", std::time::Duration::from_millis(300)).is_some();
+    runtime_status::apply_daemon_observation(&mut runtime, daemon_running);
     println!("{}", runtime_status::render_line(&runtime));
     daemon::status()?;
     // Diagnostics must survive a broken config: the paths below fall back to
@@ -2306,14 +2324,22 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("hook") {
         let event = argv.get(2).cloned().unwrap_or_default();
-        hooks::run(&event);
+        let agent = argv
+            .windows(2)
+            .find(|pair| pair[0] == "--agent")
+            .map(|pair| pair[1].as_str())
+            .or_else(|| {
+                argv.iter()
+                    .find_map(|arg| arg.strip_prefix("--agent="))
+            });
+        hooks::run(&event, agent);
         return;
     }
     let cli = Cli::parse();
     match cli.command {
-        Command::Hook { event } => {
+        Command::Hook { event, agent } => {
             // Unreachable in practice (pre-dispatch above), kept for --help.
-            hooks::run(&event);
+            hooks::run(&event, agent.as_deref());
         }
         Command::Daemon { action } => {
             let result = match action {
@@ -2497,6 +2523,25 @@ fn main() {
             // like the rest of the read path.
             if let Err(e) = dashboard::run() {
                 eprintln!("cfetch dashboard: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Doctor { json, tui, no_network } => {
+            let result = if tui {
+                dashboard::run_system(!no_network)
+            } else {
+                let report = doctor::gather(!no_network);
+                if json {
+                    serde_json::to_string_pretty(&report)
+                        .map(|body| println!("{body}"))
+                        .map_err(Into::into)
+                } else {
+                    println!("{}", doctor::render_text(&report));
+                    Ok(())
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("cfetch doctor: {e:#}");
                 std::process::exit(1);
             }
         }

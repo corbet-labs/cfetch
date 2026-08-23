@@ -74,6 +74,23 @@ that content. If a second producer ever supplies the same content hash under
 the same profile, cfetch compares the canonical record byte-for-byte and
 rejects a mismatch as cross-runner drift.
 
+Across storage groups, `embed-index` resolves artifacts in this order: the
+local shared store, authorized joined origins, then the configured embedding
+endpoint. The origin first applies the normal authenticated slice grant and
+offers only requested content hashes that occur inside that slice. The vector
+record then travels through iroh-blobs as a BLAKE3-verified blob. Its capability
+hash is salted and stored per authenticated peer, so content addressing is not
+mistaken for access control. The receiver checks this profile, the requested
+content hash, the exact 768-byte record width, and the non-degenerate vector
+guard before making the bytes durable.
+
+The current iroh-1-compatible `iroh-blobs` release is explicitly described by
+its upstream maintainers as pre-production. cfetch therefore exact-pins it,
+uses it only as a bounded transfer layer, keeps the durable artifact record in
+its own crash-consistent store, and marks this capability as next-release
+until the cross-platform acceptance matrix stays green. This dependency does
+not become cfetch's database or authorization system.
+
 Accelerator releases must additionally pass the profile's checked-in
 known-answer conformance set before they are allowed to publish vectors.
 That set is generated once with the canonical v1 artifact and released with

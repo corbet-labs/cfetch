@@ -116,6 +116,8 @@ pub struct BackendSelection {
     pub backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<InferenceRoute>,
     pub selected_at: u64,
 }
 
@@ -331,7 +333,7 @@ pub fn load_cached() -> RuntimeStatusV1 {
     load_cached_in(&paths::state_dir())
 }
 
-fn load_cached_in(state_dir: &Path) -> RuntimeStatusV1 {
+pub(crate) fn load_cached_in(state_dir: &Path) -> RuntimeStatusV1 {
     let mut status = std::fs::read_to_string(snapshot_path_in(state_dir))
         .ok()
         .and_then(|raw| serde_json::from_str::<RuntimeStatusV1>(&raw).ok())
@@ -398,11 +400,14 @@ fn update(mutate: impl FnOnce(&mut RuntimeStatusV1)) -> Option<RuntimeStatusV1> 
 fn normalize(status: &mut RuntimeStatusV1) {
     status.memory_route.origin_label = origin_label(status.memory_route.mode);
     if let Some(selected) = &mut status.inference.selected {
-        selected.backend = safe_label(&selected.backend);
-        selected.device_class = selected.device_class.as_deref().map(safe_label);
+        selected.backend = safe_backend_label(&selected.backend);
+        selected.device_class = selected
+            .device_class
+            .as_deref()
+            .and_then(safe_device_label);
     }
     if let Some(last) = &mut status.inference.last_used {
-        last.backend = safe_label(&last.backend);
+        last.backend = safe_backend_label(&last.backend);
     }
     status.failures = status
         .failures
@@ -422,7 +427,6 @@ fn normalize(status: &mut RuntimeStatusV1) {
         .failures
         .iter()
         .any(|failure| failure.severity == FailureSeverity::Warning)
-        && status.service.state == ServiceState::Ready
     {
         status.service.state = ServiceState::Degraded;
     }
@@ -552,7 +556,9 @@ pub fn refresh_static() -> anyhow::Result<RuntimeStatusV1> {
 fn set_vector_coverage(status: &mut RuntimeStatusV1, embedded: u64, total: u64) {
     status.retrieval.embedded = Some(embedded);
     status.retrieval.total = Some(total);
-    status.retrieval.vector_coverage = if total > 0 && embedded >= total {
+    status.retrieval.vector_coverage = if (total == 0 && embedded == 0)
+        || (total > 0 && embedded >= total)
+    {
         VectorCoverageState::Complete
     } else if embedded > 0 {
         VectorCoverageState::Partial
@@ -594,6 +600,24 @@ pub fn record_service(state: ServiceState, failure_code: Option<&str>) {
     });
 }
 
+/// Applies a live daemon probe to a snapshot for immediate display without
+/// persisting it. Cached surfaces remain observation-only and daemon lifecycle
+/// events continue to own the durable service state.
+pub fn apply_daemon_observation(status: &mut RuntimeStatusV1, running: bool) {
+    remove_failure(status, "daemon_unavailable");
+    if running {
+        recover_if_clean(status);
+    } else {
+        upsert_failure(
+            status,
+            "daemon_unavailable",
+            FailureSeverity::Warning,
+            "run cfetch daemon start or cfetch selfcheck",
+        );
+    }
+    normalize(status);
+}
+
 pub fn record_generation(route: MemoryRoute, generation: u64) {
     let _ = update(|status| {
         status.memory_route.mode = route;
@@ -608,9 +632,22 @@ pub fn record_memory_answer(
     fresh: Option<bool>,
     success: bool,
 ) {
-    let _ = update(|status| {
-        status.memory_route.mode = route;
-        status.memory_route.origin_label = origin_label(route);
+    let _ = update(|status| apply_memory_answer(status, route, generation, fresh, success));
+}
+
+fn apply_memory_answer(
+    status: &mut RuntimeStatusV1,
+    route: MemoryRoute,
+    generation: Option<u64>,
+    fresh: Option<bool>,
+    success: bool,
+) {
+    status.memory_route.mode = route;
+    status.memory_route.origin_label = origin_label(route);
+    remove_failure(status, "remote_unavailable");
+    remove_failure(status, "memory_unavailable");
+    remove_failure(status, "memory_stale");
+    if success {
         if let Some(generation) = generation {
             status.memory_route.generation = Some(generation);
         }
@@ -622,37 +659,32 @@ pub fn record_memory_answer(
             },
             observed_at: Some(now()),
         };
-        remove_failure(status, "remote_unavailable");
-        remove_failure(status, "memory_unavailable");
-        remove_failure(status, "memory_stale");
-        if success {
-            status.service.state = if fresh == Some(false) {
-                ServiceState::Degraded
-            } else {
-                ServiceState::Ready
-            };
-            if fresh == Some(false) {
-                upsert_failure(
-                    status,
-                    "memory_stale",
-                    FailureSeverity::Warning,
-                    "wait for serving drain or check cfetch status",
-                );
-            }
+        status.service.state = if fresh == Some(false) {
+            ServiceState::Degraded
         } else {
-            status.service.state = ServiceState::Unavailable;
+            ServiceState::Ready
+        };
+        if fresh == Some(false) {
             upsert_failure(
                 status,
-                if route == MemoryRoute::Remote {
-                    "remote_unavailable"
-                } else {
-                    "memory_unavailable"
-                },
-                FailureSeverity::Critical,
-                "check cfetch status and serving connectivity",
+                "memory_stale",
+                FailureSeverity::Warning,
+                "wait for serving drain or check cfetch status",
             );
         }
-    });
+    } else {
+        status.service.state = ServiceState::Unavailable;
+        upsert_failure(
+            status,
+            if route == MemoryRoute::Remote {
+                "remote_unavailable"
+            } else {
+                "memory_unavailable"
+            },
+            FailureSeverity::Critical,
+            "check cfetch status and serving connectivity",
+        );
+    }
 }
 
 pub fn record_retrieval(mode: RetrievalMode, degraded: bool) {
@@ -683,24 +715,38 @@ pub fn retrieval_note_is_degraded(note: Option<&str>) -> bool {
     })
 }
 
-fn safe_label(value: &str) -> String {
-    let value: String = value
-        .chars()
-        .take(32)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let value = value.trim_matches('-');
-    if value.is_empty() {
-        "unknown".to_string()
-    } else {
-        value.to_string()
+fn safe_backend_label(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "endpoint" => "endpoint",
+        "rerank-endpoint" => "rerank-endpoint",
+        "openvino" => "openvino",
+        "coreml" => "coreml",
+        "qnn" => "qnn",
+        "tensorrt" => "tensorrt",
+        "cuda" => "cuda",
+        "rocm" => "rocm",
+        "vulkan" => "vulkan",
+        "metal" => "metal",
+        "onnxruntime" => "onnxruntime",
+        "ort" => "ort",
+        "ryzen-ai" => "ryzen-ai",
+        "cpu" => "cpu",
+        _ => "other",
     }
+    .to_string()
+}
+
+fn safe_device_label(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cpu" => Some("cpu"),
+        "gpu" => Some("gpu"),
+        "npu" => Some("npu"),
+        "ane" => Some("ane"),
+        "tpu" => Some("tpu"),
+        "dsp" => Some("dsp"),
+        _ => None,
+    }
+    .map(str::to_string)
 }
 
 pub fn record_inference_attempt(
@@ -710,35 +756,53 @@ pub fn record_inference_attempt(
     device_class: Option<&str>,
     success: bool,
 ) {
-    let backend = safe_label(backend);
-    let device_class = device_class.map(safe_label);
+    let backend = safe_backend_label(backend);
+    let device_class = device_class.and_then(safe_device_label);
     let _ = update(|status| {
-        status.inference.configured = configured;
-        status.inference.configured_route = Some(route);
-        status.inference.last_used = Some(InferenceAttempt {
+        apply_inference_attempt(
+            status,
+            configured,
             route,
-            backend: backend.clone(),
+            backend,
+            device_class,
             success,
-            observed_at: now(),
-        });
-        remove_failure(status, "inference_unavailable");
-        remove_failure(status, "inference_initialization_failed");
-        if success {
-            status.inference.selected = Some(BackendSelection {
-                backend,
-                device_class,
-                selected_at: now(),
-            });
-            recover_if_clean(status);
-        } else {
-            upsert_failure(
-                status,
-                "inference_unavailable",
-                FailureSeverity::Warning,
-                "check inference configuration or use lexical recall",
-            );
-        }
+        )
     });
+}
+
+fn apply_inference_attempt(
+    status: &mut RuntimeStatusV1,
+    configured: InferenceMode,
+    route: InferenceRoute,
+    backend: String,
+    device_class: Option<String>,
+    success: bool,
+) {
+    status.inference.configured = configured;
+    status.inference.last_used = Some(InferenceAttempt {
+        route,
+        backend: backend.clone(),
+        success,
+        observed_at: now(),
+    });
+    remove_failure(status, "inference_unavailable");
+    remove_failure(status, "inference_initialization_failed");
+    if success {
+        status.inference.selected = Some(BackendSelection {
+            backend,
+            device_class,
+            route: Some(route),
+            selected_at: now(),
+        });
+        recover_if_clean(status);
+    } else {
+        upsert_failure(
+            status,
+            "inference_unavailable",
+            FailureSeverity::Warning,
+            "check inference configuration or use lexical recall",
+        );
+    }
 }
 
 pub fn record_inference_initialization_failure() {
@@ -805,6 +869,7 @@ fn coverage_label(status: &RuntimeStatusV1) -> Option<String> {
             (VectorCoverageState::Complete, Some(_), Some(total)) if total > 0 => {
                 "vectors 100%".to_string()
             }
+            (VectorCoverageState::Complete, Some(0), Some(0)) => "vectors n/a".to_string(),
             (VectorCoverageState::Partial, Some(embedded), Some(total)) if total > 0 => {
                 format!("vectors {}%", embedded.saturating_mul(100) / total)
             }
@@ -819,18 +884,22 @@ fn inference_label(status: &RuntimeStatusV1) -> String {
         InferenceMode::Disabled => "embed:off".to_string(),
         InferenceMode::Local | InferenceMode::Endpoint => {
             if let Some(last) = &status.inference.last_used {
-                let device = status
+                let selected = status
                     .inference
                     .selected
                     .as_ref()
+                    .filter(|selected| {
+                        selected.backend == last.backend && selected.route == Some(last.route)
+                    });
+                let device = selected
                     .and_then(|selected| selected.device_class.as_deref())
-                    .map(safe_label);
+                    .and_then(safe_device_label);
                 let where_ = device.as_deref().unwrap_or(match last.route {
                     InferenceRoute::Local => "local",
                     InferenceRoute::Remote => "remote",
                 });
                 let result = if last.success { "used" } else { "failed" };
-                let selected = if status.inference.selected.is_some() {
+                let selected = if selected.is_some() {
                     " selected,"
                 } else {
                     ""
@@ -841,8 +910,14 @@ fn inference_label(status: &RuntimeStatusV1) -> String {
                 )
             } else if let Some(selected) = &status.inference.selected {
                 match &selected.device_class {
-                    Some(device) => format!("embed:{} selected", safe_label(device)),
-                    None => format!("embed:{} selected", safe_label(&selected.backend)),
+                    Some(device) => format!(
+                        "embed:{} selected",
+                        safe_device_label(device).as_deref().unwrap_or("local")
+                    ),
+                    None => format!(
+                        "embed:{} selected",
+                        safe_backend_label(&selected.backend)
+                    ),
                 }
             } else {
                 match (
@@ -950,19 +1025,27 @@ pub fn transition_fingerprint(status: &RuntimeStatusV1) -> String {
         .as_ref()
         .map(|selected| {
             format!(
-                "{}:{}",
+                "{}:{}:{:?}",
                 selected.backend,
-                selected.device_class.as_deref().unwrap_or("")
+                selected.device_class.as_deref().unwrap_or(""),
+                selected.route
             )
         })
         .unwrap_or_default();
+    let last_route = status
+        .inference
+        .last_used
+        .as_ref()
+        .map(|last| format!("{:?}", last.route))
+        .unwrap_or_default();
     format!(
-        "{:?}|{:?}|{:?}|{:?}|{}|{}",
+        "{:?}|{:?}|{:?}|{:?}|{}|{}|{}",
         status.service.state,
         status.memory_route.mode,
         status.inference.configured,
         status.inference.configured_route,
         selected,
+        last_route,
         failures,
     )
 }
@@ -1080,6 +1163,62 @@ mod tests {
     }
 
     #[test]
+    fn warning_after_critical_recovery_is_degraded_not_unavailable() {
+        let mut status = RuntimeStatusV1::default();
+        status.service.state = ServiceState::Unavailable;
+        upsert_failure(
+            &mut status,
+            "vector_coverage_partial",
+            FailureSeverity::Warning,
+            "ignored",
+        );
+        normalize(&mut status);
+        assert_eq!(status.service.state, ServiceState::Degraded);
+    }
+
+    #[test]
+    fn live_daemon_observation_updates_display_without_masking_critical_failures() {
+        let mut status = RuntimeStatusV1::default();
+        apply_daemon_observation(&mut status, false);
+        assert_eq!(status.service.state, ServiceState::Degraded);
+        assert!(
+            status
+                .failures
+                .iter()
+                .any(|failure| failure.code == "daemon_unavailable")
+        );
+
+        upsert_failure(
+            &mut status,
+            "memory_unavailable",
+            FailureSeverity::Critical,
+            "ignored",
+        );
+        apply_daemon_observation(&mut status, true);
+        assert_eq!(status.service.state, ServiceState::Unavailable);
+        assert!(
+            !status
+                .failures
+                .iter()
+                .any(|failure| failure.code == "daemon_unavailable")
+        );
+    }
+
+    #[test]
+    fn empty_catalog_has_no_missing_vector_work() {
+        let mut status = RuntimeStatusV1::default();
+        status.inference.configured = InferenceMode::Endpoint;
+        set_vector_coverage(&mut status, 0, 0);
+        normalize(&mut status);
+        assert_eq!(
+            status.retrieval.vector_coverage,
+            VectorCoverageState::Complete
+        );
+        assert!(status.failures.is_empty());
+        assert!(render_line_with_width(&status, Some(200)).contains("vectors n/a"));
+    }
+
+    #[test]
     fn intentional_precision_filtering_is_not_runtime_degradation() {
         assert!(!retrieval_note_is_degraded(Some(
             "precision gate dropped 2 hit(s) carrying under 2 terms"
@@ -1111,6 +1250,7 @@ mod tests {
         status.inference.selected = Some(BackendSelection {
             backend: "vulkan".into(),
             device_class: Some("gpu".into()),
+            route: Some(InferenceRoute::Local),
             selected_at: 2,
         });
         assert_eq!(
@@ -1126,11 +1266,70 @@ mod tests {
     }
 
     #[test]
-    fn detection_strings_and_endpoints_cannot_leak_into_labels() {
-        assert_eq!(
-            safe_label("NPU /sys/private/device"),
-            "npu--sys-private-device"
+    fn older_v1_selection_without_route_still_deserializes() {
+        let mut json = serde_json::to_value(RuntimeStatusV1::default()).unwrap();
+        json["inference"]["selected"] = serde_json::json!({
+            "backend": "openvino",
+            "device_class": "npu",
+            "selected_at": 2
+        });
+
+        let status: RuntimeStatusV1 = serde_json::from_value(json).unwrap();
+        assert_eq!(status.inference.selected.unwrap().route, None);
+    }
+
+    #[test]
+    fn failed_memory_attempt_preserves_last_successful_answer() {
+        let mut status = RuntimeStatusV1::default();
+        status.memory_route.generation = Some(41);
+        status.memory_route.last_answer = LastAnswerStatus {
+            state: FreshnessState::Fresh,
+            observed_at: Some(123),
+        };
+
+        apply_memory_answer(
+            &mut status,
+            MemoryRoute::Remote,
+            Some(42),
+            None,
+            false,
         );
+        normalize(&mut status);
+
+        assert_eq!(status.memory_route.generation, Some(41));
+        assert_eq!(status.memory_route.last_answer.observed_at, Some(123));
+        assert_eq!(status.memory_route.last_answer.state, FreshnessState::Fresh);
+        assert_eq!(status.service.state, ServiceState::Unavailable);
+    }
+
+    #[test]
+    fn actual_inference_route_does_not_rewrite_mixed_configured_intent() {
+        let mut status = RuntimeStatusV1::default();
+        status.inference.configured = InferenceMode::Endpoint;
+        status.inference.configured_route = None;
+
+        apply_inference_attempt(
+            &mut status,
+            InferenceMode::Endpoint,
+            InferenceRoute::Remote,
+            "endpoint".into(),
+            None,
+            true,
+        );
+
+        assert_eq!(status.inference.configured_route, None);
+        assert_eq!(
+            status.inference.last_used.as_ref().map(|last| last.route),
+            Some(InferenceRoute::Remote)
+        );
+    }
+
+    #[test]
+    fn detection_strings_and_endpoints_cannot_leak_into_labels() {
+        assert_eq!(safe_backend_label("https://private.invalid"), "other");
+        assert_eq!(safe_backend_label("10.20.30.40"), "other");
+        assert_eq!(safe_device_label("NPU"), Some("npu".into()));
+        assert_eq!(safe_device_label("NPU /sys/private/device"), None);
         assert_eq!(
             endpoint_route("http://127.0.0.1:8080/v1"),
             InferenceRoute::Local
@@ -1161,6 +1360,7 @@ mod tests {
         status.inference.selected = Some(BackendSelection {
             backend: "openvino".into(),
             device_class: Some("npu".into()),
+            route: Some(InferenceRoute::Local),
             selected_at: now(),
         });
         status.inference.last_used = Some(InferenceAttempt {
@@ -1171,6 +1371,28 @@ mod tests {
         });
         let line = render_line_with_width(&status, Some(200));
         assert!(line.contains("embed:npu selected, used"), "{line}");
+    }
+
+    #[test]
+    fn prior_local_selection_is_not_misattributed_to_remote_use() {
+        let mut status = RuntimeStatusV1::default();
+        status.inference.configured = InferenceMode::Endpoint;
+        status.inference.selected = Some(BackendSelection {
+            backend: "openvino".into(),
+            device_class: Some("npu".into()),
+            route: Some(InferenceRoute::Local),
+            selected_at: 1,
+        });
+        status.inference.last_used = Some(InferenceAttempt {
+            route: InferenceRoute::Remote,
+            backend: "endpoint".into(),
+            success: true,
+            observed_at: now(),
+        });
+
+        let line = render_line_with_width(&status, Some(200));
+        assert!(line.contains("embed:remote used"), "{line}");
+        assert!(!line.contains("npu"), "{line}");
     }
 
     #[test]
@@ -1286,6 +1508,7 @@ mod tests {
         status.inference.selected = Some(BackendSelection {
             backend: "https://private.invalid/token".into(),
             device_class: Some("/sys/secret/device".into()),
+            route: None,
             selected_at: 1,
         });
         status.failures.push(RuntimeFailure {
@@ -1317,6 +1540,25 @@ mod tests {
         assert_eq!(transition_fingerprint(&a), transition_fingerprint(&b));
         b.service.state = ServiceState::Degraded;
         assert_ne!(transition_fingerprint(&a), transition_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_notices_a_successful_inference_route_change() {
+        let mut local = RuntimeStatusV1::default();
+        local.inference.configured = InferenceMode::Endpoint;
+        local.inference.last_used = Some(InferenceAttempt {
+            route: InferenceRoute::Local,
+            backend: "endpoint".into(),
+            success: true,
+            observed_at: 10,
+        });
+        let mut remote = local.clone();
+        remote.inference.last_used.as_mut().unwrap().route = InferenceRoute::Remote;
+        remote.inference.last_used.as_mut().unwrap().observed_at = 11;
+        assert_ne!(
+            transition_fingerprint(&local),
+            transition_fingerprint(&remote)
+        );
     }
 
     #[test]

@@ -79,11 +79,11 @@ const COMPACT_RECAP_MAX_FILES: usize = 12;
 const SELF_READ_REDIRECT_KEY: &str = "self-read-redirect";
 
 /// Dispatches a hook event by name. Never returns an error to the harness.
-pub fn run(event_name: &str) {
+pub fn run(event_name: &str, agent_hint: Option<&str>) {
     let event = HookEvent::from_stdin();
     let result = match event_name {
-        "session-start" => session_start(&event),
-        "user-prompt" => user_prompt(&event),
+        "session-start" => session_start(&event, agent_hint),
+        "user-prompt" => user_prompt(&event, agent_hint),
         "pre-tool" => pre_tool(&event),
         "post-tool" => post_tool(&event),
         "stop" => stop(&event),
@@ -125,7 +125,7 @@ fn session_start_state(state_dir: &Path, event: &HookEvent) -> session_state::St
     kind
 }
 
-fn session_start(event: &HookEvent) -> anyhow::Result<()> {
+fn session_start(event: &HookEvent, agent_hint: Option<&str>) -> anyhow::Result<()> {
     // Subagents inherit fresh context on purpose; the resident set is for the
     // primary session (a fork re-injecting rings would double-pay the budget).
     if event.is_subagent() {
@@ -139,7 +139,7 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     let start = session_start_state(&state_dir, event);
 
     let mut emit = Emit::new("SessionStart");
-    let runtime_chars = add_codex_runtime_notice(&mut emit, &state_dir, event, true);
+    let runtime_chars = add_codex_runtime_notice(&mut emit, &state_dir, event, agent_hint, true);
 
     // Everything below the digest is CONFIG-INDEPENDENT and must reach the
     // model even when the config is the thing that broke — otherwise the one
@@ -213,15 +213,21 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
 /// UserPromptSubmit: drains the reminder queue onto the prompt — the
 /// zero-extra-turn delivery channel for everything queued at Stop and by the
 /// cadence counter.
-fn user_prompt(event: &HookEvent) -> anyhow::Result<()> {
+fn user_prompt(event: &HookEvent, agent_hint: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::load().ok();
-    user_prompt_drain(&paths::state_dir(), &LedgerSink::of(cfg.as_ref()), event)
+    user_prompt_drain(
+        &paths::state_dir(),
+        &LedgerSink::of(cfg.as_ref()),
+        event,
+        agent_hint,
+    )
 }
 
 fn user_prompt_drain(
     state_dir: &Path,
     sink: &LedgerSink,
     event: &HookEvent,
+    agent_hint: Option<&str>,
 ) -> anyhow::Result<()> {
     // Reminders describe the primary session's own activity; a subagent
     // prompt must never receive them — nor consume them out of the queue.
@@ -231,7 +237,13 @@ fn user_prompt_drain(
     let reminders = session_state::update(state_dir, event.session(), |st| st.drain_reminders())
         .unwrap_or_default();
     let mut emit = Emit::new("UserPromptSubmit");
-    let runtime_chars = add_codex_runtime_notice(&mut emit, state_dir, event, false);
+    let runtime_chars = add_codex_runtime_notice(
+        &mut emit,
+        state_dir,
+        event,
+        agent_hint,
+        false,
+    );
     for r in reminders {
         emit.add_context(r);
     }
@@ -242,7 +254,10 @@ fn user_prompt_drain(
     Ok(())
 }
 
-fn is_codex_event(event: &HookEvent) -> bool {
+fn is_codex_event(event: &HookEvent, agent_hint: Option<&str>) -> bool {
+    if let Some(agent) = agent_hint {
+        return agent.eq_ignore_ascii_case(agent_session::AGENT_CODEX);
+    }
     event
         .transcript_path
         .as_deref()
@@ -254,9 +269,10 @@ fn add_codex_runtime_notice(
     emit: &mut Emit,
     state_dir: &Path,
     event: &HookEvent,
+    agent_hint: Option<&str>,
     session_start: bool,
 ) -> usize {
-    if !is_codex_event(event) {
+    if !is_codex_event(event, agent_hint) {
         return 0;
     }
     let status = crate::runtime_status::load_cached();
@@ -1204,8 +1220,10 @@ mod tests {
             transcript_path: Some("/tmp/.claude/projects/repo/session.jsonl".into()),
             ..HookEvent::default()
         };
-        assert!(is_codex_event(&codex));
-        assert!(!is_codex_event(&claude));
+        assert!(is_codex_event(&codex, None));
+        assert!(!is_codex_event(&claude, None));
+        assert!(is_codex_event(&HookEvent::default(), Some("codex")));
+        assert!(!is_codex_event(&codex, Some("claude")));
     }
 
     /// The replacement must MIRROR the received response and change only
@@ -1767,7 +1785,7 @@ mod tests {
 
         let event = HookEvent { session_id: Some("s1".into()), ..Default::default() };
         let sink = test_sink(dir.path());
-        user_prompt_drain(dir.path(), &sink, &event).unwrap();
+        user_prompt_drain(dir.path(), &sink, &event, None).unwrap();
 
         let back = session_state::load(dir.path(), "s1");
         assert!(back.queued_reminders.is_empty(), "delivery must empty the queue");
@@ -1778,7 +1796,7 @@ mod tests {
         assert!(booked.chars > 0);
 
         // A second prompt delivers (and books) nothing further.
-        user_prompt_drain(dir.path(), &sink, &event).unwrap();
+        user_prompt_drain(dir.path(), &sink, &event, None).unwrap();
         let ledger = ledger::load_from(dir.path());
         assert_eq!(ledger.sessions["s1"].by_source["reminders"].count, 1);
     }
@@ -1795,7 +1813,7 @@ mod tests {
             agent_id: Some("a1".into()),
             ..Default::default()
         };
-        user_prompt_drain(dir.path(), &test_sink(dir.path()), &sub).unwrap();
+        user_prompt_drain(dir.path(), &test_sink(dir.path()), &sub, None).unwrap();
         let back = session_state::load(dir.path(), "s1");
         assert_eq!(back.queued_reminders.len(), 1, "a subagent must not consume the queue");
         assert!(ledger::load_from(dir.path()).sessions.is_empty(), "and books nothing");

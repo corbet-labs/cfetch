@@ -113,6 +113,21 @@ pub fn endpoint_id(state_dir: &Path) -> anyhow::Result<iroh::EndpointId> {
     Ok(load_or_create(state_dir)?.public())
 }
 
+/// Reads this host's existing identity without creating one.
+///
+/// Diagnostics are observation-only: merely opening `cfetch doctor` must not
+/// enroll a host into the network or create durable state. `None` therefore
+/// means network identity has never been needed on this host, not that the
+/// identity check failed.
+pub fn existing_endpoint_id(state_dir: &Path) -> anyhow::Result<Option<iroh::EndpointId>> {
+    let path = key_path(state_dir);
+    match std::fs::metadata(&path) {
+        Ok(_) => Ok(Some(read_key(&path)?.public())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -77,6 +77,10 @@ crossterm = "0.29.0"
 fastembed = { version = "=6.0.0", git = "https://github.com/corbet-labs/fastembed-rs", rev = "ba8f8361ed81ff718edbadd26e23eecf202ecd1d", default-features = false, optional = true }
 ignore = "0.4"
 iroh = "1.0.3"
+# BLAKE3-verified, resumable artifact transfer over the daemon's existing
+# authenticated iroh endpoint. We use only the in-memory store and wire
+# protocol; cfetch's packed vector store remains the durable record.
+iroh-blobs = { version = "=0.103.0", default-features = false }
 notify = "8"
 # Kept exact with FastEmbed's own pin so provider features unify onto one ORT.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["api-24", "ndarray", "std"], optional = true }

@@ -141,6 +141,14 @@ fn hook_command_for(exe: &str, subcommand: &str) -> String {
     format!("{} hook {subcommand}", shell_quote(exe))
 }
 
+fn adapter_hook_command_for(exe: &str, subcommand: &str, agent: &str) -> String {
+    format!(
+        "{} hook {subcommand} --agent {}",
+        shell_quote(exe),
+        shell_quote(agent)
+    )
+}
+
 fn status_line_command_for(exe: &str) -> String {
     format!("{} status --line", shell_quote(exe))
 }
@@ -395,20 +403,25 @@ fn apply_claude(
     Ok(())
 }
 
-fn hook_spec(exe: &str, registration: HookRegistration) -> anyhow::Result<HookSpec> {
+fn hook_spec(agent: &str, exe: &str, registration: HookRegistration) -> anyhow::Result<HookSpec> {
     let builder = HookSpec::builder(registration.tag)
         .matcher(Matcher::All)
         .event(registration.event.agent_config())
         .timeout_seconds(10);
     let builder = if cfg!(windows) {
-        builder.command_shell_unchecked(hook_command_for(exe, registration.subcommand))
-    } else {
-        builder.command_program(exe, ["hook", registration.subcommand])
-    };
-    Ok(builder
-        .windows_command(HookCommand::shell_unchecked(hook_command_for(
+        builder.command_shell_unchecked(adapter_hook_command_for(
             exe,
             registration.subcommand,
+            agent,
+        ))
+    } else {
+        builder.command_program(exe, ["hook", registration.subcommand, "--agent", agent])
+    };
+    Ok(builder
+        .windows_command(HookCommand::shell_unchecked(adapter_hook_command_for(
+            exe,
+            registration.subcommand,
+            agent,
         )))
         .try_build()?)
 }
@@ -618,7 +631,8 @@ fn preflight_agent(
                 let plan = integration.plan_uninstall(scope, registration.tag)?;
                 refused_uninstall(agent, "hooks", &plan)?;
             } else {
-                let plan = integration.plan_install(scope, &hook_spec(exe, *registration)?)?;
+                let plan =
+                    integration.plan_install(scope, &hook_spec(agent, exe, *registration)?)?;
                 refused_install(agent, "hooks", &plan)?;
             }
         }
@@ -721,7 +735,10 @@ fn install_agent_selected(
         && supports_scope(integration.supported_scopes(), scope)
     {
         for registration in native_hooks(agent, scope) {
-            tracker.record(integration.install(scope, &hook_spec(exe, *registration)?)?)?;
+            tracker.record(integration.install(
+                scope,
+                &hook_spec(agent, exe, *registration)?,
+            )?)?;
             installed.hooks += 1;
         }
     }
@@ -889,7 +906,7 @@ fn planned_paths(agent: &str, exe: &str, scope: &Scope) -> Vec<PathBuf> {
         && supports_scope(integration.supported_scopes(), scope)
     {
         for registration in native_hooks(agent, scope) {
-            if let Ok(spec) = hook_spec(exe, *registration)
+            if let Ok(spec) = hook_spec(agent, exe, *registration)
                 && let Ok(plan) = integration.plan_install(scope, &spec)
             {
                 paths.extend(
@@ -1220,7 +1237,7 @@ pub fn codex_registration_issues() -> Option<Vec<String>> {
     }
     if let Some(integration) = agent_config::by_id("codex") {
         for registration in FULL_HOOKS {
-            match hook_spec(&exe, *registration)
+            match hook_spec("codex", &exe, *registration)
                 .and_then(|spec| Ok(integration.plan_install(&Scope::Global, &spec)?))
             {
                 Ok(plan) if plan.status == PlanStatus::NoOp => {}
@@ -1440,6 +1457,12 @@ mod tests {
 
         let hooks = std::fs::read_to_string(root.path().join(".codex/hooks.json")).unwrap();
         assert_eq!(hooks.matches("_agent_config_tag").count(), FULL_HOOKS.len());
+        assert_eq!(
+            hooks.matches("--agent").count(),
+            FULL_HOOKS.len(),
+            "every managed hook carries an explicit adapter identity"
+        );
+        assert!(hooks.contains("codex"));
         assert!(
             !root.path().join(".codex/hooks.json.bak").exists(),
             "a file created by this invocation has no user state to back up"

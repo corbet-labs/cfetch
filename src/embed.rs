@@ -529,17 +529,106 @@ pub fn run(
     Ok(EmbedIndexReport { embedded, imported, total_blocks })
 }
 
+/// Pulls missing vectors from every remembered, authorized origin before the
+/// local endpoint is considered. Origins filter the request through the
+/// joined slice, so asking all routes is safe and lets overlapping storage
+/// groups satisfy one batch cooperatively.
+fn import_peer_artifacts(
+    conn: &Connection,
+    store: &mut vectors::VectorStore,
+) -> anyhow::Result<usize> {
+    let memberships = crate::grant::memberships(&crate::paths::state_dir())?
+        .into_iter()
+        .filter(|membership| {
+            membership.network_major == crate::embedding_profile::NETWORK_MAJOR
+        })
+        .collect::<Vec<_>>();
+    if memberships.is_empty() {
+        return Ok(0);
+    }
+    let spec = store.spec().clone();
+    let mut imported = 0usize;
+    loop {
+        let pending = index::hashes_without_vectors(
+            conn,
+            &spec,
+            vectors::MAX_PEER_ARTIFACTS,
+        )?;
+        if pending.is_empty() {
+            break;
+        }
+        let mut made_progress = false;
+        for membership in &memberships {
+            let hashes: Vec<String> = pending
+                .iter()
+                .map(|(hash, _)| hash.clone())
+                .filter(|hash| !store.contains(hash))
+                .collect();
+            if hashes.is_empty() {
+                break;
+            }
+            match crate::daemon::sync_peer_vectors(
+                &membership.origin,
+                &membership.slice,
+                &hashes,
+                &spec,
+            ) {
+                Ok(received) if received > 0 => {
+                    store.refresh()?;
+                    let hydrated = vectors::hydrate(conn, store)?;
+                    imported += hydrated;
+                    made_progress |= hydrated > 0;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "peer vector route {:?} unavailable: {e:#}; trying the next route or local embedding",
+                    membership.slice
+                ),
+            }
+        }
+        if !made_progress {
+            break;
+        }
+    }
+    Ok(imported)
+}
+
 /// CLI entry for `cfetch embed-index`.
 pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
     let cfg = Config::load()?;
-    let client = EmbedClient::new(&cfg.embeddings)?;
     let spec = cfg.embeddings.spec();
     let mut store = vectors::VectorStore::open(&cfg.brain_root, &spec)?;
     let native = crate::paths::native_projects_root();
     let mut conn = index::ensure_fresh(&crate::paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
-    let report = run(&mut conn, &client, batch, &mut store)?;
+    if index::ensure_vector_spec(&conn, &spec)? {
+        println!("embedding spec changed -> local vector cache dropped, re-filling for {}", spec.model);
+    }
+    let shared_imported = vectors::hydrate(&conn, &store)?;
+    if shared_imported > 0 {
+        println!("imported {shared_imported} vector(s) from the shared store (already derived by this group)");
+    }
+    let peer_imported = import_peer_artifacts(&conn, &mut store)?;
+    if peer_imported > 0 {
+        println!(
+            "imported {peer_imported} vector(s) from authorized peers over iroh-blobs (no embedding call)"
+        );
+    }
+    let pending = index::hashes_without_vectors(&conn, &spec, 1)?;
+    let report = if pending.is_empty() {
+        let (_, total_blocks) = index::vector_coverage(&conn, &spec)?;
+        EmbedIndexReport {
+            embedded: 0,
+            imported: shared_imported + peer_imported,
+            total_blocks,
+        }
+    } else {
+        let client = EmbedClient::new(&cfg.embeddings)?;
+        let mut report = run(&mut conn, &client, batch, &mut store)?;
+        report.imported += shared_imported + peer_imported;
+        report
+    };
     println!(
-        "embed-index complete: {} embedded this run, {} imported from the shared store, {} block(s) total",
+        "embed-index complete: {} embedded this run, {} imported from existing artifacts, {} block(s) total",
         report.embedded, report.imported, report.total_blocks
     );
     println!(

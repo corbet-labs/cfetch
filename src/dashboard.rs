@@ -20,7 +20,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 
 use crate::config::{ClientServingConfig, Config};
 use crate::maintenance_inbox::{Inbox, Tone};
-use crate::{daemon, exhaust, heartbeat, index, ledger, maintenance, paths, runtime_status, serve};
+use crate::{
+    daemon, doctor, exhaust, heartbeat, index, ledger, maintenance, paths, runtime_status, serve,
+};
 
 /// Remote budget for the dashboard's own calls. Deliberately shorter than the
 /// CLI's: this screen refreshes on a timer and must not freeze on a slow drain
@@ -151,9 +153,15 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
     let l = loaded.ledger;
     // Read-only, fail-silent: an absent tree simply reports zeros.
     let staging = exhaust::Exhaust::from_config(cfg).stats();
+    let daemon_probe = daemon::call("ping", Duration::from_millis(200));
+    let daemon_running = daemon_probe.is_some();
+    let daemon_version = daemon_probe.and_then(|response| response.version);
+    let mut runtime =
+        runtime_status::refresh_static().unwrap_or_else(|_| runtime_status::load_cached());
+    runtime_status::apply_daemon_observation(&mut runtime, daemon_running);
     Stats {
-        runtime: runtime_status::refresh_static().unwrap_or_else(|_| runtime_status::load_cached()),
-        daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
+        runtime,
+        daemon_version,
         hooks: heartbeat::liveness_in(state),
         sessions: l.sessions.len(),
         injected_tokens: l
@@ -330,19 +338,23 @@ struct App {
     hits: Vec<serve::WireHit>,
     status: String,
     inbox: Inbox,
+    system: doctor::ReportV1,
+    system_scroll: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Recall,
     Maintenance,
+    System,
 }
 
 impl Pane {
     fn toggle(self) -> Self {
         match self {
             Self::Recall => Self::Maintenance,
-            Self::Maintenance => Self::Recall,
+            Self::Maintenance => Self::System,
+            Self::System => Self::Recall,
         }
     }
 }
@@ -434,6 +446,35 @@ fn draw_maintenance(f: &mut Frame, area: Rect, inbox: &Inbox) {
     );
 }
 
+fn doctor_style(tone: doctor::DisplayTone) -> Style {
+    match tone {
+        doctor::DisplayTone::Heading => {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        }
+        doctor::DisplayTone::Normal => Style::default(),
+        doctor::DisplayTone::Muted => Style::default().fg(Color::DarkGray),
+        doctor::DisplayTone::Good => Style::default().fg(Color::Green),
+        doctor::DisplayTone::Warning => Style::default().fg(Color::Yellow),
+        doctor::DisplayTone::Error => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+    }
+}
+
+fn draw_system(f: &mut Frame, area: Rect, app: &App) {
+    let lines = doctor::display_lines(&app.system)
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line.text, doctor_style(line.tone))))
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" live system diagnostics "))
+            .wrap(Wrap { trim: false })
+            .scroll((app.system_scroll, 0)),
+        area,
+    );
+}
+
 fn draw(f: &mut Frame, stats: &Stats, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -450,10 +491,11 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
         chunks[0],
     );
     f.render_widget(
-        Tabs::new(["Recall", "Maintenance inbox"])
+        Tabs::new(["Recall", "Maintenance inbox", "System"])
             .select(match app.pane {
                 Pane::Recall => 0,
                 Pane::Maintenance => 1,
+                Pane::System => 2,
             })
             .block(Block::default().borders(Borders::ALL).title(" Tab switches view "))
             .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -462,11 +504,15 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
     match app.pane {
         Pane::Recall => draw_recall(f, chunks[2], app),
         Pane::Maintenance => draw_maintenance(f, chunks[2], &app.inbox),
+        Pane::System => draw_system(f, chunks[2], app),
     }
     let help = match app.pane {
         Pane::Recall => " Tab inbox · Enter search · Backspace edit · Esc/Ctrl-C quit ",
         Pane::Maintenance => {
-            " Tab recall · ↑/↓ or j/k select · PgUp/PgDn scroll · r refresh · Esc/Ctrl-C quit "
+            " Tab system · ↑/↓ or j/k select · PgUp/PgDn scroll · r refresh · Esc/Ctrl-C quit "
+        }
+        Pane::System => {
+            " Tab recall · ↑/↓ or j/k scroll · PgUp/PgDn scroll · r probe now · Esc/Ctrl-C quit "
         }
     };
     f.render_widget(
@@ -475,7 +521,7 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
     );
 }
 
-pub fn run() -> anyhow::Result<()> {
+fn run_with_pane(initial_pane: Pane, probe_network: bool) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let state = paths::state_dir();
     let source = open_source(&cfg, &state);
@@ -497,19 +543,26 @@ pub fn run() -> anyhow::Result<()> {
 
     let can_verify_locally = cfg.client.serving.is_none();
     let mut app = App {
-        pane: Pane::Recall,
+        pane: initial_pane,
         query: String::new(),
         hits: Vec::new(),
         status: "no query yet".into(),
         inbox: Inbox::load(&cfg, can_verify_locally),
+        system: doctor::gather_with(&cfg, &state, None, probe_network),
+        system_scroll: 0,
     };
     let mut stats = gather(&cfg, &source, &state);
     let mut last_refresh = std::time::Instant::now();
+    let mut last_system_refresh = std::time::Instant::now();
 
     let result: anyhow::Result<()> = loop {
         if last_refresh.elapsed() > Duration::from_secs(2) {
             stats = gather(&cfg, &source, &state);
             last_refresh = std::time::Instant::now();
+        }
+        if last_system_refresh.elapsed() > Duration::from_secs(5) {
+            app.system = doctor::gather_with(&cfg, &state, None, probe_network);
+            last_system_refresh = std::time::Instant::now();
         }
         if let Err(e) = terminal.draw(|f| draw(f, &stats, &app)) {
             break Err(e.into());
@@ -563,6 +616,28 @@ pub fn run() -> anyhow::Result<()> {
                         stats = gather(&cfg, &source, &state);
                         last_refresh = std::time::Instant::now();
                     }
+                    KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::System => {
+                        app.system_scroll = app.system_scroll.saturating_add(1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::System => {
+                        app.system_scroll = app.system_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Home if app.pane == Pane::System => {
+                        app.system_scroll = 0;
+                    }
+                    KeyCode::PageDown if app.pane == Pane::System => {
+                        app.system_scroll = app.system_scroll.saturating_add(12);
+                    }
+                    KeyCode::PageUp if app.pane == Pane::System => {
+                        app.system_scroll = app.system_scroll.saturating_sub(12);
+                    }
+                    KeyCode::Char('r') if app.pane == Pane::System => {
+                        app.system =
+                            doctor::gather_with(&cfg, &state, None, probe_network);
+                        stats = gather(&cfg, &source, &state);
+                        last_refresh = std::time::Instant::now();
+                        last_system_refresh = std::time::Instant::now();
+                    }
                     _ => {}
                 }
             }
@@ -572,6 +647,14 @@ pub fn run() -> anyhow::Result<()> {
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
     result
+}
+
+pub fn run() -> anyhow::Result<()> {
+    run_with_pane(Pane::Recall, true)
+}
+
+pub fn run_system(probe_network: bool) -> anyhow::Result<()> {
+    run_with_pane(Pane::System, probe_network)
 }
 
 #[cfg(test)]

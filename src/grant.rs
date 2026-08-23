@@ -303,6 +303,22 @@ fn read_memberships(state_dir: &Path) -> anyhow::Result<Vec<Membership>> {
     }
 }
 
+/// Lists every remembered remote origin without exposing an invite secret.
+///
+/// This is diagnostic routing state, not proof that a peer is online. Callers
+/// that need liveness must probe the origin and report that observation
+/// separately; the presence of a membership file alone only means a join once
+/// succeeded.
+pub fn memberships(state_dir: &Path) -> anyhow::Result<Vec<Membership>> {
+    let mut memberships = read_memberships(state_dir)?;
+    memberships.sort_by(|a, b| {
+        a.slice
+            .cmp(&b.slice)
+            .then_with(|| a.origin.id.to_string().cmp(&b.origin.id.to_string()))
+    });
+    Ok(memberships)
+}
+
 /// Records a successful remote redemption without ever persisting its secret.
 pub fn remember_membership(state_dir: &Path, membership: Membership) -> anyhow::Result<()> {
     validate_slice_name(&membership.slice)?;
