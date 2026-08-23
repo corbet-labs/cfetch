@@ -54,7 +54,8 @@ proprietary database, or a change to how you edit your notes.
 ![cfetch terminal dashboard showing hook health, indexed Markdown and code, context usage, staging, and cited recall](docs/assets/cfetch-dashboard.png)
 
 `cfetch dashboard` makes the memory layer visible in one place: daemon and hook
-health, catalog generation, statements by trust ring, indexed code, captured
+health, active memory route, catalog generation, retrieval coverage, the
+configured and last-used inference path, statements by trust ring, indexed code, captured
 exhaust, staged maintenance candidates, injected context, and live cited recall.
 The screenshot is the shipped v0.9.9 dashboard indexing this repository, not a
 UI mockup. On `main`, a read-only maintenance inbox also shows captured
@@ -82,6 +83,7 @@ measurement do not.
 | Supervised AI maintenance | **Main — next release** | Evidence packets become typed, independently reviewed proposals with exact diffs, deterministic gates, reversible apply, and commit-gated finalization | `maintain`, maintenance MCP tools, dashboard |
 | Honest measurement | v0.9.9 | Transcript-derived usage, cfetch's own injection cost, rewrite-point savings, cache-rebuild attribution, and paired A/B analysis | `audit`, `bench`, dashboard |
 | Reliability | v0.9.9 | A warm daemon, incremental scanning, hook heartbeats, delivery verification, and fail-open hook behavior | `daemon`, `status`, `selfcheck` |
+| Runtime visibility | **Main — next release** | One privacy-bounded status shows whether memory is local, served, or remote; whether inference is merely configured, successfully selected, or actually used; vector coverage; freshness history; and maintenance work | dashboard, `status --line`, `status --json`, `cfetch_runtime_status`, Claude status line, Codex hooks |
 | Agent integrations | v0.9.9 | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
 | Multi-machine access | v0.9.9 | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
 | Selective sharing | v0.9.9 | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
@@ -265,6 +267,46 @@ the full lifecycle where available; Gemini, iFlow, and Tabnine receive only
 the verified tool-event subset. Other supported agents receive MCP and/or
 recall-first instructions according to their confirmed configuration format.
 
+### Runtime visibility in Claude Code, Codex, and MCP
+
+cfetch exposes one cached `RuntimeStatusV1` contract everywhere instead of
+letting each integration guess. It distinguishes three different facts:
+
+- **configured** is the requested inference mode;
+- **selected** means a backend initialized successfully;
+- **last used** records an actual local or remote attempt and its outcome.
+
+Hardware detection alone never claims that an NPU or GPU is in use. Cached
+freshness is likewise written as history (`last fresh`), not as a promise that
+the tree is fresh now.
+
+```console
+$ cfetch status --line   # one terminal-width line; no network or inference
+$ cfetch status --json   # stable, machine-readable RuntimeStatusV1
+```
+
+`cfetch install --agent claude` registers the cached line as
+[Claude Code's native status line](https://code.claude.com/docs/en/statusline)
+with a five-second refresh. An existing non-cfetch status
+line is preserved; compose `cfetch status --line` into its command or use the
+explicit `--replace-status-line` option. Removal deletes only the exact
+cfetch-owned value.
+
+Codex currently documents
+[built-in footer items](https://learn.chatgpt.com/docs/config-file/config-reference)
+rather than an arbitrary command-backed footer. cfetch therefore uses
+[native hooks](https://learn.chatgpt.com/docs/hooks): one short visible
+notice at session start, then notices only when the memory route, selected
+backend, or failure severity changes or recovers. Healthy state spends no
+model-context tokens; a short adaptation note is added only when degraded
+runtime state should change the agent's behavior.
+
+MCP clients can call the read-only `cfetch_runtime_status` tool when runtime
+health affects a task. Its cached response is bounded to 2 KiB and its tool
+description explicitly says not to poll it. RuntimeStatusV1 surfaces never include
+endpoint URLs, raw addresses, token paths, credentials, response bodies, or
+hardware evidence paths.
+
 <details>
 <summary>Show the current adapter registry</summary>
 
@@ -288,7 +330,8 @@ For any MCP client, the manual registration is the standard stdio shape:
 
 The v0.9.9 server exposes read-only `cfetch_recall`, `cfetch_expand`, and
 `cfetch_find`. On `main` for the next release, it also exposes read-only
-`cfetch_maintenance_packet` and `cfetch_maintenance_show` tools.
+`cfetch_runtime_status`, `cfetch_maintenance_packet`, and
+`cfetch_maintenance_show` tools.
 `cfetch_maintenance_propose` and `cfetch_maintenance_review` can write only
 idempotent ring-5 records; apply, revert, reject, and finalize remain CLI-only
 approval surfaces.

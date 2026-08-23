@@ -19,12 +19,13 @@ pub enum Surface {
 /// The recall-first usage doctrine — the ONE source both the marker block
 /// (AGENTS.md/GEMINI.md) and the MCP initialize `instructions` render from.
 pub fn doctrine(surface: Surface) -> String {
-    let (intro, recall, expand, find, maintain, coda) = match surface {
+    let (intro, recall, expand, find, status, maintain, coda) = match surface {
         Surface::Cli => (
             "use cfetch (installed on PATH)",
             "`cfetch recall <terms>`",
             "`cfetch recall --id <citation>`",
             "`cfetch find <symbol-or-file>`",
+            "`cfetch status --json`",
             "`cfetch maintain packet <candidate-id>`",
             "\n\nThe same tools are available over MCP: command `cfetch`, args `[\"mcp\"]`.",
         ),
@@ -33,6 +34,7 @@ pub fn doctrine(surface: Surface) -> String {
             "`cfetch_recall`",
             "`cfetch_expand` with a citation id",
             "`cfetch_find`",
+            "`cfetch_runtime_status`",
             "`cfetch_maintenance_packet`, `cfetch_maintenance_propose`, and `cfetch_maintenance_review`",
             "",
         ),
@@ -45,6 +47,7 @@ pub fn doctrine(surface: Surface) -> String {
          - {expand} — expand a citation to the full entry.\n\
          - {find} — exact line ranges from the code index;\n\
          \x20 read the returned slice instead of the whole file.\n\
+         - {status} — inspect cached runtime health only when it affects the task; do not poll.\n\
          - {maintain} — inspect maintenance evidence and, when asked, place a typed proposal or review\n\
          \x20 in ring-5 quarantine. Never apply or finalize a memory change without explicit approval.{coda}"
     )

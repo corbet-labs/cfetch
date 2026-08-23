@@ -139,6 +139,7 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     let start = session_start_state(&state_dir, event);
 
     let mut emit = Emit::new("SessionStart");
+    let runtime_chars = add_codex_runtime_notice(&mut emit, &state_dir, event, true);
 
     // Everything below the digest is CONFIG-INDEPENDENT and must reach the
     // model even when the config is the thing that broke — otherwise the one
@@ -199,7 +200,12 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     let emitted = emit.finish();
     let sink = LedgerSink::of(cfg.as_ref().ok());
     sink.book(event.session(), "compact-recap", recap_chars);
-    sink.book(event.session(), "resident-digest", emitted.saturating_sub(recap_chars));
+    sink.book(event.session(), "runtime-status", runtime_chars);
+    sink.book(
+        event.session(),
+        "resident-digest",
+        emitted.saturating_sub(recap_chars).saturating_sub(runtime_chars),
+    );
     // The config failure still counts as a hook failure for the heartbeat.
     cfg.map(|_| ())
 }
@@ -224,17 +230,53 @@ fn user_prompt_drain(
     }
     let reminders = session_state::update(state_dir, event.session(), |st| st.drain_reminders())
         .unwrap_or_default();
-    if reminders.is_empty() {
-        return Ok(());
-    }
     let mut emit = Emit::new("UserPromptSubmit");
+    let runtime_chars = add_codex_runtime_notice(&mut emit, state_dir, event, false);
     for r in reminders {
         emit.add_context(r);
     }
     // ONE JSON object regardless of how many reminders were queued.
     let emitted = emit.finish();
-    sink.book(event.session(), "reminders", emitted);
+    sink.book(event.session(), "runtime-status", runtime_chars);
+    sink.book(event.session(), "reminders", emitted.saturating_sub(runtime_chars));
     Ok(())
+}
+
+fn is_codex_event(event: &HookEvent) -> bool {
+    event
+        .transcript_path
+        .as_deref()
+        .and_then(|path| agent_session::agent_source_for_path(Path::new(path)))
+        == Some(agent_session::AGENT_CODEX)
+}
+
+fn add_codex_runtime_notice(
+    emit: &mut Emit,
+    state_dir: &Path,
+    event: &HookEvent,
+    session_start: bool,
+) -> usize {
+    if !is_codex_event(event) {
+        return 0;
+    }
+    let status = crate::runtime_status::load_cached();
+    let notice = session_state::update(state_dir, event.session(), |state| {
+        crate::runtime_status::codex_hook_notice(
+            state,
+            &status,
+            session_start,
+            crate::runtime_status::now(),
+        )
+    })
+    .unwrap_or_default();
+    if let Some(message) = notice.system_message {
+        emit.system_message(message);
+    }
+    let context_chars = notice.additional_context.as_ref().map_or(0, String::len);
+    if let Some(context) = notice.additional_context {
+        emit.add_context(context);
+    }
+    context_chars
 }
 
 /// Stop-side reminder producers (wt/govern): QUEUE only, never emit — a
@@ -1152,6 +1194,20 @@ fn precompact_state(state_dir: &Path, event: &HookEvent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_notices_are_codex_only() {
+        let codex = HookEvent {
+            transcript_path: Some("/tmp/.codex/sessions/2026/08/23/session.jsonl".into()),
+            ..HookEvent::default()
+        };
+        let claude = HookEvent {
+            transcript_path: Some("/tmp/.claude/projects/repo/session.jsonl".into()),
+            ..HookEvent::default()
+        };
+        assert!(is_codex_event(&codex));
+        assert!(!is_codex_event(&claude));
+    }
+
     /// The replacement must MIRROR the received response and change only
     /// stdout. A fresh object of the apparently-right shape is discarded by
     /// the harness, and silently — so every field the tool emitted, including

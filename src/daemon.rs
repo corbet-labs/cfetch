@@ -820,6 +820,12 @@ fn serve_query(
     resp.fresh = Some(outcome.fresh);
     resp.stale_note = outcome.note;
     resp.barrier_ms = Some(outcome.waited_ms);
+    crate::runtime_status::record_memory_answer(
+        crate::runtime_status::MemoryRoute::Serving,
+        resp.generation,
+        resp.fresh,
+        true,
+    );
     resp
 }
 
@@ -1081,6 +1087,7 @@ pub fn run() -> anyhow::Result<()> {
     // here (hooks then use their daemon-less fallbacks) instead of silently
     // starting a daemon that cannot serve.
     let cfg = Config::load()?;
+    let _ = crate::runtime_status::refresh_static();
     let serve_handle = if cfg.serve.enabled { Some(serve::start(&cfg)?) } else { None };
     let tcp_token = match (&cfg.serve.bind, &cfg.serve.token_file) {
         (Some(_), Some(tf)) => Some(serve::read_token(tf, true)?),
@@ -1140,6 +1147,7 @@ pub fn run() -> anyhow::Result<()> {
     // A stale endpoint from a dead daemon is cleared; a live one is never
     // stolen (see `ipc::listen`).
     let listener = ipc::listen(local_token)?;
+    crate::runtime_status::record_service(crate::runtime_status::ServiceState::Ready, None);
     eprintln!("cfetch daemon listening on {}", listener.describe());
     for conn in listener.incoming() {
         if ctx.shutdown.load(Ordering::SeqCst) {
@@ -1164,6 +1172,10 @@ pub fn run() -> anyhow::Result<()> {
         client.runtime.block_on(client.endpoint.close());
     }
     listener.cleanup();
+    crate::runtime_status::record_service(
+        crate::runtime_status::ServiceState::Degraded,
+        Some("daemon_unavailable"),
+    );
     Ok(())
 }
 
@@ -1225,6 +1237,7 @@ pub fn status() -> anyhow::Result<()> {
     }
     match call("ping", Duration::from_millis(300)) {
         Some(r) => {
+            crate::runtime_status::record_service(crate::runtime_status::ServiceState::Ready, None);
             println!("daemon: running (v{})", r.version.unwrap_or_default());
             if let Some(info) = info.filter(|i| i.enabled) {
                 println!(
@@ -1256,7 +1269,13 @@ pub fn status() -> anyhow::Result<()> {
                 }
             }
         }
-        None => println!("daemon: not running ({})", ipc::describe()),
+        None => {
+            crate::runtime_status::record_service(
+                crate::runtime_status::ServiceState::Degraded,
+                Some("daemon_unavailable"),
+            );
+            println!("daemon: not running ({})", ipc::describe());
+        }
     }
     // "healthy" used to mean "nothing has failed", which is also what a host
     // where no hook has ever run reports. The liveness picture compares the

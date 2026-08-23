@@ -25,6 +25,7 @@ const TOOL_NAMES: &[&str] = &[
     "cfetch_recall",
     "cfetch_expand",
     "cfetch_find",
+    "cfetch_runtime_status",
     "cfetch_maintenance_packet",
     "cfetch_maintenance_show",
     "cfetch_maintenance_propose",
@@ -87,6 +88,16 @@ fn tool_defs() -> Vec<Tool> {
                     "limit": {"type": "integer", "default": 10}
                 },
                 "required": ["query"]
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_runtime_status",
+            "Read cfetch's cached RuntimeStatusV1: memory routing and freshness, retrieval coverage, configured/selected/last-used inference, maintenance counts, and stable failure actions. Call when runtime health affects the task; do not poll. This is read-only, performs no network request or inference, and is bounded to 2 KiB.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
             })),
         )
         .with_annotations(read_only()),
@@ -285,6 +296,9 @@ fn run_tool_remote(
 }
 
 fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
+    if name == "cfetch_runtime_status" {
+        return crate::runtime_status::mcp_json();
+    }
     let cfg = Config::load()?;
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
     match name {
@@ -307,6 +321,7 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             let input: maintenance::ProposalInput = serde_json::from_value(args.clone())
                 .map_err(|error| anyhow::anyhow!("invalid maintenance proposal: {error}"))?;
             let submitted = maintenance::submit(&cfg, input)?;
+            let _ = crate::runtime_status::refresh_static();
             return Ok(format!(
                 "{} {} in ring-5 quarantine; inspect with `cfetch maintain verify {}`. Applying and finalizing require the CLI.",
                 if submitted.created { "submitted" } else { "already recorded" },
@@ -483,7 +498,12 @@ mod tests {
             names, TOOL_NAMES,
             "tools/list and the -32602 gate must agree"
         );
-        for tool in &tools[..5] {
+        for tool in tools.iter().filter(|tool| {
+            !matches!(
+                tool.name.as_ref(),
+                "cfetch_maintenance_propose" | "cfetch_maintenance_review"
+            )
+        }) {
             assert_eq!(
                 tool.annotations.as_ref().and_then(|annotations| annotations.read_only_hint),
                 Some(true),
@@ -491,7 +511,10 @@ mod tests {
                 tool.name
             );
         }
-        let proposal = &tools[5];
+        let proposal = tools
+            .iter()
+            .find(|tool| tool.name == "cfetch_maintenance_propose")
+            .unwrap();
         assert_eq!(proposal.name, "cfetch_maintenance_propose");
         assert_eq!(
             proposal.annotations.as_ref().and_then(|annotations| annotations.read_only_hint),
@@ -503,7 +526,10 @@ mod tests {
             Some(false),
             "a proposal cannot edit trusted memory"
         );
-        let review = &tools[6];
+        let review = tools
+            .iter()
+            .find(|tool| tool.name == "cfetch_maintenance_review")
+            .unwrap();
         assert_eq!(review.name, "cfetch_maintenance_review");
         assert_eq!(
             review.annotations.as_ref().and_then(|annotations| annotations.destructive_hint),
@@ -521,6 +547,24 @@ mod tests {
             "MCP surface names the MCP tools"
         );
         assert!(instructions.contains("Before searching files or reading code wholesale"));
+    }
+
+    #[test]
+    fn runtime_status_tool_is_cached_read_only_and_bounded() {
+        let tool = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "cfetch_runtime_status")
+            .unwrap();
+        assert_eq!(
+            tool.annotations.and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
+        let text = run_tool("cfetch_runtime_status", &json!({})).unwrap();
+        assert!(text.len() <= crate::runtime_status::MCP_MAX_BYTES);
+        let status: crate::runtime_status::RuntimeStatusV1 = serde_json::from_str(&text).unwrap();
+        assert_eq!(status.schema_version, crate::runtime_status::SCHEMA_VERSION);
+        assert!(!text.contains("://"));
+        assert!(!text.contains("token_file"));
     }
 
     #[test]

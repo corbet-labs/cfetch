@@ -147,6 +147,7 @@ pub fn ranked(
         match rerank::RerankClient::new(&cfg.rerank) {
             Ok(c) => Some(c),
             Err(e) => {
+                crate::runtime_status::record_inference_initialization_failure();
                 notes.push(format!(
                     "rerank misconfigured ({e}) — answering in retrieval order"
                 ));
@@ -223,9 +224,31 @@ pub fn ranked(
     }
     hits.truncate(limit);
 
+    let note = (!notes.is_empty()).then(|| notes.join("; "));
+    let degraded = crate::runtime_status::retrieval_note_is_degraded(note.as_deref());
+    crate::runtime_status::record_retrieval(
+        if hybrid {
+            crate::runtime_status::RetrievalMode::Hybrid
+        } else if semantic {
+            crate::runtime_status::RetrievalMode::Semantic
+        } else {
+            crate::runtime_status::RetrievalMode::Lexical
+        },
+        degraded,
+    );
+    crate::runtime_status::record_memory_answer(
+        if cfg.serve.enabled {
+            crate::runtime_status::MemoryRoute::Serving
+        } else {
+            crate::runtime_status::MemoryRoute::Local
+        },
+        Some(index::generation(conn)),
+        None,
+        true,
+    );
     Ok(Ranked {
         hits,
-        note: (!notes.is_empty()).then(|| notes.join("; ")),
+        note,
     })
 }
 

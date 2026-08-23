@@ -141,6 +141,29 @@ fn hook_command_for(exe: &str, subcommand: &str) -> String {
     format!("{} hook {subcommand}", shell_quote(exe))
 }
 
+fn status_line_command_for(exe: &str) -> String {
+    format!("{} status --line", shell_quote(exe))
+}
+
+fn direct_cfetch_command(command: &str, suffix: &str) -> bool {
+    let command = command.trim();
+    let Some(program) = command.strip_suffix(suffix).map(str::trim) else {
+        return false;
+    };
+    let program = match (program.as_bytes().first(), program.as_bytes().last()) {
+        (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"')) if program.len() >= 2 => {
+            &program[1..program.len() - 1]
+        }
+        _ if !program.chars().any(char::is_whitespace) => program,
+        _ => return false,
+    };
+    matches!(
+        program.rsplit(['/', '\\']).next(),
+        Some(name) if name.eq_ignore_ascii_case("cfetch")
+            || name.eq_ignore_ascii_case("cfetch.exe")
+    )
+}
+
 fn legacy_managed_entry(exe: &str, subcommand: &str) -> Value {
     json!({
         "hooks": [{
@@ -158,24 +181,9 @@ fn legacy_managed_entry(exe: &str, subcommand: &str) -> Value {
 /// foreign creates one more invocation on every upgrade. Shell wrappers stay
 /// foreign because cfetch cannot prove what else they do.
 fn exact_cfetch_hook(command: &str, expected_subcommand: Option<&str>) -> bool {
-    let command = command.trim();
     let matches_subcommand = |subcommand: &str| {
         let suffix = format!(" hook {subcommand}");
-        let Some(program) = command.strip_suffix(&suffix).map(str::trim) else {
-            return false;
-        };
-        let program = match (program.as_bytes().first(), program.as_bytes().last()) {
-            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"')) if program.len() >= 2 => {
-                &program[1..program.len() - 1]
-            }
-            _ if !program.chars().any(char::is_whitespace) => program,
-            _ => return false,
-        };
-        matches!(
-            program.rsplit(['/', '\\']).next(),
-            Some(name) if name.eq_ignore_ascii_case("cfetch")
-                || name.eq_ignore_ascii_case("cfetch.exe")
-        )
+        direct_cfetch_command(command, &suffix)
     };
     expected_subcommand.map_or_else(
         || {
@@ -185,6 +193,35 @@ fn exact_cfetch_hook(command: &str, expected_subcommand: Option<&str>) -> bool {
         },
         matches_subcommand,
     )
+}
+
+fn owned_claude_status_line(exe: &str) -> Value {
+    json!({
+        "type": "command",
+        "command": status_line_command_for(exe),
+        "refreshInterval": 5,
+    })
+}
+
+fn exact_owned_status_line(value: &Value) -> bool {
+    let Some(object) = value.as_object() else { return false };
+    object.len() == 3
+        && object.get("type").and_then(Value::as_str) == Some("command")
+        && object.get("refreshInterval").and_then(Value::as_u64) == Some(5)
+        && object
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| direct_cfetch_command(command, " status --line"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeStatusLineResult {
+    Installed,
+    Updated,
+    Replaced,
+    PreservedForeign,
+    Removed,
+    Absent,
 }
 
 fn strip_legacy_managed(entry: &mut Value, expected_subcommand: Option<&str>) -> bool {
@@ -207,7 +244,11 @@ fn strip_legacy_managed(entry: &mut Value, expected_subcommand: Option<&str>) ->
 
 /// Claude's explicit-settings merger. Only the handler object is tagged, so a
 /// user hook co-located in the same group survives both repair and removal.
-fn merge_claude_for_exe(settings: Value, exe: &str) -> anyhow::Result<Value> {
+fn merge_claude_for_exe_with_status(
+    settings: Value,
+    exe: &str,
+    replace_status_line: bool,
+) -> anyhow::Result<(Value, ClaudeStatusLineResult)> {
     let mut root = match settings {
         Value::Object(map) => map,
         Value::Null => Map::new(),
@@ -230,20 +271,56 @@ fn merge_claude_for_exe(settings: Value, exe: &str) -> anyhow::Result<Value> {
         entries.retain_mut(|entry| strip_legacy_managed(entry, Some(registration.subcommand)));
         entries.push(legacy_managed_entry(exe, registration.subcommand));
     }
-    Ok(Value::Object(root))
+    let desired = owned_claude_status_line(exe);
+    let status_line = match root.get("statusLine") {
+        None => {
+            root.insert("statusLine".to_string(), desired);
+            ClaudeStatusLineResult::Installed
+        }
+        Some(current) if exact_owned_status_line(current) => {
+            let updated = current != &desired;
+            root.insert("statusLine".to_string(), desired);
+            if updated {
+                ClaudeStatusLineResult::Updated
+            } else {
+                ClaudeStatusLineResult::Installed
+            }
+        }
+        Some(_) if replace_status_line => {
+            root.insert("statusLine".to_string(), desired);
+            ClaudeStatusLineResult::Replaced
+        }
+        Some(_) => ClaudeStatusLineResult::PreservedForeign,
+    };
+    Ok((Value::Object(root), status_line))
 }
 
-fn unmerge_legacy(settings: Value) -> anyhow::Result<Value> {
+#[cfg(test)]
+fn merge_claude_for_exe(settings: Value, exe: &str) -> anyhow::Result<Value> {
+    merge_claude_for_exe_with_status(settings, exe, false).map(|(settings, _)| settings)
+}
+
+fn unmerge_legacy_with_status(settings: Value) -> anyhow::Result<(Value, ClaudeStatusLineResult)> {
     let mut root = match settings {
         Value::Object(map) => map,
-        other => return Ok(other),
+        other => return Ok((other, ClaudeStatusLineResult::Absent)),
     };
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
             entries.retain_mut(|entry| strip_legacy_managed(entry, None));
         }
     }
-    Ok(Value::Object(root))
+    let status_line = if root.get("statusLine").is_some_and(exact_owned_status_line) {
+        root.remove("statusLine");
+        ClaudeStatusLineResult::Removed
+    } else {
+        ClaudeStatusLineResult::Absent
+    };
+    Ok((Value::Object(root), status_line))
+}
+
+fn unmerge_legacy(settings: Value) -> anyhow::Result<Value> {
+    unmerge_legacy_with_status(settings).map(|(settings, _)| settings)
 }
 
 fn current_exe_str() -> String {
@@ -271,7 +348,12 @@ fn json_file(path: &Path) -> anyhow::Result<Value> {
     })
 }
 
-fn apply_claude(settings_path: &Path, remove: bool, exe: &str) -> anyhow::Result<()> {
+fn apply_claude(
+    settings_path: &Path,
+    remove: bool,
+    exe: &str,
+    replace_status_line: bool,
+) -> anyhow::Result<()> {
     let current = match std::fs::read_to_string(settings_path) {
         Ok(content) => serde_json::from_str(&content).map_err(|error| {
             anyhow::anyhow!(
@@ -285,10 +367,10 @@ fn apply_claude(settings_path: &Path, remove: bool, exe: &str) -> anyhow::Result
             return Err(anyhow::anyhow!("read {}: {error}", settings_path.display()));
         }
     };
-    let next = if remove {
-        unmerge_legacy(current)?
+    let (next, status_line) = if remove {
+        unmerge_legacy_with_status(current)?
     } else {
-        merge_claude_for_exe(current, exe)?
+        merge_claude_for_exe_with_status(current, exe, replace_status_line)?
     };
     crate::fsutil::atomic_write(settings_path, serde_json::to_string_pretty(&next)?)?;
     println!(
@@ -296,6 +378,20 @@ fn apply_claude(settings_path: &Path, remove: bool, exe: &str) -> anyhow::Result
         if remove { "removed" } else { "registered" },
         settings_path.display()
     );
+    match status_line {
+        ClaudeStatusLineResult::Installed => {
+            println!("claude: cfetch runtime status line registered (refresh 5s)")
+        }
+        ClaudeStatusLineResult::Updated => println!("claude: cfetch runtime status line updated"),
+        ClaudeStatusLineResult::Replaced => {
+            println!("claude: existing status line replaced with cfetch runtime status")
+        }
+        ClaudeStatusLineResult::PreservedForeign => println!(
+            "claude: existing statusLine preserved; compose `cfetch status --line` into its command, or rerun with --replace-status-line"
+        ),
+        ClaudeStatusLineResult::Removed => println!("claude: cfetch runtime status line removed"),
+        ClaudeStatusLineResult::Absent => {}
+    }
     Ok(())
 }
 
@@ -1005,6 +1101,7 @@ pub fn configure(
     all: bool,
     remove: bool,
     project: Option<&Path>,
+    replace_status_line: bool,
 ) -> anyhow::Result<()> {
     if settings.is_some() && project.is_some() {
         anyhow::bail!("--settings and --project target different scopes");
@@ -1057,7 +1154,7 @@ pub fn configure(
             let path = settings
                 .map(Path::to_path_buf)
                 .unwrap_or_else(default_settings_path);
-            apply_claude(&path, remove, &exe)?;
+            apply_claude(&path, remove, &exe, replace_status_line)?;
         }
         let description = surfaces.describe();
         if !description.is_empty() {
@@ -1086,6 +1183,9 @@ pub fn configure(
             report.staged,
             report.db.display()
         );
+    }
+    if !remove {
+        let _ = crate::runtime_status::refresh_static();
     }
     Ok(())
 }
@@ -1178,6 +1278,45 @@ mod tests {
         );
         assert_eq!(twice["permissions"]["allow"][0], "Bash(ls:*)");
         assert_eq!(twice["hooks"].as_object().unwrap().len(), FULL_HOOKS.len());
+    }
+
+    #[test]
+    fn claude_foreign_status_line_is_preserved_exactly_without_opt_in() {
+        let foreign = json!({
+            "type": "command",
+            "command": "my-status --json",
+            "refreshInterval": 17,
+            "padding": 1
+        });
+        let before = serde_json::to_vec(&foreign).unwrap();
+        let (merged, result) = merge_claude_for_exe_with_status(
+            json!({"statusLine": foreign}),
+            "/usr/bin/cfetch",
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, ClaudeStatusLineResult::PreservedForeign);
+        assert_eq!(serde_json::to_vec(&merged["statusLine"]).unwrap(), before);
+
+        let (replaced, result) =
+            merge_claude_for_exe_with_status(merged, "/usr/bin/cfetch", true).unwrap();
+        assert_eq!(result, ClaudeStatusLineResult::Replaced);
+        assert_eq!(replaced["statusLine"], owned_claude_status_line("/usr/bin/cfetch"));
+    }
+
+    #[test]
+    fn claude_removal_removes_only_the_exact_cfetch_status_line() {
+        let (owned, _) = merge_claude_for_exe_with_status(Value::Null, "/usr/bin/cfetch", false)
+            .unwrap();
+        let (removed, result) = unmerge_legacy_with_status(owned).unwrap();
+        assert_eq!(result, ClaudeStatusLineResult::Removed);
+        assert!(removed.get("statusLine").is_none());
+
+        let foreign = json!({"type": "command", "command": "cfetch status --line", "refreshInterval": 9});
+        let (preserved, result) =
+            unmerge_legacy_with_status(json!({"statusLine": foreign.clone()})).unwrap();
+        assert_eq!(result, ClaudeStatusLineResult::Absent);
+        assert_eq!(preserved["statusLine"], foreign);
     }
 
     #[test]

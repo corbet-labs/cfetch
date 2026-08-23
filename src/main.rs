@@ -65,6 +65,7 @@ mod paths;
 mod pipeline;
 mod rerank;
 mod resident;
+mod runtime_status;
 mod serve;
 mod session_state;
 #[cfg(test)]
@@ -113,6 +114,9 @@ enum Command {
         /// Remove cfetch's managed entries instead of adding them
         #[arg(long)]
         remove: bool,
+        /// Replace an existing foreign Claude status line instead of preserving it
+        #[arg(long, conflicts_with = "remove")]
+        replace_status_line: bool,
     },
     /// Rebuild the recall index and sync the code index
     Scan {
@@ -274,8 +278,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show daemon, hook health, and state footprint
-    Status,
+    /// Show runtime routing, inference, maintenance, and detailed diagnostics
+    Status {
+        /// Print the stable RuntimeStatusV1 contract
+        #[arg(long, conflicts_with = "line")]
+        json: bool,
+        /// Print one cached, terminal-width-aware line (no network or inference)
+        #[arg(long, conflicts_with = "json")]
+        line: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1865,6 +1876,8 @@ fn delivery_status_line(agent: &str, verification: Option<(u64, u64)>) -> String
 }
 
 fn status() -> anyhow::Result<()> {
+    let runtime = runtime_status::refresh_static()?;
+    println!("{}", runtime_status::render_line(&runtime));
     daemon::status()?;
     // Diagnostics must survive a broken config: the paths below fall back to
     // the defaults rather than making `status` the second casualty.
@@ -2310,13 +2323,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Install { settings, agents, all, project, remove } => {
+        Command::Install {
+            settings,
+            agents,
+            all,
+            project,
+            remove,
+            replace_status_line,
+        } => {
             if let Err(e) = install::configure(
                 settings.as_deref(),
                 &agents,
                 all,
                 remove,
                 project.as_deref(),
+                replace_status_line,
             ) {
                 eprintln!("cfetch install: {e}");
                 std::process::exit(1);
@@ -2448,7 +2469,10 @@ fn main() {
             }
         }
         Command::Maintain { action } => {
-            if let Err(e) = maintain_cmd(action) {
+            if let Err(e) = maintain_cmd(action).and_then(|()| {
+                let _ = runtime_status::refresh_static()?;
+                Ok(())
+            }) {
                 eprintln!("cfetch maintain: {e:#}");
                 std::process::exit(1);
             }
@@ -2480,7 +2504,10 @@ fn main() {
             }
         }
         Command::Scan { background } => {
-            if let Err(e) = scan(background) {
+            if let Err(e) = scan(background).and_then(|()| {
+                let _ = runtime_status::refresh_static()?;
+                Ok(())
+            }) {
                 eprintln!("cfetch scan: {e}");
                 std::process::exit(1);
             }
@@ -2521,7 +2548,13 @@ fn main() {
         }
         Command::EmbedIndex { batch } => {
             let guard = config::Config::load().and_then(|c| none_tier_guard(&c, "embed-index"));
-            if let Err(e) = guard.and_then(|()| embed::embed_index_cmd(batch)) {
+            if let Err(e) = guard
+                .and_then(|()| embed::embed_index_cmd(batch))
+                .and_then(|()| {
+                    let _ = runtime_status::refresh_static()?;
+                    Ok(())
+                })
+            {
                 eprintln!("cfetch embed-index: {e}");
                 std::process::exit(1);
             }
@@ -2538,8 +2571,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Status => {
-            if let Err(e) = status() {
+        Command::Status { json, line } => {
+            let result = if line {
+                println!("{}", runtime_status::render_line(&runtime_status::load_cached()));
+                Ok(())
+            } else if json {
+                runtime_status::refresh_static().and_then(|snapshot| {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    Ok(())
+                })
+            } else {
+                status()
+            };
+            if let Err(e) = result {
                 eprintln!("cfetch status: {e}");
                 std::process::exit(1);
             }

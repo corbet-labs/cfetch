@@ -85,6 +85,7 @@ fn official_stdio_transport_negotiates_and_serves_tools() {
             "cfetch_recall",
             "cfetch_expand",
             "cfetch_find",
+            "cfetch_runtime_status",
             "cfetch_maintenance_packet",
             "cfetch_maintenance_show",
             "cfetch_maintenance_propose",
@@ -92,9 +93,9 @@ fn official_stdio_transport_negotiates_and_serves_tools() {
         ]
     );
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert!(tools[..5].iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
-    assert!(tools[5..].iter().all(|tool| tool["annotations"]["readOnlyHint"] == false));
-    assert!(tools[5..].iter().all(|tool| tool["annotations"]["destructiveHint"] == false));
+    assert!(tools[..6].iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
+    assert!(tools[6..].iter().all(|tool| tool["annotations"]["readOnlyHint"] == false));
+    assert!(tools[6..].iter().all(|tool| tool["annotations"]["destructiveHint"] == false));
 
     send(
         &mut stdin,

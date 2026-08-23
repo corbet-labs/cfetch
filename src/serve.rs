@@ -613,6 +613,10 @@ impl ServeState {
         p.settled = true;
         p.last_error = None;
         drop(p);
+        crate::runtime_status::record_generation(
+            crate::runtime_status::MemoryRoute::Serving,
+            generation,
+        );
         self.cv.notify_all();
     }
 
@@ -1271,9 +1275,44 @@ pub fn client_call(
     body: serde_json::Value,
     read_timeout: Duration,
 ) -> anyhow::Result<daemon::Response> {
-    let token = read_token(&cs.token_file, false)
-        .map_err(|e| anyhow::anyhow!("client.serving token: {e}"))?;
-    remote_request(&cs.addr, &token, body, read_timeout)
+    let retrieval = (body.get("op").and_then(serde_json::Value::as_str) == Some("recall"))
+        .then(|| {
+            if body.get("hybrid").and_then(serde_json::Value::as_bool) == Some(true) {
+                crate::runtime_status::RetrievalMode::Hybrid
+            } else if body.get("semantic").and_then(serde_json::Value::as_bool) == Some(true) {
+                crate::runtime_status::RetrievalMode::Semantic
+            } else {
+                crate::runtime_status::RetrievalMode::Lexical
+            }
+        });
+    let result = (|| {
+        let token = read_token(&cs.token_file, false)
+            .map_err(|e| anyhow::anyhow!("client.serving token: {e}"))?;
+        remote_request(&cs.addr, &token, body, read_timeout)
+    })();
+    match &result {
+        Ok(response) => {
+            crate::runtime_status::record_memory_answer(
+                crate::runtime_status::MemoryRoute::Remote,
+                response.generation,
+                response.fresh,
+                true,
+            );
+            if let Some(mode) = retrieval {
+                crate::runtime_status::record_retrieval(
+                    mode,
+                    crate::runtime_status::retrieval_note_is_degraded(response.note.as_deref()),
+                );
+            }
+        }
+        Err(_) => crate::runtime_status::record_memory_answer(
+            crate::runtime_status::MemoryRoute::Remote,
+            None,
+            None,
+            false,
+        ),
+    }
+    result
 }
 
 #[cfg(test)]

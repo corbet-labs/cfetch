@@ -285,6 +285,22 @@ impl EmbedClient {
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let result = self.embed_request(texts, timeout);
+        crate::runtime_status::record_inference_attempt(
+            crate::runtime_status::InferenceMode::Endpoint,
+            crate::runtime_status::endpoint_route(&self.url),
+            "endpoint",
+            None,
+            result.is_ok(),
+        );
+        result
+    }
+
+    fn embed_request(
+        &self,
+        texts: &[&str],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         #[derive(serde::Deserialize)]
         struct Response {
             data: Vec<Row>,
@@ -534,8 +550,10 @@ pub fn semantic_hits(
     hybrid: bool,
     prefixes: &[String],
 ) -> anyhow::Result<SemanticRecall> {
-    let client = EmbedClient::new(&cfg.embeddings)
-        .map_err(|e| anyhow::anyhow!("semantic recall unavailable: {e}"))?;
+    let client = EmbedClient::new(&cfg.embeddings).map_err(|e| {
+        crate::runtime_status::record_inference_initialization_failure();
+        anyhow::anyhow!("semantic recall unavailable: {e}")
+    })?;
     let spec = cfg.embeddings.spec();
     // The shared store is the record: take whatever this group already
     // derived before judging our own coverage.

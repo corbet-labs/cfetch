@@ -78,6 +78,14 @@ pub struct SessionState {
     /// activity-gated reminder stays silent.
     #[serde(default)]
     pub shell_writes: u64,
+    /// Last model-relevant cfetch runtime transition surfaced to this Codex
+    /// session. The fingerprint excludes generations and timestamps.
+    #[serde(default)]
+    pub runtime_status_fingerprint: Option<String>,
+    /// Rate limit for a still-present failure. Recovery or a different
+    /// transition is surfaced immediately.
+    #[serde(default)]
+    pub runtime_status_last_notice: Option<u64>,
 }
 
 impl SessionState {
@@ -172,6 +180,8 @@ impl SessionState {
             shown_keys,
             tool_events,
             shell_writes,
+            runtime_status_fingerprint,
+            runtime_status_last_notice,
         } = self;
         *compacted = false;
         reads.clear();
@@ -182,6 +192,8 @@ impl SessionState {
         shown_keys.clear();
         *tool_events = 0;
         *shell_writes = 0;
+        *runtime_status_fingerprint = None;
+        *runtime_status_last_notice = None;
     }
 }
 

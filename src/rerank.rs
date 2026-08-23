@@ -81,6 +81,18 @@ impl RerankClient {
     /// unbounded and negative); only their ORDER is meaningful, and nothing
     /// here interprets them as probabilities.
     pub fn rank(&self, query: &str, documents: &[&str]) -> anyhow::Result<Vec<f32>> {
+        let result = self.rank_request(query, documents);
+        crate::runtime_status::record_inference_attempt(
+            crate::runtime_status::InferenceMode::Endpoint,
+            crate::runtime_status::endpoint_route(&self.url),
+            "rerank-endpoint",
+            None,
+            result.is_ok(),
+        );
+        result
+    }
+
+    fn rank_request(&self, query: &str, documents: &[&str]) -> anyhow::Result<Vec<f32>> {
         #[derive(serde::Deserialize)]
         struct Response {
             results: Vec<Row>,

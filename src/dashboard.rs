@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 
 use crate::config::{ClientServingConfig, Config};
 use crate::maintenance_inbox::{Inbox, Tone};
-use crate::{daemon, exhaust, heartbeat, index, ledger, maintenance, paths, serve};
+use crate::{daemon, exhaust, heartbeat, index, ledger, maintenance, paths, runtime_status, serve};
 
 /// Remote budget for the dashboard's own calls. Deliberately shorter than the
 /// CLI's: this screen refreshes on a timer and must not freeze on a slow drain
@@ -91,6 +91,7 @@ enum IndexView {
 }
 
 struct Stats {
+    runtime: runtime_status::RuntimeStatusV1,
     daemon_version: Option<String>,
     /// Expected-versus-observed, never a bare failure count: a hook that has
     /// never fired must not share a rendering with one that runs cleanly.
@@ -151,6 +152,7 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
     // Read-only, fail-silent: an absent tree simply reports zeros.
     let staging = exhaust::Exhaust::from_config(cfg).stats();
     Stats {
+        runtime: runtime_status::refresh_static().unwrap_or_else(|_| runtime_status::load_cached()),
         daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
         hooks: heartbeat::liveness_in(state),
         sessions: l.sessions.len(),
@@ -215,7 +217,18 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         Some(v) => Span::styled(format!("daemon v{v} ●"), Style::default().fg(Color::Green)),
         None => Span::styled("daemon down ○", Style::default().fg(Color::Red)),
     };
+    let runtime_style = match s.runtime.service.state {
+        runtime_status::ServiceState::Ready => Style::default().fg(Color::Green),
+        runtime_status::ServiceState::Degraded => Style::default().fg(Color::Yellow),
+        runtime_status::ServiceState::Unavailable => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+    };
     let mut lines = vec![
+        Line::from(Span::styled(
+            runtime_status::render_line_with_width(&s.runtime, Some(180)),
+            runtime_style,
+        )),
         Line::from(vec![
             daemon_span,
             index_span(&s.index),
@@ -425,7 +438,7 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(3),
             Constraint::Min(3),
             Constraint::Length(1),
@@ -657,6 +670,7 @@ mod tests {
     #[test]
     fn header_shows_the_serving_origin_and_generation() {
         let s = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
@@ -674,6 +688,7 @@ mod tests {
             exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&s));
+        assert!(text.contains("cfetch ● memory:local"), "{text}");
         assert!(text.contains("served by storage-1"), "{text}");
         assert!(text.contains("generation 91"), "{text}");
         // A stale remote answer must say so rather than look authoritative.
@@ -687,6 +702,7 @@ mod tests {
     #[test]
     fn header_reports_failing_hooks_and_unreadable_streams() {
         let s = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: None,
             hooks: liveness(&[
                 (
@@ -726,6 +742,7 @@ mod tests {
         // called the lot healthy, so a hook that had never fired since
         // install was indistinguishable from one that had just succeeded.
         let base = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: liveness(&[("session-start", heartbeat::HookState::Healthy { last_ok: 1 })]),
             sessions: 0,
@@ -770,6 +787,7 @@ mod tests {
         // Generation 0 is "never scanned". Rendering its counts would print
         // "0 blocks", which reads as a brain with nothing in it.
         let never = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
@@ -814,6 +832,7 @@ mod tests {
     #[test]
     fn zero_staging_with_no_exhaust_on_disk_is_unobserved() {
         let base = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
@@ -838,6 +857,7 @@ mod tests {
     #[test]
     fn header_shows_staging_counts_and_exhaust_footprint() {
         let s = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
