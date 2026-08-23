@@ -91,6 +91,7 @@ measurement do not.
 | Multi-machine access | v0.9.9 | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
 | Selective sharing | v0.9.9 | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
 | Frozen shared-vector profile | **Main — next release** | Every producer uses one pinned model pipeline and exact 768-byte INT8 vector contract; incompatible network majors fail closed | `embedding-profile`, semantic and hybrid recall |
+| Peer vector artifacts | **Main — next release** | A second storage group fetches matching canonical vectors from authorized origins before considering its own endpoint, avoiding duplicate embedding work | `embed-index`, iroh-blobs, `doctor` |
 | Privacy and safety | v0.9.9 | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
 | Cross-platform delivery | v0.9.9 | Linux, macOS, and Windows block releases; packages are available through Cargo, Homebrew, Nix, AUR, and release archives | `variants`, `hardware` |
 
@@ -133,8 +134,8 @@ deployment, trust, and sharing model.
 This map answers the practical question: which ideas exist in each project,
 and how are they experienced?
 
-This comparison follows cfetch `main`. The two rows marked as next-release
-features in the feature map are not part of the v0.9.9 binaries.
+This comparison follows cfetch `main`. Rows marked as next-release features in
+the feature map are not part of the v0.9.9 binaries.
 
 | Capability | OpenWolf 2.x | OpenWolf Enhanced 1.x | cfetch (`main`) |
 |---|---|---|---|
@@ -148,7 +149,7 @@ features in the feature map are not part of the v0.9.9 binaries.
 | Measurement | Real transcript usage, verified delivery, cache attribution, and A/B bench | Estimated ledger including its own injection cost | Transcript usage, rewrite deltas, injection cost, cache attribution, audit, and paired bench |
 | Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Project health/size doctor, cleanup checks, and expanded web dashboard | Evidence-rich system doctor, truthful delivery state, selfcheck, status, and terminal dashboard |
 | Agent reach | Full integration for Claude Code, Codex, and OpenCode; context for several others | Hooks for four agents plus MCP clients | Confirmed configuration surfaces across 25 harnesses; native hooks only where the payload contract is understood |
-| Sharing | Git carries useful project state | Optional explicit push to a linked workspace | Authenticated serving and per-slice grants over iroh |
+| Sharing | Git carries useful project state | Optional explicit push to a linked workspace | Authenticated serving, per-slice grants, and content-verified vector delivery over iroh |
 | Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Supervised AI evidence review, typed proposals, exact diffs, reversible apply, and commit-gated promotion |
 | Runtime | Node.js 20+, per-project hook files | Node.js 20+, per-project hook files | One Rust binary plus an optional per-host daemon |
 | License | AGPL-3.0 | AGPL-3.0 | FSL-1.1-ALv2, converting to Apache-2.0 after two years |
@@ -356,7 +357,10 @@ line should not try to fit:
 - whether the daemon and its authenticated network endpoint are running, and
   whether joined origins currently answer through the granted serving path;
 - vector coverage, shared artifact count, hook liveness, outbound grants, and
-  concrete repair actions.
+  concrete repair actions;
+- whether peer artifact delivery is ready, how many authorized routes exist,
+  and the actual resolution order: shared store, authorized peers, then the
+  configured embedding endpoint.
 
 ```console
 $ cfetch doctor               # one read-only diagnostic report with bounded peer probes
@@ -486,6 +490,16 @@ plain OpenAI wire shape alone is not permission to publish shared vectors:
 Then run `cfetch embed-index`. Vectors are keyed by the statement content hash,
 so editing one file re-embeds only changed statements. Missing or partial vector
 coverage is always reported.
+
+With a running daemon and one or more joined origins, `embed-index` checks the
+shared tree first, then requests only its missing content hashes from each
+authorized slice. Matching canonical records stream over iroh-blobs with
+BLAKE3 verification; only the remainder reaches the configured embedding
+endpoint. Artifact capabilities are salted and isolated by authenticated peer,
+and the receiver verifies the exact profile, content hash, record width, and
+non-degenerate bytes before appending them. A host whose peers cover every
+block can complete `embed-index` with embeddings disabled and zero endpoint
+calls.
 
 Run `cfetch embedding-profile --json` for the executable manifest. Changing
 any model-pipeline field is a new incompatible network major and requires every

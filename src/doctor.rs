@@ -87,6 +87,15 @@ pub struct MemoryDiagnostic {
     pub generation: Option<u64>,
     pub vector_coverage: CoverageDiagnostic,
     pub shared_vector_artifacts: Option<usize>,
+    pub peer_artifacts: PeerArtifactDiagnostic,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerArtifactDiagnostic {
+    pub transport: String,
+    pub state: String,
+    pub authorized_routes: usize,
+    pub route_order: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -498,6 +507,12 @@ fn memory_diagnostic(
                 detail: Some("configuration unavailable".into()),
             },
             shared_vector_artifacts: None,
+            peer_artifacts: PeerArtifactDiagnostic {
+                transport: "iroh-blobs".into(),
+                state: "configuration_unavailable".into(),
+                authorized_routes: 0,
+                route_order: "shared_store_then_authorized_peers_then_configured_endpoint".into(),
+            },
         };
     };
 
@@ -563,12 +578,36 @@ fn memory_diagnostic(
         }
     };
 
+    let authorized_routes = grant::memberships(state_dir)
+        .map(|memberships| {
+            memberships
+                .into_iter()
+                .filter(|membership| {
+                    membership.network_major == embedding_profile::NETWORK_MAJOR
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let peer_artifact_state = if authorized_routes == 0 {
+        "no_joined_routes"
+    } else if daemon::call("ping", Duration::from_millis(300)).is_some() {
+        "ready"
+    } else {
+        "daemon_stopped"
+    };
+
     MemoryDiagnostic {
         route: route.into(),
         origin,
         generation: runtime.memory_route.generation,
         vector_coverage,
         shared_vector_artifacts,
+        peer_artifacts: PeerArtifactDiagnostic {
+            transport: "iroh-blobs".into(),
+            state: peer_artifact_state.into(),
+            authorized_routes,
+            route_order: "shared_store_then_authorized_peers_then_configured_endpoint".into(),
+        },
     }
 }
 
@@ -1159,6 +1198,19 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
             format!("    {detail}"),
         ));
     }
+    lines.push(DisplayLine::new(
+        match report.memory.peer_artifacts.state.as_str() {
+            "ready" => DisplayTone::Good,
+            "daemon_stopped" => DisplayTone::Warning,
+            _ => DisplayTone::Muted,
+        },
+        format!(
+            "  peer artifacts {} — {} · {} authorized route(s)",
+            report.memory.peer_artifacts.transport,
+            report.memory.peer_artifacts.state,
+            report.memory.peer_artifacts.authorized_routes,
+        ),
+    ));
 
     lines.push(DisplayLine::new(DisplayTone::Heading, "Inference"));
     lines.push(DisplayLine::new(
@@ -1494,6 +1546,13 @@ mod tests {
                     detail: None,
                 },
                 shared_vector_artifacts: Some(3),
+                peer_artifacts: PeerArtifactDiagnostic {
+                    transport: "iroh-blobs".into(),
+                    state: "ready".into(),
+                    authorized_routes: 1,
+                    route_order: "shared_store_then_authorized_peers_then_configured_endpoint"
+                        .into(),
+                },
             },
             inference: InferenceDiagnostic {
                 build_backend: "endpoint".into(),

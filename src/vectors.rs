@@ -52,6 +52,8 @@ use crate::index;
 /// network artifacts.
 const MAGIC: &str = "cfetch-vectors v3";
 const HEADER_LINES: usize = 8;
+const PEER_ARTIFACT_MAGIC: &[u8] = b"cfetch-vector-artifact-v1\0";
+pub(crate) const MAX_PEER_ARTIFACTS: usize = 256;
 
 /// Short, stable, filename-safe digest of a document prefix.
 fn prefix_tag(prefix: &str) -> String {
@@ -246,6 +248,12 @@ impl VectorStore {
         &self.spec
     }
 
+    /// Refreshes the read view after another process (normally the daemon's
+    /// peer-artifact receiver) appended records under the store lock.
+    pub fn refresh(&mut self) -> anyhow::Result<()> {
+        self.reload()
+    }
+
     /// Bytes one vector occupies.
     fn stride(&self) -> usize {
         self.spec.precision.record_bytes(self.spec.dim)
@@ -271,7 +279,7 @@ impl VectorStore {
     }
 
     /// One canonical record by content hash, without decoding or rewriting.
-    fn get_blob(&self, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    pub(crate) fn get_blob(&self, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let Some(record) = self.hashes.iter().position(|h| h == hash) else {
             return Ok(None);
         };
@@ -411,6 +419,30 @@ impl VectorWriter<'_> {
             ))
         })?;
         let encoded = index::vec_to_blob(vector, self.store.spec.precision);
+        self.put_encoded(hash, &encoded)
+    }
+
+    /// Appends one already-canonical vector record received from a peer.
+    /// The byte representation is preserved exactly: decoding and re-
+    /// quantizing an INT8 artifact could otherwise manufacture drift.
+    pub(crate) fn put_encoded(&mut self, hash: &str, encoded: &[u8]) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !hash.contains(['\n', '\r']) && !hash.is_empty(),
+            "content hash {hash:?} is not a hash"
+        );
+        anyhow::ensure!(
+            encoded.len() == self.store.stride(),
+            "canonical vector record has {} bytes, profile {} requires {}",
+            encoded.len(),
+            self.store.spec.profile_id,
+            self.store.stride()
+        );
+        let widened = index::blob_to_vec(encoded, self.store.spec.precision);
+        degenerate(&widened).map_or(Ok(()), |why| {
+            Err(anyhow::anyhow!(
+                "refusing peer vector for {hash}: {why}"
+            ))
+        })?;
         if self.store.present.contains(hash) {
             let existing = self
                 .store
@@ -426,7 +458,7 @@ impl VectorWriter<'_> {
         // Record FIRST, index line second: a crash between them leaves an
         // orphan record (invisible, truncated by the next writer), never an
         // index line pointing at bytes that are not there.
-        self.bin.write_all(&encoded)?;
+        self.bin.write_all(encoded)?;
         writeln!(self.idx, "{hash}")?;
         self.store.hashes.push(hash.to_string());
         self.store.present.insert(hash.to_string());
@@ -442,6 +474,56 @@ impl VectorWriter<'_> {
         self.idx.sync_all()?;
         Ok(())
     }
+}
+
+/// Encodes one canonical vector record for iroh-blobs.
+///
+/// `nonce` is derived from a daemon-private key plus peer, slice and content
+/// hash. It makes the resulting BLAKE3 hash an unguessable, stable bearer
+/// capability: repeated requests deduplicate in memory, while another peer
+/// or slice gets a different capability for the same vector.
+pub(crate) fn encode_peer_artifact(
+    hash: &str,
+    record: &[u8],
+    nonce: [u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "content hash {hash:?} is not canonical lowercase SHA-256"
+    );
+    anyhow::ensure!(!record.is_empty(), "peer vector artifact has no vector bytes");
+    let mut out = Vec::with_capacity(PEER_ARTIFACT_MAGIC.len() + 32 + 64 + record.len());
+    out.extend_from_slice(PEER_ARTIFACT_MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(hash.as_bytes());
+    out.extend_from_slice(record);
+    Ok(out)
+}
+
+/// Decodes and structurally validates one peer artifact. The expected hash is
+/// supplied by the receiver, so a faulty peer cannot smuggle an unrelated
+/// record into the local artifact store.
+pub(crate) fn decode_peer_artifact(
+    raw: &[u8],
+    spec: &VectorSpec,
+    expected_hash: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let stride = spec.precision.record_bytes(spec.dim);
+    let header = PEER_ARTIFACT_MAGIC.len() + 32 + 64;
+    anyhow::ensure!(raw.len() == header + stride, "peer vector artifact length is inconsistent");
+    anyhow::ensure!(
+        raw.starts_with(PEER_ARTIFACT_MAGIC),
+        "peer vector artifact has unknown format"
+    );
+    let hash_start = PEER_ARTIFACT_MAGIC.len() + 32;
+    let hash = std::str::from_utf8(&raw[hash_start..hash_start + 64])?;
+    anyhow::ensure!(hash == expected_hash, "peer returned vector {hash} for requested {expected_hash}");
+    let record = raw[header..].to_vec();
+    anyhow::ensure!(
+        degenerate(&index::blob_to_vec(&record, spec.precision)).is_none(),
+        "peer returned a degenerate vector for {hash}"
+    );
+    Ok(record)
 }
 
 /// Fills the local index cache from the shared store: every block hash that
@@ -517,6 +599,36 @@ mod tests {
         assert_eq!(store.len(), 0);
         assert!(!store.contains("deadbeef"));
         assert!(store.get("deadbeef").unwrap().is_none());
+    }
+
+    #[test]
+    fn peer_artifact_round_trip_preserves_canonical_bytes() {
+        let s = spec(4, Precision::I8);
+        let hash = "ab".repeat(32);
+        let record = vec![1, 2, 3, 4];
+        let raw = encode_peer_artifact(&hash, &record, [7; 32]).unwrap();
+        assert_eq!(decode_peer_artifact(&raw, &s, &hash).unwrap(), record);
+        assert!(
+            decode_peer_artifact(&raw, &s, &"cd".repeat(32))
+                .unwrap_err()
+                .to_string()
+                .contains("requested")
+        );
+    }
+
+    #[test]
+    fn peer_artifact_rejects_wrong_width_and_degenerate_bytes() {
+        let s = spec(4, Precision::I8);
+        let hash = "ab".repeat(32);
+        let short = encode_peer_artifact(&hash, &[1, 2], [7; 32]).unwrap();
+        assert!(decode_peer_artifact(&short, &s, &hash).is_err());
+        let zero = encode_peer_artifact(&hash, &[0, 0, 0, 0], [7; 32]).unwrap();
+        assert!(
+            decode_peer_artifact(&zero, &s, &hash)
+                .unwrap_err()
+                .to_string()
+                .contains("degenerate")
+        );
     }
 
     #[test]

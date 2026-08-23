@@ -36,10 +36,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
+use iroh::protocol::ProtocolHandler as _;
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
-use crate::{grant, heartbeat, hooks, index, ipc, net, paths, resident, serve};
+use crate::config::{Config, VectorSpec};
+use crate::{grant, heartbeat, hooks, index, ipc, net, paths, resident, serve, vectors};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Request {
@@ -96,6 +97,13 @@ struct Request {
     /// request and never copied into its nested payload.
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Peer-artifact negotiation. The ordinary slice grant is still the
+    /// authority; these fields only describe which exact derived artifacts a
+    /// receiver already knows it needs.
+    #[serde(default)]
+    vector_hashes: Option<Vec<String>>,
+    #[serde(default)]
+    vector_spec: Option<VectorSpec>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -158,6 +166,15 @@ pub struct Response {
     /// the slice or operation. Absent means no transport claim can be made.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iroh_connected: Option<bool>,
+    /// Authenticated vector capabilities offered by a serving peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_artifacts: Option<Vec<WireVectorArtifact>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_spec: Option<VectorSpec>,
+    /// Local-only result after the daemon fetched, verified and durably
+    /// appended peer artifacts to this host's shared vector store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vectors_imported: Option<usize>,
 }
 
 impl Response {
@@ -171,6 +188,13 @@ pub struct WireGrant {
     pub slice: String,
     pub mode: grant::Mode,
     pub peer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireVectorArtifact {
+    pub content_hash: String,
+    pub blob_hash: String,
+    pub bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +516,44 @@ pub fn redeem_iroh(ticket: &grant::Ticket) -> anyhow::Result<WireGrant> {
     resp.grant.context("origin accepted redemption without returning the grant")
 }
 
+/// Asks this host's daemon to import missing canonical vectors from one
+/// joined origin. The CLI never opens a second endpoint with the same host
+/// identity; negotiation and iroh-blobs transfer both travel through the
+/// daemon-owned endpoint.
+pub fn sync_peer_vectors(
+    target: &iroh::EndpointAddr,
+    slice: &str,
+    hashes: &[String],
+    spec: &VectorSpec,
+) -> anyhow::Result<usize> {
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    anyhow::ensure!(
+        hashes.len() <= vectors::MAX_PEER_ARTIFACTS,
+        "one peer vector request may name at most {} hashes",
+        vectors::MAX_PEER_ARTIFACTS
+    );
+    let resp = call_req(
+        &serde_json::to_value(Request {
+            op: "vector-sync".to_string(),
+            target: Some(target.clone()),
+            slice: Some(slice.to_string()),
+            vector_hashes: Some(hashes.to_vec()),
+            vector_spec: Some(spec.clone()),
+            ..Request::default()
+        })?,
+        IROH_REQUEST_TIMEOUT + Duration::from_secs(5),
+    )
+    .context("local daemon is not running — peer vectors were not checked")?;
+    anyhow::ensure!(
+        resp.ok,
+        "{}",
+        resp.error.unwrap_or_else(|| "peer vector synchronization failed".into())
+    );
+    Ok(resp.vectors_imported.unwrap_or(0))
+}
+
 /// Shared state of one daemon process across its connection threads.
 struct Ctx {
     /// The daemon's own configuration. A serving host ranks ON BEHALF OF
@@ -510,6 +572,10 @@ struct Ctx {
     /// async iroh runtime to make an outbound call without minting a second
     /// endpoint with the same host identity.
     iroh: Mutex<Option<IrohClient>>,
+    /// Per-process capability key. It salts peer artifact blobs so their
+    /// BLAKE3 hashes cannot be guessed from public vector bytes; stable within
+    /// the daemon so repeated requests deduplicate in the blob store.
+    artifact_key: [u8; 32],
     shutdown: AtomicBool,
 }
 
@@ -517,6 +583,66 @@ struct Ctx {
 struct IrohClient {
     endpoint: iroh::Endpoint,
     runtime: tokio::runtime::Handle,
+    download_blobs: iroh_blobs::api::Store,
+    peer_blobs: PeerBlobStores,
+}
+
+/// Provider storage is partitioned by the QUIC-authenticated endpoint id.
+/// A blob hash disclosed to peer A is therefore not servable to peer B even
+/// if A leaks it. The durable vectors stay in cfetch's packed store; these are
+/// bounded transfer views populated only after slice authorization.
+#[derive(Clone, Default)]
+struct PeerBlobStores {
+    inner: Arc<Mutex<std::collections::HashMap<String, iroh_blobs::api::Store>>>,
+}
+
+impl std::fmt::Debug for PeerBlobStores {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let peers = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        f.debug_struct("PeerBlobStores").field("peers", &peers).finish()
+    }
+}
+
+impl PeerBlobStores {
+    fn get(&self, peer: &str) -> Option<iroh_blobs::api::Store> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(peer)
+            .cloned()
+    }
+
+    fn get_or_create(&self, peer: &str) -> iroh_blobs::api::Store {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(peer.to_string())
+            .or_insert_with(|| iroh_blobs::store::mem::MemStore::new().into())
+            .clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PeerBlobsProtocol {
+    stores: PeerBlobStores,
+}
+
+impl iroh::protocol::ProtocolHandler for PeerBlobsProtocol {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        let peer = conn.remote_id().to_string();
+        let Some(store) = self.stores.get(&peer) else {
+            conn.close(1u32.into(), b"no authorized artifact offer");
+            return Ok(());
+        };
+        iroh_blobs::BlobsProtocol::new(&store, None).accept(conn).await
+    }
 }
 
 const IROH_ALPN: &[u8] = b"cfetch/network/1/line-json";
@@ -661,6 +787,210 @@ fn forward_iroh(
     ))
 }
 
+fn artifact_nonce(ctx: &Ctx, peer: &str, slice: &str, content_hash: &str) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(ctx.artifact_key);
+    hasher.update(b"cfetch-peer-vector-v1\0");
+    for field in [peer, slice, content_hash] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    // Keying both ends avoids treating the construction as a generic
+    // secret-prefix digest. The output is a capability salt, not a MAC.
+    hasher.update(ctx.artifact_key);
+    hasher.finalize().into()
+}
+
+/// Builds iroh-blobs capabilities only for vectors whose source block falls
+/// inside the authenticated slice. The blob hash is not itself the grant: it
+/// is disclosed only after the grant check above and is salted per peer and
+/// slice so public vector bytes do not make it guessable.
+fn offer_peer_vectors(req: &Request, peer: &str, slice: &str, ctx: &Ctx) -> Response {
+    let Some(wanted_spec) = req.vector_spec.as_ref() else {
+        return Response::err("vector artifact request names no embedding profile");
+    };
+    let local_spec = ctx.cfg.embeddings.spec();
+    if wanted_spec != &local_spec {
+        return Response::err(format!(
+            "vector artifact profile mismatch: peer requested {}, this host serves {}",
+            wanted_spec.profile_id, local_spec.profile_id
+        ));
+    }
+    let Some(hashes) = req.vector_hashes.as_ref() else {
+        return Response::err("vector artifact request names no content hashes");
+    };
+    if hashes.is_empty() || hashes.len() > vectors::MAX_PEER_ARTIFACTS {
+        return Response::err(format!(
+            "vector artifact request must name 1..={} hashes",
+            vectors::MAX_PEER_ARTIFACTS
+        ));
+    }
+    if hashes.iter().any(|hash| {
+        hash.len() != 64
+            || !hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }) {
+        return Response::err("vector artifact request contains a non-canonical content hash");
+    }
+    let model = match ctx.cfg.slice_model() {
+        Ok(model) => model,
+        Err(e) => return Response::err(e.to_string()),
+    };
+    let store = match vectors::VectorStore::open(&ctx.cfg.brain_root, &local_spec) {
+        Ok(store) => store,
+        Err(e) => return Response::err(e.to_string()),
+    };
+    let client = match iroh_client(ctx) {
+        Ok(client) => client,
+        Err(e) => return Response::err(e.to_string()),
+    };
+    serve_query(ctx, |conn| {
+        let mut path_stmt = conn.prepare(
+            "SELECT DISTINCT d.path FROM blocks b JOIN docs d ON d.id=b.doc_id WHERE b.hash=?1",
+        )?;
+        let mut unique = std::collections::HashSet::with_capacity(hashes.len());
+        let mut artifacts = Vec::new();
+        for hash in hashes {
+            if !unique.insert(hash.as_str()) {
+                continue;
+            }
+            let paths = path_stmt.query_map([hash], |row| row.get::<_, String>(0))?;
+            let in_slice = paths.filter_map(Result::ok).any(|path| model.contains(slice, &path));
+            if !in_slice {
+                continue;
+            }
+            let Some(record) = store.get_blob(hash)? else {
+                continue;
+            };
+            let raw = vectors::encode_peer_artifact(
+                hash,
+                &record,
+                artifact_nonce(ctx, peer, slice, hash),
+            )?;
+            let bytes = raw.len();
+            let peer_store = client.peer_blobs.get_or_create(peer);
+            let blob_hash = client.runtime.block_on(async {
+                let mut tag = peer_store.add_slice(&raw).temp_tag().await?;
+                let hash = tag.hash();
+                // MemStore has no GC task, but leaking the temporary tag makes
+                // the serving lifetime explicit and deduplicates by hash.
+                tag.leak();
+                Ok::<_, anyhow::Error>(hash)
+            })?;
+            artifacts.push(WireVectorArtifact {
+                content_hash: hash.clone(),
+                blob_hash: blob_hash.to_string(),
+                bytes,
+            });
+        }
+        Ok(Response {
+            ok: true,
+            vector_artifacts: Some(artifacts),
+            vector_spec: Some(local_spec.clone()),
+            ..Response::default()
+        })
+    })
+}
+
+fn fetch_peer_vectors(req: &Request, ctx: &Ctx) -> anyhow::Result<usize> {
+    let target = req.target.clone().context("peer vector synchronization names no target")?;
+    let slice = req.slice.as_deref().context("peer vector synchronization names no slice")?;
+    let hashes = req
+        .vector_hashes
+        .as_ref()
+        .context("peer vector synchronization names no content hashes")?;
+    let spec = req
+        .vector_spec
+        .as_ref()
+        .context("peer vector synchronization names no embedding profile")?;
+    anyhow::ensure!(spec == &ctx.cfg.embeddings.spec(), "local embedding profile changed");
+    anyhow::ensure!(
+        !hashes.is_empty() && hashes.len() <= vectors::MAX_PEER_ARTIFACTS,
+        "peer vector synchronization must name 1..={} hashes",
+        vectors::MAX_PEER_ARTIFACTS
+    );
+    let requested: std::collections::HashSet<&str> = hashes.iter().map(String::as_str).collect();
+    anyhow::ensure!(requested.len() == hashes.len(), "peer vector synchronization repeats a hash");
+
+    let remote = Request {
+        op: "vector-artifacts".to_string(),
+        network_major: Some(crate::embedding_profile::NETWORK_MAJOR),
+        slice: Some(slice.to_string()),
+        vector_hashes: Some(hashes.clone()),
+        vector_spec: Some(spec.clone()),
+        ..Request::default()
+    };
+    let offered = forward_iroh(ctx, target.clone(), &remote, None)?;
+    anyhow::ensure!(
+        offered.ok,
+        "{}",
+        offered.error.unwrap_or_else(|| "peer refused vector artifacts".into())
+    );
+    anyhow::ensure!(
+        offered.vector_spec.as_ref() == Some(spec),
+        "peer answered with a different embedding profile"
+    );
+    let artifacts = offered.vector_artifacts.unwrap_or_default();
+    anyhow::ensure!(artifacts.len() <= hashes.len(), "peer offered more artifacts than requested");
+    let mut offered_hashes = std::collections::HashSet::with_capacity(artifacts.len());
+    for artifact in &artifacts {
+        anyhow::ensure!(
+            requested.contains(artifact.content_hash.as_str()),
+            "peer offered unrequested vector {}",
+            artifact.content_hash
+        );
+        anyhow::ensure!(
+            offered_hashes.insert(artifact.content_hash.as_str()),
+            "peer offered vector {} twice",
+            artifact.content_hash
+        );
+    }
+    if artifacts.is_empty() {
+        return Ok(0);
+    }
+
+    let client = iroh_client(ctx)?;
+    let fetched = client.runtime.block_on(async {
+        tokio::time::timeout(IROH_REQUEST_TIMEOUT, async {
+            let conn = client
+                .endpoint
+                .connect(target, iroh_blobs::ALPN)
+                .await
+                .context("connect peer artifact transport")?;
+            let mut records = Vec::with_capacity(artifacts.len());
+            for artifact in &artifacts {
+                let blob_hash: iroh_blobs::Hash = artifact
+                    .blob_hash
+                    .parse()
+                    .context("peer returned an invalid artifact hash")?;
+                client
+                    .download_blobs
+                    .remote()
+                    .fetch(conn.clone(), blob_hash)
+                    .await
+                    .context("fetch peer vector artifact")?;
+                let raw = client.download_blobs.get_bytes(blob_hash).await?;
+                anyhow::ensure!(raw.len() == artifact.bytes, "peer artifact size changed in transit");
+                let record = vectors::decode_peer_artifact(&raw, spec, &artifact.content_hash)?;
+                records.push((artifact.content_hash.clone(), record));
+            }
+            conn.close(0u32.into(), b"artifacts complete");
+            Ok::<_, anyhow::Error>(records)
+        })
+        .await
+        .context("timed out fetching peer vector artifacts")?
+    })?;
+
+    let mut store = vectors::VectorStore::open(&ctx.cfg.brain_root, spec)?;
+    let mut writer = store.begin_write()?;
+    let mut imported = 0usize;
+    for (hash, record) in fetched {
+        imported += usize::from(writer.put_encoded(&hash, &record)?);
+    }
+    writer.flush()?;
+    Ok(imported)
+}
+
 /// Handles a request after QUIC has authenticated `peer` as the remote
 /// endpoint id. A ticket secret may create a grant; every subsequent data
 /// request must name a slice that this exact peer holds.
@@ -717,6 +1047,7 @@ fn handle_iroh(req: &Request, peer: &str, ctx: &Ctx) -> Response {
                 "authenticated endpoint is reachable, but serving is not enabled on this daemon",
             ),
         },
+        "vector-artifacts" => offer_peer_vectors(req, peer, slice, ctx),
         "recall" | "generation" => handle(req, ctx).0,
         "checksum" => {
             let model = match ctx.cfg.slice_model() {
@@ -760,10 +1091,18 @@ fn handle_iroh(req: &Request, peer: &str, ctx: &Ctx) -> Response {
 async fn serve_iroh_connection(
     incoming: iroh::endpoint::Incoming,
     ctx: Arc<Ctx>,
+    blobs: PeerBlobsProtocol,
 ) -> anyhow::Result<()> {
     let conn = tokio::time::timeout(IROH_CONNECT_TIMEOUT, incoming)
         .await
         .context("iroh handshake timed out")??;
+    if conn.alpn() == iroh_blobs::ALPN {
+        return blobs
+            .accept(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("iroh-blobs provider failed: {e:?}"));
+    }
+    anyhow::ensure!(conn.alpn() == IROH_ALPN, "unsupported iroh protocol");
     let peer = conn.remote_id().to_string();
     let (mut send, mut recv) = tokio::time::timeout(IROH_CONNECT_TIMEOUT, conn.accept_bi())
         .await
@@ -822,9 +1161,15 @@ fn start_iroh(ctx: Arc<Ctx>) -> anyhow::Result<()> {
             };
             let handle = runtime.handle().clone();
             runtime.block_on(async move {
+                let download_store = iroh_blobs::store::mem::MemStore::new();
+                let download_blobs: iroh_blobs::api::Store = download_store.into();
+                let peer_blobs = PeerBlobStores::default();
+                let blob_protocol = PeerBlobsProtocol {
+                    stores: peer_blobs.clone(),
+                };
                 let endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret)
-                    .alpns(vec![IROH_ALPN.to_vec()])
+                    .alpns(vec![IROH_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
                     .bind()
                     .await
                 {
@@ -839,6 +1184,8 @@ fn start_iroh(ctx: Arc<Ctx>) -> anyhow::Result<()> {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(IrohClient {
                     endpoint: endpoint.clone(),
                     runtime: handle,
+                    download_blobs,
+                    peer_blobs,
                 });
                 let _ = ready_tx.send(Ok(endpoint.addr()));
                 let permits = Arc::new(tokio::sync::Semaphore::new(64));
@@ -851,9 +1198,10 @@ fn start_iroh(ctx: Arc<Ctx>) -> anyhow::Result<()> {
                         continue;
                     };
                     let ctx = ctx.clone();
+                    let blobs = blob_protocol.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) = serve_iroh_connection(incoming, ctx).await {
+                        if let Err(e) = serve_iroh_connection(incoming, ctx, blobs).await {
                             eprintln!("cfetch iroh: {e:#}");
                         }
                     });
@@ -946,6 +1294,17 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
                 Err(e) => (Response::err(e.to_string()), false),
             }
         }
+        "vector-sync" => match fetch_peer_vectors(req, ctx) {
+            Ok(imported) => (
+                Response {
+                    ok: true,
+                    vectors_imported: Some(imported),
+                    ..Response::default()
+                },
+                false,
+            ),
+            Err(e) => (Response::err(e.to_string()), false),
+        },
         "resident" => {
             // Config is reloaded per request: a startup snapshot would make
             // the warm path silently diverge from the daemon-less fallback
@@ -1138,7 +1497,10 @@ fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, chan: Channel) -> bool {
                     && !authorized(expected, req.token.as_ref())
                 {
                     (Response::err("unauthorized"), false)
-                } else if matches!(req.op.as_str(), "shutdown" | "iroh-addr" | "iroh-forward")
+                } else if matches!(
+                    req.op.as_str(),
+                    "shutdown" | "iroh-addr" | "iroh-forward" | "vector-sync"
+                )
                     && !chan.allows_local_only()
                 {
                     (Response::err(format!("{} is local-only", req.op)), false)
@@ -1186,6 +1548,7 @@ pub fn run() -> anyhow::Result<()> {
         tcp_token: tcp_token.clone(),
         local_token: local_token.clone(),
         iroh: Mutex::new(None),
+        artifact_key: iroh::SecretKey::generate().to_bytes(),
         shutdown: AtomicBool::new(false),
     });
     start_iroh(ctx.clone())?;
@@ -1438,8 +1801,26 @@ mod tests {
             tcp_token: None,
             local_token: None,
             iroh: Mutex::new(None),
+            artifact_key: [0; 32],
             shutdown: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn artifact_capabilities_are_stable_but_bound_to_peer_and_slice() {
+        let ctx = no_serve_ctx();
+        let hash = "ab".repeat(32);
+        let a = artifact_nonce(&ctx, "peer-a", "shared", &hash);
+        assert_eq!(a, artifact_nonce(&ctx, "peer-a", "shared", &hash));
+        assert_ne!(a, artifact_nonce(&ctx, "peer-b", "shared", &hash));
+        assert_ne!(a, artifact_nonce(&ctx, "peer-a", "private", &hash));
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _entered = runtime.enter();
+        let stores = PeerBlobStores::default();
+        stores.get_or_create("peer-a");
+        assert!(stores.get("peer-a").is_some());
+        assert!(stores.get("peer-b").is_none(), "another endpoint cannot see peer-a's blobs");
     }
 
     #[test]
@@ -1625,6 +2006,7 @@ mod tests {
             tcp_token: Some("right-token".to_string()),
             local_token: None,
             iroh: Mutex::new(None),
+            artifact_key: [0; 32],
             shutdown: AtomicBool::new(false),
         };
         let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "ping"}));
@@ -1644,6 +2026,7 @@ mod tests {
             tcp_token: Some("right-token".to_string()),
             local_token: None,
             iroh: Mutex::new(None),
+            artifact_key: [0; 32],
             shutdown: AtomicBool::new(false),
         };
         let r = roundtrip(
@@ -1663,9 +2046,17 @@ mod tests {
             tcp_token: Some("right-token".to_string()),
             local_token: None,
             iroh: Mutex::new(None),
+            artifact_key: [0; 32],
             shutdown: AtomicBool::new(false),
         };
-        for op in ["resident", "health", "scan-code", "scan-status", "iroh-forward"] {
+        for op in [
+            "resident",
+            "health",
+            "scan-code",
+            "scan-status",
+            "iroh-forward",
+            "vector-sync",
+        ] {
             let r = roundtrip(
                 &ctx,
                 Channel::Remote,
@@ -1706,6 +2097,7 @@ mod tests {
             tcp_token: None,
             local_token: None,
             iroh: Mutex::new(None),
+            artifact_key: [0; 32],
             shutdown: AtomicBool::new(false),
         };
         let peer = iroh::SecretKey::from_bytes(&[2; 32]).public().to_string();
@@ -1752,6 +2144,7 @@ mod tests {
             tcp_token: Some("t".to_string()),
             local_token: None,
             iroh: Mutex::new(None),
+            artifact_key: [0; 32],
             shutdown: AtomicBool::new(false),
         };
         let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "shutdown", "token": "t"}));
@@ -1789,6 +2182,7 @@ mod tests {
             tcp_token: None,
             local_token: Some("local-token".to_string()),
             iroh: Mutex::new(None),
+            artifact_key: [0; 32],
             shutdown: AtomicBool::new(false),
         };
         let r = roundtrip(&ctx, Channel::LocalToken, serde_json::json!({"op": "ping"}));

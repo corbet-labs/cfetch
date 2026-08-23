@@ -437,7 +437,7 @@ impl Precision {
 /// in the store and in the local cache belongs to exactly one of these, and a
 /// query only ever scores vectors of ITS spec — mixing models, widths or
 /// dimensions produces numbers that look like similarity and are not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorSpec {
     pub network_major: u32,
     pub profile_id: String,

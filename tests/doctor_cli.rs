@@ -29,6 +29,11 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["daemon"]["state"], "stopped");
     assert_eq!(report["inference"]["utilization"]["state"], "not_reported");
+    assert_eq!(report["memory"]["peer_artifacts"]["transport"], "iroh-blobs");
+    assert_eq!(
+        report["memory"]["peer_artifacts"]["route_order"],
+        "shared_store_then_authorized_peers_then_configured_endpoint"
+    );
     assert!(
         report["hardware"]
             .as_array()
@@ -52,5 +57,6 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     assert!(text.contains("Detected hardware"), "{text}");
     assert!(text.contains("not supported by this build"), "{text}");
     assert!(text.contains("live utilization: not reported"), "{text}");
+    assert!(text.contains("peer artifacts iroh-blobs"), "{text}");
     assert!(text.contains("no network identity yet"), "{text}");
 }
