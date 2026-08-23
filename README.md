@@ -18,8 +18,9 @@
 </p>
 
 <p align="center">
-  <a href="#experience-cfetch-in-five-minutes">Quick start</a> ·
+  <a href="#terminal-dashboard">Dashboard</a> ·
   <a href="#feature-map">Feature map</a> ·
+  <a href="#benchmarks">Benchmarks</a> ·
   <a href="#openwolf-openwolf-enhanced-and-cfetch">OpenWolf comparison</a> ·
   <a href="#installation">Installation</a> ·
   <a href="#configuration">Configuration</a>
@@ -48,51 +49,16 @@ proprietary database, or a change to how you edit your notes.
 | Hooks can fail silently | Heartbeats, transcript verification, `status`, and `selfcheck` expose the gap |
 | Every machine builds a private, potentially stale copy | A storage machine can serve fresh, generation-stamped answers to thin clients |
 
-## Experience cfetch in five minutes
+## Terminal dashboard
 
-Install it, point it at an existing Markdown directory, and use the same shell
-for this first tour:
+![cfetch terminal dashboard showing hook health, indexed Markdown and code, context usage, staging, and cited recall](docs/assets/cfetch-dashboard.png)
 
-```console
-$ cargo install cfetch --locked
-$ export CFETCH_BRAIN="$HOME/agent-memory"
-$ cfetch init
-$ cfetch install
-$ cfetch daemon start
-$ cfetch scan
-indexed 42 docs, 386 blocks (generation 1, 0 file(s) skipped as ring 5+)
-code: 18 files, 147 symbols (re)parsed, 23 import edges
-```
-
-Ask for a decision. The result names its trust level, stable citation, source
-file, and exact lines:
-
-```console
-$ cfetch recall "refresh token rotation"
-r3-84c1a44f0d knowledge/decisions/authentication.md:18-21 (ring 3)
-    Refresh tokens rotate after every successful exchange. Reuse invalidates
-    the token family and records a security event.
-
-expand a hit: cfetch recall --id r3-84c1a44f0d
-```
-
-Jump to code without reading the whole file:
-
-```console
-$ cfetch find rotate_refresh_token
-src/auth/tokens.rs:74-116  function_item rotate_refresh_token  (~310 tok)
-```
-
-Then make the invisible parts visible:
-
-```console
-$ cfetch status       # daemon, index, hooks, capture, ledger, and freshness
-$ cfetch audit        # always-on context cost and measurement gaps
-$ cfetch dashboard    # terminal UI for health, usage, staging, and live recall
-```
-
-For permanent use, put `brain_root` in the configuration file instead of
-relying on `CFETCH_BRAIN`; see [Configuration](#configuration).
+`cfetch dashboard` makes the memory layer visible in one place: daemon and hook
+health, catalog generation, statements by trust ring, indexed code, captured
+exhaust, staged maintenance candidates, injected context, and live cited recall.
+The screenshot is the shipped v0.9.9 dashboard indexing this repository, not a
+UI mockup. The current dashboard is read-only; the CLI and MCP surfaces perform
+the underlying actions.
 
 ## Feature map
 
@@ -116,6 +82,34 @@ code navigation, hooks, capture, and measurement do not.
 | Selective sharing | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
 | Privacy and safety | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
 | Cross-platform delivery | Linux, macOS, and Windows block releases; packages are available through Cargo, Homebrew, Nix, AUR, and release archives | `variants`, `hardware` |
+
+## Benchmarks
+
+cfetch measures output reduction where the rewrite happens, retaining both the
+original and model-facing sizes. With the v0.9.9 release binary, 13 real command
+outputs from the public cfetch and dotkeeper repositories produced these results:
+
+| Measurement | Result |
+|---|---:|
+| Oversized outputs rewritten | 8 |
+| Original size | 86,469 estimated tokens |
+| Model-facing size, including preservation pointers | 5,702 estimated tokens |
+| Context avoided | **80,767 estimated tokens (93.4%)** |
+| Median reduction per rewritten output | **91.2%** |
+| Short-output controls passed through unchanged | 4 of 4 |
+| 2,150-line CI test-log control passed through unchanged | yes |
+
+The benchmark deliberately selects oversized repository listings, search
+results, and version-control history—the output families cfetch is designed to
+condense. Token counts use cfetch's labeled characters/3.5 estimate; the byte
+measurements themselves are taken from the real hook input and replacement.
+Test and build output is never rewritten, because the useful failure can be in
+the middle. Full inputs, commands, pinned commits, and per-case results are in
+[the benchmark study](studies/context-reduction-v0.9.9.md).
+
+This is an output-reduction result, not a whole-session savings claim. For that,
+`cfetch bench` compares transcript-grounded cfetch and bare runs with identical
+first prompts and refuses to report a paired delta below three task pairs.
 
 ## OpenWolf, OpenWolf Enhanced, and cfetch
 
@@ -141,28 +135,15 @@ and how are they experienced?
 | Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Doctor, health checks, and expanded web dashboard | Heartbeats, truthful delivery state, selfcheck, status, and terminal dashboard |
 | Agent reach | Full integration for Claude Code, Codex, and OpenCode; context for several others | Hooks for four agents plus MCP clients | Confirmed configuration surfaces across 25 harnesses; native hooks only where the payload contract is understood |
 | Sharing | Git carries useful project state | Optional explicit push to a linked workspace | Authenticated serving and per-slice grants over iroh |
-| Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Deliberately focused on deterministic scan, staging, audit, and health; no unattended AI maintenance |
+| Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Automatic scan, health, capture, staging, and audit; no packaged AI-assisted maintenance workflow yet |
 | Runtime | Node.js 20+, per-project hook files | Node.js 20+, per-project hook files | One Rust binary plus an optional per-host daemon |
 | License | AGPL-3.0 | AGPL-3.0 | FSL-1.1-ALv2, converting to Apache-2.0 after two years |
 
-cfetch keeps the parts that are easy to prove—retrieval, exact code ranges,
-hook health, compaction continuity, and measured context costs—and avoids
-per-project executable copies, automatic LLM maintenance, and a bundled AI cron
-system. Captured text cannot become trusted memory without crossing the staging
-boundary.
+cfetch keeps maintenance that can run deterministically inside the binary and
+keeps judgment behind the staging boundary. Captured text cannot become trusted
+memory without a deliberate review and promotion step.
 
 ## How cfetch works
-
-```mermaid
-flowchart LR
-    A[Plain Markdown] --> B[cfetch daemon]
-    B --> C[Cited recall and code index]
-    C --> D[CLI, MCP, and native hooks]
-    D --> E[AI coding agents]
-    E --> F[Redacted session capture]
-    F --> G[Quarantined staging]
-    G -->|review and promote| A
-```
 
 ### Plain Markdown is the record
 
@@ -190,6 +171,16 @@ part of every citation.
 Ring assignment defaults by path and can be overridden with `ring: N` in
 frontmatter. Rings express trust, not authorization; slice grants control who
 can access which content.
+
+### Maintenance stops at the trust boundary
+
+cfetch automatically rebuilds derived indexes, checks hook delivery, captures
+redacted session activity, flags recurring signals, and queues candidates in
+staging. It does not yet package the next step as an AI maintenance command.
+A safe AI-assisted workflow would review staged evidence, propose cited Markdown
+changes, show the diff, and use the existing lint and commit gates before any
+candidate reaches trusted memory. Background model-written promotion would erase
+the distinction between captured text and reviewed knowledge.
 
 ### Retrieval is layered, bounded, and explicit
 
@@ -414,6 +405,13 @@ agents connect through verified hook subsets, MCP, and instruction files.
 No. Capture is redacted and placed in ring 6. Deterministic signals may create
 a ring-5 candidate, but neither ring is implicitly recalled or injected.
 Promotion into curated memory is deliberate.
+
+### Does cfetch use AI to maintain memory?
+
+Not yet as a packaged workflow. Deterministic maintenance is automatic, while
+AI-assisted review and promotion still happens in a deliberate agent session.
+The missing product surface is a supervised maintenance run, not an unattended
+model cron job.
 
 ### How is cfetch different from OpenWolf?
 
