@@ -1,8 +1,8 @@
-//! Read-only view model for the dashboard's maintenance inbox.
+//! Read-only view model for the dashboard's maintenance activity timeline.
 //!
-//! It deliberately exposes no lifecycle mutation. Proposal generation and
-//! semantic review stay with an external agent or human, while apply, revert,
-//! reject, and finalize remain explicit CLI operations.
+//! Automatic outcomes and exceptions are the primary story. Candidates and
+//! proposals remain visible so a person can inspect or debug the engine, but
+//! normal maintenance does not wait for interaction in this screen.
 
 use crate::config::Config;
 use crate::{maintenance, paths, staging};
@@ -50,6 +50,7 @@ pub struct InboxRow {
 
 #[derive(Debug, Clone)]
 enum Record {
+    Event(maintenance::MaintenanceEvent),
     Candidate(staging::Candidate),
     Proposal(maintenance::ProposalSummary),
 }
@@ -57,6 +58,7 @@ enum Record {
 impl Record {
     fn id(&self) -> &str {
         match self {
+            Self::Event(event) => &event.id,
             Self::Candidate(candidate) => &candidate.id,
             Self::Proposal(proposal) => &proposal.id,
         }
@@ -64,6 +66,7 @@ impl Record {
 
     fn timestamp(&self) -> i64 {
         match self {
+            Self::Event(event) => event.created_at,
             Self::Candidate(candidate) => candidate.ts,
             Self::Proposal(proposal) => proposal.created_at,
         }
@@ -71,6 +74,16 @@ impl Record {
 
     fn row(&self) -> InboxRow {
         match self {
+            Self::Event(event) => InboxRow {
+                id: event.id.clone(),
+                badge: enum_name(event.outcome),
+                summary: event
+                    .target
+                    .as_deref()
+                    .map(|target| format!("{} · {target}", event.detail))
+                    .unwrap_or_else(|| event.detail.clone()),
+                tone: outcome_tone(event.outcome),
+            },
             Self::Candidate(candidate) => InboxRow {
                 id: candidate.id.clone(),
                 badge: "candidate".to_string(),
@@ -120,9 +133,10 @@ impl Inbox {
             .map(Record::id)
             .map(str::to_string);
         let candidate_dir = paths::staging_dir(&cfg.brain_root);
-        let mut records: Vec<Record> = staging::list(&candidate_dir)
+        let mut records: Vec<Record> = maintenance::history(cfg)
             .into_iter()
-            .map(Record::Candidate)
+            .map(Record::Event)
+            .chain(staging::list(&candidate_dir).into_iter().map(Record::Candidate))
             .chain(maintenance::list(cfg).into_iter().map(Record::Proposal))
             .collect();
         records.sort_by(|a, b| {
@@ -137,9 +151,27 @@ impl Inbox {
             .unwrap_or(0)
             .min(self.records.len().saturating_sub(1));
         self.detail_scroll = 0;
+        let events = self
+            .records
+            .iter()
+            .filter(|record| matches!(record, Record::Event(_)))
+            .count();
+        let candidates = self
+            .records
+            .iter()
+            .filter(|record| matches!(record, Record::Candidate(_)))
+            .count();
+        let mode = if !cfg.maintenance.enabled {
+            "off"
+        } else if maintenance::is_paused(cfg) {
+            "paused"
+        } else if cfg.maintenance.configured() {
+            "automatic"
+        } else {
+            "setup needed"
+        };
         self.status = format!(
-            "{} maintenance item(s) · read-only inbox",
-            self.records.len()
+            "{events} event(s) · {candidates} staged · {mode}"
         );
         self.load_selected(cfg, can_verify_locally);
     }
@@ -194,6 +226,7 @@ impl Inbox {
 
     fn load_selected(&mut self, cfg: &Config, can_verify_locally: bool) {
         self.detail = match self.records.get(self.selected) {
+            Some(Record::Event(event)) => event_detail(event),
             Some(Record::Candidate(candidate)) => candidate_detail(candidate),
             Some(Record::Proposal(summary)) => proposal_detail(cfg, summary, can_verify_locally)
                 .unwrap_or_else(|error| {
@@ -220,16 +253,26 @@ fn state_tone(state: &str) -> Tone {
     }
 }
 
+fn outcome_tone(outcome: maintenance::EventOutcome) -> Tone {
+    match outcome {
+        maintenance::EventOutcome::Applied => Tone::Good,
+        maintenance::EventOutcome::Dismissed
+        | maintenance::EventOutcome::Noop
+        | maintenance::EventOutcome::Reverted => Tone::Muted,
+        maintenance::EventOutcome::Exception => Tone::Error,
+    }
+}
+
 fn empty_detail() -> DetailDocument {
     DetailDocument {
-        title: " maintenance inbox ".to_string(),
+        title: " maintenance activity ".to_string(),
         lines: vec![
             DetailLine::new(
-                "No candidates or proposals are waiting in the tree.",
+                "No maintenance activity has been recorded yet.",
                 Tone::Muted,
             ),
             DetailLine::new(
-                "Deterministic traps will place new ring-5 candidates here.",
+                "Captured evidence, automatic changes, and exceptions will appear here.",
                 Tone::Muted,
             ),
         ],
@@ -260,13 +303,108 @@ fn fields(lines: &mut Vec<DetailLine>, values: impl IntoIterator<Item = (String,
 
 fn lifecycle(state: &str) -> String {
     match state {
-        "candidate" => "[CANDIDATE] → pending → applied → finalized".to_string(),
-        "pending" => "candidate → [PENDING] → applied → finalized".to_string(),
-        "applied" => "candidate → pending → [APPLIED] → finalized".to_string(),
-        "finalized" => "candidate → pending → applied → [FINALIZED]".to_string(),
-        "rejected" => "candidate → pending → [REJECTED]".to_string(),
-        "reverted" => "candidate → pending → applied → [REVERTED]".to_string(),
+        "candidate" => "[CAPTURED] → propose → review → apply / settle".to_string(),
+        "pending" => "captured → [PROPOSED] → review → apply / settle".to_string(),
+        "applied" => "captured → proposed → reviewed → [LEGACY APPLY]".to_string(),
+        "finalized" => "captured → proposed → reviewed → [SETTLED]".to_string(),
+        "rejected" => "captured → proposed → [DISMISSED]".to_string(),
+        "reverted" => "captured → proposed → applied → [REVERTED]".to_string(),
         other => format!("candidate → [{other}]"),
+    }
+}
+
+fn event_detail(event: &maintenance::MaintenanceEvent) -> DetailDocument {
+    let mut lines = Vec::new();
+    let outcome = enum_name(event.outcome);
+    lines.push(DetailLine::new(
+        format!("AUTONOMOUS OUTCOME: {}", outcome.to_ascii_uppercase()),
+        outcome_tone(event.outcome),
+    ));
+    heading(&mut lines, "Transaction");
+    fields(
+        &mut lines,
+        [
+            ("Outcome".to_string(), outcome.clone()),
+            (
+                "Target".to_string(),
+                event
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| "no Markdown write".to_string()),
+            ),
+            (
+                "Recorded".to_string(),
+                format!("Unix timestamp {}", event.created_at),
+            ),
+            ("Origin".to_string(), event.created_by_host.clone()),
+        ],
+    );
+    lines.push(DetailLine::new(event.detail.clone(), Tone::Normal));
+
+    heading(&mut lines, "Evidence and provenance");
+    if event.candidate_ids.is_empty() {
+        lines.push(DetailLine::new("No candidate ids recorded.", Tone::Muted));
+    } else {
+        lines.extend(event.candidate_ids.iter().map(|id| {
+            DetailLine::new(format!("• candidate {id}"), Tone::Normal)
+        }));
+    }
+    if let Some(proposal) = &event.proposal_id {
+        lines.push(DetailLine::new(format!("• proposal {proposal}"), Tone::Normal));
+    }
+    if let Some(review) = &event.review_id {
+        lines.push(DetailLine::new(format!("• review {review}"), Tone::Normal));
+    }
+    if let Some(before) = &event.before_sha256 {
+        lines.push(DetailLine::new(
+            format!("• before sha256:{}", short_hash(before)),
+            Tone::Muted,
+        ));
+    }
+    if let Some(after) = &event.after_sha256 {
+        lines.push(DetailLine::new(
+            format!("• after  sha256:{}", short_hash(after)),
+            Tone::Muted,
+        ));
+    }
+
+    heading(&mut lines, "Checks");
+    if event.checks.is_empty() {
+        lines.push(DetailLine::new("No deterministic checks recorded.", Tone::Muted));
+    } else {
+        lines.extend(event.checks.iter().map(|check| {
+            DetailLine::new(
+                format!("{} {} — {}", mark(check.ok), check.name, check.detail),
+                bool_tone(check.ok),
+            )
+        }));
+    }
+
+    heading(&mut lines, "Debug controls");
+    lines.push(DetailLine::new(
+        "cfetch maintain history --json",
+        Tone::Accent,
+    ));
+    if let Some(proposal) = &event.proposal_id {
+        lines.push(DetailLine::new(
+            format!("cfetch maintain show {proposal} --json"),
+            Tone::Accent,
+        ));
+        if matches!(event.outcome, maintenance::EventOutcome::Applied) {
+            lines.push(DetailLine::new(
+                format!("cfetch maintain revert {proposal}"),
+                Tone::Warning,
+            ));
+        }
+    }
+    lines.push(DetailLine::new(
+        "Direct edits in the Markdown tree remain authoritative; cfetch will never overwrite changed bytes with this old transaction.",
+        Tone::Muted,
+    ));
+
+    DetailDocument {
+        title: format!(" {outcome} · {} ", event.id),
+        lines,
     }
 }
 
@@ -298,17 +436,22 @@ fn candidate_detail(candidate: &staging::Candidate) -> DetailDocument {
             .lines()
             .map(|line| DetailLine::new(line, Tone::Normal)),
     );
-    heading(&mut lines, "Next step");
+    heading(&mut lines, "Automatic path");
+    lines.push(DetailLine::new(
+        "The daemon proposes, independently reviews, verifies, and either applies or safely settles this evidence.",
+        Tone::Good,
+    ));
+    lines.push(DetailLine::new(
+        "A direct Obsidian or Markdown edit always wins if the target changes before apply.",
+        Tone::Muted,
+    ));
+    heading(&mut lines, "Debug controls");
     lines.push(DetailLine::new(
         format!("cfetch maintain packet {} --json", candidate.id),
         Tone::Accent,
     ));
     lines.push(DetailLine::new(
-        "A connected agent can request the same bounded packet with cfetch_maintenance_packet.",
-        Tone::Muted,
-    ));
-    lines.push(DetailLine::new(
-        "Proposal generation and semantic review remain external; this dashboard never calls a model.",
+        "Use `cfetch maintain run` to request an immediate bounded cycle; pause only when investigating behavior.",
         Tone::Muted,
     ));
     DetailDocument {
@@ -546,12 +689,18 @@ fn next_step_section(
     review: Option<&maintenance::Review>,
     verification: Option<&maintenance::Verification>,
 ) {
-    heading(lines, "Next explicit command");
+    heading(lines, "Automatic disposition and debug controls");
     match state {
-        "pending" if review.is_none() => lines.push(DetailLine::new(
-            format!("cfetch maintain review {} --file review.json", proposal.id),
-            Tone::Accent,
-        )),
+        "pending" if review.is_none() => {
+            lines.push(DetailLine::new(
+                "Awaiting semantic review. The autonomous runner normally performs this without interaction.",
+                Tone::Warning,
+            ));
+            lines.push(DetailLine::new(
+                format!("Debug manually: cfetch maintain review {} --file review.json", proposal.id),
+                Tone::Accent,
+            ));
+        }
         "pending"
             if review.is_some_and(|review| {
                 review.verdict == maintenance::ReviewVerdict::Fail
@@ -564,7 +713,7 @@ fn next_step_section(
             }) =>
         {
             lines.push(DetailLine::new(
-                "The failed review is immutable. Revise the proposal to produce a new id.",
+                "The failed review is immutable. The autonomous runner settles this evidence as an exception or dismissal.",
                 Tone::Error,
             ));
             lines.push(DetailLine::new(
@@ -573,37 +722,29 @@ fn next_step_section(
             ));
         }
         "pending" => {
-            if let Some(token) = verification
-                .filter(|report| report.valid)
-                .and_then(|report| report.approval_token.as_deref())
-            {
+            if verification.is_some_and(|report| report.valid) {
                 lines.push(DetailLine::new(
-                    format!(
-                        "cfetch maintain apply {} --approval-token {}",
-                        proposal.id, token
-                    ),
-                    Tone::Accent,
+                    "All current gates pass. The autonomous runner applies the exact revision without routine approval.",
+                    Tone::Good,
                 ));
                 lines.push(DetailLine::new(
-                    "Copying this exact, revision-bound token is the approval act; the inbox never applies automatically.",
-                    Tone::Muted,
+                    format!("Run now: cfetch maintain auto-apply {}", proposal.id),
+                    Tone::Accent,
                 ));
             } else {
                 lines.push(DetailLine::new(
-                    format!("cfetch maintain verify {}", proposal.id),
+                    format!("Debug gates: cfetch maintain verify {}", proposal.id),
                     Tone::Accent,
                 ));
             }
         }
         "applied" => {
-            if let Some(target) = proposal.target.as_deref() {
-                lines.push(DetailLine::new(
-                    format!("Commit the exact bytes in {target}, then:"),
-                    Tone::Normal,
-                ));
-            }
             lines.push(DetailLine::new(
-                format!("cfetch maintain finalize {}", proposal.id),
+                "Legacy/manual apply state. Automatic transactions settle directly into immutable history.",
+                Tone::Warning,
+            ));
+            lines.push(DetailLine::new(
+                format!("Finish legacy transaction: cfetch maintain finalize {}", proposal.id),
                 Tone::Accent,
             ));
             lines.push(DetailLine::new(
@@ -615,7 +756,7 @@ fn next_step_section(
             ));
         }
         "finalized" => lines.push(DetailLine::new(
-            "Complete. Git contains the approved bytes and the candidate evidence is settled.",
+            "Settled. Exact target bytes and the immutable event record retain the provenance; no interaction is required.",
             Tone::Good,
         )),
         "rejected" => lines.push(DetailLine::new(
@@ -693,16 +834,46 @@ mod tests {
     }
 
     #[test]
-    fn candidate_detail_exposes_evidence_and_external_next_step() {
+    fn candidate_detail_exposes_evidence_and_autonomous_path() {
         let document = candidate_detail(&candidate("fix-discovered-a1b2c3d4", 42));
         let rendered = text(&document);
-        assert!(rendered.contains("[CANDIDATE] → pending → applied → finalized"));
+        assert!(rendered.contains("[CAPTURED] → propose → review → apply / settle"));
         assert!(
             rendered.contains("cargo test"),
             "captured payload must be visible"
         );
         assert!(rendered.contains("cfetch maintain packet fix-discovered-a1b2c3d4 --json"));
-        assert!(rendered.contains("never calls a model"));
+        assert!(rendered.contains("daemon proposes, independently reviews, verifies"));
+        assert!(rendered.contains("direct Obsidian or Markdown edit always wins"));
+    }
+
+    #[test]
+    fn event_detail_exposes_outcome_provenance_checks_and_revert() {
+        let event = maintenance::MaintenanceEvent {
+            schema_version: maintenance::SCHEMA_VERSION,
+            id: "event-0011223344556677".to_string(),
+            created_at: 44,
+            created_by_host: "example-host".to_string(),
+            proposal_id: Some("maintenance-001122334455".to_string()),
+            candidate_ids: vec!["fix-discovered-a1b2c3d4".to_string()],
+            outcome: maintenance::EventOutcome::Applied,
+            target: Some("mind/facts.md".to_string()),
+            before_sha256: Some("00".repeat(32)),
+            after_sha256: Some("11".repeat(32)),
+            review_id: Some("review-example".to_string()),
+            checks: vec![maintenance::Check {
+                name: "target unchanged".to_string(),
+                ok: true,
+                detail: "exact before bytes still present".to_string(),
+            }],
+            detail: "applied exact reviewed bytes".to_string(),
+        };
+        let rendered = text(&event_detail(&event));
+        assert!(rendered.contains("AUTONOMOUS OUTCOME: APPLIED"));
+        assert!(rendered.contains("candidate fix-discovered-a1b2c3d4"));
+        assert!(rendered.contains("✓ target unchanged"));
+        assert!(rendered.contains("cfetch maintain revert maintenance-001122334455"));
+        assert!(rendered.contains("Markdown tree remain authoritative"));
     }
 
     #[test]
@@ -805,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_pending_proposal_exposes_only_the_revision_bound_apply_command() {
+    fn valid_pending_proposal_exposes_the_automatic_apply_path() {
         let proposal = maintenance::Proposal {
             schema_version: maintenance::SCHEMA_VERSION,
             id: "maintenance-001122334455".to_string(),
@@ -861,10 +1032,11 @@ mod tests {
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(rendered.contains("without routine approval"));
         assert!(rendered.contains(
-            "cfetch maintain apply maintenance-001122334455 --approval-token approve-revision001122"
+            "cfetch maintain auto-apply maintenance-001122334455"
         ));
-        assert!(rendered.contains("exact, revision-bound token is the approval act"));
+        assert!(!rendered.contains("--approval-token"));
         assert!(!rendered.contains("maintain verify"));
     }
 

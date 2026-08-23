@@ -1,5 +1,5 @@
-//! Ratatui terminal dashboard: read-only brain health, live recall, and the
-//! supervised maintenance inbox. One TUI, no daemon required.
+//! Ratatui terminal dashboard: brain health, live recall, autonomous
+//! maintenance activity, and system diagnostics. One TUI, no browser.
 //!
 //! The numbers come from whatever holds this host's index: the LOCAL index on
 //! a storage host, the SERVING host on a none-tier one. It opens a local index
@@ -253,8 +253,8 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             }
         )),
     ];
-    // Ring-5 staging: candidates awaiting a distillation session. Yellow the
-    // moment anything is pending — quarantine must not be invisible.
+    // Ring-5 staging is unfinished evidence, not an approval queue. Yellow the
+    // moment anything is waiting or an old manual transaction is unfinished.
     lines.push(if s.staging_total > 0 {
         let reasons = s
             .staging_by_reason
@@ -264,8 +264,11 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             .join(", ");
         Line::from(Span::styled(
             format!(
-                "staging: {} candidate(s) [{reasons}]   maintenance: {} pending / {} applied",
-                s.staging_total, s.maintenance_pending, s.maintenance_applied
+                "staging: {} candidate(s) [{reasons}]   activity: {} event(s), {} proposed / {} legacy applied",
+                s.staging_total,
+                s.runtime.maintenance.history_events,
+                s.maintenance_pending,
+                s.maintenance_applied
             ),
             Style::default().fg(Color::Yellow),
         ))
@@ -275,22 +278,27 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         // traps, so this zero is the absence of a measurement.
         Line::from(Span::styled(
             format!(
-                "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust written   maintenance: {} pending / {} applied",
-                s.maintenance_pending, s.maintenance_applied
+                "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust written   activity: {} event(s)",
+                s.runtime.maintenance.history_events
             ),
             Style::default().fg(Color::Yellow),
         ))
     } else if s.maintenance_pending > 0 || s.maintenance_applied > 0 {
         Line::from(Span::styled(
             format!(
-                "staging: 0 candidates (measured)   maintenance: {} pending / {} applied",
-                s.maintenance_pending, s.maintenance_applied
+                "staging: 0 candidates (measured)   activity: {} event(s), {} proposed / {} legacy applied",
+                s.runtime.maintenance.history_events,
+                s.maintenance_pending,
+                s.maintenance_applied
             ),
             Style::default().fg(Color::Yellow),
         ))
     } else {
         Line::from(Span::styled(
-            "staging: 0 candidates (measured)   maintenance: 0 pending / 0 applied".to_string(),
+            format!(
+                "staging: 0 candidates (measured)   activity: {} event(s)",
+                s.runtime.maintenance.history_events
+            ),
             Style::default().fg(Color::DarkGray),
         ))
     });
@@ -345,15 +353,15 @@ struct App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Recall,
-    Maintenance,
+    Activity,
     System,
 }
 
 impl Pane {
     fn toggle(self) -> Self {
         match self {
-            Self::Recall => Self::Maintenance,
-            Self::Maintenance => Self::System,
+            Self::Recall => Self::Activity,
+            Self::Activity => Self::System,
             Self::System => Self::Recall,
         }
     }
@@ -402,7 +410,7 @@ fn draw_recall(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_maintenance(f: &mut Frame, area: Rect, inbox: &Inbox) {
+fn draw_activity(f: &mut Frame, area: Rect, inbox: &Inbox) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
@@ -491,10 +499,10 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
         chunks[0],
     );
     f.render_widget(
-        Tabs::new(["Recall", "Maintenance inbox", "System"])
+        Tabs::new(["Recall", "Activity", "System"])
             .select(match app.pane {
                 Pane::Recall => 0,
-                Pane::Maintenance => 1,
+                Pane::Activity => 1,
                 Pane::System => 2,
             })
             .block(Block::default().borders(Borders::ALL).title(" Tab switches view "))
@@ -503,12 +511,12 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
     );
     match app.pane {
         Pane::Recall => draw_recall(f, chunks[2], app),
-        Pane::Maintenance => draw_maintenance(f, chunks[2], &app.inbox),
+        Pane::Activity => draw_activity(f, chunks[2], &app.inbox),
         Pane::System => draw_system(f, chunks[2], app),
     }
     let help = match app.pane {
-        Pane::Recall => " Tab inbox · Enter search · Backspace edit · Esc/Ctrl-C quit ",
-        Pane::Maintenance => {
+        Pane::Recall => " Tab activity · Enter search · Backspace edit · Esc/Ctrl-C quit ",
+        Pane::Activity => {
             " Tab system · ↑/↓ or j/k select · PgUp/PgDn scroll · r refresh · Esc/Ctrl-C quit "
         }
         Pane::System => {
@@ -593,25 +601,25 @@ fn run_with_pane(initial_pane: Pane, probe_network: bool) -> anyhow::Result<()> 
                         app.query.pop();
                     }
                     KeyCode::Char(c) if app.pane == Pane::Recall => app.query.push(c),
-                    KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Maintenance => {
+                    KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Activity => {
                         app.inbox.select_next(&cfg, can_verify_locally);
                     }
-                    KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Maintenance => {
+                    KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Activity => {
                         app.inbox.select_previous(&cfg, can_verify_locally);
                     }
-                    KeyCode::Home if app.pane == Pane::Maintenance => {
+                    KeyCode::Home if app.pane == Pane::Activity => {
                         app.inbox.select_first(&cfg, can_verify_locally);
                     }
-                    KeyCode::End if app.pane == Pane::Maintenance => {
+                    KeyCode::End if app.pane == Pane::Activity => {
                         app.inbox.select_last(&cfg, can_verify_locally);
                     }
-                    KeyCode::PageDown if app.pane == Pane::Maintenance => {
+                    KeyCode::PageDown if app.pane == Pane::Activity => {
                         app.inbox.scroll_down(12);
                     }
-                    KeyCode::PageUp if app.pane == Pane::Maintenance => {
+                    KeyCode::PageUp if app.pane == Pane::Activity => {
                         app.inbox.scroll_up(12);
                     }
-                    KeyCode::Char('r') if app.pane == Pane::Maintenance => {
+                    KeyCode::Char('r') if app.pane == Pane::Activity => {
                         app.inbox.refresh(&cfg, can_verify_locally);
                         stats = gather(&cfg, &source, &state);
                         last_refresh = std::time::Instant::now();
@@ -973,7 +981,10 @@ mod tests {
             "got: {text}"
         );
         assert!(text.contains("exhaust: 4.2 MiB"), "got: {text}");
-        assert!(text.contains("maintenance: 2 pending / 1 applied"), "got: {text}");
+        assert!(
+            text.contains("activity: 0 event(s), 2 proposed / 1 legacy applied"),
+            "got: {text}"
+        );
         let staging_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("staging:")))
