@@ -135,7 +135,7 @@ and how are they experienced?
 | Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Doctor, health checks, and expanded web dashboard | Heartbeats, truthful delivery state, selfcheck, status, and terminal dashboard |
 | Agent reach | Full integration for Claude Code, Codex, and OpenCode; context for several others | Hooks for four agents plus MCP clients | Confirmed configuration surfaces across 25 harnesses; native hooks only where the payload contract is understood |
 | Sharing | Git carries useful project state | Optional explicit push to a linked workspace | Authenticated serving and per-slice grants over iroh |
-| Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Automatic scan, health, capture, staging, and audit; no packaged AI-assisted maintenance workflow yet |
+| Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Supervised AI evidence review, typed proposals, exact diffs, reversible apply, and commit-gated promotion |
 | Runtime | Node.js 20+, per-project hook files | Node.js 20+, per-project hook files | One Rust binary plus an optional per-host daemon |
 | License | AGPL-3.0 | AGPL-3.0 | FSL-1.1-ALv2, converting to Apache-2.0 after two years |
 
@@ -172,15 +172,36 @@ Ring assignment defaults by path and can be overridden with `ring: N` in
 frontmatter. Rings express trust, not authorization; slice grants control who
 can access which content.
 
-### Maintenance stops at the trust boundary
+### AI maintenance crosses the trust boundary only with approval
 
-cfetch automatically rebuilds derived indexes, checks hook delivery, captures
-redacted session activity, flags recurring signals, and queues candidates in
-staging. It does not yet package the next step as an AI maintenance command.
-A safe AI-assisted workflow would review staged evidence, propose cited Markdown
-changes, show the diff, and use the existing lint and commit gates before any
-candidate reaches trusted memory. Background model-written promotion would erase
-the distinction between captured text and reviewed knowledge.
+cfetch turns maintenance into an inspectable transaction. A connected coding
+agent can ask for a bounded evidence packet and submit a typed proposal, but
+that proposal remains in ring 5: it is neither recalled nor injected. cfetch
+then independently rechecks the source evidence, citation snapshots, authority,
+target ring, current file hash, path safety, expiry, and secret-shaped content.
+
+```console
+$ cfetch staging list
+$ cfetch maintain packet recurring-failure-a1b2c3d4
+$ cfetch maintain submit --file proposal.json
+$ cfetch maintain review maintenance-9f31d870ac42 --file review.json
+$ cfetch maintain verify maintenance-9f31d870ac42
+$ cfetch maintain apply maintenance-9f31d870ac42 --approval-token approve-...
+
+# Review and commit the Markdown with normal git tooling, then:
+$ cfetch maintain finalize maintenance-9f31d870ac42
+```
+
+Applying is explicit and reversible. The staging candidate is consumed only
+after git `HEAD` contains the exact approved bytes. Ring 0 and ring 1 are never
+maintenance targets, unendorsed model claims cannot cross inward, and an
+attested observation may enter ring 3 but not behavioral ring 2. No daemon or
+hook calls a model in the background; the active agent supplies the analysis
+under the operator's existing model and approval policy. The terminal dashboard
+shows pending and applied maintenance proposals alongside staging.
+
+See [Supervised AI maintenance](docs/ai-maintenance.md) for the proposal schema,
+lifecycle, failure behavior, and agent integration.
 
 ### Retrieval is layered, bounded, and explicit
 
@@ -253,8 +274,11 @@ For any MCP client, the manual registration is the standard stdio shape:
 }
 ```
 
-The server exposes read-only `cfetch_recall`, `cfetch_expand`, and
-`cfetch_find` tools.
+The server exposes read-only `cfetch_recall`, `cfetch_expand`, `cfetch_find`,
+`cfetch_maintenance_packet`, and `cfetch_maintenance_show` tools.
+`cfetch_maintenance_propose` and `cfetch_maintenance_review` can write only
+idempotent ring-5 records; apply, revert, reject, and finalize remain CLI-only
+approval surfaces.
 
 ## Installation
 
@@ -408,10 +432,14 @@ Promotion into curated memory is deliberate.
 
 ### Does cfetch use AI to maintain memory?
 
-Not yet as a packaged workflow. Deterministic maintenance is automatic, while
-AI-assisted review and promotion still happens in a deliberate agent session.
-The missing product surface is a supervised maintenance run, not an unattended
-model cron job.
+Yes, through a supervised agent session. One pass receives immutable evidence
+references and current cited context, then proposes a typed transition: add,
+fold, supersede, revalidate, dismiss, or no-op. A separate immutable review
+checks coverage, faithfulness, preservation, authority, target choice, and
+contradictions. cfetch then performs deterministic verification and requires an
+explicit approval token before applying exact bytes. It never runs an
+unattended model cron job, and MCP cannot promote a proposal into trusted
+memory.
 
 ### How is cfetch different from OpenWolf?
 

@@ -79,14 +79,22 @@ fn official_stdio_transport_negotiates_and_serves_tools() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert_eq!(names, ["cfetch_recall", "cfetch_expand", "cfetch_find"]);
-    assert!(
-        listed["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|tool| tool["annotations"]["readOnlyHint"] == true)
+    assert_eq!(
+        names,
+        [
+            "cfetch_recall",
+            "cfetch_expand",
+            "cfetch_find",
+            "cfetch_maintenance_packet",
+            "cfetch_maintenance_show",
+            "cfetch_maintenance_propose",
+            "cfetch_maintenance_review",
+        ]
     );
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(tools[..5].iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
+    assert!(tools[5..].iter().all(|tool| tool["annotations"]["readOnlyHint"] == false));
+    assert!(tools[5..].iter().all(|tool| tool["annotations"]["destructiveHint"] == false));
 
     send(
         &mut stdin,

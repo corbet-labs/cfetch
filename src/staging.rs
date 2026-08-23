@@ -34,7 +34,7 @@ use sha2::{Digest as _, Sha256};
 pub const DISMISSED: &str = "dismissed";
 
 /// One ring-5 candidate awaiting a distillation session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {
     pub id: String,
     /// Which trap fired (`hot-file`, `fix-discovered`, `recurring-failure`, …).

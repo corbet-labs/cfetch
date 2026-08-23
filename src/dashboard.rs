@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::config::{ClientServingConfig, Config};
-use crate::{daemon, exhaust, heartbeat, index, ledger, paths, serve};
+use crate::{daemon, exhaust, heartbeat, index, ledger, maintenance, paths, serve};
 
 /// Remote budget for the dashboard's own calls. Deliberately shorter than the
 /// CLI's: this screen refreshes on a timer and must not freeze on a slow drain
@@ -101,6 +101,8 @@ struct Stats {
     index: IndexView,
     staging_total: i64,
     staging_by_reason: Vec<(String, i64)>,
+    maintenance_pending: usize,
+    maintenance_applied: usize,
     exhaust_bytes: u64,
 }
 
@@ -161,6 +163,8 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
         index: index_view(source),
         staging_total: staging.staged_total,
         staging_by_reason: staging.staged_by_reason,
+        maintenance_pending: maintenance::pending_count(cfg),
+        maintenance_applied: maintenance::applied_count(cfg),
         exhaust_bytes: staging.bytes,
     }
 }
@@ -237,7 +241,10 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             .collect::<Vec<_>>()
             .join(", ");
         Line::from(Span::styled(
-            format!("staging: {} candidate(s) [{reasons}]", s.staging_total),
+            format!(
+                "staging: {} candidate(s) [{reasons}]   maintenance: {} pending / {} applied",
+                s.staging_total, s.maintenance_pending, s.maintenance_applied
+            ),
             Style::default().fg(Color::Yellow),
         ))
     } else if s.exhaust_bytes == 0 {
@@ -245,13 +252,23 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         // exhaust anywhere in the tree, nothing has ever run the flagging
         // traps, so this zero is the absence of a measurement.
         Line::from(Span::styled(
-            "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust has ever been written, so nothing has been examined"
-                .to_string(),
+            format!(
+                "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust written   maintenance: {} pending / {} applied",
+                s.maintenance_pending, s.maintenance_applied
+            ),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else if s.maintenance_pending > 0 || s.maintenance_applied > 0 {
+        Line::from(Span::styled(
+            format!(
+                "staging: 0 candidates (measured)   maintenance: {} pending / {} applied",
+                s.maintenance_pending, s.maintenance_applied
+            ),
             Style::default().fg(Color::Yellow),
         ))
     } else {
         Line::from(Span::styled(
-            "staging: 0 candidates (measured)".to_string(),
+            "staging: 0 candidates (measured)   maintenance: 0 pending / 0 applied".to_string(),
             Style::default().fg(Color::DarkGray),
         ))
     });
@@ -518,6 +535,8 @@ mod tests {
             },
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&s));
@@ -552,6 +571,8 @@ mod tests {
             index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&s));
@@ -579,6 +600,8 @@ mod tests {
             index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 12,
         };
         let lines = header_lines(&base);
@@ -628,6 +651,8 @@ mod tests {
             },
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 4096,
         };
         let text = flat_text(&header_lines(&never));
@@ -663,6 +688,8 @@ mod tests {
             index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&base));
@@ -696,6 +723,8 @@ mod tests {
                 ("recurring-failure".into(), 2),
                 ("hot-file".into(), 1),
             ],
+            maintenance_pending: 2,
+            maintenance_applied: 1,
             exhaust_bytes: 4321 * 1024,
         };
         let lines = header_lines(&s);
@@ -707,6 +736,7 @@ mod tests {
             "got: {text}"
         );
         assert!(text.contains("exhaust: 4.2 MiB"), "got: {text}");
+        assert!(text.contains("maintenance: 2 pending / 1 applied"), "got: {text}");
         let staging_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("staging:")))
