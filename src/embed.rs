@@ -155,10 +155,8 @@ pub struct EmbedClient {
     auth: Option<String>,
     /// One interactive request's bound; the batch path scales it.
     base_timeout: std::time::Duration,
-    /// Stored/queried vector width. Sent to the endpoint as `dimensions`
-    /// (Matryoshka truncation server-side) AND enforced on the response, so
-    /// an endpoint that ignores the parameter still yields exactly this
-    /// width. 0 = take whatever the model returns.
+    /// Stored/queried vector width. Sent to the endpoint as `dimensions` and
+    /// required exactly in the response. v1 never truncates or pads.
     dimensions: usize,
     /// Instruction prepended to a query, never to a document (see
     /// [`crate::config::EmbeddingsConfig::query_prefix`]).
@@ -218,31 +216,21 @@ impl EmbedClient {
         self.dimensions
     }
 
-    /// Brings one response vector to the configured width. A model that
-    /// returns MORE is truncated to the Matryoshka prefix and re-normalized
-    /// (the endpoint either ignored `dimensions` or does not support it); a
-    /// model that returns FEWER is an error, never a silently padded or
-    /// silently narrower vector — the operator asked for a width this model
-    /// cannot produce and has to hear it.
-    fn fit(&self, mut v: Vec<f32>) -> anyhow::Result<Vec<f32>> {
+    /// Enforces the profile width. Truncating, padding, or accepting a native
+    /// width would create a second vector space inside the same major.
+    fn fit(&self, v: Vec<f32>) -> anyhow::Result<Vec<f32>> {
         if self.dimensions == 0 {
             return Ok(v);
         }
         anyhow::ensure!(
-            v.len() >= self.dimensions,
-            "model {} returned {}-d vectors but embeddings.dimensions asks for {} \
-             (set embeddings.dimensions to {} or fewer, or configure a wider model)",
+            v.len() == self.dimensions,
+            "model {} returned {}-d vectors but cfetch network major {} requires exactly {}; \
+             refusing truncation or padding because that would create incompatible vectors",
             self.model,
             v.len(),
-            self.dimensions,
-            v.len()
+            crate::embedding_profile::NETWORK_MAJOR,
+            self.dimensions
         );
-        if v.len() > self.dimensions {
-            // A Matryoshka prefix is no longer a unit vector: re-normalize,
-            // or every truncated vector would score short against the query.
-            v.truncate(self.dimensions);
-            index::l2_normalize(&mut v);
-        }
         Ok(v)
     }
 
@@ -300,6 +288,16 @@ impl EmbedClient {
         #[derive(serde::Deserialize)]
         struct Response {
             data: Vec<Row>,
+            #[serde(default)]
+            model: String,
+            #[serde(default)]
+            cfetch_profile: String,
+            #[serde(default)]
+            cfetch_model_revision: String,
+            #[serde(default)]
+            cfetch_model_quantization: String,
+            #[serde(default)]
+            cfetch_model_artifact: String,
         }
         #[derive(serde::Deserialize)]
         struct Row {
@@ -308,9 +306,7 @@ impl EmbedClient {
         }
         let mut request = serde_json::json!({ "model": self.model, "input": texts });
         if self.dimensions > 0 {
-            // Modern embedders are Matryoshka-trained: asking for the width
-            // we store saves the endpoint work and the wire the bytes. An
-            // endpoint that ignores the field is handled by `fit`.
+            // The profile width is both requested and checked exactly.
             request["dimensions"] = serde_json::json!(self.dimensions);
         }
         let body = request.to_string();
@@ -339,6 +335,21 @@ impl EmbedClient {
         );
         let parsed: Response = serde_json::from_str(&text)
             .with_context(|| format!("unparseable embeddings response: {}", snippet(&text)))?;
+        anyhow::ensure!(
+            parsed.cfetch_profile == crate::embedding_profile::PROFILE_ID
+                && parsed.cfetch_model_revision == crate::embedding_profile::MODEL_REVISION
+                && parsed.cfetch_model_quantization
+                    == crate::embedding_profile::MODEL_QUANTIZATION
+                && parsed.cfetch_model_artifact == crate::embedding_profile::MODEL_ARTIFACT_ID,
+            "embeddings endpoint is not certified for {} (profile/revision/quantization/artifact attestation mismatch)",
+            crate::embedding_profile::PROFILE_ID
+        );
+        anyhow::ensure!(
+            parsed.model == self.model,
+            "embeddings endpoint answered with model {:?}, requested {:?}",
+            parsed.model,
+            self.model
+        );
         anyhow::ensure!(
             parsed.data.len() == texts.len(),
             "embeddings endpoint returned {} vector(s) for {} input(s)",
@@ -586,7 +597,18 @@ mod tests {
                 )
             })
             .collect();
-        http_response(200, &format!(r#"{{"object":"list","data":[{}]}}"#, rows.join(",")))
+        http_response(
+            200,
+            &format!(
+                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
+                v["model"],
+                crate::embedding_profile::PROFILE_ID,
+                crate::embedding_profile::MODEL_REVISION,
+                crate::embedding_profile::MODEL_QUANTIZATION,
+                crate::embedding_profile::MODEL_ARTIFACT_ID,
+                rows.join(",")
+            ),
+        )
     }
 
     fn client_for(url: &str) -> EmbedClient {
@@ -611,7 +633,18 @@ mod tests {
                 format!(r#"{{"object":"embedding","index":{i},"embedding":[{}]}}"#, comps.join(","))
             })
             .collect();
-        http_response(200, &format!(r#"{{"object":"list","data":[{}]}}"#, rows.join(",")))
+        http_response(
+            200,
+            &format!(
+                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
+                v["model"],
+                crate::embedding_profile::PROFILE_ID,
+                crate::embedding_profile::MODEL_REVISION,
+                crate::embedding_profile::MODEL_QUANTIZATION,
+                crate::embedding_profile::MODEL_ARTIFACT_ID,
+                rows.join(",")
+            ),
+        )
     }
 
     /// Response honoring the requested `dimensions` (Matryoshka-style
@@ -623,12 +656,12 @@ mod tests {
     }
 
     fn spec_for(dim: usize) -> crate::config::VectorSpec {
-        crate::config::VectorSpec {
+        EmbeddingsConfig {
             model: "test-model".into(),
-            dim,
-            precision: crate::config::Precision::F16,
-            doc_prefix: String::new(),
+            dimensions: dim,
+            ..EmbeddingsConfig::default()
         }
+        .spec()
     }
 
     // ---- SSRF guard ----
@@ -721,6 +754,7 @@ mod tests {
             ..EmbeddingsConfig::default()
         };
         cfg.query_prefix = "Instruct: find it\nQuery: ".into();
+        cfg.document_prefix.clear();
         let client = EmbedClient::new(&cfg).unwrap();
 
         client.embed_query("what is it").unwrap();
@@ -766,7 +800,16 @@ mod tests {
     #[test]
     fn an_empty_prefix_leaves_the_query_untouched() {
         let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
-        let client = client_for(&url);
+        let client = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: url,
+            model: "test-model".into(),
+            dimensions: 2,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+            ..EmbeddingsConfig::default()
+        })
+        .unwrap();
         client.embed_query("plain").unwrap();
         let q: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
         assert_eq!(q["input"], serde_json::json!(["plain"]));
@@ -781,7 +824,10 @@ mod tests {
         assert_eq!(out, vec![vec![10.0, 1.0], vec![11.0, 1.0]]);
         let sent: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
         assert_eq!(sent["model"], "test-model");
-        assert_eq!(sent["input"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(
+            sent["input"],
+            serde_json::json!(["title: none | text: alpha", "title: none | text: beta"])
+        );
     }
 
     #[test]
@@ -811,6 +857,18 @@ mod tests {
         });
         let client = client_for(&url);
         assert!(client.embed_documents_batch(&["a", "b"]).is_err());
+    }
+
+    #[test]
+    fn an_unattested_endpoint_cannot_publish_v1_vectors() {
+        let (url, _, _) = spawn_server(|_, _| {
+            http_response(
+                200,
+                r#"{"object":"list","model":"test-model","data":[{"index":0,"embedding":[1.0,0.0]}]}"#,
+            )
+        });
+        let err = client_for(&url).embed_documents_batch(&["a"]).unwrap_err().to_string();
+        assert!(err.contains("not certified for cfetch-embedding-v1"), "{err}");
     }
 
     // ---- auth header ----
@@ -1007,7 +1065,15 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(inputs_b, vec!["- three", "- four", "- five"], "already-embedded blocks not re-sent");
+        assert_eq!(
+            inputs_b,
+            vec![
+                "title: none | text: - three",
+                "title: none | text: - four",
+                "title: none | text: - five",
+            ],
+            "already-embedded blocks not re-sent"
+        );
     }
 
     #[test]
@@ -1039,9 +1105,7 @@ mod tests {
     // ---- dimensions and width ----
 
     #[test]
-    fn the_configured_width_is_requested_and_enforced_client_side() {
-        // The endpoint here IGNORES `dimensions` and always answers 8-d, so
-        // the client must truncate and re-normalize (Matryoshka prefix).
+    fn an_endpoint_ignoring_the_profile_width_is_rejected() {
         let (url, bodies, _) = spawn_server(|_, body| canned_width(body, 8));
         let client = EmbedClient::new(&EmbeddingsConfig {
             enabled: true,
@@ -1051,14 +1115,10 @@ mod tests {
             ..EmbeddingsConfig::default()
         })
         .unwrap();
-        let out = client.embed_documents_batch(&["alpha"]).unwrap();
+        let err = client.embed_documents_batch(&["alpha"]).unwrap_err().to_string();
         let sent: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
         assert_eq!(sent["dimensions"], 4, "the request asks the endpoint for the width");
-        assert_eq!(out[0].len(), 4, "an endpoint that ignores it is sliced client-side");
-        let norm: f32 = out[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-6, "re-normalized after slicing, got {norm}");
-        // The prefix is the model's first 4 components, direction preserved.
-        assert!(out[0][0] < out[0][1] && out[0][1] < out[0][2]);
+        assert!(err.contains("returned 8-d") && err.contains("exactly 4"), "got: {err}");
     }
 
     #[test]
@@ -1090,19 +1150,19 @@ mod tests {
         .unwrap();
         let err = client.embed_documents_batch(&["alpha"]).unwrap_err().to_string();
         assert!(err.contains("16") && err.contains('2'), "both widths named: {err}");
-        assert!(err.contains("embeddings.dimensions"), "the fix is named: {err}");
+        assert!(err.contains("refusing truncation or padding"), "the compatibility reason is named: {err}");
     }
 
     #[test]
     fn dimensions_are_honored_end_to_end_into_the_shared_store() {
         let (brain, _state, mut conn) = five_block_index();
-        let (url, _, _) = spawn_server(|_, body| canned_width(body, 8));
+        let (url, _, _) = spawn_server(|_, body| canned_honoring_dimensions(body, 8));
         let cfg = EmbeddingsConfig {
             enabled: true,
             endpoint: url,
             model: "test-model".into(),
             dimensions: 4,
-            precision: crate::config::Precision::F16,
+            precision: crate::config::Precision::I8,
             ..EmbeddingsConfig::default()
         };
         let client = EmbedClient::new(&cfg).unwrap();
@@ -1114,9 +1174,16 @@ mod tests {
         assert_eq!(dim, 4);
         let blob_len: i64 =
             conn.query_row("SELECT length(embedding) FROM vectors LIMIT 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(blob_len, 8, "f16: 4 components in 8 bytes");
-        let file = crate::paths::shared_vector_dir(brain.path()).join("test-model-4-f16.bin");
-        assert_eq!(std::fs::metadata(&file).unwrap().len(), 5 * 8, "5 blocks x 4 f16 components");
+        assert_eq!(blob_len, 4, "INT8: 4 components in 4 bytes");
+        let dir = crate::paths::shared_vector_dir(brain.path());
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("bin"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::metadata(&files[0]).unwrap().len(), 5 * 4, "5 blocks x 4 INT8 components");
     }
 
     // ---- compute-once across hosts ----
@@ -1167,7 +1234,7 @@ mod tests {
         assert!(line.contains("cfetch embed-index"), "got: {line}");
         let line = coverage_status_line(&spec, 19478, 19478, 19478);
         assert!(line.contains("complete"), "got: {line}");
-        assert!(line.contains("1024 dims") && line.contains("f16"), "got: {line}");
+        assert!(line.contains("1024 dims") && line.contains("i8"), "got: {line}");
         assert!(coverage_status_line(&spec, 0, 0, 0).contains("index is empty"));
     }
 

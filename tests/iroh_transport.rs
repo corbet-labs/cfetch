@@ -126,7 +126,7 @@ fn two_daemons_redeem_and_serve_a_slice_over_iroh() {
     let _origin_daemon = origin.daemon();
     let _peer_daemon = peer.daemon();
     let ticket = text(&origin.run_ok(&["invite", "shared", "--mode", "ro"]));
-    assert!(ticket.starts_with("cfetch-invite-2:"), "{ticket}");
+    assert!(ticket.starts_with("cfetch-network1-invite-3:"), "{ticket}");
 
     let joined = peer.run_ok(&["join", &ticket, "--json"]);
     let joined: serde_json::Value = serde_json::from_slice(&joined.stdout).unwrap();
@@ -152,7 +152,7 @@ fn grant_secret(ticket: &str) -> String {
     // Decode the base64url body with the same tiny, dependency-free alphabet
     // as the product ticket format.
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let body = ticket.strip_prefix("cfetch-invite-2:").unwrap();
+    let body = ticket.strip_prefix("cfetch-network1-invite-3:").unwrap();
     let values: Vec<u8> = body
         .bytes()
         .map(|c| B64.iter().position(|&x| x == c).unwrap() as u8)

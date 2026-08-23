@@ -1247,6 +1247,7 @@ pub fn remote_request(
     stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(read_timeout))?;
     body["token"] = serde_json::Value::String(token.to_string());
+    body["network_major"] = serde_json::json!(crate::embedding_profile::NETWORK_MAJOR);
     let mut stream = stream;
     writeln!(stream, "{body}").map_err(|e| anyhow::anyhow!("serving host {addr}: send: {e}"))?;
     let mut line = String::new();

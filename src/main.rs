@@ -36,6 +36,7 @@ mod config;
 mod daemon;
 mod dashboard;
 mod embed;
+mod embedding_profile;
 mod exhaust;
 mod fsutil;
 mod govern;
@@ -199,6 +200,11 @@ enum Command {
     },
     /// List release artifacts that actually exist
     Variants {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the immutable embedding and network compatibility contract
+    EmbeddingProfile {
         #[arg(long)]
         json: bool,
     },
@@ -2182,6 +2188,7 @@ fn join(ticket: &str, json: bool) -> anyhow::Result<()> {
             grant::remember_membership(
                 &paths::state_dir(),
                 grant::Membership {
+                    network_major: embedding_profile::NETWORK_MAJOR,
                     origin: t.origin.clone(),
                     slice: g.slice.clone(),
                     mode: g.mode,
@@ -2395,6 +2402,26 @@ fn main() {
                     println!("  {:<36} {:<8} {:<8} {}", v.id, v.os, v.arch, v.backend);
                 }
                 println!("build variant: {}", variant::build_id().unwrap_or("unidentified source build"));
+            }
+        }
+        Command::EmbeddingProfile { json } => {
+            let profile = embedding_profile::manifest();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&profile).expect("profile serializes"));
+            } else {
+                println!(
+                    "{}: network major {}, {} @ {}, {}, {} dims / {} bytes",
+                    profile.profile_id,
+                    profile.network_major,
+                    profile.model,
+                    profile.model_revision,
+                    profile.model_quantization,
+                    profile.dimensions,
+                    profile.vector_bytes,
+                );
+                println!("query prefix: {:?}", profile.query_prefix);
+                println!("document prefix: {:?}", profile.document_prefix);
+                println!("pooling: {}; normalization: {}", profile.pooling, profile.normalization);
             }
         }
         Command::Identity { json } => {

@@ -223,6 +223,7 @@ fn start_daemon_env(
 fn tcp_req(addr: &str, token: &str, body: &Value) -> Value {
     let mut body = body.clone();
     body["token"] = Value::String(token.to_string());
+    body["network_major"] = json!(1);
     let mut s = TcpStream::connect(addr).expect("tcp connect");
     s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
     s.set_write_timeout(Some(Duration::from_secs(15))).unwrap();

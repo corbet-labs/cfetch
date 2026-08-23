@@ -387,28 +387,18 @@ fn default_capture_enabled() -> bool {
     true
 }
 
-/// Stored width of one vector component. f16 halves the artifact (and the
-/// bytes every host has to move) at a cosine error far below the ranking's
-/// resolution — normalized components live in [-1, 1], where f16 keeps ~3
-/// decimal digits. f32 stays available for anyone who wants the exact
-/// endpoint output back.
+/// Stored width of one vector component.
+///
+/// `I8` is the only precision admitted by the v1 profile. The legacy enum
+/// values remain parseable solely so an upgraded binary can reject an old
+/// configuration with a precise major-version error instead of a serde typo.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Precision {
-    #[default]
     F16,
     F32,
-    /// Signed 8-bit, with a per-vector scale stored alongside each record.
-    ///
-    /// Measured on a real 16,596-vector store: the top hit is IDENTICAL for
-    /// 300 of 300 queries and 99.3% of each top-10 is unchanged, for half the
-    /// bytes of f16. Since semantic recall is a full linear scan, halving the
-    /// bytes halves the bandwidth it is bound by — this is smaller AND faster,
-    /// not a trade.
-    ///
-    /// The scale is per-vector rather than global because a global one is
-    /// measurably worse (98.9% vs 99.3% overlap, and it loses top-1 exactness),
-    /// and it costs 2 bytes on a 256-byte record.
+    /// Canonical signed 8-bit vector components, with no float trailer.
+    #[default]
     I8,
 }
 
@@ -430,13 +420,11 @@ impl Precision {
         }
     }
 
-    /// Bytes each record carries BEYOND its components — the per-vector scale
-    /// that quantized precisions need to be decodable on their own.
+    /// Bytes each record carries beyond its components. The canonical INT8
+    /// codec derives its max-absolute scale per vector and cosine ignores
+    /// absolute magnitude, so the scale is deliberately not serialized.
     pub fn trailer(self) -> usize {
-        match self {
-            Precision::F16 | Precision::F32 => 0,
-            Precision::I8 => 2,
-        }
+        0
     }
 
     /// Bytes one whole record occupies: components plus any trailer.
@@ -445,12 +433,14 @@ impl Precision {
     }
 }
 
-/// The identity of a vector artifact: `(model, dim, precision)`. Every vector
+/// The identity of a vector artifact. Every vector
 /// in the store and in the local cache belongs to exactly one of these, and a
 /// query only ever scores vectors of ITS spec — mixing models, widths or
 /// dimensions produces numbers that look like similarity and are not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorSpec {
+    pub network_major: u32,
+    pub profile_id: String,
     pub model: String,
     pub dim: usize,
     pub precision: Precision,
@@ -459,6 +449,16 @@ pub struct VectorSpec {
     /// configured differently would otherwise write incompatible vectors into
     /// the same shared file, and nothing would ever notice.
     pub doc_prefix: String,
+}
+
+impl VectorSpec {
+    pub fn vector_encoding(&self) -> String {
+        match self.precision {
+            Precision::I8 => format!("signed-int8x{}", self.dim),
+            Precision::F16 => format!("f16x{}", self.dim),
+            Precision::F32 => format!("f32x{}", self.dim),
+        }
+    }
 }
 
 /// Embeddings backend: any OpenAI-compatible `/embeddings` endpoint (a
@@ -473,7 +473,7 @@ pub struct EmbeddingsConfig {
     /// config is a file agents write, so the URL is SSRF-guarded at use.
     #[serde(default)]
     pub endpoint: String,
-    #[serde(default)]
+    #[serde(default = "default_embed_model")]
     pub model: String,
     /// Exact hostnames/IPs the operator exempts from the private-range
     /// refusal (mesh overlays, lab networks). Never exempts from https.
@@ -489,45 +489,24 @@ pub struct EmbeddingsConfig {
     /// per batched item (see embed::batch_timeout).
     #[serde(default = "default_embed_timeout_secs")]
     pub timeout_secs: u64,
-    /// Vector width to ask the endpoint for and to store. Modern embedders
-    /// are Matryoshka-trained: the request carries `dimensions`, and a model
-    /// that ignores it gets truncated client-side and re-normalized. 1024 is
-    /// the default because a 4096-dim vector over this corpus is 8-16x
-    /// oversized — it dominated the index file and measurably slowed the
-    /// scan without buying ranking quality.
+    /// Vector width carried on the wire and in the store. This field remains
+    /// serializable so old configuration fails with a precise migration
+    /// error; network major 1 admits exactly EmbeddingGemma's full 768.
     #[serde(default = "default_embed_dimensions")]
     pub dimensions: usize,
     /// Text prepended to every DOCUMENT before embedding it.
     ///
-    /// The other half of asymmetric retrieval. Some families want one — E5
-    /// wants `"passage: "`, EmbeddingGemma wants a `title:`/`text:` pair —
-    /// and some want documents raw, which is the default.
-    ///
-    /// Unlike [`Self::query_prefix`] this changes what is STORED, so it is
-    /// part of the artifact identity: the shared store is keyed by it and its
-    /// header records it exactly. Change it and the existing vectors are a
-    /// different artifact set that has to be re-derived — which is why it is
-    /// configuration and not something an agent should flip casually.
-    #[serde(default)]
+    /// It is frozen to the v1 EmbeddingGemma retrieval prompt. The field is
+    /// retained for migration diagnostics, but changing it requires a new
+    /// network major and full re-embedding.
+    #[serde(default = "default_document_prefix")]
     pub document_prefix: String,
     /// Text prepended to a QUERY before embedding it, and to nothing else.
     ///
-    /// Modern retrieval embedders are asymmetric: they are trained with an
-    /// instruction on the query side and raw text on the document side, and
-    /// they lose accuracy when both are embedded the same way. The exact
-    /// wording is the model's, so it is configuration rather than a constant
-    /// — E5 wants `"query: "`, Qwen3 wants an `Instruct:`/`Query:` pair.
-    ///
-    /// Measured on this corpus with qwen3-embed-8b, the documented Instruct
-    /// wording widened the margin between a relevant block and a distractor
-    /// from +0.082 to +0.128 cosine.
-    ///
-    /// There is deliberately NO document-side prefix. A query prefix changes
-    /// only this query; a document prefix would change every stored vector,
-    /// so it would have to become part of the artifact identity or two hosts
-    /// configured differently would write incompatible vectors into the same
-    /// shared file. That is a bigger change than a string.
-    #[serde(default)]
+    /// It is frozen to the v1 EmbeddingGemma retrieval prompt. The field is
+    /// retained for migration diagnostics, but changing it requires a new
+    /// network major and full re-embedding.
+    #[serde(default = "default_query_prefix")]
     pub query_prefix: String,
     /// Stored component width (see [`Precision`]).
     #[serde(default)]
@@ -538,11 +517,17 @@ impl EmbeddingsConfig {
     /// The artifact identity this configuration asks for.
     pub fn spec(&self) -> VectorSpec {
         VectorSpec {
+            network_major: crate::embedding_profile::NETWORK_MAJOR,
+            profile_id: crate::embedding_profile::PROFILE_ID.to_string(),
             model: self.model.clone(),
             dim: self.dimensions,
             precision: self.precision,
             doc_prefix: self.document_prefix.clone(),
         }
+    }
+
+    pub fn validate_profile(&self) -> anyhow::Result<()> {
+        crate::embedding_profile::validate(self)
     }
 }
 
@@ -599,13 +584,13 @@ impl Default for EmbeddingsConfig {
         EmbeddingsConfig {
             enabled: false,
             endpoint: String::new(),
-            model: String::new(),
+            model: crate::embedding_profile::MODEL.to_string(),
             allow_hosts: Vec::new(),
             api_key_env: String::new(),
             timeout_secs: default_embed_timeout_secs(),
             dimensions: default_embed_dimensions(),
-            document_prefix: String::new(),
-            query_prefix: String::new(),
+            document_prefix: crate::embedding_profile::DOCUMENT_PREFIX.to_string(),
+            query_prefix: crate::embedding_profile::QUERY_PREFIX.to_string(),
             precision: Precision::default(),
         }
     }
@@ -615,8 +600,20 @@ fn default_embed_timeout_secs() -> u64 {
     10
 }
 
+fn default_embed_model() -> String {
+    crate::embedding_profile::MODEL.to_string()
+}
+
 fn default_embed_dimensions() -> usize {
-    1024
+    crate::embedding_profile::DIMENSIONS
+}
+
+fn default_document_prefix() -> String {
+    crate::embedding_profile::DOCUMENT_PREFIX.to_string()
+}
+
+fn default_query_prefix() -> String {
+    crate::embedding_profile::QUERY_PREFIX.to_string()
 }
 
 fn default_rerank_timeout_secs() -> u64 {
@@ -940,6 +937,7 @@ impl Config {
                  an open listener is unconfigurable"
             );
         }
+        cfg.embeddings.validate_profile()?;
         Ok(cfg)
     }
 
@@ -1064,7 +1062,7 @@ mod tests {
         let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
         assert!(!cfg.embeddings.enabled);
         assert!(cfg.embeddings.endpoint.is_empty());
-        assert!(cfg.embeddings.model.is_empty());
+        assert_eq!(cfg.embeddings.model, crate::embedding_profile::MODEL);
         assert_eq!(cfg.recall.rrf_k, 2.0);
     }
 
@@ -1093,16 +1091,15 @@ mod tests {
     fn embeddings_dimensions_and_precision_defaults_and_parse() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
-        assert_eq!(cfg.embeddings.dimensions, 1024, "default width: 1024, not the model native size");
-        assert_eq!(cfg.embeddings.precision, Precision::F16, "default: half floats");
-        assert_eq!(EmbeddingsConfig::default().dimensions, 1024, "Default impl must agree with serde");
-        assert_eq!(EmbeddingsConfig::default().precision, Precision::F16);
+        assert_eq!(cfg.embeddings.dimensions, 768, "v1 keeps EmbeddingGemma's full width");
+        assert_eq!(cfg.embeddings.precision, Precision::I8, "v1 stores signed INT8 only");
+        assert_eq!(EmbeddingsConfig::default().dimensions, 768, "Default impl must agree with serde");
+        assert_eq!(EmbeddingsConfig::default().precision, Precision::I8);
 
         let p = dir.path().join("config.json");
         std::fs::write(&p, r#"{"embeddings": {"dimensions": 512, "precision": "f32"}}"#).unwrap();
-        let cfg = Config::load_from(&p).unwrap();
-        assert_eq!(cfg.embeddings.dimensions, 512);
-        assert_eq!(cfg.embeddings.precision, Precision::F32);
+        let err = Config::load_from(&p).unwrap_err().to_string();
+        assert!(err.contains("network major") && err.contains("re-embedding"), "{err}");
 
         // An unknown width is a typo, not a policy: refused at load.
         std::fs::write(&p, r#"{"embeddings": {"precision": "bfloat16"}}"#).unwrap();
@@ -1133,14 +1130,14 @@ mod tests {
         let p = dir.path().join("config.json");
         std::fs::write(
             &p,
-            r#"{"embeddings": {"enabled": true, "endpoint": "https://llm.example/v1", "model": "nomic"},
+            r#"{"embeddings": {"enabled": true, "endpoint": "https://llm.example/v1"},
                 "recall": {"rrf_k": 60}}"#,
         )
         .unwrap();
         let cfg = Config::load_from(&p).unwrap();
         assert!(cfg.embeddings.enabled);
         assert_eq!(cfg.embeddings.endpoint, "https://llm.example/v1");
-        assert_eq!(cfg.embeddings.model, "nomic");
+        assert_eq!(cfg.embeddings.model, crate::embedding_profile::MODEL);
         assert_eq!(cfg.recall.rrf_k, 60.0);
     }
 

@@ -1604,23 +1604,23 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(out)
 }
 
-/// Little-endian encoding at the configured width — the ONE codec, used by
-/// both the local cache and the shared artifact files.
+/// Canonical vector encoding, used byte-for-byte by both the local cache and
+/// the shared artifact files.
+///
+/// INT8 uses the full signed symmetric range `[-127, 127]`. Each vector's
+/// maximum absolute component maps to 127 with round-to-nearest-even. The
+/// scale is intentionally not stored: semantic search uses cosine, which is
+/// invariant under that positive per-vector scale. One 768-d v1 vector is
+/// therefore exactly 768 bytes, with no hidden float metadata.
 pub fn vec_to_blob(v: &[f32], precision: Precision) -> Vec<u8> {
     let mut out = Vec::with_capacity(precision.record_bytes(v.len()));
     if precision == Precision::I8 {
-        // Per-vector scale: the largest magnitude in THIS vector maps to 127,
-        // so the full int8 range is used whatever the vector's spread. A
-        // global scale wastes most of the range — components of a normalized
-        // 1024-dim embedding peak around 0.3, not 1.0 — and measurably loses
-        // top-1 exactness.
         let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         let scale = if max > 0.0 { max } else { 1.0 };
         for x in v {
-            let q = (x / scale * 127.0).round().clamp(-127.0, 127.0) as i8;
+            let q = (x / scale * 127.0).round_ties_even().clamp(-127.0, 127.0) as i8;
             out.push(q as u8);
         }
-        out.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
         return out;
     }
     for x in v {
@@ -1633,20 +1633,15 @@ pub fn vec_to_blob(v: &[f32], precision: Precision) -> Vec<u8> {
     out
 }
 
-/// Inverse of [`vec_to_blob`], widened to f32 for the dot product; a trailing
-/// partial component (corrupt blob) is dropped rather than misread.
+/// Inverse of [`vec_to_blob`], widened and normalized for callers that need a
+/// float view. The canonical record remains the INT8 bytes; no scale is
+/// reconstructed because cosine does not need it.
 pub fn blob_to_vec(b: &[u8], precision: Precision) -> Vec<f32> {
     match precision {
         Precision::I8 => {
-            // The last two bytes are the scale; a record too short to hold
-            // one cannot be decoded at all, so it reads as empty rather than
-            // as a vector of wrong magnitude.
-            if b.len() < 3 {
-                return Vec::new();
-            }
-            let (body, tail) = b.split_at(b.len() - 2);
-            let scale = f16_to_f32(u16::from_le_bytes([tail[0], tail[1]]));
-            body.iter().map(|q| (*q as i8) as f32 / 127.0 * scale).collect()
+            let mut v: Vec<f32> = b.iter().map(|q| (*q as i8) as f32).collect();
+            l2_normalize(&mut v);
+            v
         }
         Precision::F16 => {
             let (chunks, _remainder) = b.as_chunks::<2>();
@@ -1690,18 +1685,21 @@ fn meta_set(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
 
 /// The artifact spec the cached vectors were written under, if any.
 pub fn stored_vector_spec(conn: &Connection) -> Option<VectorSpec> {
+    let network_major = meta_get(conn, "embed_network_major")?.parse().ok()?;
+    let profile_id = meta_get(conn, "embed_profile_id")?;
     let model = meta_get(conn, "embed_model")?;
     let dim = meta_get(conn, "embed_dim")?.parse().ok()?;
     let precision = match meta_get(conn, "embed_precision")?.as_str() {
         "f16" => Precision::F16,
         "f32" => Precision::F32,
+        "i8" => Precision::I8,
         _ => return None,
     };
     // Absent means the empty prefix: a cache written before document
     // prefixes existed held raw-document vectors, which is exactly what an
     // empty prefix means today.
     let doc_prefix = meta_get(conn, "embed_doc_prefix").unwrap_or_default();
-    Some(VectorSpec { model, dim, precision, doc_prefix })
+    Some(VectorSpec { network_major, profile_id, model, dim, precision, doc_prefix })
 }
 
 /// Records `(model, dim, precision, doc_prefix)` in meta; a DIFFERENT stored spec drops
@@ -1716,6 +1714,8 @@ pub fn ensure_vector_spec(conn: &Connection, spec: &VectorSpec) -> anyhow::Resul
     }
     let dropping = stored.is_some();
     conn.execute("DELETE FROM vectors", [])?;
+    meta_set(conn, "embed_network_major", &spec.network_major.to_string())?;
+    meta_set(conn, "embed_profile_id", &spec.profile_id)?;
     meta_set(conn, "embed_model", &spec.model)?;
     meta_set(conn, "embed_dim", &spec.dim.to_string())?;
     meta_set(conn, "embed_precision", spec.precision.as_str())?;
@@ -1776,6 +1776,13 @@ pub fn insert_vector(
     spec: &VectorSpec,
     embedding: &[f32],
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        embedding.len() == spec.dim,
+        "vector has {} components, profile {} requires {}",
+        embedding.len(),
+        spec.profile_id,
+        spec.dim
+    );
     let mut v = embedding.to_vec();
     l2_normalize(&mut v);
     conn.execute(
@@ -1850,6 +1857,17 @@ fn semantic_block_ids(
     let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
     })?;
+    if spec.precision == Precision::I8 {
+        let query = vec_to_blob(query_vec, Precision::I8);
+        anyhow::ensure!(query.len() == spec.dim, "query vector width does not match {}", spec.dim);
+        let mut scored: Vec<I8Score> = rows
+            .filter_map(Result::ok)
+            .filter_map(|(id, blob)| i8_score(id, &query, &blob))
+            .collect();
+        scored.sort_by(|a, b| i8_cosine_desc(a, b).then(a.id.cmp(&b.id)));
+        scored.truncate(limit);
+        return Ok(scored.into_iter().map(|score| score.id).collect());
+    }
     let mut scored: Vec<(i64, f32)> = rows
         .filter_map(Result::ok)
         .filter_map(|(id, blob)| {
@@ -1860,6 +1878,50 @@ fn semantic_block_ids(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
     scored.truncate(limit);
     Ok(scored.into_iter().map(|(id, _)| id).collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct I8Score {
+    id: i64,
+    dot: i64,
+    document_norm_sq: u64,
+}
+
+fn i8_score(id: i64, query: &[u8], document: &[u8]) -> Option<I8Score> {
+    if query.len() != document.len() {
+        return None;
+    }
+    let mut dot = 0i64;
+    let mut document_norm_sq = 0u64;
+    for (&q, &d) in query.iter().zip(document) {
+        let q = (q as i8) as i64;
+        let d = (d as i8) as i64;
+        dot += q * d;
+        document_norm_sq += (d * d) as u64;
+    }
+    (document_norm_sq > 0).then_some(I8Score { id, dot, document_norm_sq })
+}
+
+/// Exact descending cosine order for INT8 documents. The query norm is the
+/// same for every candidate and cancels; squaring and cross-multiplying in
+/// u128 avoids square roots and floating-point differences across machines.
+fn i8_cosine_desc(a: &I8Score, b: &I8Score) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.dot.signum(), b.dot.signum()) {
+        (sa, sb) if sa != sb => sb.cmp(&sa),
+        (0, 0) => Ordering::Equal,
+        (1, 1) => {
+            let left = (a.dot as u128).pow(2) * b.document_norm_sq as u128;
+            let right = (b.dot as u128).pow(2) * a.document_norm_sq as u128;
+            right.cmp(&left)
+        }
+        (-1, -1) => {
+            let left = (a.dot.unsigned_abs() as u128).pow(2) * b.document_norm_sq as u128;
+            let right = (b.dot.unsigned_abs() as u128).pow(2) * a.document_norm_sq as u128;
+            left.cmp(&right)
+        }
+        _ => unreachable!("signum is -1, 0, or 1"),
+    }
 }
 
 /// Pure cosine ranking over all stored vectors (query vector must be
@@ -2142,14 +2204,12 @@ mod tests {
         // vector's range rather than of an assumed [-1,1].
         let v: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.017).sin() * 0.31).collect();
         let blob = vec_to_blob(&v, Precision::I8);
-        assert_eq!(blob.len(), Precision::I8.record_bytes(256), "components + scale trailer");
+        assert_eq!(blob.len(), Precision::I8.record_bytes(256), "one byte per component");
         let back = blob_to_vec(&blob, Precision::I8);
         assert_eq!(back.len(), 256);
-        let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-        let step = max / 127.0;
-        for (a, b) in v.iter().zip(&back) {
-            assert!((a - b).abs() <= step, "{a} vs {b}, step {step}");
-        }
+        let mut expected = v.clone();
+        l2_normalize(&mut expected);
+        assert!(dot(&expected, &back) > 0.9999, "INT8 record preserves direction");
     }
 
     #[test]
@@ -2165,10 +2225,32 @@ mod tests {
     }
 
     #[test]
-    fn an_int8_record_too_short_to_carry_a_scale_reads_as_empty() {
-        // Never as a vector of arbitrary magnitude: a truncated record with a
-        // misread scale would rank wildly and look plausible.
-        assert!(blob_to_vec(&[1, 2], Precision::I8).is_empty());
+    fn int8_codec_is_byte_exact_ties_even_and_idempotent() {
+        let blob = vec_to_blob(&[1.0, 0.5, -1.0, 0.0], Precision::I8);
+        assert_eq!(blob, vec![127, 64, 129, 0], "-127 is stored as its two's-complement byte");
+        assert_eq!(
+            vec_to_blob(&blob_to_vec(&blob, Precision::I8), Precision::I8),
+            blob,
+            "hydrate/cache cycles must never rewrite canonical bytes"
+        );
+    }
+
+    #[test]
+    fn int8_cosine_order_is_exact_across_norms_and_signs() {
+        let query = vec![127u8, 0];
+        let mut scores = [
+            i8_score(4, &query, &[156, 100]).unwrap(), // [-100, 100]
+            i8_score(3, &query, &[0, 127]).unwrap(),
+            i8_score(2, &query, &[100, 100]).unwrap(),
+            i8_score(1, &query, &[127, 0]).unwrap(),
+        ];
+        scores.sort_by(|a, b| i8_cosine_desc(a, b).then(a.id.cmp(&b.id)));
+        assert_eq!(scores.map(|score| score.id), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn an_int8_record_has_no_hidden_scale_trailer() {
+        assert_eq!(blob_to_vec(&[1, 2], Precision::I8).len(), 2);
         assert!(blob_to_vec(&[], Precision::I8).is_empty());
     }
 
@@ -2176,7 +2258,7 @@ mod tests {
     fn each_precision_reports_the_bytes_it_actually_occupies() {
         assert_eq!(Precision::F32.record_bytes(10), 40);
         assert_eq!(Precision::F16.record_bytes(10), 20);
-        assert_eq!(Precision::I8.record_bytes(10), 12, "10 components + a 2-byte scale");
+        assert_eq!(Precision::I8.record_bytes(10), 10, "exactly one byte per component");
         // The reason i8 is worth having: half of f16 on the scan path.
         assert!(Precision::I8.record_bytes(1024) * 2 < Precision::F16.record_bytes(1024) * 2 + 8);
     }
@@ -2903,7 +2985,14 @@ mod tests {
     }
 
     fn test_spec(dim: usize) -> VectorSpec {
-        VectorSpec { model: "test-model".into(), dim, precision: Precision::F16, doc_prefix: String::new() }
+        VectorSpec {
+            network_major: 1,
+            profile_id: "test-profile".into(),
+            model: "test-model".into(),
+            dim,
+            precision: Precision::I8,
+            doc_prefix: String::new(),
+        }
     }
 
     fn embed_everything(conn: &Connection, spec: &VectorSpec, vector: &[f32]) {
@@ -3030,9 +3119,9 @@ mod tests {
         let blob: Vec<u8> = conn
             .query_row("SELECT embedding FROM vectors WHERE content_hash=?1", [&missing[0].0], |r| r.get(0))
             .unwrap();
-        let stored = blob_to_vec(&blob, Precision::F16);
-        assert!((stored[0] - 0.6).abs() < 1e-3, "normalized at insert");
-        assert!((stored[1] - 0.8).abs() < 1e-3);
+        let stored = blob_to_vec(&blob, Precision::I8);
+        assert!((stored[0] - 0.6).abs() < 2e-3, "normalized at insert");
+        assert!((stored[1] - 0.8).abs() < 2e-3);
         assert!(hashes_without_vectors(&conn, &spec, 10).unwrap().is_empty());
         assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 1));
     }

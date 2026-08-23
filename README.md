@@ -367,16 +367,18 @@ Ring rules are ordered; the first matching path prefix wins:
 ```
 
 Semantic recall is off by default. Point it at an OpenAI-compatible embeddings
-endpoint; keep the credential in an environment variable, never in JSON:
+endpoint; keep the credential in an environment variable, never in JSON. The
+model pipeline is not configurable: network major 1 fixes EmbeddingGemma-300M,
+XINT8 W8A8 execution, full 768 dimensions, the prompts/pooling/normalization,
+and one 768-byte signed-INT8 vector format. A producer endpoint must attest the
+exact cfetch profile, pinned model revision, quantizer, and artifact ID in its response;
+plain OpenAI wire shape alone is not permission to publish shared vectors:
 
 ```json
 {
   "embeddings": {
     "enabled": true,
     "endpoint": "http://127.0.0.1:8080/v1",
-    "model": "embed-model",
-    "dimensions": 1024,
-    "precision": "f16",
     "api_key_env": "EMBEDDINGS_API_KEY"
   }
 }
@@ -385,6 +387,11 @@ endpoint; keep the credential in an environment variable, never in JSON:
 Then run `cfetch embed-index`. Vectors are keyed by the statement content hash,
 so editing one file re-embeds only changed statements. Missing or partial vector
 coverage is always reported.
+
+Run `cfetch embedding-profile --json` for the executable manifest. Changing
+any model-pipeline field is a new incompatible network major and requires every
+participant to upgrade plus a full re-embedding; different majors do not
+network with each other. See [embedding profile v1](docs/embedding-profile-v1.md).
 
 Named slices limit recall and sharing by path:
 

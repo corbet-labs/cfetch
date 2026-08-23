@@ -53,11 +53,12 @@ impl std::str::FromStr for Mode {
 
 /// Human-visible ticket prefix. Versioned so a future format is refused by
 /// name rather than misparsed.
-const TICKET_PREFIX: &str = "cfetch-invite-2:";
+const TICKET_PREFIX: &str = "cfetch-network1-invite-3:";
 
 /// What `cfetch invite` prints and `cfetch join` consumes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Ticket {
+    pub network_major: u32,
     /// Authenticated endpoint plus the direct/relay routes known when the
     /// invite was minted. The endpoint id is the authority; the routes only
     /// make it reachable without depending on a discovery lookup succeeding.
@@ -86,6 +87,12 @@ impl Ticket {
         })?;
         let raw = b64_decode(body).context("invite is not valid base64url")?;
         let t: Ticket = serde_json::from_slice(&raw).context("invite payload is not a ticket")?;
+        anyhow::ensure!(
+            t.network_major == crate::embedding_profile::NETWORK_MAJOR,
+            "invite is for cfetch network major {}, this host requires {}",
+            t.network_major,
+            crate::embedding_profile::NETWORK_MAJOR
+        );
         validate_slice_name(&t.slice)?;
         anyhow::ensure!(
             t.secret.len() == 64
@@ -103,6 +110,8 @@ impl Ticket {
 /// One record on the origin's side.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Grant {
+    #[serde(default)]
+    pub network_major: u32,
     pub slice: String,
     pub mode: Mode,
     /// Hash of the invite secret, hex. Never the secret itself.
@@ -200,6 +209,7 @@ pub fn invite(
     let secret = random_hex_32();
     let mut grants = read(brain_root, slice)?;
     grants.push(Grant {
+        network_major: crate::embedding_profile::NETWORK_MAJOR,
         slice: slice.to_string(),
         mode,
         secret_hash: hash_hex(&secret),
@@ -209,6 +219,7 @@ pub fn invite(
     });
     write_unlocked(brain_root, slice, &grants)?;
     Ok(Ticket {
+        network_major: crate::embedding_profile::NETWORK_MAJOR,
         origin: origin.clone(),
         slice: slice.to_string(),
         mode,
@@ -240,6 +251,12 @@ pub fn redeem(
         .context("invite is not known to this host")?;
     let g = &grants[idx];
     anyhow::ensure!(
+        g.network_major == crate::embedding_profile::NETWORK_MAJOR,
+        "invite grant belongs to cfetch network major {}, this host requires {}",
+        g.network_major,
+        crate::embedding_profile::NETWORK_MAJOR
+    );
+    anyhow::ensure!(
         g.mode == mode,
         "invite mode does not match the origin's grant"
     );
@@ -262,6 +279,8 @@ pub fn redeem(
 /// against its grant record and the caller's authenticated iroh endpoint id.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Membership {
+    #[serde(default)]
+    pub network_major: u32,
     pub origin: iroh::EndpointAddr,
     pub slice: String,
     pub mode: Mode,
@@ -287,6 +306,12 @@ fn read_memberships(state_dir: &Path) -> anyhow::Result<Vec<Membership>> {
 /// Records a successful remote redemption without ever persisting its secret.
 pub fn remember_membership(state_dir: &Path, membership: Membership) -> anyhow::Result<()> {
     validate_slice_name(&membership.slice)?;
+    anyhow::ensure!(
+        membership.network_major == crate::embedding_profile::NETWORK_MAJOR,
+        "membership belongs to cfetch network major {}, this host requires {}",
+        membership.network_major,
+        crate::embedding_profile::NETWORK_MAJOR
+    );
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("create {}", state_dir.display()))?;
     let lock_path = state_dir.join("memberships.lock");
@@ -310,7 +335,9 @@ pub fn membership_for_slice(state_dir: &Path, slice: &str) -> anyhow::Result<Opt
     validate_slice_name(slice)?;
     let mut matches = read_memberships(state_dir)?
         .into_iter()
-        .filter(|m| m.slice == slice);
+        .filter(|m| {
+            m.slice == slice && m.network_major == crate::embedding_profile::NETWORK_MAJOR
+        });
     let first = matches.next();
     anyhow::ensure!(
         matches.next().is_none(),
@@ -331,7 +358,9 @@ pub fn access(brain_root: &Path, slice: &str, peer: &str, now: u64) -> anyhow::R
     Ok(read(brain_root, slice)?
         .into_iter()
         .find(|g| {
-            g.peer.as_deref() == Some(peer) && g.expires_at.is_none_or(|e| now < e)
+            g.network_major == crate::embedding_profile::NETWORK_MAJOR
+                && g.peer.as_deref() == Some(peer)
+                && g.expires_at.is_none_or(|e| now < e)
         })
         .map(|g| g.mode))
 }
@@ -441,8 +470,25 @@ mod tests {
     fn a_ticket_that_is_not_ours_is_refused_by_name() {
         assert!(Ticket::decode("hello").unwrap_err().to_string().contains("not a cfetch invite"));
         assert!(
-            Ticket::decode("cfetch-invite-2:!!!").unwrap_err().to_string().contains("base64url")
+            Ticket::decode(&format!("{TICKET_PREFIX}!!!")).unwrap_err().to_string().contains("base64url")
         );
+    }
+
+    #[test]
+    fn a_ticket_from_another_network_major_is_refused() {
+        let mut ticket = Ticket {
+            network_major: crate::embedding_profile::NETWORK_MAJOR + 1,
+            origin: origin(),
+            slice: "hosts".into(),
+            mode: Mode::Ro,
+            secret: "00".repeat(32),
+            expires_at: None,
+        };
+        let err = Ticket::decode(&ticket.encode()).unwrap_err().to_string();
+        assert!(err.contains("network major"), "{err}");
+
+        ticket.network_major = crate::embedding_profile::NETWORK_MAJOR;
+        assert_eq!(Ticket::decode(&ticket.encode()).unwrap(), ticket);
     }
 
     #[test]
@@ -594,6 +640,7 @@ mod tests {
     fn membership_routing_is_atomic_idempotent_and_never_stores_the_secret() {
         let dir = tempfile::tempdir().unwrap();
         let membership = Membership {
+            network_major: crate::embedding_profile::NETWORK_MAJOR,
             origin: origin(),
             slice: "hosts".to_string(),
             mode: Mode::Ro,
@@ -611,13 +658,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         remember_membership(
             dir.path(),
-            Membership { origin: origin(), slice: "hosts".into(), mode: Mode::Ro, joined_at: 1 },
+            Membership {
+                network_major: crate::embedding_profile::NETWORK_MAJOR,
+                origin: origin(),
+                slice: "hosts".into(),
+                mode: Mode::Ro,
+                joined_at: 1,
+            },
         )
         .unwrap();
         let other = iroh::SecretKey::from_bytes(&[8; 32]).public().into();
         remember_membership(
             dir.path(),
-            Membership { origin: other, slice: "hosts".into(), mode: Mode::Ro, joined_at: 2 },
+            Membership {
+                network_major: crate::embedding_profile::NETWORK_MAJOR,
+                origin: other,
+                slice: "hosts".into(),
+                mode: Mode::Ro,
+                joined_at: 2,
+            },
         )
         .unwrap();
         assert!(

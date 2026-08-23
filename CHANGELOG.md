@@ -5,6 +5,19 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **One embedding/network ABI for v1.** The v1 profile freezes the pinned
+  EmbeddingGemma-300M Q8-QAT source, XINT8 W8A8 execution, official
+  retrieval prompts, full 768 dimensions, pooling/normalization, and an exact
+  768-byte signed-INT8 vector. Model-pipeline changes now require a new network
+  major and coordinated re-embedding; configuration drift is refused.
+- **Byte-stable shared vectors.** INT8 records no longer carry an FP16 scale
+  trailer. Ranking uses integer-defined cosine order, repeated producers must
+  match an existing content hash byte-for-byte, and store/cache headers include
+  the network/profile identity.
+- **Cross-major networking fails closed.** TCP, iroh ALPN, invites, grants, and
+  remote memberships carry network major 1. Missing or different majors are
+  rejected before slice data is served. `cfetch embedding-profile [--json]`
+  prints the executable contract.
 - **Unified contributor stewardship.** Accepted contributions now assign
   copyright to the project steward while preserving authorship attribution and
   granting contributors a broad license back to their own work. This keeps the
