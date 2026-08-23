@@ -130,6 +130,12 @@ fn grants_file(brain_root: &Path, slice: &str) -> PathBuf {
     grants_dir(brain_root).join(format!("{slice}.json"))
 }
 
+// Grant mutation is an explicit CLI or daemon operation, not a deadline-bound
+// agent hook. Windows durable replacement writes can serialize slowly under a
+// burst of concurrent invites, so give every writer enough time to take its
+// turn instead of dropping otherwise valid grants after two seconds.
+const GRANT_LOCK_WAIT_MS: u64 = 10_000;
+
 /// Slice names become filenames on every supported platform. Keep them to a
 /// portable identifier rather than letting separators or drive syntax escape
 /// the grants directory.
@@ -150,7 +156,7 @@ fn grant_lock(brain_root: &Path, slice: &str) -> anyhow::Result<crate::lockfile:
     let dir = grants_dir(brain_root);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!(".{slice}.lock"));
-    crate::lockfile::acquire(&path, 2_000, 0)
+    crate::lockfile::acquire(&path, GRANT_LOCK_WAIT_MS, 0)
         .ok_or_else(|| anyhow::anyhow!("timed out waiting for {}", path.display()))
 }
 

@@ -37,10 +37,16 @@ fn marker(state_dir: &Path) -> PathBuf {
     state_dir.join(MARKER)
 }
 
+/// Whether this host still has capture data from the pre-tree store. This is
+/// deliberately cheap so ordinary installs do not load configuration merely
+/// to discover that there is nothing to convert.
+pub fn legacy_exhaust_pending(state_dir: &Path) -> bool {
+    legacy_db(state_dir).is_file() && !marker(state_dir).exists()
+}
+
 /// Imports the legacy database if there is one and it has not been imported
-/// yet. `Ok(None)` = nothing to do. Errors are the caller's to log; the hook
-/// path treats them as it treats any capture failure (heartbeat, never a
-/// broken session).
+/// yet. `Ok(None)` = nothing to do. This runs only from explicit installation;
+/// errors are reported to that caller and never consume a hook deadline.
 pub fn import_legacy_exhaust(state_dir: &Path, ex: &Exhaust) -> anyhow::Result<Option<Report>> {
     let db = legacy_db(state_dir);
     if !db.is_file() || marker(state_dir).exists() {
@@ -119,6 +125,12 @@ fn legacy_key(reason: &str, id: i64, session: &str, payload: &serde_json::Value)
 /// import: it is dead weight now, and only a human may delete it.
 pub fn legacy_note(state_dir: &Path) -> Option<String> {
     let db = legacy_db(state_dir);
+    if legacy_exhaust_pending(state_dir) {
+        return Some(format!(
+            "note: {} still holds legacy capture data — run cfetch install to import it",
+            db.display()
+        ));
+    }
     if db.is_file() && marker(state_dir).exists() {
         return Some(format!(
             "note: {} was imported into the tree and is no longer used — it can be removed",
