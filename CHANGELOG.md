@@ -5,6 +5,13 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Supervised AI maintenance.** `cfetch maintain` turns a staged signal into
+  a bounded evidence packet, typed proposal, immutable independent review, and
+  exact Markdown diff. Deterministic authority, citation, path, secret, expiry,
+  and stale-file gates protect apply; changes are reversible, and the candidate
+  is finalized only after git contains the approved bytes. MCP may inspect and
+  write ring-5 proposal/review records, but apply and finalization remain
+  explicit CLI actions. The dashboard reports pending and applied proposals.
 - **One embedding/network ABI for v1.** The v1 profile freezes the pinned
   EmbeddingGemma-300M Q8-QAT source, XINT8 W8A8 execution, official
   retrieval prompts, full 768 dimensions, pooling/normalization, and an exact
@@ -18,6 +25,12 @@ listed here is a fix or an internal change with no effect on behavior.
   remote memberships carry network major 1. Missing or different majors are
   rejected before slice data is served. `cfetch embedding-profile [--json]`
   prints the executable contract.
+- **Public feature and benchmark guide.** The README now maps the product's
+  agent-memory, retrieval, code-navigation, capture, measurement, serving, and
+  sharing surfaces; includes the real v0.9.9 terminal dashboard; and compares
+  cfetch with OpenWolf and OpenWolf Enhanced. A reproducible v0.9.9 study
+  records 93.4% aggregate model-facing reduction across eight selected
+  oversized command outputs, explicitly without claiming whole-session savings.
 - **Unified contributor stewardship.** Accepted contributions now assign
   copyright to the project steward while preserving authorship attribution and
   granting contributors a broad license back to their own work. This keeps the

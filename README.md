@@ -57,31 +57,36 @@ proprietary database, or a change to how you edit your notes.
 health, catalog generation, statements by trust ring, indexed code, captured
 exhaust, staged maintenance candidates, injected context, and live cited recall.
 The screenshot is the shipped v0.9.9 dashboard indexing this repository, not a
-UI mockup. The current dashboard is read-only; the CLI and MCP surfaces perform
+UI mockup. On `main`, the dashboard also reports pending and applied supervised
+maintenance proposals. It remains read-only; the CLI and MCP surfaces perform
 the underlying actions.
 
 ## Feature map
 
-Everything below is available in cfetch 0.9.9. Optional semantic search and
-reranking require an OpenAI-compatible inference endpoint; lexical recall,
-code navigation, hooks, capture, and measurement do not.
+The latest tagged release is v0.9.9. Features added since that tag are clearly
+marked **Main — next release**; install from source to try them before the next
+release. Optional semantic search and reranking require an OpenAI-compatible
+inference endpoint; lexical recall, code navigation, hooks, capture, and
+measurement do not.
 
-| Area | What you experience | Main surfaces |
-|---|---|---|
-| Persistent agent memory | Decisions, rules, notes, and working state stay in plain Markdown and git | `cfetch init`, configurable knowledge tree |
-| Cited retrieval | BM25, semantic, and hybrid search return statement-level citations that survive file reordering | `recall`, `recall --semantic`, `recall --hybrid`, `recall --id` |
-| Retrieval quality | Trust-aware ranking, optional cross-encoder reranking, lexical precision gates, duplicate suppression, and wikilink expansion | `recall --expand`, `rerank.*`, `recall.gate` |
-| Code intelligence | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
-| Session continuity | Scoped startup memory, periodic rule refresh, modified-file recovery after compaction, and known-failure lookup | hooks, `failures` |
-| Context control | Repeat-read guidance, large-file slice hints, token-capped answers, and structural command-output condensation | native tool hooks, `--budget-tokens` |
-| Learning loop | Redacted session activity is captured, deterministic signals flag useful candidates, and unreviewed material stays quarantined | `staging list`, `staging consume`, `staging dismiss` |
-| Honest measurement | Transcript-derived usage, cfetch's own injection cost, rewrite-point savings, cache-rebuild attribution, and paired A/B analysis | `audit`, `bench`, dashboard |
-| Reliability | A warm daemon, incremental scanning, hook heartbeats, delivery verification, and fail-open hook behavior | `daemon`, `status`, `selfcheck` |
-| Agent integrations | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
-| Multi-machine access | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
-| Selective sharing | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
-| Privacy and safety | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
-| Cross-platform delivery | Linux, macOS, and Windows block releases; packages are available through Cargo, Homebrew, Nix, AUR, and release archives | `variants`, `hardware` |
+| Area | Availability | What you experience | Main surfaces |
+|---|---|---|---|
+| Persistent agent memory | v0.9.9 | Decisions, rules, notes, and working state stay in plain Markdown and git | `cfetch init`, configurable knowledge tree |
+| Cited retrieval | v0.9.9 | BM25, semantic, and hybrid search return statement-level citations that survive file reordering | `recall`, `recall --semantic`, `recall --hybrid`, `recall --id` |
+| Retrieval quality | v0.9.9 | Trust-aware ranking, optional cross-encoder reranking, lexical precision gates, duplicate suppression, and wikilink expansion | `recall --expand`, `rerank.*`, `recall.gate` |
+| Code intelligence | v0.9.9 | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
+| Session continuity | v0.9.9 | Scoped startup memory, periodic rule refresh, modified-file recovery after compaction, and known-failure lookup | hooks, `failures` |
+| Context control | v0.9.9 | Repeat-read guidance, large-file slice hints, token-capped answers, and structural command-output condensation | native tool hooks, `--budget-tokens` |
+| Learning capture | v0.9.9 | Redacted session activity is captured, deterministic signals flag useful candidates, and unreviewed material stays quarantined | `staging list`, `staging consume`, `staging dismiss` |
+| Supervised AI maintenance | **Main — next release** | Evidence packets become typed, independently reviewed proposals with exact diffs, deterministic gates, reversible apply, and commit-gated finalization | `maintain`, maintenance MCP tools, dashboard |
+| Honest measurement | v0.9.9 | Transcript-derived usage, cfetch's own injection cost, rewrite-point savings, cache-rebuild attribution, and paired A/B analysis | `audit`, `bench`, dashboard |
+| Reliability | v0.9.9 | A warm daemon, incremental scanning, hook heartbeats, delivery verification, and fail-open hook behavior | `daemon`, `status`, `selfcheck` |
+| Agent integrations | v0.9.9 | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
+| Multi-machine access | v0.9.9 | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
+| Selective sharing | v0.9.9 | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
+| Frozen shared-vector profile | **Main — next release** | Every producer uses one pinned model pipeline and exact 768-byte INT8 vector contract; incompatible network majors fail closed | `embedding-profile`, semantic and hybrid recall |
+| Privacy and safety | v0.9.9 | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
+| Cross-platform delivery | v0.9.9 | Linux, macOS, and Windows block releases; packages are available through Cargo, Homebrew, Nix, AUR, and release archives | `variants`, `hardware` |
 
 ## Benchmarks
 
@@ -122,7 +127,10 @@ deployment, trust, and sharing model.
 This map answers the practical question: which ideas exist in each project,
 and how are they experienced?
 
-| Capability | OpenWolf 2.x | OpenWolf Enhanced 1.x | cfetch 0.9.9 |
+This comparison follows cfetch `main`. The two rows marked as next-release
+features in the feature map are not part of the v0.9.9 binaries.
+
+| Capability | OpenWolf 2.x | OpenWolf Enhanced 1.x | cfetch (`main`) |
 |---|---|---|---|
 | Memory scope | One `.wolf/` memory per project | One bounded `.wolf/` memory per project | Any Markdown tree, composed from nested slices |
 | Session startup | Budgeted project digest and handoff | Smart resume digest and structured summaries | Budgeted, trust-aware, host/repository-scoped injection |
@@ -173,6 +181,8 @@ frontmatter. Rings express trust, not authorization; slice grants control who
 can access which content.
 
 ### AI maintenance crosses the trust boundary only with approval
+
+> Available on `main` for the next release; not included in v0.9.9 binaries.
 
 cfetch turns maintenance into an inspectable transaction. A connected coding
 agent can ask for a bounded evidence packet and submit a typed proposal, but
@@ -274,8 +284,9 @@ For any MCP client, the manual registration is the standard stdio shape:
 }
 ```
 
-The server exposes read-only `cfetch_recall`, `cfetch_expand`, `cfetch_find`,
-`cfetch_maintenance_packet`, and `cfetch_maintenance_show` tools.
+The v0.9.9 server exposes read-only `cfetch_recall`, `cfetch_expand`, and
+`cfetch_find`. On `main` for the next release, it also exposes read-only
+`cfetch_maintenance_packet` and `cfetch_maintenance_show` tools.
 `cfetch_maintenance_propose` and `cfetch_maintenance_review` can write only
 idempotent ring-5 records; apply, revert, reject, and finalize remain CLI-only
 approval surfaces.
@@ -367,8 +378,10 @@ Ring rules are ordered; the first matching path prefix wins:
 ```
 
 Semantic recall is off by default. Point it at an OpenAI-compatible embeddings
-endpoint; keep the credential in an environment variable, never in JSON. The
-model pipeline is not configurable: network major 1 fixes EmbeddingGemma-300M,
+endpoint; keep the credential in an environment variable, never in JSON.
+
+On `main` for the next release, the model pipeline is no longer configurable:
+network major 1 fixes EmbeddingGemma-300M,
 XINT8 W8A8 execution, full 768 dimensions, the prompts/pooling/normalization,
 and one 768-byte signed-INT8 vector format. A producer endpoint must attest the
 exact cfetch profile, pinned model revision, quantizer, and artifact ID in its response;
@@ -439,14 +452,14 @@ Promotion into curated memory is deliberate.
 
 ### Does cfetch use AI to maintain memory?
 
-Yes, through a supervised agent session. One pass receives immutable evidence
-references and current cited context, then proposes a typed transition: add,
-fold, supersede, revalidate, dismiss, or no-op. A separate immutable review
-checks coverage, faithfulness, preservation, authority, target choice, and
-contradictions. cfetch then performs deterministic verification and requires an
-explicit approval token before applying exact bytes. It never runs an
-unattended model cron job, and MCP cannot promote a proposal into trusted
-memory.
+On `main` for the next release, yes, through a supervised agent session. One
+pass receives immutable evidence references and current cited context, then
+proposes a typed transition: add, fold, supersede, revalidate, dismiss, or
+no-op. A separate immutable review checks coverage, faithfulness, preservation,
+authority, target choice, and contradictions. cfetch then performs
+deterministic verification and requires an explicit approval token before
+applying exact bytes. It never runs an unattended model cron job, and MCP
+cannot promote a proposal into trusted memory.
 
 ### How is cfetch different from OpenWolf?
 
