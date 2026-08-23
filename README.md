@@ -1,213 +1,248 @@
-# cfetch
+<h1 align="center">cfetch</h1>
 
-[![CI](https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/corbet-labs/cfetch?display_name=tag)](https://github.com/corbet-labs/cfetch/releases/latest)
-[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE.md)
+<p align="center">
+  <strong>Local-first memory and context control for AI coding agents.</strong>
+</p>
 
-A cited, trust-tiered memory layer for Claude Code, Codex, Gemini and other AI
-agents, built on plain Markdown and Rust. It combines hook injection, ranked
-retrieval, automatic capture and a code index in one binary.
+<p align="center">
+  Give Claude Code, Codex, Gemini, Cursor, and MCP clients one durable memory:<br />
+  cited Markdown recall, exact code navigation, session continuity, automatic capture,<br />
+  context-cost measurement, and cross-machine access from a single Rust binary.
+</p>
 
-Your agent's accumulated knowledge (rules, decisions, facts, working state)
-lives as plain markdown in a single git-tracked tree (by default `~/agents`).
-cfetch assigns every statement a **privilege ring**, kernel-style — ring 0 is
-the highest privilege, and when statements contradict, the lower ring wins:
+<p align="center">
+  <a href="https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml"><img src="https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status" /></a>
+  <a href="https://github.com/corbet-labs/cfetch/releases/latest"><img src="https://img.shields.io/github/v/release/corbet-labs/cfetch?display_name=tag" alt="Latest release" /></a>
+  <a href="https://crates.io/crates/cfetch"><img src="https://img.shields.io/crates/v/cfetch.svg" alt="crates.io version" /></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg" alt="License: FSL-1.1-ALv2" /></a>
+</p>
 
-| Ring | Name | Contents | Reaches the agent |
-|------|------|----------|-------------------|
-| 0 | Invariants | Hard guards, never-do rules | always injected |
-| 1 | Policy | Locked-in decisions, standing authorities | always injected |
-| 2 | Behavior | Distilled feedback: how to work | injected where it applies |
-| 3 | Knowledge | Curated facts: hosts, projects, world | on demand (`recall`) |
-| 4 | State | Todo queues, working notes | on demand (`recall`) |
-| 5 | Staging | Promotion candidates, quarantined | never implicitly |
-| 6 | Exhaust | Raw capture from sessions | never implicitly |
+<p align="center">
+  <a href="#experience-cfetch-in-five-minutes">Quick start</a> ·
+  <a href="#feature-map">Feature map</a> ·
+  <a href="#openwolf-openwolf-enhanced-and-cfetch">OpenWolf comparison</a> ·
+  <a href="#installation">Installation</a> ·
+  <a href="#configuration">Configuration</a>
+</p>
 
-A file's ring defaults by location — the mapping is yours, see
-[Configuration](#configuration) — and can be overridden per file with
-`ring: N` frontmatter. Rings 0–1 are injected at session start through Claude
-Code or Codex hooks; a ring-2 file is injected too, but only into the sessions
-it is scoped to (a host, a repo). Rings 0–4 are searchable; every hit carries a
-ring-prefixed, content-addressed citation, so the id itself reveals how much to
-trust the statement. Rings 5–6 (automatic capture and its staging area) never
-reach an agent's context implicitly — captured exhaust is untrusted input by
-definition, and both live as plain text in the tree so any host can review
-them. Automatic capture, the promotion traps and the staging queue are live,
-as are recall, the code index, scoped injection, MCP and the dashboard.
+## What is cfetch?
 
-## One brain, many machines
+cfetch is a source-available AI agent memory system and MCP server for software
+development. It indexes a directory of ordinary Markdown files, retrieves the
+most relevant statements with stable citations, maps source code to exact
+symbols and line ranges, and connects that context to coding agents through
+native hooks, instructions, MCP, or the command line.
 
-cfetch does not replicate your knowledge across machines and hope the copies
-agree. The machine that **holds** the markdown runs a serving daemon; every
-other machine holds **nothing** and asks it:
+Your Markdown remains the source of truth. Search databases, vector caches,
+and daemon state are derived or disposable; capture and usage streams remain
+inspectable files. cfetch does not require a hosted memory service, a
+proprietary database, or a change to how you edit your notes.
 
-```console
-# on the machine with the files
-$ cfetch daemon start        # serve.enabled in config: watches the tree, answers queries
+| Without cfetch | With cfetch |
+|---|---|
+| A new agent session starts cold | A small, scoped memory digest arrives at session start |
+| Finding one decision means searching and opening several files | `cfetch recall` returns ranked statements with file, line, and trust-aware citations |
+| Finding one function can pull an entire file into context | `cfetch find` returns the exact symbol range and an estimated token cost |
+| Large command output occupies every later model turn | Safe output families are condensed; the complete original remains available |
+| Context compaction drops in-flight knowledge | cfetch restores the session's modified-file record and relevant reminders |
+| Hooks can fail silently | Heartbeats, transcript verification, `status`, and `selfcheck` expose the gap |
+| Every machine builds a private, potentially stale copy | A storage machine can serve fresh, generation-stamped answers to thin clients |
 
-# on any other machine (config: client.serving = { addr, token_file })
-$ cfetch recall zfs backup
-r3-b7e2519cc0 knowledge/hosts/backups.md:12-19 (ring 3)
-    The mirror job snapshots hourly and prunes by tier ...
+## Experience cfetch in five minutes
 
-served by workstation (generation 412, fresh)
-```
-
-Two properties make that safe to rely on:
-
-- **Serve-fresh-or-wait.** Every query passes a drain barrier: the answer is
-  computed only after every write the daemon could already have seen has been
-  indexed. An agent reads its teammate's write, not the world before it.
-- **Freshness is never assumed.** Every answer carries its origin, catalog
-  generation, and a `fresh` flag. If the barrier expires the answer still
-  comes — labeled stale, with the reason. Silent staleness is the one failure
-  this design refuses.
-
-How the barrier proves coverage depends on what the platform's file watcher can
-promise, and `cfetch status` says which is in force. On Linux, inotify delivers
-events in order, so a numbered sentinel riding the same queue proves it for
-free. Where events carry no usable order — macOS FSEvents, kqueue, Windows,
-polling — the barrier proves coverage by content instead, comparing a stat
-fingerprint of the tree taken at query entry against what the committed catalog
-has seen. That costs a stat walk per query (tens of milliseconds on a normal
-brain) and it is not optional: a guarantee the platform cannot give is not a
-guarantee, and an answer that cannot be proven fresh says so.
-
-A machine that holds nothing opens no database, keeps no index, and needs no
-storage: it is a network call away from the whole brain.
-
-## What you get
-
-- **`cfetch recall`** — BM25-ranked search over rings 0–4, ring-prefixed
-  citations, 1-hop wikilink expansion, `--json` for scripts.
-- **`cfetch find`** — a tree-sitter code index over your project roots
-  (Rust, TypeScript/JavaScript, Python, Go): symbols with exact line ranges
-  and token estimates, so agents read the 40 relevant lines instead of the
-  whole file.
-- **Hooks** — `cfetch install` registers the full session lifecycle in Claude
-  Code, Codex and CodeBuddy, plus safe tool-event hooks in compatible
-  harnesses. Injection, capture, governance reminders and compaction remain
-  fail-open: a broken brain never breaks the agent session.
-  Hooks are thin clients of a warm per-host daemon and always exit 0;
-  a broken brain degrades to silence, never to a broken session.
-- **MCP** — `cfetch mcp` serves `cfetch_recall` / `cfetch_expand` /
-  `cfetch_find` over the official MCP SDK's stdio transport. The installer can
-  register it in every MCP-capable harness known to the pinned adapter
-  library.
-- **`cfetch dashboard`** — a terminal dashboard: daemon and hook health,
-  injection ledger, live recall.
-- **`cfetch selfcheck` / `cfetch status`** — verify the installation end to
-  end; surface silently-failing hooks instead of letting the brain die
-  unnoticed for weeks. Every reporting surface compares the hooks cfetch
-  registered at install time against the ones that have actually reported, so
-  a hook that has never fired reads as UNOBSERVED rather than as healthy — and
-  an index nobody has scanned, a ledger nobody has written and a staging queue
-  nothing has ever examined all say so instead of printing a zero.
-
-## Install
-
-Published archives are generated from [`release/variants.json`](release/variants.json),
-which contains only builds that exist. `cfetch variants` prints the same catalog
-embedded in the executable. Current archives are explicitly named `remote`
-because they use the configured embeddings endpoint; accelerator names are not
-published until their inference runtime is actually linked and tested.
-
-Prebuilt archives are attached to [GitHub releases](https://github.com/corbet-labs/cfetch/releases).
-Each archive contains the binary, `LICENSE.md`, and the generated
-`THIRD-PARTY-LICENSES.txt` attribution bundle.
-
-Package-manager installs:
+Install it, point it at an existing Markdown directory, and use the same shell
+for this first tour:
 
 ```console
-# Homebrew (macOS and Linux)
-brew tap corbet-labs/cfetch
-brew install cfetch
-
-# Arch Linux (AUR)
-paru -S cfetch-agent
-
-# nix (flake; x86_64-linux and aarch64-linux)
-nix profile install github:corbet-labs/cfetch
+$ cargo install cfetch --locked
+$ export CFETCH_BRAIN="$HOME/agent-memory"
+$ cfetch init
+$ cfetch install
+$ cfetch daemon start
+$ cfetch scan
+indexed 42 docs, 386 blocks (generation 1, 0 file(s) skipped as ring 5+)
+code: 18 files, 147 symbols (re)parsed, 23 import edges
 ```
 
-From crates.io, on any platform with Rust 1.95 or later:
+Ask for a decision. The result names its trust level, stable citation, source
+file, and exact lines:
 
 ```console
-cargo install cfetch --locked
+$ cfetch recall "refresh token rotation"
+r3-84c1a44f0d knowledge/decisions/authentication.md:18-21 (ring 3)
+    Refresh tokens rotate after every successful exchange. Reuse invalidates
+    the token family and records a security event.
+
+expand a hit: cfetch recall --id r3-84c1a44f0d
 ```
 
-To install the current development branch instead:
+Jump to code without reading the whole file:
 
 ```console
-cargo install --git https://github.com/corbet-labs/cfetch
-
-# or build the Arch package directly
-git clone https://github.com/corbet-labs/cfetch
-cd cfetch/packaging/arch && makepkg -si
+$ cfetch find rotate_refresh_token
+src/auth/tokens.rs:74-116  function_item rotate_refresh_token  (~310 tok)
 ```
 
-### Platforms
+Then make the invisible parts visible:
 
-Linux, macOS and Windows are all first-class. One binary, one behaviour; the
-platform differences are confined to three places:
+```console
+$ cfetch status       # daemon, index, hooks, capture, ledger, and freshness
+$ cfetch audit        # always-on context cost and measurement gaps
+$ cfetch dashboard    # terminal UI for health, usage, staging, and live recall
+```
 
-| | Linux / macOS | Windows |
+For permanent use, put `brain_root` in the configuration file instead of
+relying on `CFETCH_BRAIN`; see [Configuration](#configuration).
+
+## Feature map
+
+Everything below is available in cfetch 0.9.9. Optional semantic search and
+reranking require an OpenAI-compatible inference endpoint; lexical recall,
+code navigation, hooks, capture, and measurement do not.
+
+| Area | What you experience | Main surfaces |
 |---|---|---|
-| Daemon control channel | unix socket (`$XDG_RUNTIME_DIR/cfetch.sock`, else the state dir) | loopback TCP on an ephemeral port, gated by a per-daemon token, both published in `daemon.endpoint` in the state dir |
-| State dir | `~/.local/state/cfetch` | `%LOCALAPPDATA%\cfetch` |
-| Config | `~/.config/cfetch/config.json` | `%APPDATA%\cfetch\config.json` |
+| Persistent agent memory | Decisions, rules, notes, and working state stay in plain Markdown and git | `cfetch init`, configurable knowledge tree |
+| Cited retrieval | BM25, semantic, and hybrid search return statement-level citations that survive file reordering | `recall`, `recall --semantic`, `recall --hybrid`, `recall --id` |
+| Retrieval quality | Trust-aware ranking, optional cross-encoder reranking, lexical precision gates, duplicate suppression, and wikilink expansion | `recall --expand`, `rerank.*`, `recall.gate` |
+| Code intelligence | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
+| Session continuity | Scoped startup memory, periodic rule refresh, modified-file recovery after compaction, and known-failure lookup | hooks, `failures` |
+| Context control | Repeat-read guidance, large-file slice hints, token-capped answers, and structural command-output condensation | native tool hooks, `--budget-tokens` |
+| Learning loop | Redacted session activity is captured, deterministic signals flag useful candidates, and unreviewed material stays quarantined | `staging list`, `staging consume`, `staging dismiss` |
+| Honest measurement | Transcript-derived usage, cfetch's own injection cost, rewrite-point savings, cache-rebuild attribution, and paired A/B analysis | `audit`, `bench`, dashboard |
+| Reliability | A warm daemon, incremental scanning, hook heartbeats, delivery verification, and fail-open hook behavior | `daemon`, `status`, `selfcheck` |
+| Agent integrations | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
+| Multi-machine access | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
+| Selective sharing | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
+| Privacy and safety | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
+| Cross-platform delivery | Linux, macOS, and Windows block releases; packages are available through Cargo, Homebrew, Nix, AUR, and release archives | `variants`, `hardware` |
 
-`CFETCH_STATE_DIR`, `CFETCH_CONFIG`, `CFETCH_BRAIN` and `HOME` override the
-defaults identically on every platform. A unix socket file is access-
-controlled by its mode; a loopback TCP port is not, which is why the Windows
-control channel carries a bearer token — the same gate the optional serving
-listener (`serve.bind`) uses.
+## OpenWolf, OpenWolf Enhanced, and cfetch
 
-## Quick start
+cfetch was informed by the public behavior and lessons of
+[OpenWolf 2.x](https://github.com/cytostack/openwolf#readme) and the separate
+[OpenWolf Enhanced 1.x](https://github.com/bassprofressor-lab/openwolf-enhanced#readme)
+lineage. It is an independent Rust implementation with a different storage,
+deployment, trust, and sharing model.
+
+This map answers the practical question: which ideas exist in each project,
+and how are they experienced?
+
+| Capability | OpenWolf 2.x | OpenWolf Enhanced 1.x | cfetch 0.9.9 |
+|---|---|---|---|
+| Memory scope | One `.wolf/` memory per project | One bounded `.wolf/` memory per project | Any Markdown tree, composed from nested slices |
+| Session startup | Budgeted project digest and handoff | Smart resume digest and structured summaries | Budgeted, trust-aware, host/repository-scoped injection |
+| Compaction survival | Restores state, rules, and scoped instructions | Carries the 1.x session state forward | Restores modified-file evidence and re-arms relevant guidance |
+| Knowledge retrieval | Project index, symbol search, and bug search | BM25, semantic/hybrid recall, citations, and MCP | BM25, semantic/hybrid recall, reranking, citations, wikilinks, and slice filters |
+| Code navigation | Symbol ranges and import-aware project map | `find`, optional tree-sitter ranges, and PageRank | Tree-sitter `find`, exact ranges, import graph, and token-fitted `map` |
+| Context reduction | Repeat-read awareness, file-size hints, and Bash output governor | Same 1.x family plus bounded storage controls | Repeat-read guidance, slice hints, answer budgets, precision gate, and output condensation |
+| Memory capture | Corrections, bug fixes, action log, and handoff files | Optional activity capture, bug memory, lint, and distillation | Redacted exhaust → deterministic flags → quarantined staging → deliberate promotion |
+| Measurement | Real transcript usage, verified delivery, cache attribution, and A/B bench | Estimated ledger including its own injection cost | Transcript usage, rewrite deltas, injection cost, cache attribution, audit, and paired bench |
+| Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Doctor, health checks, and expanded web dashboard | Heartbeats, truthful delivery state, selfcheck, status, and terminal dashboard |
+| Agent reach | Full integration for Claude Code, Codex, and OpenCode; context for several others | Hooks for four agents plus MCP clients | Confirmed configuration surfaces across 25 harnesses; native hooks only where the payload contract is understood |
+| Sharing | Git carries useful project state | Optional explicit push to a linked workspace | Authenticated serving and per-slice grants over iroh |
+| Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Deliberately focused on deterministic scan, staging, audit, and health; no unattended AI maintenance |
+| Runtime | Node.js 20+, per-project hook files | Node.js 20+, per-project hook files | One Rust binary plus an optional per-host daemon |
+| License | AGPL-3.0 | AGPL-3.0 | FSL-1.1-ALv2, converting to Apache-2.0 after two years |
+
+cfetch keeps the parts that are easy to prove—retrieval, exact code ranges,
+hook health, compaction continuity, and measured context costs—and avoids
+per-project executable copies, automatic LLM maintenance, and a bundled AI cron
+system. Captured text cannot become trusted memory without crossing the staging
+boundary.
+
+## How cfetch works
+
+```mermaid
+flowchart LR
+    A[Plain Markdown] --> B[cfetch daemon]
+    B --> C[Cited recall and code index]
+    C --> D[CLI, MCP, and native hooks]
+    D --> E[AI coding agents]
+    E --> F[Redacted session capture]
+    F --> G[Quarantined staging]
+    G -->|review and promote| A
+```
+
+### Plain Markdown is the record
+
+The knowledge tree is the only fact store. The local SQLite catalog, symbol
+index, fingerprints, and vector cache can be deleted and rebuilt without
+losing knowledge. This also means ordinary editors, git history, Obsidian,
+shell tools, and code review continue to work.
+
+### Trust is visible in every citation
+
+cfetch uses configurable rings to distinguish critical constraints from raw
+session capture. A lower ring number means higher trust; the ring prefix is
+part of every citation.
+
+| Ring | Typical content | Default context behavior |
+|---|---|---|
+| 0 | Critical invariants and safety constraints | Eligible for explicit resident injection |
+| 1 | Durable policy and settled decisions | Eligible for explicit resident injection |
+| 2 | Distilled behavior and scoped guidance | Injectable only with an explicit scope |
+| 3 | Curated knowledge and documentation | Retrieved on demand |
+| 4 | Current tasks and working state | Retrieved on demand |
+| 5 | Review candidates | Never recalled or injected implicitly |
+| 6 | Redacted raw capture | Never recalled or injected implicitly |
+
+Ring assignment defaults by path and can be overridden with `ring: N` in
+frontmatter. Rings express trust, not authorization; slice grants control who
+can access which content.
+
+### Retrieval is layered, bounded, and explicit
+
+Lexical BM25 recall works immediately. Semantic and hybrid search are optional,
+use content-addressed vector artifacts, and report partial coverage instead of
+quietly pretending to be semantic. An optional cross-encoder reranks the
+retrieved shortlist. Every text answer has a token budget, so asking for ten
+hits cannot unexpectedly fill the context window.
 
 ```console
-$ cfetch install          # configure every supported harness detected on this machine
-$ cfetch install --agent qwen --agent iflow
-$ cfetch install --all    # explicitly create every supported global configuration
-$ cfetch install --project . --all  # all confirmed project-local surfaces
-$ cfetch daemon start     # warm per-host daemon (optional but recommended)
-$ cfetch scan             # build the recall + code index
-indexed 412 docs, 3187 blocks (2 file(s) skipped as ring 5+)
-code: 66 files, 891 symbols (re)parsed
+$ cfetch recall --hybrid "request retry policy"
+$ cfetch recall --slice engineering "deployment rollback"
+$ cfetch recall --expand "database migration"
 ```
 
-Search the brain — lower ring means higher trust:
+### Freshness is part of the answer
+
+A machine holding the Markdown can serve recall, citation expansion, code
+search, and repository maps to other machines. Every response carries an
+origin, catalog generation, and `fresh` flag. Queries pass a bounded drain
+barrier: cfetch either proves that visible writes have reached the catalog or
+labels the answer stale and explains why.
 
 ```console
-$ cfetch recall zfs backup
-r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
-    Native filesystem backup only — never file-level tools between ZFS datasets ...
-r3-b7e2519cc0 knowledge/hosts/server/backups.md:12-19 (ring 3)
-    The mirror job snapshots hourly and prunes by tier; restores are tested by ...
+# Storage machine
+$ cfetch daemon start
 
-expand a hit: cfetch recall --id <citation>
+# Client configured with client.serving
+$ cfetch recall "release checklist"
+...
+served by docs-host (generation 42, fresh)
 ```
 
-Locate code with exact ranges:
+## Agent integrations
+
+`cfetch install` detects initialized agent configurations and adds only the
+surfaces each agent actually supports. Entries are ownership-ledgered,
+idempotent, backed up on first touch, and removed symmetrically with
+`cfetch install --remove`.
 
 ```console
-$ cfetch find segment
-src/index.rs:149-171  function_item segment  (~180 tok)
-src/index.rs:723-741  function_item segment_skips_frontmatter  (~150 tok)
+$ cfetch install                         # detected agents
+$ cfetch install --agent claude --agent codex
+$ cfetch install --project . --all       # confirmed project-local surfaces
 ```
 
-For Claude Desktop (or any other MCP client), register the binary as a stdio
-server:
+Native hooks are capability-gated. Claude Code, Codex, and CodeBuddy receive
+the full lifecycle where available; Gemini, iFlow, and Tabnine receive only
+the verified tool-event subset. Other supported agents receive MCP and/or
+recall-first instructions according to their confirmed configuration format.
 
-```json
-{ "mcpServers": { "cfetch": { "command": "cfetch", "args": ["mcp"] } } }
-```
-
-`cfetch install` feature-detects initialized harnesses and leaves absent ones
-alone. Use repeatable `--agent <id>` for an explicit selection or `--all` for
-every surface in the selected scope. The default scope is global;
-`--project <path>` selects project-local files and makes local-only harnesses
-such as Trae available. The current adapter registry covers:
+<details>
+<summary>Show the current adapter registry</summary>
 
 ```text
 claude cursor gemini openclaw hermes codex copilot opencode cline roo
@@ -215,174 +250,109 @@ windsurf kilocode antigravity antigravitycli amp codebuddy crush forge
 iflow junie pi qodercli qwen tabnine trae
 ```
 
-Support is capability-based, not a blanket claim. MCP is registered wherever
-the harness exposes a confirmed MCP file contract; recall-first instructions
-are installed wherever it exposes a confirmed instruction surface; native
-hooks are installed only where cfetch also understands the hook payload and
-output contract. Measured transcript accounting currently normalizes Claude,
-Codex, Gemini and Cursor sessions. This gives every listed harness at least its
-confirmed surfaces without inventing unsupported hooks.
+</details>
 
-Codex asks you to approve changed command hooks once in `/hooks`; cfetch never
-bypasses that trust gate. Adapter-managed entries are atomic, backed up on
-first touch, ownership-ledgered, and reversible. `cfetch install --remove`
-removes only cfetch-owned entries. Restart an agent after changing MCP
-configuration so its tool inventory is rebuilt.
+For any MCP client, the manual registration is the standard stdio shape:
 
-On Codex, completed oversized Bash listings are structurally condensed before
-their result enters the next model turn. Build and test output is never
-rewritten. The full original is kept as a private file under
-`$CFETCH_STATE_DIR/condensed-output/` (or the default local state directory),
-with mode `0600` on Unix, and the condensed result carries its exact path.
-The recovery directory is capped at 64 MiB. Claude events never receive
-Codex's `continue:false` replacement signal.
+```json
+{
+  "mcpServers": {
+    "cfetch": { "command": "cfetch", "args": ["mcp"] }
+  }
+}
+```
+
+The server exposes read-only `cfetch_recall`, `cfetch_expand`, and
+`cfetch_find` tools.
+
+## Installation
+
+### Package managers
+
+```console
+# Homebrew on macOS or Linux
+brew tap corbet-labs/cfetch
+brew install cfetch
+
+# crates.io on any platform with Rust 1.95+
+cargo install cfetch --locked
+
+# Arch Linux (AUR package name avoids an unrelated cfetch package)
+paru -S cfetch-agent
+
+# Nix flake
+nix profile install github:corbet-labs/cfetch
+```
+
+Prebuilt archives for Linux, macOS, and Windows are attached to
+[GitHub releases](https://github.com/corbet-labs/cfetch/releases/latest).
+Every archive includes the binary, cfetch license, generated third-party
+notices, and embedded variant metadata. `cfetch variants` prints the exact
+catalog used to build the release.
+
+### Build the development branch
+
+```console
+$ git clone https://github.com/corbet-labs/cfetch.git
+$ cd cfetch
+$ cargo build --release
+```
+
+Linux, macOS, and Windows all gate releases in CI. Platform-specific local
+control transport is hidden behind the same CLI: Unix sockets on Linux/macOS,
+and authenticated loopback TCP on Windows.
 
 ## Configuration
 
-`~/.config/cfetch/config.json` (all keys optional; partial files merge over
-defaults):
+cfetch searches for one JSON configuration in this order:
+
+- `CFETCH_CONFIG`, when set;
+- `<brain_root>/.cfetch/config.json` for tree-wide policy; then
+- `~/.config/cfetch/config.json` on Linux/macOS or
+  `%APPDATA%\cfetch\config.json` on Windows for host-specific settings.
+
+The first existing file wins; configuration files are not layered. Missing
+fields use built-in defaults.
+
+Environment variables `CFETCH_BRAIN` and `CFETCH_STATE_DIR` override the
+knowledge and local-state paths.
+
+A compact starting point:
 
 ```json
 {
-  "brain_root": "/home/you/notes",
+  "brain_root": "/home/you/agent-memory",
   "resident": [
-    { "path": "AGENT.md", "ring": 1 },
-    { "path": "rules/invariants.md", "ring": 0 }
+    { "path": "rules/critical.md", "ring": 0 },
+    {
+      "path": "guidance/rust.md",
+      "ring": 2,
+      "scope": { "repos": ["api-service"] }
+    }
   ],
   "code_roots": ["projects"],
   "budget_chars": 6000,
-  "exhaust_max_bytes": 33554432,
-  "ledger_max_bytes": 8388608
+  "exclude_prefixes": ["vendor/", "archive/", "scratch/"]
 }
 ```
 
-- `brain_root` — the knowledge tree (default `~/agents`, or `$CFETCH_BRAIN`).
-- `resident` — files injected verbatim (budget-clipped) at session start, in
-  order. Rings 0–1 may be injected anywhere; ring 2 only with a `scope` (see
-  below); rings 3+ are refused at load time. An explicitly empty list means
-  "inject nothing" — useful where the harness already auto-loads these files,
-  so they are not paid for twice.
-- `code_roots` — roots for the code index, relative to `brain_root` unless
-  absolute. Empty means `<brain_root>/projects/github`. A running daemon keeps
-  this index current on its own — an initial scan once its file watches are up,
-  then an incremental refresh on the same 60-second cadence as the integrity
-  backstop — so `cfetch find` and `cfetch map` answer on a freshly started host
-  without anyone running `cfetch scan` by hand.
-- `budget_chars` — hard cap on the injected digest.
-- `exhaust_max_bytes` — writer-side cap on this host's ring-6 exhaust stream
-  before it rotates; two rotated generations are kept.
-- `ledger_max_bytes` — the same, for this host's ledger stream.
-
-### Ring assignment (`ring_rules`)
-
-Which ring a file lands on is a property of your tree, so it is configuration.
-`ring_rules` is an ORDERED list; the **first matching rule wins**, so a
-specific rule goes above a general one and nothing depends on counting prefix
-characters. A prefix ending in `/` matches the whole subtree; a prefix without
-a trailing slash matches that exact path only (`AGENT.md` never captures
-`AGENT.md.bak`); the empty prefix `""` matches everything and is how a list
-declares its own catch-all. A path no rule matches lands on **ring 3**. A
-`ring: N` key in a file's frontmatter still overrides whatever the rules say.
-
-The shipped default, which you replace wholesale by setting the key:
+Ring rules are ordered; the first matching path prefix wins:
 
 ```json
 {
   "ring_rules": [
-    { "prefix": "AGENT.md", "ring": 1 },
-    { "prefix": "README.md", "ring": 1 },
-    { "prefix": "mind/memories/MEMORY.md", "ring": 1 },
-    { "prefix": "mind/memories/", "ring": 2 },
-    { "prefix": "todo/", "ring": 4 },
-    { "prefix": "staging/", "ring": 5 }
-  ]
-}
-```
-
-A tree organized differently just says so — for example:
-
-```json
-{
-  "ring_rules": [
-    { "prefix": "rules/invariants.md", "ring": 0 },
-    { "prefix": "handbook/", "ring": 1 },
-    { "prefix": "habits/", "ring": 2 },
+    { "prefix": "rules/critical.md", "ring": 0 },
+    { "prefix": "rules/", "ring": 1 },
+    { "prefix": "guidance/", "ring": 2 },
     { "prefix": "tasks/", "ring": 4 },
+    { "prefix": "staging/", "ring": 5 },
     { "prefix": "", "ring": 3 }
   ]
 }
 ```
 
-Rings run 0–6; a rule naming anything higher is refused at load.
-
-`staging/` is shipped as ring 5 because the LOCATION decides: a staged
-candidate whose frontmatter is stripped or hand-mangled is still never
-recallable. Point the rule elsewhere if your staging area lives elsewhere, but
-do not delete it — ring 5 is the ladder's quarantine.
-
-### Exclusions (`exclude_prefixes`)
-
-Two layers, deliberately:
-
-- **Hard boundary, not configurable.** The secrets directory
-  (`mind/secrets/`), logs (`logs/`), and git internals (any `.git/`, at any
-  depth) never enter the index and are never watched — no config can lift
-  that. Secret-shaped filenames (`.env*`, `*.key`, `*.pem`, `*credential*`,
-  `*password*`, `*secret*`) are refused wherever they live, and secret-shaped
-  paths are withheld from session capture as well.
-- **Your own exclusions.** `exclude_prefixes` adds to that boundary. The
-  shipped value is `["projects/", "knowledge/archive/"]` — repo clones belong
-  to the code index rather than the prose index, and an archive is retired
-  knowledge you should not recall by accident. Both are conventions, so both
-  are yours to change:
-
-```json
-{ "exclude_prefixes": ["vendor/", "attachments/", "scratch/"] }
-```
-
-A prefix matches on path components, so `drafts` excludes `drafts/note.md`
-but never `draftsman.md`; a trailing slash is optional.
-
-### Scoped injection
-
-Injection is policy, not a fixed resident set: with many domains there is no
-universal most-important file. Any resident entry may carry a `scope`, and
-only sessions it matches receive it.
-
-```json
-{
-  "resident": [
-    { "path": "AGENT.md", "ring": 1 },
-    { "path": "rules/build-host.md", "ring": 1,
-      "scope": { "hosts": ["build-box"] } },
-    { "path": "habits/widget-review.md", "ring": 2,
-      "scope": { "repos": ["widget", "widget-docs"] } },
-    { "path": "rules/invariants.md", "ring": 0,
-      "scope": { "always": true } }
-  ]
-}
-```
-
-- `hosts` — machine names. Matched against this machine's hostname, either in
-  full or by its first label (`build-box` also matches
-  `build-box.example.net`).
-- `repos` — the name of the directory the session was started in (the last
-  path component of the agent's working directory).
-- `always` — inject regardless of host and repo. An entry with no `scope` at
-  all already means everywhere; `always` states it explicitly so that adding
-  one host to the list later cannot narrow it by accident.
-- `hosts` and `repos` are ORed: an entry listing both arrives on any listed
-  host AND in any listed repo, not only where the two coincide.
-
-Ring 2 (distilled behavior) is injectable only WITH a scope — that is what
-makes it selective rather than a second unconditional set. `cfetch selfcheck`
-prints which entries the current host and directory left out, so a file that
-stops arriving is explainable without reading the config.
-
-### Semantic recall (`embeddings`)
-
-Off by default. Point it at any OpenAI-compatible `/embeddings` endpoint — a
-local llama.cpp server, LM Studio, vLLM, or a hosted API:
+Semantic recall is off by default. Point it at an OpenAI-compatible embeddings
+endpoint; keep the credential in an environment variable, never in JSON:
 
 ```json
 {
@@ -392,272 +362,90 @@ local llama.cpp server, LM Studio, vLLM, or a hosted API:
     "model": "embed-model",
     "dimensions": 1024,
     "precision": "f16",
-    "api_key_env": "MY_EMBED_KEY"
+    "api_key_env": "EMBEDDINGS_API_KEY"
   }
 }
 ```
 
-- `dimensions` — the vector width to ask for and to store (default 1024). It
-  is sent to the endpoint as `dimensions`, which Matryoshka-trained embedders
-  honor; an endpoint that ignores it gets its vector truncated to that prefix
-  and re-normalized client-side. A model that cannot reach the width is an
-  error, never a silently narrower vector. Full native width is usually 8–16x
-  more than a documentation corpus can use, and it dominates the index file.
-- `document_prefix` — the instruction the model expects on a DOCUMENT, if it
-  wants one (E5 wants `"passage: "`, EmbeddingGemma wants a `title:`/`text:`
-  pair, Qwen3 wants documents raw). Unlike the query prefix this changes what
-  is STORED, so it is part of the artifact identity: the shared store's
-  filename carries a digest of it and its header records it exactly. Two hosts
-  configured differently therefore write to different files instead of
-  appending incompatible vectors to one. Changing it means re-deriving.
-- `query_prefix` — the instruction this model expects on a QUERY, and on
-  nothing else. Retrieval embedders are asymmetric: they are trained with an
-  instruction on the query side and raw text on the document side, and they
-  lose accuracy when both are embedded identically. E5 wants `"query: "`;
-  Qwen3 wants an `Instruct:`/`Query:` pair. Measured here against
-  qwen3-embed-8b over a 17,610-block tree, the documented wording widened the
-  cosine margin between a relevant block and a distractor from +0.082 to
-  +0.128, and visibly fixed the ranking. There is deliberately no
-  document-side prefix: a query prefix changes one query, while a document
-  prefix would change every stored vector and so would have to become part of
-  the artifact identity.
-- `precision` — `f16` (default) or `f32`. Half floats halve the artifact at a
-  cosine error far below the ranking's resolution.
-- `api_key_env` — the NAME of an environment variable holding the key, never
-  the key. Endpoints are SSRF-guarded: https or loopback only, private and
-  metadata ranges refused unless listed in `allow_hosts`.
+Then run `cfetch embed-index`. Vectors are keyed by the statement content hash,
+so editing one file re-embeds only changed statements. Missing or partial vector
+coverage is always reported.
 
-Then derive the vectors once:
-
-```console
-$ cfetch embed-index
-embedded 3187/3187 blocks
-embed-index complete: 3187 embedded this run, 0 imported from the shared store, 3187 block(s) total
-```
-
-Vectors are keyed by the CONTENT HASH of the block — the same digest the
-citation shows a prefix of. Two consequences:
-
-- Editing a file costs only the blocks that changed. A rescan keeps every
-  unchanged block's vector and prunes only hashes that left the tree.
-- They are a property of the content, not of a machine. They are written to
-  `<brain_root>/state/cfetch/vectors/` as one packed artifact file plus a
-  hash index per `(model, dimensions, precision)`. Any host that can reach
-  the tree READS them; only a host with an endpoint configured writes.
-  `embed-index` derives only hashes no host has derived yet, and resumes
-  where it stopped. The per-host database keeps a cache of the same vectors —
-  never the record. The shared store is append-only: a vector whose text left
-  YOUR tree may still be someone else's slice, so it is kept, and the artifact
-  count is printed next to the block coverage rather than quietly diverging
-  from it.
-
-`--semantic` ranks by cosine alone, `--hybrid` fuses it with BM25 (reciprocal
-rank fusion, `recall.rrf_k`). Neither degrades quietly: when vector coverage
-is partial or zero, the numbers are reported on stderr (and as
-`semantic_note` in `--json`) and the answer still comes back lexically.
-
-```console
-$ cfetch recall --hybrid zfs backup
-cfetch recall: semantic: 0/3187 blocks embedded — answering lexically only; run cfetch embed-index
-r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
-    Native filesystem backup only — never file-level tools between ZFS datasets ...
-```
-
-`cfetch status` prints the same coverage before you need it.
-
-### Slices (`slices`)
-
-A slice is a named set of brain-relative prefixes — the unit of composition
-and sharing, nestable down to a single file. Nesting is implicit: a slice
-whose prefixes sit under another's is inside it, so there is no parent field
-to keep in step with the paths.
+Named slices limit recall and sharing by path:
 
 ```json
 {
   "slices": [
-    { "name": "knowledge", "prefixes": ["knowledge"] },
-    { "name": "hosts",     "prefixes": ["knowledge/hosts"] },
-    { "name": "memories",  "prefixes": ["mind/memories"] }
+    { "name": "engineering", "prefixes": ["knowledge/engineering"] },
+    { "name": "backend", "prefixes": ["knowledge/engineering/backend"] }
   ]
 }
 ```
 
-```console
-$ cfetch slices
-knowledge: 64 doc(s), 3266 block(s) — knowledge
-hosts: 134 doc(s), 8350 block(s) — knowledge/hosts
-memories: 200 doc(s), 1931 block(s) — mind/memories
-root: 308 doc(s), 5994 block(s) — the whole tree, minus anything a slice claims
+Every document belongs to its innermost slice. Unknown slice names are refused
+instead of widening to the whole tree.
 
-$ cfetch recall --slice hosts backup
-```
+Hard exclusions cannot be disabled: secret directories, logs, git internals,
+and secret-shaped filenames never enter recall, and their paths are withheld
+from capture. Configured `exclude_prefixes` and `.cfetchignore` add
+project-specific boundaries.
 
-- Every document belongs to its INNERMOST slice — the longest matching prefix
-  wins, and configuration order breaks a tie. Documents no slice claims are in
-  the reserved `root` slice, which no configured slice may be named.
-- `--slice NAME` reaches everything nested inside NAME, because a nested
-  slice's prefixes sit under its parent's by construction.
-- A name that does not exist is an error, not a silent widening to the whole
-  tree — that is how a private slice would leak.
-- Prefixes match path COMPONENTS, so `drafts` never claims `draftsman`.
-- Membership is derived from the path at query time, never stored: a stored
-  slice would disagree with the configuration the moment one was edited
-  without a rescan.
-- With no slices configured, nothing changes — the whole tree is one implicit
-  slice.
+## Frequently asked questions
 
-To share one, enable serving on the origin and keep its daemon running:
+### Does cfetch replace built-in agent memory?
 
-```console
-origin$ cfetch invite hosts --mode ro
-cfetch-invite-2:...
+No. It can index supported native memory read-only and adds a shared,
+agent-independent retrieval and governance layer. You can run both without
+duplicating resident injection.
 
-peer$ cfetch join 'cfetch-invite-2:...'
-peer$ cfetch recall --slice hosts backup
-```
+### Does cfetch require a vector database or cloud service?
 
-The ticket contains the origin's authenticated iroh endpoint address and a
-one-time secret. The origin stores only the secret hash; the peer stores only
-the successfully joined route. QUIC supplies the peer identity used to bind
-and check the grant, so an endpoint id claimed inside a request is never
-trusted. A ticket can still be redeemed locally when both hosts share the
-same tree; otherwise the running daemons exchange the same line-JSON query
-protocol over iroh. A slice grant permits `recall`, citation expansion,
-generation and checksum reads for that slice only—host control and unscoped
-code-index operations are refused.
+No. Lexical recall and code search are local and work without embeddings.
+Semantic search can use a local or hosted OpenAI-compatible endpoint. The
+per-host catalog is disposable SQLite; Markdown remains the record.
 
-### Reranking (`rerank`)
+### Is cfetch only for Claude Code?
 
-Off by default, and independent of how the candidates were found — it improves
-a lexical, semantic or hybrid list alike.
+No. Claude Code and Codex have the deepest native integration, while other
+agents connect through verified hook subsets, MCP, and instruction files.
 
-```json
-{
-  "rerank": {
-    "enabled": true,
-    "endpoint": "http://127.0.0.1:8080/v1",
-    "model": "bge-reranker-v2-m3",
-    "candidates": 40
-  }
-}
-```
+### Is captured session text trusted automatically?
 
-Retrieval scores a query against a document it never sees beside it: BM25
-counts terms, and a bi-encoder compares two vectors that were built
-independently. A cross-encoder reads query and document TOGETHER and judges
-relevance far better — but it costs one forward pass per candidate, so it can
-only run over a shortlist. Recall proposes, rerank reorders.
+No. Capture is redacted and placed in ring 6. Deterministic signals may create
+a ring-5 candidate, but neither ring is implicitly recalled or injected.
+Promotion into curated memory is deliberate.
 
-- `candidates` — how many hits are retrieved and sent to the cross-encoder.
-  Recall widens to this number and the answer is cut back to your `--limit`
-  afterwards, because a reranker can only promote what retrieval proposed.
-  Everything past the window keeps its retrieval order and follows.
-- Scores are whatever the model emits — cross-encoder logits are commonly
-  negative and unbounded. Only their ORDER is used, never their magnitude, and
-  equal scores keep retrieval order rather than shuffling.
+### How is cfetch different from OpenWolf?
 
-Reranking never decides whether an answer comes back. An unreachable endpoint,
-an unparseable response, or a score list that does not line up with what was
-sent all return the retrieval order with the reason attached (on stderr, and
-as `rerank_note` in `--json`).
+OpenWolf centers a project-local `.wolf/` directory and Node.js lifecycle
+hooks. cfetch centers an arbitrary Markdown tree, trust-aware citations,
+token-bounded retrieval, a single Rust daemon, and authenticated slices that
+can be served across machines. See the
+[feature comparison](#openwolf-openwolf-enhanced-and-cfetch).
 
-```console
-$ cfetch recall --hybrid zfs backup
-cfetch recall: rerank unavailable (POST http://127.0.0.1:8080/v1/rerank: connection refused) — answering in retrieval order
-r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
-    Native filesystem backup only — never file-level tools between ZFS datasets ...
-```
+## Security
 
-### The precision gate (`recall.gate`)
+- Hooks never emit an automatic permission approval.
+- Internal hook failures exit successfully and degrade to silence, so memory
+  infrastructure cannot trap or break an agent session.
+- Secret-shaped paths and private regions are filtered at collection time.
+- Serving and Windows local control channels use bearer tokens and
+  constant-time comparison.
+- Configured URLs require HTTPS or loopback unless a host is explicitly
+  allowed; redirects cannot carry credentials across the boundary.
 
-Off by default. Retrieval OR-joins the query's terms on purpose, so a six-word
-question still finds the block that phrased it differently — and a block
-sharing one ordinary word with the query comes back too. This is the stage
-that refuses it.
+Report suspected vulnerabilities through the private process in
+[SECURITY.md](SECURITY.md).
 
-```json
-{
-  "recall": {
-    "gate": { "min_terms": 2 }
-  }
-}
-```
+## License and contributing
 
-`min_terms` is how many DISTINCT non-stopword query terms a hit must carry. It
-is clamped to the number the query actually has, so a one-word query is never
-gated against itself, and `0` or `1` means no gate at all.
+[FSL-1.1-ALv2](LICENSE.md): use, modify, and redistribute cfetch for any
+purpose except offering a competing commercial product or service. Each
+release converts automatically to Apache-2.0 two years after publication.
 
-```console
-$ cfetch recall zfs snapshot retention policy
-cfetch recall: precision gate dropped 1 hit(s) carrying under 2 of the query's 4 term(s)
-r3-8c1a44f0d2 knowledge/hosts/server/storage.md:31-33 (ring 3)
-    [Storage > Snapshots] zfs snapshot retention runs nightly and prunes ...
-```
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), sign the
+[CLA](CLA.md) once on your first pull request, and follow the clean-room rule:
+do not copy or closely paraphrase code from OpenWolf, OpenWolf Enhanced, or
+other incompatibly licensed projects.
 
-- A term counts when a word of the hit STARTS WITH it — the same prefix rule
-  retrieval asks FTS5 for, so the gate never contradicts what proposed the hit.
-  The whole block is weighed, not the one-line snippet.
-- The gate runs LAST, after every stage that orders, and before the answer is
-  cut to `--limit`. Retrieval widens to twice the limit while it is armed, so
-  hits that pass refill the slots the dropped ones free.
-- It never empties an answer: when nothing reaches the floor, the best-ranked
-  hit comes back anyway. An operator who cannot tell a gate from an empty brain
-  is worse off than one holding a weak hit they can dismiss themselves.
-- It weighs lexical overlap, so it stands down for `--semantic`, `--hybrid` and
-  any reranked answer — a vector hit that shares no word with the query is what
-  semantic recall is FOR — and says on stderr that it did.
-- Every removal is reported, on stderr and as `note` in `--json`. A gate that
-  quietly swallows a hit you expected is worse than the hit it suppressed.
-
-## What lives where
-
-The tree is the only storage of record, and that includes the automatic half
-of the ladder:
-
-```
-<brain_root>/logs/cfetch/exhaust-<host>.jsonl   ring-6 capture, append-only
-<brain_root>/logs/cfetch/ledger-<host>.jsonl    injection + measured usage
-<brain_root>/staging/cfetch/<id>.md             ring-5 candidates (ring: 5)
-<brain_root>/staging/cfetch/dismissed/<id>.md   candidates ruled out, kept
-```
-
-Both stream formats are versioned line by line (`{"v":1,…}`) and refused
-rather than guessed at on a version this binary does not know. One file per
-host means concurrent machines never interleave, and every reader — `cfetch
-status`, `cfetch audit`, `cfetch staging list` — folds ALL of them, so a
-candidate flagged on one machine is visible to a distillation session on
-another.
-
-Everything else cfetch keeps is DERIVED and rebuildable: the index database,
-heartbeats and session state live per-host in `~/.local/state/cfetch`, never
-inside the shared tree, which may be shared between machines over NFS. Vectors
-are the one derived exception: they are a property of the CONTENT rather than
-of a machine, so they live in `<brain_root>/state/cfetch/vectors/`
-(self-ignoring for git) and every host that can reach the tree reads them.
-
-## License
-
-[FSL-1.1-ALv2](LICENSE.md) — the Functional Source License. You can use,
-modify, and redistribute cfetch for any purpose except offering a competing
-commercial product or service. Each release automatically becomes
-[Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) two years after it
-ships. Dependency licenses, copyright notices, and any upstream Apache NOTICE
-files are collected in [THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt).
-CI rejects dependencies outside the reviewed allow list and verifies that the
-generated bundle matches `Cargo.lock`.
-
-## Contributing
-
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Two things
-to know up front:
-
-- Every contributor signs the [CLA](CLA.md) once, by posting a sentence on
-  their first pull request (a bot walks you through it). You keep your
-  copyright; the grant keeps the project relicensable as a single-owner work.
-- cfetch is a clean-room implementation of mechanisms studied in two AGPL
-  projects. Do not copy or closely paraphrase code from them (or any other
-  incompatibly-licensed work) into a contribution.
-
-Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Use
-the structured issue forms for [support](SUPPORT.md), and report suspected
-vulnerabilities through the private process in [SECURITY.md](SECURITY.md).
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
