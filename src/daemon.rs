@@ -40,7 +40,9 @@ use iroh::protocol::ProtocolHandler as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, VectorSpec};
-use crate::{grant, heartbeat, hooks, index, ipc, net, paths, resident, serve, vectors};
+use crate::{
+    grant, heartbeat, hooks, index, ipc, maintenance_worker, net, paths, resident, serve, vectors,
+};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Request {
@@ -1552,6 +1554,19 @@ pub fn run() -> anyhow::Result<()> {
         shutdown: AtomicBool::new(false),
     });
     start_iroh(ctx.clone())?;
+
+    if cfg.maintenance.enabled && cfg.maintenance.configured() {
+        let maintenance_cfg = cfg.clone();
+        let maintenance_ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("cfetch-maintenance".into())
+            .spawn(move || {
+                maintenance_worker::run(maintenance_cfg, || {
+                    maintenance_ctx.shutdown.load(Ordering::SeqCst)
+                });
+            })
+            .context("start maintenance worker")?;
+    }
 
     if let (Some(bind), Some(_)) = (&cfg.serve.bind, &tcp_token) {
         let listener = std::net::TcpListener::bind(bind)?;

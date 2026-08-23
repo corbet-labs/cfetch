@@ -1581,6 +1581,18 @@ pub fn pause_reason(cfg: &Config) -> Option<String> {
         .filter(|reason| !reason.is_empty())
 }
 
+pub fn is_paused(cfg: &Config) -> bool {
+    pause_path(&cfg.brain_root).is_file()
+}
+
+/// Content revision of the actionable candidate set. Background maintenance
+/// uses this as an event signal: polling may be periodic, but model inference
+/// happens only after the evidence set changes (or a bounded retry is due).
+pub fn candidate_revision(cfg: &Config) -> String {
+    let candidates = staging::list(&paths::staging_dir(&cfg.brain_root));
+    hash_bytes(serde_json::to_vec(&candidates).unwrap_or_default())
+}
+
 pub fn resume(cfg: &Config) -> anyhow::Result<()> {
     let _lock = lock(cfg)?;
     match std::fs::remove_file(pause_path(&cfg.brain_root)) {

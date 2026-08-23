@@ -58,6 +58,7 @@ mod markers;
 mod maintenance;
 mod maintenance_inbox;
 mod maintenance_model;
+mod maintenance_worker;
 mod mcp;
 mod migrate;
 mod net;
