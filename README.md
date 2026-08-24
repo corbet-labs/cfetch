@@ -6,8 +6,8 @@
 
 <p align="center">
   Give Claude Code, Codex, Gemini, Cursor, and MCP clients one durable memory:<br />
-  cited Markdown recall, exact code navigation, session continuity, automatic capture,<br />
-  context-cost measurement, and cross-machine access from a single Rust binary.
+  cited Markdown recall, exact code navigation, autonomous Obsidian maintenance,<br />
+  knowledge graphs, vector search, and cross-machine access from one Rust binary.
 </p>
 
 <p align="center">
@@ -29,8 +29,8 @@
 
 ## What is cfetch?
 
-cfetch is a source-available AI agent memory system and MCP server for software
-development. It indexes a directory of ordinary Markdown files, retrieves the
+cfetch is a source-available AI agent memory system, Obsidian second brain, and
+MCP server for software development. It indexes ordinary Markdown, retrieves the
 most relevant statements with stable citations, maps source code to exact
 symbols and line ranges, and connects that context to coding agents through
 native hooks, instructions, MCP, or the command line.
@@ -49,22 +49,24 @@ proprietary database, or a change to how you edit your notes.
 | Context compaction drops in-flight knowledge | cfetch restores the session's modified-file record and relevant reminders |
 | Hooks, hardware, or remote routes can fail silently | Heartbeats, transcript verification, `status`, `doctor`, and `selfcheck` expose the exact gap |
 | Every machine builds a private, potentially stale copy | A storage machine can serve fresh, generation-stamped answers to thin clients |
+| Captured fixes accumulate as an inbox someone must clean | Evidence-driven maintenance continuously updates Markdown, while direct Obsidian edits always win |
 
 ## Terminal dashboard
 
 ![cfetch terminal dashboard showing hook health, indexed Markdown and code, context usage, staging, and cited recall](docs/assets/cfetch-dashboard.png)
 
-`cfetch dashboard` makes the memory layer visible in one place: daemon and hook
-health, active memory route, catalog generation, retrieval coverage, the
-configured and last-used inference path, statements by trust ring, indexed code, captured
-exhaust, staged maintenance candidates, injected context, and live cited recall.
-The screenshot is the shipped v0.9.9 dashboard indexing this repository, not a
-UI mockup. On `main`, a read-only maintenance inbox also shows captured
-candidates, proposal lifecycles, semantic review gates, deterministic failures,
-bounded diff previews, and the exact revision-bound CLI command for the next
-step. A live System pane adds detected hardware, build binding, model identity,
-peer reachability, grants, artifact coverage, and actionable findings. The
-dashboard never calls a model or applies a proposal.
+`cfetch dashboard` makes the memory layer visible in one terminal UI. Recall
+searches cited knowledge. Activity shows captured evidence, automatic changes,
+independent reviews, exact checks, exceptions, and reversible transactions.
+Graph exposes the Obsidian wikilink network derived from Markdown. System shows
+daemon and hook health, local or remote routes, catalog generation, vector
+coverage, model identity, detected hardware, actual backend selection, peer
+reachability, grants, and actionable findings.
+
+The screenshot shows the shipped v0.9.9 dashboard; `main` adds the Activity,
+Graph, and expanded System views described above. The TUI is an observability
+and debugging surface. Normal maintenance runs in the daemon and does not wait
+for this screen or for routine approval.
 
 ## Feature map
 
@@ -82,16 +84,18 @@ measurement do not.
 | Code intelligence | v0.9.9 | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
 | Session continuity | v0.9.9 | Scoped startup memory, periodic rule refresh, modified-file recovery after compaction, and known-failure lookup | hooks, `failures` |
 | Context control | v0.9.9 | Repeat-read guidance, large-file slice hints, token-capped answers, and structural command-output condensation | native tool hooks, `--budget-tokens` |
-| Learning capture | v0.9.9 | Redacted session activity is captured, deterministic signals flag useful candidates, and unreviewed material stays quarantined | `staging list`, `staging consume`, `staging dismiss` |
-| Supervised AI maintenance | **Main — next release** | Evidence packets become typed, independently reviewed proposals with exact diffs, deterministic gates, reversible apply, and commit-gated finalization | `maintain`, maintenance MCP tools, dashboard |
+| Learning capture | v0.9.9 | Redacted session activity is captured and deterministic signals flag evidence worth maintaining | hooks, ring-6 exhaust, ring-5 staging |
+| Autonomous AI maintenance | **Main — next release** | A change-driven daemon proposes, independently reviews, verifies, and applies evidence-grounded Markdown updates without routine approval; external edits win and every outcome is journaled | `maintain run`, `maintain history`, Activity pane |
+| Obsidian knowledge graph | **Main — next release** | Human-authored wikilinks become a rebuildable, ambiguity-safe graph with focused neighborhoods, degree counts, rings, and slice-scoped remote access | `graph`, Graph pane, `recall --expand` |
 | Honest measurement | v0.9.9 | Transcript-derived usage, cfetch's own injection cost, rewrite-point savings, cache-rebuild attribution, and paired A/B analysis | `audit`, `bench`, dashboard |
 | Reliability | v0.9.9 | A warm daemon, incremental scanning, hook heartbeats, delivery verification, and fail-open hook behavior | `daemon`, `status`, `selfcheck` |
-| Runtime visibility and diagnostics | **Main — next release** | Compact agent-safe status plus an evidence-rich doctor distinguish detected, supported, selected, last-used, reachable, and unmeasured state | dashboard System pane, `doctor`, `doctor --json`, `status`, `cfetch_runtime_status`, Claude status line, Codex hooks |
+| Runtime visibility and diagnostics | **Main — next release** | Compact agent-safe status plus an evidence-rich doctor distinguish configured, detected, selected, last-used, local, remote, paused, failed, and unmeasured state | Activity/System panes, `doctor`, `doctor --json`, `status`, `cfetch_runtime_status`, Claude status line, Codex hooks |
 | Agent integrations | v0.9.9 | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
 | Multi-machine access | v0.9.9 | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
 | Selective sharing | v0.9.9 | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
 | Frozen shared-vector profile | **Main — next release** | Every producer uses one pinned model pipeline and exact 768-byte INT8 vector contract; incompatible network majors fail closed | `embedding-profile`, semantic and hybrid recall |
 | Peer vector artifacts | **Main — next release** | A second storage group fetches matching canonical vectors from authorized origins before considering its own endpoint, avoiding duplicate embedding work | `embed-index`, iroh-blobs, `doctor` |
+| Continuous index and vector upkeep | **Main — next release** | Direct Obsidian edits and automatic maintenance advance the local catalog; generation changes hydrate shared/peer vectors and derive only missing content hashes | daemon watcher, vector worker, `status`, `doctor` |
 | Privacy and safety | v0.9.9 | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
 | Cross-platform delivery | v0.9.9 | Linux, macOS, and Windows block releases; packages are available through Cargo, Homebrew, Nix, AUR, and release archives | `variants`, `hardware` |
 
@@ -145,18 +149,20 @@ the feature map are not part of the v0.9.9 binaries.
 | Knowledge retrieval | Project index, symbol search, and bug search | BM25, semantic/hybrid recall, citations, and MCP | BM25, semantic/hybrid recall, reranking, citations, wikilinks, and slice filters |
 | Code navigation | Symbol ranges and import-aware project map | `find`, optional tree-sitter ranges, and PageRank | Tree-sitter `find`, exact ranges, import graph, and token-fitted `map` |
 | Context reduction | Repeat-read awareness, file-size hints, and Bash output governor | Same 1.x family plus bounded storage controls | Repeat-read guidance, slice hints, answer budgets, precision gate, and output condensation |
-| Memory capture | Corrections, bug fixes, action log, and handoff files | Optional activity capture, bug memory, lint, and distillation | Redacted exhaust → deterministic flags → quarantined staging → deliberate promotion |
+| Memory capture | Corrections, bug fixes, action log, and handoff files | Optional activity capture, bug memory, lint, and distillation | Redacted exhaust → deterministic flags → autonomous evidence-grounded maintenance |
 | Measurement | Real transcript usage, verified delivery, cache attribution, and A/B bench | Estimated ledger including its own injection cost | Transcript usage, rewrite deltas, injection cost, cache attribution, audit, and paired bench |
-| Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Project health/size doctor, cleanup checks, and expanded web dashboard | Evidence-rich system doctor, truthful delivery state, selfcheck, status, and terminal dashboard |
+| Health and UI | Heartbeats, selfcheck, and token-authenticated web dashboard | Project health/size doctor, cleanup checks, and expanded web dashboard | Terminal-only Activity, Graph, Recall, and System views plus `doctor`, `status`, and `selfcheck` |
 | Agent reach | Full integration for Claude Code, Codex, and OpenCode; context for several others | Hooks for four agents plus MCP clients | Confirmed configuration surfaces across 25 harnesses; native hooks only where the payload contract is understood |
 | Sharing | Git carries useful project state | Optional explicit push to a linked workspace | Authenticated serving, per-slice grants, and content-verified vector delivery over iroh |
-| Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Supervised AI evidence review, typed proposals, exact diffs, reversible apply, and commit-gated promotion |
+| Maintenance extras | Project update/restore, cron, and skills | Doctor, lint, distill, export, Design QC, and optional AI tasks | Constant change-driven AI maintenance, independent review, exact-byte gates, immutable history, pause/interject controls, and safe revert |
 | Runtime | Node.js 20+, per-project hook files | Node.js 20+, per-project hook files | One Rust binary plus an optional per-host daemon |
 | License | AGPL-3.0 | AGPL-3.0 | FSL-1.1-ALv2, converting to Apache-2.0 after two years |
 
-cfetch keeps maintenance that can run deterministically inside the binary and
-keeps judgment behind the staging boundary. Captured text cannot become trusted
-memory without a deliberate review and promotion step.
+cfetch keeps Markdown—not a hidden graph or vector database—as the record.
+Captured evidence crosses the staging boundary only after an independent
+semantic review and deterministic checks, but the healthy path is autonomous.
+A person interjects by editing Markdown, pausing the worker, inspecting history,
+or running the same transaction commands manually for debugging.
 
 ## How cfetch works
 
@@ -187,39 +193,52 @@ Ring assignment defaults by path and can be overridden with `ring: N` in
 frontmatter. Rings express trust, not authorization; slice grants control who
 can access which content.
 
-### AI maintenance crosses the trust boundary only with approval
+### AI maintenance is continuous, inspectable, and reversible
 
 > Available on `main` for the next release; not included in v0.9.9 binaries.
 
-cfetch turns maintenance into an inspectable transaction. A connected coding
-agent can ask for a bounded evidence packet and submit a typed proposal, but
-that proposal remains in ring 5: it is neither recalled nor injected. cfetch
-then independently rechecks the source evidence, citation snapshots, authority,
-target ring, current file hash, path safety, expiry, and secret-shaped content.
+The daemon reacts to new ring-5 evidence after a quiet period. It builds a
+bounded packet, asks one model pass for a typed proposal, asks a fresh isolated
+pass (optionally a different model) for semantic review, re-runs deterministic
+checks, and applies the exact complete Markdown bytes. Healthy maintenance does
+not wait for a person, a browser, a git commit, or an approval click.
 
-```console
-$ cfetch staging list
-$ cfetch maintain packet recurring-failure-a1b2c3d4
-$ cfetch maintain submit --file proposal.json
-$ cfetch maintain review maintenance-9f31d870ac42 --file review.json
-$ cfetch maintain verify maintenance-9f31d870ac42
-$ cfetch maintain apply maintenance-9f31d870ac42 --approval-token approve-...
-
-# Review and commit the Markdown with normal git tooling, then:
-$ cfetch maintain finalize maintenance-9f31d870ac42
+```json
+{
+  "maintenance": {
+    "endpoint": "http://127.0.0.1:8080/v1",
+    "model": "memory-maintainer",
+    "review_model": "memory-reviewer",
+    "api_key_env": "MAINTENANCE_API_KEY"
+  }
+}
 ```
 
-Applying is explicit and reversible. The staging candidate is consumed only
-after git `HEAD` contains the exact approved bytes. Ring 0 and ring 1 are never
-maintenance targets, unendorsed model claims cannot cross inward, and an
-attested observation may enter ring 3 but not behavioral ring 2. No daemon or
-hook calls a model in the background; the active agent supplies the analysis
-under the operator's existing model and approval policy. The terminal dashboard
-provides a read-only inbox for candidate evidence, proposal state, review gates,
-verification failures, bounded diff previews, and revision-bound next commands.
+```console
+$ cfetch daemon start
+$ cfetch maintain history            # immutable outcomes and exceptions
+$ cfetch maintain run                # request one bounded cycle now
+$ cfetch maintain pause debugging    # interject without losing evidence
+$ cfetch maintain resume
+```
 
-See [Supervised AI maintenance](docs/ai-maintenance.md) for the proposal schema,
-lifecycle, failure behavior, and agent integration.
+Obsidian and direct Markdown edits are authoritative. Every proposal captures
+the exact before bytes; if the file changes before apply, cfetch records an
+exception and leaves the new bytes untouched. Applied events retain before and
+after hashes, candidate ids, review ids, checks, and rationale. A transaction
+can be reverted only while its exact applied bytes still match, so revert also
+refuses to overwrite a later human edit.
+
+Ring 0 and ring 1 remain protected. Automatic ring-2 changes require direct
+operator instruction in the evidence itself; a model cannot manufacture that
+authority. Attested evidence may update rings 3 and 4, unendorsed claims cannot
+cross into trusted memory, secret-shaped content is refused, and symlinks or
+stale targets fail closed.
+
+The Activity pane and `cfetch doctor` show whether maintenance is local or
+remote, which proposal and review models are configured, what is staged, what
+changed, and why anything stopped. See [Autonomous AI memory maintenance](docs/ai-maintenance.md)
+for the full transaction contract and debugging workflow.
 
 ### Retrieval is layered, bounded, and explicit
 
@@ -235,11 +254,31 @@ $ cfetch recall --slice engineering "deployment rollback"
 $ cfetch recall --expand "database migration"
 ```
 
+### Graphs and vectors remain derived from readable files
+
+`[[Obsidian wikilinks]]` are the knowledge graph. cfetch resolves them only
+when a target is unambiguous, exposes incoming and outgoing relationships, and
+can center a bounded neighborhood on one note. It does not require a separate
+graph database or make hidden relationships authoritative.
+
+```console
+$ cfetch graph
+$ cfetch graph --focus deployment --limit 30
+$ cfetch graph --focus knowledge/runbooks/deployment.md --json
+```
+
+Vectors follow the same rule. They are keyed by statement content hashes and
+stored as reusable artifacts; the daemon watches Markdown generations,
+hydrates vectors already produced by the storage group or authorized peers,
+and sends only missing hashes to the configured endpoint. Direct Obsidian edits
+therefore update lexical search, graph edges, and semantic coverage without an
+export step.
+
 ### Freshness is part of the answer
 
-A machine holding the Markdown can serve recall, citation expansion, code
-search, and repository maps to other machines. Every response carries an
-origin, catalog generation, and `fresh` flag. Queries pass a bounded drain
+A machine holding the Markdown can serve recall, citation expansion, knowledge
+graphs, code search, and repository maps to other machines. Every response
+carries an origin, catalog generation, and `fresh` flag. Queries pass a bounded drain
 barrier: cfetch either proves that visible writes have reached the catalog or
 labels the answer stale and explains why.
 
@@ -311,6 +350,13 @@ description explicitly says not to poll it. RuntimeStatusV1 surfaces never inclu
 endpoint URLs, raw addresses, token paths, credentials, response bodies, or
 hardware evidence paths.
 
+The same line and JSON contract report autonomous-maintenance state: disabled,
+not configured, local or remote and idle, paused, exception, or model failure.
+They also report the proposal and review model labels, candidate count, history
+count, last outcome, and last inference attempt without exposing endpoint
+details. Agent integrations can therefore say that maintenance is active—or
+why it is not—without injecting a recurring explanation into model context.
+
 <details>
 <summary>Show the current adapter registry</summary>
 
@@ -337,8 +383,8 @@ The v0.9.9 server exposes read-only `cfetch_recall`, `cfetch_expand`, and
 `cfetch_runtime_status`, `cfetch_maintenance_packet`, and
 `cfetch_maintenance_show` tools.
 `cfetch_maintenance_propose` and `cfetch_maintenance_review` can write only
-idempotent ring-5 records; apply, revert, reject, and finalize remain CLI-only
-approval surfaces.
+idempotent ring-5 records for debugging and intervention. Apply, revert, reject,
+and finalize remain CLI-only; MCP cannot promote or overwrite trusted memory.
 
 ## System diagnostics and hardware visibility
 
@@ -360,7 +406,10 @@ line should not try to fit:
   concrete repair actions;
 - whether peer artifact delivery is ready, how many authorized routes exist,
   and the actual resolution order: shared store, authorized peers, then the
-  configured embedding endpoint.
+  configured embedding endpoint;
+- whether autonomous maintenance is configured and running, its local or
+  remote route, proposal and review models, pending candidates, immutable
+  outcomes, exceptions, and last model attempt.
 
 ```console
 $ cfetch doctor               # one read-only diagnostic report with bounded peer probes
@@ -487,8 +536,10 @@ plain OpenAI wire shape alone is not permission to publish shared vectors:
 }
 ```
 
-Then run `cfetch embed-index`. Vectors are keyed by the statement content hash,
-so editing one file re-embeds only changed statements. Missing or partial vector
+Run `cfetch embed-index` for an explicit backfill or debugging pass. With the
+daemon running, catalog generation changes trigger the same shared-first
+resolution automatically. Vectors are keyed by statement content hash, so
+editing one file processes only changed statements. Missing or partial vector
 coverage is always reported.
 
 With a running daemon and one or more joined origins, `embed-index` checks the
@@ -548,18 +599,19 @@ agents connect through verified hook subsets, MCP, and instruction files.
 
 No. Capture is redacted and placed in ring 6. Deterministic signals may create
 a ring-5 candidate, but neither ring is implicitly recalled or injected.
-Promotion into curated memory is deliberate.
+Promotion into curated memory requires an independent semantic review plus all
+deterministic evidence, authority, trust, path, secret, and exact-byte gates.
+The healthy path is automatic; it is not blind trust in captured text.
 
 ### Does cfetch use AI to maintain memory?
 
-On `main` for the next release, yes, through a supervised agent session. One
-pass receives immutable evidence references and current cited context, then
-proposes a typed transition: add, fold, supersede, revalidate, dismiss, or
-no-op. A separate immutable review checks coverage, faithfulness, preservation,
-authority, target choice, and contradictions. cfetch then performs
-deterministic verification and requires an explicit approval token before
-applying exact bytes. It never runs an unattended model cron job, and MCP
-cannot promote a proposal into trusted memory.
+On `main` for the next release, yes. The daemon reacts to changed evidence,
+runs a bounded proposal pass and a fresh isolated review pass, rechecks every
+deterministic gate under a write lock, and applies exact Markdown bytes without
+routine approval. Direct Obsidian edits remain authoritative, maintenance can
+be paused globally or per file, every outcome is journaled, and safe revert
+refuses to overwrite newer work. MCP cannot promote a proposal into trusted
+memory.
 
 ### How is cfetch different from OpenWolf?
 
