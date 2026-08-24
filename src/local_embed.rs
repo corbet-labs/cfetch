@@ -14,6 +14,8 @@ use anyhow::Context as _;
 use fastembed::{
     InitOptionsUserDefined, OutputKey, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
+#[cfg(feature = "inference-vitis")]
+use ort::ep::ArbitrarilyConfigurableExecutionProvider as _;
 use ort::ep::ExecutionProviderDispatch;
 use sha2::Digest as _;
 use tokenizers::{PaddingStrategy, TruncationParams};
@@ -202,7 +204,7 @@ impl std::fmt::Debug for LocalEmbedder {
 impl LocalEmbedder {
     fn load_unadmitted(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
         let bundle = VerifiedBundle::load(model_dir)?;
-        let (provider, device_class, dispatch) = execution_provider(requested_provider)?;
+        let (provider, device_class, dispatch) = execution_provider(requested_provider, None)?;
         let mut length_tokenizer = tokenizers::Tokenizer::from_bytes(bundle.tokenizer.clone())
             .map_err(|error| anyhow::anyhow!("load verified tokenizer: {error}"))?;
         length_tokenizer.with_padding(None);
@@ -269,7 +271,7 @@ impl LocalEmbedder {
                 ModelState::Dynamic(model) => model,
                 ModelState::StaticAccelerator { bundle, current } => {
                     if current.as_ref().map(|(shape, _)| *shape) != Some(bucket) {
-                        let (_, _, dispatch) = execution_provider(self.provider)?;
+                        let (_, _, dispatch) = execution_provider(self.provider, Some(bucket))?;
                         *current = Some((
                             bucket,
                             build_model(bundle.clone(), self.provider, dispatch, Some(bucket))?,
@@ -612,6 +614,7 @@ fn set_fixed_padding(model: &mut TextEmbedding, bucket: usize) -> anyhow::Result
 
 fn execution_provider(
     requested: &str,
+    fixed_bucket: Option<usize>,
 ) -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
     let requested = requested.trim().to_ascii_lowercase();
     let requested = requested.as_str();
@@ -623,7 +626,7 @@ fn execution_provider(
         #[cfg(feature = "inference-qnn")]
         return qnn_provider();
         #[cfg(all(not(feature = "inference-qnn"), feature = "inference-vitis"))]
-        return Ok(vitis_provider());
+        return vitis_provider(fixed_bucket);
         #[cfg(all(
             not(feature = "inference-qnn"),
             not(feature = "inference-vitis"),
@@ -724,7 +727,7 @@ fn execution_provider(
         #[cfg(feature = "inference-qnn")]
         "qnn" => qnn_provider(),
         #[cfg(feature = "inference-vitis")]
-        "vitis" => Ok(vitis_provider()),
+        "vitis" => vitis_provider(fixed_bucket),
         #[cfg(feature = "inference-cuda")]
         "cuda" => Ok(cuda_provider()),
         #[cfg(feature = "inference-tensorrt")]
@@ -817,12 +820,49 @@ fn qnn_provider() -> anyhow::Result<(&'static str, &'static str, ExecutionProvid
 }
 
 #[cfg(feature = "inference-vitis")]
-fn vitis_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
-    (
-        "vitis",
-        "npu",
-        ort::ep::Vitis::default().build().error_on_failure(),
-    )
+fn vitis_provider(
+    fixed_bucket: Option<usize>,
+) -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
+    let target = std::env::var("CFETCH_VITIS_TARGET").unwrap_or_else(|_| "X2".to_string());
+    anyhow::ensure!(
+        matches!(target.as_str(), "X1" | "X2"),
+        "CFETCH_VITIS_TARGET must be X1 or X2"
+    );
+    let xclbin = std::env::var("CFETCH_VITIS_XCLBIN")
+        .ok()
+        .filter(|path| !path.trim().is_empty());
+    anyhow::ensure!(
+        target != "X1" || xclbin.is_some(),
+        "Ryzen AI X1 targets require CFETCH_VITIS_XCLBIN"
+    );
+    anyhow::ensure!(
+        target != "X2" || xclbin.is_none(),
+        "Ryzen AI X2 targets must not set CFETCH_VITIS_XCLBIN"
+    );
+
+    let mut provider = ort::ep::Vitis::default()
+        .with_arbitrary_config("target", target)
+        .with_arbitrary_config("opt_level", "0");
+    if let Some(xclbin) = xclbin {
+        provider = provider.with_arbitrary_config("xclbin", xclbin);
+    }
+    if let Some(report_dir) = std::env::var("CFETCH_VITIS_REPORT_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+    {
+        let bucket = fixed_bucket
+            .context("CFETCH_VITIS_REPORT_DIR requires a fixed accelerator sequence bucket")?;
+        provider = provider
+            .with_cache_dir(report_dir)
+            .with_cache_key(format!("cfetch-v1-seq-{bucket}"))
+            // AMD requires disk-backed compilation for its operator-assignment
+            // report. Bucket-specific cache keys prevent one compiled static
+            // shape from being reused for another.
+            .with_arbitrary_config("enable_cache_file_io_in_mem", "0")
+            .with_arbitrary_config("ai_analyzer_profiling", "true");
+    }
+
+    Ok(("vitis", "npu", provider.build().error_on_failure()))
 }
 
 #[cfg(feature = "inference-cuda")]
@@ -900,14 +940,14 @@ mod tests {
             feature = "inference-webgpu"
         )))]
         {
-            let (name, class, _) = execution_provider("auto").unwrap();
+            let (name, class, _) = execution_provider("auto", None).unwrap();
             assert_eq!((name, class), ("cpu", "cpu"));
         }
     }
 
     #[test]
     fn unavailable_provider_is_never_silently_cpu() {
-        let error = execution_provider("definitely-not-compiled")
+        let error = execution_provider("definitely-not-compiled", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("not compiled"), "{error}");

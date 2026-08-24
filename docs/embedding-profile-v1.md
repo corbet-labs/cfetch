@@ -113,6 +113,15 @@ of 768 components. This proves that “same ONNX Q/DQ graph” and “real INT8
 acceleration” still do not imply identical output arithmetic across kernels.
 It also rules out bypassing ORT with direct MIGraphX as a v1 producer.
 
+AMD's current NPU material illustrates why v1 cannot accept a vendor-specific
+"optimized EmbeddingGemma" by name alone. Ryzen AI 1.8's classic compiler has
+A8W8 operators, but its compatibility table promises INT8 only for CNNs; its
+Windows ML path requires A16W8 for quantized Transformers. AMD's published
+EmbeddingGemma NPU artifact instead uses UINT4 weights and BFP16 activations.
+Those are useful vendor formats, but they are a different numerical pipeline
+and therefore cannot produce network-major-1 records. The physical VitisAI
+harness tests only the unchanged cfetch W8A8 graph and fails closed.
+
 These results settle the apparent common-denominator problem at the correct
 boundary. V1 has one logical W8A8 model and one canonical signed `INT8x768`
 record, but it cannot honestly promise that every vendor kernel derives those

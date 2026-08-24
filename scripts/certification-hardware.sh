@@ -26,7 +26,7 @@ case "$(uname -s)" in
       -e '/^Virtualization type:/p'
     if command -v lspci >/dev/null 2>&1; then
       lspci -nn \
-        | sed -n -E '/(VGA compatible controller|3D controller|Display controller|Processing accelerators|Co-processor)/Ip' \
+        | sed -n -E '/(VGA compatible controller|3D controller|Display controller|Processing accelerators|Signal processing controller|Co-processor)/Ip' \
         | sed -E 's/^[[:xdigit:]:.]+[[:space:]]+/pci_device=/'
     fi
     if command -v rocminfo >/dev/null 2>&1; then
@@ -39,6 +39,14 @@ case "$(uname -s)" in
           -e '/^[[:space:]]+Device Type:[[:space:]]+GPU[[:space:]]*$/p' \
           -e '/^[[:space:]]+Wavefront Size:/p' \
         | sed -E 's/^[[:space:]]+/rocm_/'
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      # Query only portable model/architecture/driver fields, never GPU UUID,
+      # PCI address, serial number, hostname, process list or memory contents.
+      nvidia-smi \
+        --query-gpu=name,compute_cap,driver_version \
+        --format=csv,noheader 2>/dev/null \
+        | sed -E 's/^/nvidia_gpu=/' || true
     fi
     ;;
   Darwin)

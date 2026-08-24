@@ -25,12 +25,21 @@
             # flake would need NIXPKGS_ALLOW_UNFREE=1 just to install cfetch
             # from cfetch's own flake. Scoped to exactly this package.
             config.allowUnfreePredicate = pkg:
-              builtins.elem (nixpkgs.lib.getName pkg) [
+              let
+                name = nixpkgs.lib.getName pkg;
+              in
+              nixpkgs.lib.hasPrefix "cuda_" name || builtins.elem name [
                 "cfetch"
                 "cfetch-local-cpu"
                 "cfetch-test-coreml"
+                "cfetch-test-cuda"
                 "cfetch-test-migraphx"
                 "cfetch-test-openvino"
+                "cfetch-test-tensorrt"
+                "cfetch-cudnn-runtime"
+                "cfetch-tensorrt-runtime"
+                "libcublas"
+                "libcurand"
               ];
             # Nixpkgs only builds ONNX Runtime's MIGraphX provider when the
             # ROCm package set is enabled. Keep that expensive closure scoped
@@ -103,6 +112,103 @@
               > "$out/share/licenses/onnxruntime-openvino/ThirdPartyNotices.txt"
             runHook postInstall
           '';
+        };
+        # Microsoft's CUDA 12 archive contains both CUDA and TensorRT EPs. It
+        # is preferable to rebuilding ORT here: the exact vendor release bytes
+        # are independently hashable certification inputs. Nix supplies only
+        # the ABI-compatible redistributables that the archive intentionally
+        # leaves external; the physical host still supplies libcuda.
+        nvidiaOrt = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cfetch-nvidia-onnxruntime";
+          version = ortVersion;
+          src = pkgs.fetchurl {
+            url = "https://github.com/microsoft/onnxruntime/releases/download/v${ortVersion}/onnxruntime-linux-x64-gpu_cuda12-${ortVersion}.tgz";
+            hash = "sha256-6mvStl19+rvrksSvXdjxLlrthgHlRK03jS+HInVDixo=";
+          };
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            cp -R include lib "$out/"
+            install -Dm644 LICENSE "$out/share/licenses/onnxruntime/LICENSE"
+            install -Dm644 ThirdPartyNotices.txt \
+              "$out/share/licenses/onnxruntime/ThirdPartyNotices.txt"
+            runHook postInstall
+          '';
+        };
+        # Runtime-only wheels avoid nixpkgs' 8.55 GiB TensorRT SDK download.
+        # They are still large because TensorRT ships its device kernels, but
+        # they contain exactly the libraries ORT needs and retain NVIDIA's
+        # non-redistributable licenses as separate, tester-local Nix inputs.
+        nvidiaCudnn = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cfetch-cudnn-runtime";
+          version = "9.22.0.52";
+          src = pkgs.fetchurl {
+            url = "https://files.pythonhosted.org/packages/a0/8f/2ede6b758b7524608472010f632bdd3370ea271d715d1d66044614b84cdc/nvidia_cudnn_cu12-9.22.0.52-py3-none-manylinux_2_27_x86_64.whl";
+            hash = "sha256-ORuafuY4barKf43KQeg8LJn3YMlYGgQAdV6HtCh7iEc=";
+          };
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.unzip ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/lib" "$out/share/licenses/cudnn"
+            unzip -j "$src" 'nvidia/cudnn/lib/*.so*' -d "$out/lib"
+            unzip -j "$src" '*dist-info/licenses/*' -d "$out/share/licenses/cudnn"
+            runHook postInstall
+          '';
+          meta.license = {
+            fullName = "cuDNN Supplement to Software License Agreement for NVIDIA SDKs";
+            url = "https://docs.nvidia.com/deeplearning/cudnn/backend/latest/reference/eula.html";
+            free = false;
+            redistributable = false;
+          };
+        };
+        nvidiaTensorRt = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cfetch-tensorrt-runtime";
+          version = "10.16.1.11";
+          src = pkgs.fetchurl {
+            url = "https://pypi.nvidia.com/tensorrt-cu12-libs/tensorrt_cu12_libs-10.16.1.11-py3-none-manylinux_2_28_x86_64.whl";
+            hash = "sha256-jkUDbv65ZNMjIxVERCpzYZIBE2zMhDklYCVMyPDVFuQ=";
+          };
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.unzip ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/lib" "$out/share/licenses/tensorrt"
+            unzip -j "$src" 'tensorrt_libs/*.so*' -d "$out/lib"
+            unzip -j "$src" '*dist-info/LICENSE*' -d "$out/share/licenses/tensorrt"
+            runHook postInstall
+          '';
+          meta.license = {
+            fullName = "TensorRT Supplement to Software License Agreement for NVIDIA SDKs";
+            url = "https://docs.nvidia.com/deeplearning/tensorrt/latest/reference/sla.html";
+            free = false;
+            redistributable = false;
+          };
+        };
+        cudaOrt = pkgs.symlinkJoin {
+          name = "cfetch-cuda-onnxruntime-${ortVersion}";
+          paths = [
+            nvidiaOrt
+            (pkgs.lib.getLib pkgs.cudaPackages.cuda_cudart)
+            (pkgs.lib.getLib pkgs.cudaPackages.libcublas)
+            (pkgs.lib.getLib pkgs.cudaPackages.libcurand)
+          ];
+          # Do not expose a TensorRT provider whose non-redistributable runtime
+          # is absent from this package. The separate package below is explicit.
+          postBuild = ''
+            rm "$out/lib/libonnxruntime_providers_tensorrt.so"
+          '';
+        };
+        tensorrtOrt = pkgs.symlinkJoin {
+          name = "cfetch-tensorrt-onnxruntime-${ortVersion}";
+          paths = [
+            nvidiaOrt
+            (pkgs.lib.getLib pkgs.cudaPackages.cuda_cudart)
+            (pkgs.lib.getLib pkgs.cudaPackages.libcublas)
+            (pkgs.lib.getLib pkgs.cudaPackages.libcurand)
+            nvidiaCudnn
+            nvidiaTensorRt
+          ];
         };
         # Build the AMD provider from the same pinned nixpkgs input as cfetch.
         # Nixpkgs 7.2.3 otherwise disables RTTI while ORT 1.27.1's MIGraphX
@@ -241,6 +347,25 @@
           runtime = migraphxOrt;
           runtimeDistribution = "nixpkgs-${nixpkgs.rev}-onnxruntime-1.27.1-migraphx-7.2.3";
           runtimeArchiveSha256 = "8b6bbf2677db27fb2bb196370136f662c0415c48531a16adb2bdfef5e1d55773";
+        };
+        # Both NVIDIA packages use Microsoft's exact CUDA 12 ORT release. CUDA
+        # redistributables are Nix-pinned; TensorRT/cuDNN retain their upstream
+        # non-redistributable licenses and are never copied into cfetch assets.
+        cfetch-test-cuda = mkCfetch {
+          pname = "cfetch-test-cuda";
+          localInference = true;
+          inferenceFeature = "inference-cuda";
+          runtime = cudaOrt;
+          runtimeDistribution = "microsoft-github-release-v${ortVersion}-cuda12+nixpkgs-cuda12.9";
+          runtimeArchiveSha256 = "ea6bd2b65d7dfabbeb92c4af5dd8f12e5aed8601e544ad378d2f872275438b1a";
+        };
+        cfetch-test-tensorrt = mkCfetch {
+          pname = "cfetch-test-tensorrt";
+          localInference = true;
+          inferenceFeature = "inference-tensorrt";
+          runtime = tensorrtOrt;
+          runtimeDistribution = "microsoft-github-release-v${ortVersion}-cuda12+nixpkgs-cuda12.9-tensorrt10.16";
+          runtimeArchiveSha256 = "ea6bd2b65d7dfabbeb92c4af5dd8f12e5aed8601e544ad378d2f872275438b1a";
         };
       });
 

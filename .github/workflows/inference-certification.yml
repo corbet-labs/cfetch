@@ -175,3 +175,69 @@ jobs:
             ${{ runner.temp }}/cfetch-openvino-run.log
             ${{ runner.temp }}/cfetch-hardware.txt
           if-no-files-found: warn
+
+  windows-provider-kat:
+    name: Windows ${{ matrix.provider }} KAT (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            provider: directml
+          - runner: windows-11-arm
+            provider: qnn
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate frozen bundle input
+        shell: pwsh
+        env:
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+        run: |
+          if ($env:BUNDLE_SHA256 -ne "12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1") {
+            throw "unexpected model bundle digest"
+          }
+          $uri = [Uri]$env:BUNDLE_URL
+          if ($uri.Scheme -ne "https" -or $uri.Host -ne "github.com" -or
+              -not $uri.AbsolutePath.StartsWith("/corbet-labs/cfetch/releases/download/") -or
+              -not $uri.AbsolutePath.EndsWith("/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz")) {
+            throw "bundle_url must name the frozen archive in a public cfetch GitHub release"
+          }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record non-identifying hardware evidence
+        shell: pwsh
+        run: ./scripts/certification-hardware.ps1 | Tee-Object "$env:RUNNER_TEMP/cfetch-hardware.jsonl"
+      - name: Build pinned provider evidence package
+        shell: pwsh
+        env:
+          PROVIDER: ${{ matrix.provider }}
+        run: ./scripts/build-windows-inference-package.ps1 -Provider $env:PROVIDER -Output "$env:RUNNER_TEMP/cfetch-$env:PROVIDER"
+      - name: Download frozen model bundle
+        shell: pwsh
+        env:
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+        run: Invoke-WebRequest -Uri $env:BUNDLE_URL -OutFile "$env:RUNNER_TEMP/cfetch-embedding-v1.tar.gz"
+      - name: Run exact vector certification
+        shell: pwsh
+        env:
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          PROVIDER: ${{ matrix.provider }}
+        run: |
+          ./scripts/certify-windows-inference-package.ps1 `
+            -Package "$env:RUNNER_TEMP/cfetch-$env:PROVIDER" `
+            -Bundle "$env:RUNNER_TEMP/cfetch-embedding-v1.tar.gz" `
+            -BundleSha256 $env:BUNDLE_SHA256 `
+            -Report "$env:RUNNER_TEMP/cfetch-inference-certificate.json" `
+            2>&1 | Tee-Object "$env:RUNNER_TEMP/cfetch-$env:PROVIDER-run.log"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: inference-certificate-${{ matrix.runner }}-${{ matrix.provider }}
+          path: |
+            ${{ runner.temp }}/cfetch-inference-certificate.json
+            ${{ runner.temp }}/cfetch-${{ matrix.provider }}-run.log
+            ${{ runner.temp }}/cfetch-hardware.jsonl
+            ${{ runner.temp }}/cfetch-${{ matrix.provider }}/runtime-manifest.json
+          if-no-files-found: warn

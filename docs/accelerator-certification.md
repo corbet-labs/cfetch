@@ -27,11 +27,11 @@ inference; they are never silently called producers.
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: hardware-identified public runs loaded and executed but failed 0/11 exact vectors; alternative runtime pending |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
 | Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official `cfetch-test-openvino` runtime package integrated for Linux x86-64; local CPU probe rejected because OpenVINO did not own the complete frozen graph; public reproduction and physical GPU/NPU certificates pending |
-| AMD XDNA2 NPU | ORT Vitis AI or a reviewed Ryzen AI adapter | XDNA2 exposes INT8, but Ryzen AI 1.8 documents INT8 for CNN and BF16 for NLP, an ORT 1.16 Vitis path, and automatic CPU partitioning | Rust session surface integrated, but no compatible cfetch runtime package yet; an AMD adapter/runtime update and physical KAT/placement proof are required |
+| AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
 | AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT |
-| NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Session path integrated; runtime packaging and oldest/current architecture certificates pending |
-| Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Session path integrated; Microsoft publishes Windows QNN packages; Snapdragon package/KAT/placement pending |
-| Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Session path integrated; DirectML runtime package and physical certificate pending |
+| NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
+| Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Microsoft QNN 1.24.4 Windows ARM64 evidence package and public job integrated; physical Snapdragon HTP KAT/placement remains pending |
+| Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Microsoft DirectML 1.24.4 x64/ARM64 evidence package and public job integrated; each physical adapter still needs exact KAT and placement evidence |
 | WebGPU / Vulkan-class fallback | ORT WebGPU EP where available | useful coverage for older GPUs is possible, but native W8A8 placement is not assumed | Experimental session path; runtime package and producer certificate pending |
 
 There is no single native 8-bit container that every vendor accelerates.
@@ -88,12 +88,34 @@ cfetch and its FastEmbed fork request ORT C API 18, the lowest API used by the
 provider/session code, while the certified CPU runtime remains Microsoft's
 1.28.0 release. The C API is backward-compatible, so this lowers only the
 minimum loadable vendor-runtime ABI; it does not change the graph, optimizer,
-or vector bytes. It covers current 1.23-class MIGraphX and QNN packages.
-AMD's Ryzen AI 1.8 documentation still identifies its Vitis EP as ORT 1.16,
-below this Rust binding's provider floor. That row therefore needs an updated
-AMD plugin or a small provider-specific adapter before physical testing can
-begin; compiling cfetch's `inference-vitis` feature alone is not a runnable
-XDNA package.
+or vector bytes. It covers current 1.23-class MIGraphX and QNN packages. The
+old ORT 1.16 statement still visible near the bottom of AMD's cumulative
+release history describes an earlier VOE release, not the current Ryzen AI
+1.8 deployment contract, and is not used as the present XDNA blocker.
+
+## AMD XDNA evidence package and precision boundary
+
+AMD's current Ryzen AI 1.8 deployment documentation explicitly lists the
+INT8 application DLL set, supports on-device compilation, and exposes an
+operator-assignment report. `scripts/build-windows-vitis-package.ps1` builds
+cfetch against those exact bytes from an already installed Ryzen AI tree,
+hashes every copied source file, and emits a self-checking evidence package.
+It does not download, publish, or license AMD's proprietary runtime. XDNA2
+Strix/Krackan uses the current `X2` target without an xclbin. First-generation
+Phoenix/Hawk Point uses `X1` plus AMD's `phoenix/4x4.xclbin`. The cfetch
+provider keeps optimization level zero, creates a different compiler cache
+key for every frozen sequence bucket, and disables ORT CPU fallback.
+
+The silicon's INT8 throughput does not establish graph compatibility. AMD's
+Ryzen AI 1.8 table advertises CNN INT8 and NLP BF16, even though its newer
+integer compiler and operator table contain A8W8 support. Its separate Windows
+ML VitisAI table is stricter: a quantized QDQ CNN may be A8W8, but a quantized
+Transformer must be A16W8. AMD's own optimized EmbeddingGemma 1.8 artifact is
+UINT4-weight/BFP16-activation, not cfetch's frozen W8A8 model. Neither route is
+an interchangeable v1 substitute. The only unresolved route is to submit the
+unchanged cfetch graph to the installed classic VitisAI compiler on physical
+X1/X2 hardware; session construction must own the full graph, all 11 vectors
+must match, and every bucket's assignment report must prove NPU placement.
 
 The Linux x86-64 OpenVINO evidence package extracts only the language-neutral
 runtime libraries and notices from Intel's official
@@ -165,6 +187,66 @@ than a default flake check: compiling the ROCm closure on every public CPU-only
 CI run would consume substantial time while proving no GPU execution. It must
 be built and exercised on the actual AMD device under test.
 
+## NVIDIA CUDA and TensorRT evidence packages
+
+Linux x86-64 exposes `cfetch-test-cuda` and `cfetch-test-tensorrt`. Both start
+from Microsoft's official
+`onnxruntime-linux-x64-gpu_cuda12-1.28.0.tgz`, archive SHA-256
+`ea6bd2b65d7dfabbeb92c4af5dd8f12e5aed8601e544ad378d2f872275438b1a`.
+That archive contains the CUDA and TensorRT provider libraries. The CUDA
+package includes only CUDA EP plus Nix-pinned CUDA 12.9 `cudart`, cuBLAS and
+cuRAND libraries; the physical host supplies its NVIDIA driver and
+`libcuda.so.1`. Its loaded ORT library SHA-256 is
+`87097979b341c4df9c1bf71b14f7376f84a91206fbc64c0ccc4733dcbbab9e40`
+and CUDA provider SHA-256 is
+`958b1b20df4177c10418bfc203898aab85bda9504afaba108a88775dd0aa0539`.
+The complete cfetch package test suite passes without an NVIDIA device.
+
+TensorRT is separate because its provider also requires cuDNN and TensorRT
+itself. Their runtime-only upstream wheels are hash-pinned Nix inputs. They
+retain NVIDIA's non-redistributable licenses, stay in the tester's local Nix
+store, and are never copied into a cfetch release artifact. The runtime-only
+route avoids nixpkgs' 8.55 GiB complete TensorRT SDK archive while preserving
+the libraries ORT actually links. The TensorRT 10.16.1.11 wheel SHA-256 is
+`8e45036efeb964d323231544442a73619201136ccc84392560254cc8f0d516e4`;
+the cuDNN 9.22.0.52 wheel SHA-256 is
+`391b9a7ee6386daaca7f8dca41e83c2c99f760c9581a0400755e87b4287b8847`.
+The assembled ORT TensorRT provider SHA-256 is
+`4e4fd8e65341ff80698d9051c7cd3badcee07d050fa03b95c7124b311849fa0c`.
+The complete cfetch package test suite passes. Building it is only provenance
+and ABI evidence: neither route becomes a producer until a physical NVIDIA
+GPU passes all KAT bytes with fallback disabled and supplies reviewed
+device/INT8 placement evidence.
+
+On the available AMD-only host, the CUDA certificate predictably stopped
+before session construction because `libcuda.so.1` was absent. That confirms
+the package did not fall back to CPU; it is not an NVIDIA hardware result and
+does not appear in the accepted or rejected device registry.
+
+## Windows DirectML and Qualcomm QNN evidence packages
+
+`scripts/build-windows-inference-package.ps1` creates a self-checking local
+package for `directml` or `qnn`; the companion certification script verifies
+every packaged file and the frozen model bundle before running cfetch. DirectML
+uses Microsoft's
+`Microsoft.ML.OnnxRuntime.DirectML` 1.24.4 NuGet, archive SHA-256
+`57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681`,
+and supports the package's x64 or ARM64 native runtime. QNN uses
+`Microsoft.ML.OnnxRuntime.QNN` 1.24.4, archive SHA-256
+`e4d6eabb9e503d4f3c78494fc9400f02509b2ee315d9f707644a174ece8da17f`,
+and intentionally refuses anything except native Windows ARM64. The QNN
+package carries Microsoft's ORT QNN provider and Qualcomm's CPU/GPU/HTP
+runtime libraries and notices; cfetch selects `QnnHtp.dll` and still forbids
+ORT CPU fallback.
+
+The public workflow uses `windows-latest` for DirectML and
+`windows-11-arm` for QNN. These are packaging and adverse-execution probes on
+the hardware actually exposed to each hosted runner. A Windows ARM runner name
+is not proof of a Snapdragon HTP, and a virtual display adapter is not proof of
+a physical DirectML GPU. The uploaded hardware JSONL deliberately contains
+only OS/build, CPU name, GPU name/vendor/driver, and compute-accelerator
+friendly name/status—never PnP IDs, PCI addresses, UUIDs or serials.
+
 ## Running a certificate
 
 Use the actual package and extracted, separately licensed model bundle:
@@ -207,7 +289,7 @@ The minimum useful tester pool is deliberately explicit:
 | CPU | x86-64 generic/older AVX, x86-64 v3/v4, Linux arm64, Apple arm64 |
 | Apple | oldest and newest supported Apple silicon; Metal and ANE placement separately |
 | Intel | OpenVINO CPU, integrated/discrete GPU, first and current NPU generations |
-| AMD NPU | XDNA2 device through the real Ryzen AI/Vitis runtime |
+| AMD NPU | Phoenix/Hawk Point XDNA (`X1`) and Strix/Krackan XDNA2 (`X2`) through the real Ryzen AI/Vitis runtime |
 | AMD GPU | an older supported RDNA consumer GPU and a current RDNA/CDNA device; Linux MIGraphX/ROCm and Windows path separately |
 | NVIDIA | oldest supported and current CUDA architecture; CUDA and TensorRT separately |
 | Qualcomm | Snapdragon X-class Windows arm64 device using QNN HTP |
@@ -252,6 +334,43 @@ and registry-pinned as described above. Current RDNA/CDNA devices and a
 different compatible runtime path remain open; no AMD GPU producer is
 advertised.
 
+On a physical Ryzen AI Windows system, first install the vendor runtime and
+driver, then create a local-only evidence package:
+
+```powershell
+./scripts/build-windows-vitis-package.ps1 -Output ./cfetch-vitis
+./scripts/certify-windows-inference-package.ps1 `
+  -Package ./cfetch-vitis `
+  -Bundle ./cfetch-embeddinggemma-300m-a8w8-v1.tar.gz `
+  -Report ./cfetch-inference-certificate.json `
+  -VitisTarget X2
+```
+
+For Phoenix/Hawk Point, use `-VitisTarget X1`; the script selects the packaged
+`phoenix/4x4.xclbin` unless an explicit path is supplied. Submit the JSON
+certificate, `*.vitis-placement` reports and runtime manifest, but never
+upload AMD's runtime package or DLLs.
+
+On physical Linux NVIDIA systems, `nix build .#cfetch-test-cuda` builds the
+CUDA evidence package. `nix build .#cfetch-test-tensorrt` adds the separately
+licensed TensorRT/cuDNN runtime-only inputs. Run the former with `cuda` and the
+latter with `tensorrt`; test minimum and current GPU architectures separately.
+These large provider closures are explicit targets rather than default
+CPU-only flake checks.
+
+On Windows, build and run a provider package from PowerShell 7:
+
+```powershell
+./scripts/build-windows-inference-package.ps1 -Provider directml -Output ./cfetch-directml
+./scripts/certify-windows-inference-package.ps1 `
+  -Package ./cfetch-directml `
+  -Bundle ./cfetch-embeddinggemma-300m-a8w8-v1.tar.gz `
+  -Report ./cfetch-inference-certificate.json
+```
+
+Use `qnn` instead of `directml` only on native Windows ARM64. A physical QNN
+submission must also attach HTP placement/profiling evidence.
+
 The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,
 runs the KAT, and uploads the JSON report. No secret or private runner is
@@ -272,5 +391,9 @@ Primary implementation references:
 - [Core ML optimization overview](https://apple.github.io/coremltools/docs-guides/source/opt-overview.html)
 - [OpenVINO execution provider](https://onnxruntime.ai/docs/execution-providers/OpenVINO-ExecutionProvider.html)
 - [Vitis AI execution provider](https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html)
+- [Ryzen AI 1.8 model deployment](https://ryzenai.docs.amd.com/en/latest/modelrun.html)
+- [Ryzen AI 1.8 application packaging](https://ryzenai.docs.amd.com/en/latest/app_development.html)
+- [Ryzen AI 1.8 operator support](https://ryzenai.docs.amd.com/en/latest/ops_support.html)
+- [Windows ML VitisAI model support](https://ryzenai.docs.amd.com/projects/WinML/en/latest/model_support.html)
 - [MIGraphX execution provider](https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html)
 - [DirectML execution provider](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html)
