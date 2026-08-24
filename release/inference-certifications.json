@@ -5,6 +5,7 @@
   "profile_manifest_sha256": "09e8c7c15c09fb273da3f5f639b38869ee27992d62b30b3f0da9350f37a7e3aa",
   "artifact_id": "cfetch-embeddinggemma-300m-a8w8-v1",
   "artifact_sha256": "ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1",
+  "bundle_url": "https://github.com/corbet-labs/cfetch/releases/download/model-v1/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz",
   "bundle_sha256": "12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1",
   "policy": {
     "exact_known_answers_required": 11,
@@ -17,7 +18,7 @@
       "id": "linux-x86_64-cpu-microsoft-ort-1.28.0",
       "status": "passing-reference",
       "catalog_admitted": false,
-      "catalog_blocker": "the separately licensed v1 model bundle is not yet a public release asset",
+      "catalog_blocker": "the standalone local release variant and its reviewed release certificate have not been assembled",
       "os": "linux",
       "arch": "x86_64",
       "provider": "cpu",
@@ -31,7 +32,7 @@
       "exact_known_answers_passed": 11,
       "exact_known_answers_failed": 0,
       "int8_evidence": "canonical QDQ graph audit: 171 learned nodes covered; no floating-point shadow learned weights",
-      "note": "Catalog admission stays false until model distribution and the complete release package exist."
+      "note": "The public model-v1 bundle and Nix package on main are usable directly; catalog admission stays false until they are assembled and reviewed as a standalone local release variant."
     }
   ],
   "pending_physical_families": [

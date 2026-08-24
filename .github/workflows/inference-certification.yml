@@ -8,6 +8,7 @@ on:
       bundle_url:
         description: Public cfetch GitHub-release URL for the frozen v1 model bundle
         required: true
+        default: https://github.com/corbet-labs/cfetch/releases/download/model-v1/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz
         type: string
       bundle_sha256:
         description: SHA-256 of the complete model bundle archive

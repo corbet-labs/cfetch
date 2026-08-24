@@ -46,6 +46,8 @@ is part of the build.
 The model bundle is deterministic and separately licensed under the included
 Gemma terms. Its current archive SHA-256 is
 `12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1`.
+The immutable archive is published in the public
+[`model-v1` release](https://github.com/corbet-labs/cfetch/releases/tag/model-v1).
 The archive includes the graph, tokenizer, source card, build report,
 retrieval audit, artifact lock, terms, modification notice, and per-file
 checksums. The graph digest above, rather than the archive filename or URL, is
@@ -130,7 +132,9 @@ closed on a mismatch.
 Uncertified hardware remains fully useful as a consumer: it can search shared
 vectors or request inference from a certified producer. It must not advertise
 local producer capability. The release catalog remains remote-only until a
-complete local package, model distribution and reviewed certificate exist.
+standalone local release variant assembles the published model, provider
+runtime, and reviewed certificate. The source flake's `cfetch-local-cpu`
+package and public model bundle can already be used directly for evaluation.
 
 Reranking is deliberately outside this boundary. It is transient per query,
 never stored or exchanged as vector truth, and may use a different model or be

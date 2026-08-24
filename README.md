@@ -456,6 +456,31 @@ Every archive includes the binary, cfetch license, generated third-party
 notices, and embedded variant metadata. `cfetch variants` prints the exact
 catalog used to build the release.
 
+### Evaluate the frozen v1 local CPU path
+
+The source flake exposes the certified local CPU package on x86-64 Linux,
+arm64 Linux, and Apple silicon. The separately licensed, immutable model bundle
+is published in the public
+[`model-v1` release](https://github.com/corbet-labs/cfetch/releases/tag/model-v1):
+
+```console
+$ nix build github:corbet-labs/cfetch#cfetch-local-cpu
+$ curl --proto '=https' --tlsv1.2 --location --fail --output model-v1.tar.gz \
+    https://github.com/corbet-labs/cfetch/releases/download/model-v1/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz
+$ test "$(nix hash file --type sha256 --base16 model-v1.tar.gz)" = \
+    12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+$ tar -xzf model-v1.tar.gz
+$ ./result/bin/cfetch inference-certify \
+    --model-dir ./cfetch-embeddinggemma-300m-a8w8-v1 --provider auto --json
+```
+
+The x86-64 package is the current certified CPU reference. Linux arm64 and
+macOS arm64 use pinned official runtime archives but remain producer-ineligible
+until public physical runs pass the exact-vector certificate. The release
+catalog therefore remains remote-only; direct evaluation is not a hardware
+support claim. See the [frozen profile](docs/embedding-profile-v1.md) and
+[certification matrix](docs/accelerator-certification.md).
+
 ### Build the development branch
 
 ```console
@@ -518,7 +543,8 @@ Ring rules are ordered; the first matching path prefix wins:
 ```
 
 Semantic recall is off by default. Point it at an OpenAI-compatible embeddings
-endpoint; keep the credential in an environment variable, never in JSON.
+endpoint, or use the local package and extracted v1 model bundle. Keep remote
+credentials in an environment variable, never in JSON.
 
 On `main` for the next release, the model pipeline is no longer configurable:
 network major 1 fixes EmbeddingGemma-300M,
@@ -532,11 +558,15 @@ plain OpenAI wire shape alone is not permission to publish shared vectors:
 {
   "embeddings": {
     "enabled": true,
-    "endpoint": "http://127.0.0.1:8080/v1",
-    "api_key_env": "EMBEDDINGS_API_KEY"
+    "model_dir": "/absolute/path/to/cfetch-embeddinggemma-300m-a8w8-v1",
+    "execution_provider": "auto"
   }
 }
 ```
+
+For a remote certified producer, replace `model_dir` and `execution_provider`
+with `endpoint` and `api_key_env`. A configured local model never silently
+falls back to that endpoint.
 
 Run `cfetch embed-index` for an explicit backfill or debugging pass. With the
 daemon running, catalog generation changes trigger the same shared-first
