@@ -488,6 +488,12 @@ Linux x86-64 Intel testers use
 complete official ORT/OpenVINO wheel; exact bytes and per-device placement are
 still mandatory. The available local CPU probe was rejected because OpenVINO
 did not own the complete frozen graph, so this is an evidence package only.
+For current Intel drivers, `cfetch-test-openvino-current` instead pins ORT
+1.27.1 and OpenVINO 2026.3 from the locked Nix input. A physical Core Ultra 7
+258V probe compiled the frozen graph on both Arc 140V and its NPU, but strict
+sessions still required forbidden CPU remainder. An explicit diagnostic that
+allowed the remainder then failed all 11 exact vectors on both devices. These
+are rejected routes, not producer support; production remains fail-closed.
 Windows x64 testers can create the equivalent hash-pinned NuGet evidence
 package with `scripts/build-windows-inference-package.ps1 -Provider
 openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
@@ -505,13 +511,13 @@ Hyper-V Video, where WebGPU could not own the complete graph. The isolated
 macOS retry reached the pinned plugin on a virtual Apple M1 but likewise left
 nodes on forbidden CPU fallback. None is a physical GPU certificate.
 
-Recorded EPYC 7763 hosts pass the current CPU reference; a recorded Xeon 8573C
-with AVX-512, VNNI and AMX-INT8 using the exact same package/runtime failed all
-11 vectors. Public Linux arm64 and macOS arm64 runs failed all 11 too. These
-are host/runtime certificates, never architecture-wide promises. The release
-catalog therefore remains remote-only. Ordinary local loading runs the same
-admission gate on the actual host and fails closed before writing incompatible
-vectors. See the
+Recorded EPYC 7763 and physical Ryzen 9 5950X hosts pass the current CPU
+reference; recorded Xeon 8573C and physical Core Ultra 7 258V hosts using the
+same package/runtime failed all 11 vectors. Public Linux arm64 and macOS arm64
+runs failed all 11 too. These are host/runtime certificates, never
+architecture-wide promises. The release catalog therefore remains
+remote-only. Ordinary local loading runs the same admission gate on the actual
+host and fails closed before writing incompatible vectors. See the
 [frozen profile](docs/embedding-profile-v1.md) and
 [certification matrix](docs/accelerator-certification.md).
 

@@ -23,10 +23,10 @@ inference; they are never silently called producers.
 
 | Hardware class | cfetch path | INT8 common-denominator evidence | Producer status |
 |---|---|---|---|
-| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified only on named hosts** with Microsoft's official ORT 1.28.0 release, 11/11 exact; a hosted run of the same bytes failed 0/11, so every host remains KAT-gated |
+| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified only on named hosts** with Microsoft's official ORT 1.28.0 release: recorded EPYC 7763 and physical Ryzen 9 5950X hosts passed 11/11; hosted Xeon 8573C and physical Core Ultra 7 258V hosts failed 0/11; every host remains KAT-gated |
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: hardware-identified public runs loaded and executed but failed 0/11 exact vectors; alternative runtime pending |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
-| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official Linux Nix and Windows NuGet evidence packages integrated; hosted Linux and Windows CPU probes rejected because OpenVINO did not own the complete frozen graph; physical Intel CPU/GPU/NPU certificates pending |
+| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning and numerical results are graph/device specific | **Rejected on physical Lunar Lake**: OpenVINO 2026.3 compiled the unchanged graph for Arc 140V and NPU, strict ORT ownership failed, and an explicit hybrid diagnostic produced 0/11 exact vectors on both; alternative full-graph/exact paths remain pending |
 | AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
 | AMD GPU | ORT MIGraphX EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT; ORT's older ROCm EP was removed in 1.23 and is not a second current path |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
@@ -78,6 +78,24 @@ AVX-512, VNNI and AMX-INT8; 412–739 bytes changed per answer. Run
 reproduced 11/11 on the recorded EPYC 7763. The ISA's advertised integer
 instructions are therefore not sufficient admission metadata: the exact host
 executes the KAT and either produces or fails closed.
+
+A fresh build of `nix:cfetch-local-cpu` at commit `92066ad` then verified the
+released archive and passed 11/11 on a physical AMD Ryzen 9 5950X (Zen 3,
+AVX/AVX2/FMA), covering all seven static sequence buckets. The bounded report
+SHA-256 is
+`dbb39bd261b895f2aa5bb916124015402a22853f774333a0837c358b409898d5`;
+the non-identifying hardware capture SHA-256 is
+`c83ec99a6cf7d6c39c6287ca11d1ebf66fc8e82e519159c4439dcf71d459054e`.
+This is a second named CPU host certificate, not a Zen or x86-wide promise.
+
+The same official CPU package then failed 0/11 on a physical Intel Core Ultra
+7 258V (Lunar Lake), changing 401–739 of 768 bytes per record despite its
+AVX2/VNNI support. Report SHA-256
+`f7c32d71b1445d08c6113c4acfbc9a0548b071d155f75e72815786377a8ca4fa`
+and hardware-capture SHA-256
+`c437e642a844f919f182869ab2e8d686dd87b57634b4998127d9c0d0e2944c49`
+are registry-pinned. This is physical confirmation of the host-specific gate,
+not a claim about every Lunar Lake configuration.
 
 The ort-sys bundled/static 1.28 build was deliberately rejected after failing
 all 11 records. ORT version strings are therefore informational; distribution
@@ -144,8 +162,32 @@ shared executable profile. Silently changing that setting for one vendor would
 no longer be the same pipeline. An isolated diagnostic build nevertheless
 tested `ORT_DISABLE_ALL`; it was rejected at the same full-graph boundary, so
 that documented suggestion is not a hidden working route. The public job
-reproduces the failure boundary; each selected Intel device still requires a
-compatible full-graph path, exact bytes and placement review.
+reproduces the failure boundary.
+
+The flake also exposes `cfetch-test-openvino-current`, built entirely from the
+locked nixpkgs revision: ONNX Runtime 1.27.1 plus OpenVINO 2026.3.0, with
+fixed ORT source SHA-256
+`8b6bbf2677db27fb2bb196370136f662c0415c48531a16adb2bdfef5e1d55773`
+and loaded-library SHA-256
+`4679de3b061093b85262b0a79466f05d31068a90750c740cd3c592350471b4de`.
+It is an explicit evidence lane for current Intel drivers, not a catalogue
+producer. Host driver/compiler libraries remain outside the Nix closure, so a
+matching NixOS driver stack is the reproducible deployment target; on other
+Linux distributions the system compiler's loader/glibc ABI must be bridged
+and recorded explicitly.
+
+That current lane was exercised on a physical Core Ultra 7 258V with Arc 140V
+GPU and Lunar Lake NPU. Native OpenVINO 2026.3 compiled the unchanged frozen
+1x32 graph for both `GPU.0` and `NPU`, proving that neither device nor graph
+compilation was the immediate blocker. Strict cfetch sessions nevertheless
+failed because the ORT provider requested forbidden CPU remainder. A
+controlled diagnostic then enabled that remainder explicitly to test the only
+remaining shortcut; it exercised all 11 inputs and seven buckets but matched
+0/11 on both devices. The NPU changed 687–752 components per vector and the
+GPU 734–752. Those diagnostic reports are not certificates, and production
+source remains no-fallback. The registry pins the hardware, strict logs,
+runtime and diagnostic report hashes. Each Intel device therefore still needs
+an alternative route that both owns the full graph and passes exact bytes.
 
 Public runs
 [`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
@@ -408,20 +450,25 @@ rejected for CPU-only placement and incomplete provider ownership. A hosted
 result can prove only the device actually exposed to that runner; it cannot
 stand in for another Apple model or an absent accelerator.
 
-On Linux x86-64, `nix build .#cfetch-test-openvino` builds the equivalently
-non-catalogue Intel evidence package. The public runner exercises
-`openvino-cpu`; physical Intel systems use that same binary with
-`openvino-gpu` or `openvino-npu`. The package disables dynamic shapes and uses
-one stream/thread, while the seven frozen cfetch buckets remain unchanged. The
-first local CPU attempt was rejected at full-graph ownership; the package is a
-reproducible evidence tool, not a producer. Public run
+On Linux x86-64, `nix build .#cfetch-test-openvino` builds the official-wheel
+Intel evidence package, while `nix build .#cfetch-test-openvino-current`
+builds the locked ORT 1.27.1/OpenVINO 2026.3 lane for current host drivers.
+Both are non-catalogue tools. The public runner exercises `openvino-cpu`;
+physical systems select `openvino-gpu` or `openvino-npu`. The packages disable
+dynamic shapes and use one stream/thread, while the seven frozen cfetch
+buckets remain unchanged. The first local CPU attempt was rejected at
+full-graph ownership. Public run
 [`32681875052`](https://github.com/corbet-labs/cfetch/actions/runs/32681875052)
 reproduced that boundary on a recorded AMD EPYC 7763 hosted VM. That validates
 the package and rejection path, not Intel CPU/GPU/NPU support.
 Run
 [`32693600516`](https://github.com/corbet-labs/cfetch/actions/runs/32693600516)
 reproduced the same ownership rejection with both Linux and Windows evidence
-packages; its Windows host was also AMD, so Intel hardware remains untested.
+packages; its Windows host was also AMD. The later physical Lunar Lake run is
+the first Intel GPU/NPU evidence: both current devices compiled the graph but
+were rejected by strict ownership and then failed 0/11 in the deliberately
+non-certifying hybrid diagnostic. First-generation Intel NPU, discrete GPU,
+and alternative runtime/graph paths remain open.
 
 On physical Linux AMD systems, `nix build .#cfetch-test-migraphx` builds the
 locked ORT/MIGraphX/ROCm evidence package. Its first RX 6800 result is rejected

@@ -108,11 +108,12 @@ They are rejected producers, not “probably compatible” CPU packages. This is
 why shared vectors are derived once and distributed, and why an architecture
 name or matching runtime version cannot bypass the KAT.
 
-The same conclusion holds inside x86-64. A recorded AMD EPYC 7763 passed all
-11 answers, while a recorded Intel Xeon Platinum 8573C with AVX-512, VNNI and
-AMX-INT8 failed all 11 with identical model/runtime bytes. The v1 contract
-therefore names passing hosts, never an ISA marketing feature as a producer
-guarantee.
+The same conclusion holds inside x86-64. Recorded AMD EPYC 7763 and physical
+Ryzen 9 5950X hosts passed all 11 answers, while a recorded Intel Xeon
+Platinum 8573C with AVX-512, VNNI and AMX-INT8 and a physical Core Ultra 7
+258V with AVX2/VNNI both failed all 11 with identical model/runtime bytes. The
+v1 contract therefore names passing hosts, never an ISA marketing feature as
+a producer guarantee.
 
 A physical AMD Radeon RX 6800 produced the complementary accelerator result.
 ORT's MIGraphX provider could not own the whole graph with CPU fallback
@@ -121,6 +122,15 @@ graph on RDNA2 INT8-capable kernels, but its first encoded result changed 729
 of 768 components. This proves that “same ONNX Q/DQ graph” and “real INT8
 acceleration” still do not imply identical output arithmetic across kernels.
 It also rules out bypassing ORT with direct MIGraphX as a v1 producer.
+
+A physical Intel Lunar Lake probe reached the same boundary from the NPU side.
+OpenVINO 2026.3 compiled the unchanged graph for both its Arc 140V GPU and NPU,
+but strict ORT/OpenVINO sessions could not own the complete graph. A temporary,
+explicit hybrid diagnostic allowed the CPU remainder only to test that
+hypothesis; both devices executed every bucket but matched 0/11 vectors. The
+production implementation was restored immediately to mandatory no-fallback.
+This shows that current INT8 hardware and successful graph compilation are
+still insufficient: exact final bytes remain the admission boundary.
 
 AMD's current NPU material illustrates why v1 cannot accept a vendor-specific
 "optimized EmbeddingGemma" by name alone. Ryzen AI 1.8's classic compiler has

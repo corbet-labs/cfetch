@@ -35,6 +35,7 @@
                 "cfetch-test-cuda"
                 "cfetch-test-migraphx"
                 "cfetch-test-openvino"
+                "cfetch-test-openvino-current"
                 "cfetch-test-tensorrt"
                 "cfetch-test-webgpu"
                 "cfetch-cudnn-runtime"
@@ -208,6 +209,22 @@
             redistributable = false;
           };
         };
+        # The official ORT/OpenVINO wheel currently embeds OpenVINO 2025.4.1.
+        # Keep a second evidence lane built from the same locked nixpkgs input
+        # so current Intel GPU/NPU drivers can be tested against OpenVINO
+        # 2026.3 without splicing runtime libraries at execution time.
+        currentOpenvinoOrt = (pkgs.onnxruntime.override {
+          pythonSupport = false;
+          openvinoSupport = true;
+          coremlSupport = false;
+          cudaSupport = false;
+          rocmSupport = false;
+        }).overrideAttrs {
+          # cfetch and the frozen 11-vector KAT are the acceptance tests for
+          # this evidence package. Avoid compiling ORT's several-thousand-test
+          # upstream suite as part of every hardware probe.
+          doCheck = false;
+        };
         nvidiaTensorRt = pkgs.stdenvNoCC.mkDerivation {
           pname = "cfetch-tensorrt-runtime";
           version = "10.16.1.11";
@@ -283,6 +300,7 @@
             pluginDistribution ? null,
             pluginArchiveSha256 ? null,
             pluginLibrary ? null,
+            hostDriverSearch ? false,
             runTests ? true,
           }:
           pkgs.rustPlatform.buildRustPackage {
@@ -335,7 +353,8 @@
                 else
                   "libonnxruntime.so"
               }"${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " \\
-              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ runtime pkgs.stdenv.cc.cc.lib pkgs.zlib ]}"}${pkgs.lib.optionalString (pluginLibrary != null) " \\
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath ([ runtime pkgs.stdenv.cc.cc.lib pkgs.zlib ] ++ pkgs.lib.optionals hostDriverSearch [ pkgs.stdenv.cc.libc ])}"}${pkgs.lib.optionalString hostDriverSearch " \\
+              --suffix LD_LIBRARY_PATH : /run/opengl-driver/lib:/usr/lib:/opt/intel/oneapi/compiler/latest/lib"}${pkgs.lib.optionalString (pluginLibrary != null) " \\
               --set-default CFETCH_WEBGPU_LIBRARY ${pluginLibrary}"}
           '';
 
@@ -403,6 +422,16 @@
           runtime = openvinoOrt;
           runtimeDistribution = "pypi-onnxruntime-openvino-${openvinoVersion}";
           runtimeArchiveSha256 = openvinoWheelSha256;
+        };
+        cfetch-test-openvino-current = mkCfetch {
+          pname = "cfetch-test-openvino-current";
+          localInference = true;
+          inferenceFeature = "inference-openvino";
+          runtime = currentOpenvinoOrt;
+          hostDriverSearch = true;
+          runtimeDistribution = "nixpkgs-${nixpkgs.rev}-onnxruntime-${currentOpenvinoOrt.version}-openvino-${pkgs.openvino.version}";
+          # Nix-fixed SHA-256 of the ORT source at the flake-locked revision.
+          runtimeArchiveSha256 = "8b6bbf2677db27fb2bb196370136f662c0415c48531a16adb2bdfef5e1d55773";
         };
         # AMD GPU evidence package. The distribution string pins every build
         # input through flake.lock; the recorded SHA-256 is the Nix-fixed ORT
