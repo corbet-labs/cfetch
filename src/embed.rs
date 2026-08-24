@@ -534,7 +534,6 @@ pub fn sync_configured(
     cfg: &Config,
     batch: usize,
 ) -> anyhow::Result<(EmbedIndexReport, usize)> {
-    anyhow::ensure!(cfg.embeddings.enabled, "embeddings are disabled");
     anyhow::ensure!(
         cfg.client.serving.is_none(),
         "this host delegates its index; vectors are maintained by the storage host"

@@ -93,7 +93,7 @@ How to behave, who you are, and what grants access.
         children: &["active", "backlog", "blocked", "done"],
         reserved: &[
             ("scratch", "never indexed: high-volume disposable working files"),
-            ("staging", "never indexed: ring-5 candidates awaiting distillation"),
+            ("staging", "never indexed: autonomous maintenance evidence and history"),
         ],
         readme: "\
 # todo

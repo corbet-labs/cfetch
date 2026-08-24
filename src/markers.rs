@@ -26,7 +26,7 @@ pub fn doctrine(surface: Surface) -> String {
             "`cfetch recall --id <citation>`",
             "`cfetch find <symbol-or-file>`",
             "`cfetch status --json`",
-            "`cfetch maintain packet <candidate-id>`",
+            "`cfetch maintain history`",
             "\n\nThe same tools are available over MCP: command `cfetch`, args `[\"mcp\"]`.",
         ),
         Surface::Mcp => (
@@ -35,7 +35,7 @@ pub fn doctrine(surface: Surface) -> String {
             "`cfetch_expand` with a citation id",
             "`cfetch_find`",
             "`cfetch_runtime_status`",
-            "`cfetch_maintenance_packet`, `cfetch_maintenance_propose`, and `cfetch_maintenance_review`",
+            "`cfetch_maintenance_packet`, `cfetch_maintenance_propose`, and `cfetch_maintenance_review` when debugging",
             "",
         ),
     };
@@ -48,8 +48,9 @@ pub fn doctrine(surface: Surface) -> String {
          - {find} — exact line ranges from the code index;\n\
          \x20 read the returned slice instead of the whole file.\n\
          - {status} — inspect cached runtime health only when it affects the task; do not poll.\n\
-         - {maintain} — inspect maintenance evidence and, when asked, place a typed proposal or review\n\
-         \x20 in ring-5 quarantine. Never apply or finalize a memory change without explicit approval.{coda}"
+         - {maintain} — inspect autonomous maintenance only when debugging or asked. cfetch normally\n\
+         \x20 proposes, independently reviews, verifies, and applies evidence-grounded changes itself;\n\
+         \x20 direct Markdown or Obsidian edits remain authoritative and must never be overwritten by stale work.{coda}"
     )
 }
 

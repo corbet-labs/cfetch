@@ -735,6 +735,8 @@ fn inference_diagnostic(
                     "paused"
                 } else if !cfg.maintenance.configured() {
                     "setup_needed"
+                } else if runtime.maintenance.last_model_success == Some(false) {
+                    "model_unavailable"
                 } else if runtime.maintenance.last_outcome.as_deref() == Some("exception") {
                     "exception"
                 } else if runtime.maintenance.candidates > 0 {
@@ -1349,7 +1351,9 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
     lines.push(DisplayLine::new(
         match report.inference.maintenance.state.as_str() {
             "idle" => DisplayTone::Good,
-            "processing" | "setup_needed" | "exception" => DisplayTone::Warning,
+            "processing" | "setup_needed" | "model_unavailable" | "exception" => {
+                DisplayTone::Warning
+            }
             _ => DisplayTone::Muted,
         },
         if report.inference.maintenance.configured {

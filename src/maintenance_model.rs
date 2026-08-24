@@ -131,6 +131,8 @@ impl MaintenanceClient {
             let status = response.status();
             let text = response
                 .body_mut()
+                .with_config()
+                .limit(MAX_RESPONSE_BYTES as u64)
                 .read_to_string()
                 .with_context(|| format!("read response from {}", self.url))?;
             anyhow::ensure!(
@@ -151,11 +153,9 @@ impl MaintenanceClient {
             serde_json::from_str(content).context("maintenance model output does not match the required JSON schema")
         })();
 
-        crate::runtime_status::record_inference_attempt(
-            crate::runtime_status::InferenceMode::Endpoint,
+        crate::runtime_status::record_maintenance_attempt(
             crate::runtime_status::endpoint_route(&self.url),
             activity,
-            None,
             result.is_ok(),
         );
         result
@@ -168,7 +168,7 @@ impl MaintenanceModel for MaintenanceClient {
             &self.model,
             PROPOSER_SYSTEM,
             serde_json::json!({"evidence_packet": packet}),
-            "maintenance-proposal",
+            "proposal",
         )
     }
 
@@ -181,7 +181,7 @@ impl MaintenanceModel for MaintenanceClient {
             &self.review_model,
             REVIEWER_SYSTEM,
             serde_json::json!({"evidence_packet": packet, "proposal": proposal}),
-            "maintenance-review",
+            "review",
         )?;
         // The transport, not model prose, determines how this review happened.
         review.method = ReviewMethod::IndependentAgent;
@@ -255,5 +255,25 @@ mod tests {
         assert!(MaintenanceClient::new(&cfg).unwrap_err().to_string().contains("not configured"));
         let cfg = config("http://10.0.0.4:8080/v1");
         assert!(MaintenanceClient::new(&cfg).is_err());
+    }
+
+    #[test]
+    fn response_body_is_stream_bounded_before_allocation() {
+        let oversized = "x".repeat(MAX_RESPONSE_BYTES + 1024);
+        let (url, _, _) = spawn_server(move |_, _| http_response(200, &oversized));
+        let client = MaintenanceClient::new(&config(&url)).unwrap();
+        let error = client
+            .complete::<serde_json::Value>(
+                "proposer",
+                PROPOSER_SYSTEM,
+                serde_json::json!({}),
+                "proposal",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("read response") || error.contains("exceeds"),
+            "{error}"
+        );
     }
 }

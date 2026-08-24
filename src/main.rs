@@ -398,11 +398,11 @@ enum MaintainAction {
     },
     /// Apply a passing independent review through the autonomous policy gates
     AutoApply { id: String },
-    /// Restore the captured bytes of an applied, unfinalized proposal
+    /// Restore captured before-bytes while the exact applied bytes still match
     Revert { id: String },
     /// Reject a proposal without dismissing its source candidate
     Reject { id: String },
-    /// Finish only after git HEAD contains the exact applied bytes
+    /// Finish a legacy manual apply after git HEAD contains its exact bytes
     Finalize { id: String },
 }
 
@@ -1505,9 +1505,9 @@ fn recall(
     Ok(())
 }
 
-/// Ring-5 staging review over the shared tree. Flagging happens in the Stop
-/// hook's traps; this is the human side of the ladder. Candidates from EVERY
-/// host are listed, because the staging directory is one directory.
+/// Manual/debug view over ring-5 evidence in the shared tree. The autonomous
+/// worker normally settles these candidates; this surface remains available
+/// for intervention and inspection across every host.
 fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     let ex = exhaust::Exhaust::from_config(&cfg);
@@ -1538,7 +1538,7 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
                     .collect();
                 println!("{}", serde_json::json!(arr));
             } else if rows.is_empty() {
-                println!("staging is empty — no flagged exhaust awaiting review");
+                println!("staging is empty — no captured evidence awaiting maintenance");
                 println!("  ({})", dir.display());
             } else {
                 for c in &rows {
@@ -1548,7 +1548,7 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
                         c.id, c.reason, c.kind, c.host, session, c.payload
                     );
                 }
-                println!("\ndistill a candidate, then: cfetch staging consume <id> | dismiss <id>");
+                println!("\ndebug manually: cfetch maintain packet <id> | staging dismiss <id>");
             }
         }
         StagingAction::Consume { id } => {
@@ -2169,7 +2169,7 @@ fn status() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "staging: {} ring-5 candidate(s) awaiting distillation [{reasons}] in {}",
+            "staging: {} ring-5 candidate(s) awaiting autonomous maintenance [{reasons}] in {}",
             ring56.staged_total,
             ex.staging_dir.display()
         );
@@ -2181,7 +2181,7 @@ fn status() -> anyhow::Result<()> {
             "staging: 0 ring-5 candidates — UNOBSERVED: no ring-6 exhaust has ever been written, so no turn has been examined"
         );
     } else {
-        println!("staging: no ring-5 candidates awaiting distillation (measured)");
+        println!("staging: no ring-5 candidates awaiting maintenance (measured)");
     }
     println!(
         "exhaust: {} of ring-6 stream in {}",

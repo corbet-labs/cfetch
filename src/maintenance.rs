@@ -25,6 +25,7 @@ const MAX_RELEVANT: usize = 12;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_JOURNAL_TEXT_BYTES: usize = 16 * 1024;
 const LOCK_WAIT_MS: u64 = 2_000;
 
 const PENDING: &str = "pending";
@@ -729,8 +730,9 @@ fn render(proposal: &Proposal) -> String {
     let json = serde_json::to_string_pretty(proposal).unwrap_or_else(|_| "{}".to_string());
     format!(
         "---\nring: 5\ntype: cfetch-maintenance-proposal\nid: {:?}\ntransition: {:?}\n---\n\n\
-         Quarantined maintenance proposal. It is not recalled or injected. Review the exact\n\
-         evidence and diff with `cfetch maintain verify {}` before approving it.\n\n\
+         Quarantined maintenance proposal. It is not recalled or injected. The automatic and\n\
+         manual paths re-run exact evidence, authority, and target checks before applying it.\n\
+         Inspect those checks with `cfetch maintain verify {}`.\n\n\
          ```json\n{}\n```\n",
         proposal.id,
         format!("{:?}", proposal.transition).to_ascii_lowercase(),
@@ -744,7 +746,7 @@ fn render_review(review: &Review) -> String {
     format!(
         "---\nring: 5\ntype: cfetch-maintenance-review\nid: {:?}\nproposal: {:?}\nverdict: {:?}\n---\n\n\
          Immutable semantic review of a quarantined maintenance proposal. Deterministic\n\
-         gates are re-run separately before any approval token is issued.\n\n\
+         gates are re-run separately before either automatic or manual application.\n\n\
          ```json\n{}\n```\n",
         review.id,
         review.proposal_id,
@@ -772,6 +774,10 @@ fn load_event_at(path: &Path) -> anyhow::Result<MaintenanceEvent> {
 }
 
 fn write_event(cfg: &Config, mut event: MaintenanceEvent) -> anyhow::Result<MaintenanceEvent> {
+    event.detail = journal_text(&event.detail);
+    for check in &mut event.checks {
+        check.detail = journal_text(&check.detail);
+    }
     let mut identity = event.clone();
     identity.id.clear();
     event.id = format!("event-{}", &hash_bytes(serde_json::to_vec(&identity)?)[..16]);
@@ -783,6 +789,20 @@ fn write_event(cfg: &Config, mut event: MaintenanceEvent) -> anyhow::Result<Main
     }
     fsutil::atomic_write(&path, render_event(&event))?;
     Ok(event)
+}
+
+fn journal_text(value: &str) -> String {
+    if let Some(shape) = secret_shape(value) {
+        return format!("detail redacted by the maintenance journal ({shape})");
+    }
+    if value.len() <= MAX_JOURNAL_TEXT_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_JOURNAL_TEXT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [journal detail truncated]", &value[..end])
 }
 
 pub fn history(cfg: &Config) -> Vec<MaintenanceEvent> {
@@ -2349,5 +2369,17 @@ mod tests {
             std::fs::read_to_string(fixture.brain.path().join("knowledge/reversible.md")).unwrap(),
             "# Human edit\n"
         );
+    }
+
+    #[test]
+    fn journal_details_are_secret_safe_and_bounded() {
+        let redacted = journal_text("endpoint returned sk-123456789012345678901234567890");
+        assert!(redacted.contains("redacted"), "{redacted}");
+        assert!(!redacted.contains("sk-"), "{redacted}");
+
+        let large = "é".repeat(MAX_JOURNAL_TEXT_BYTES);
+        let bounded = journal_text(&large);
+        assert!(bounded.len() <= MAX_JOURNAL_TEXT_BYTES + 64);
+        assert!(bounded.ends_with("[journal detail truncated]"));
     }
 }
