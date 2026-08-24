@@ -93,7 +93,7 @@ How to behave, who you are, and what grants access.
         children: &["active", "backlog", "blocked", "done"],
         reserved: &[
             ("scratch", "never indexed: high-volume disposable working files"),
-            ("staging", "never indexed: ring-5 candidates awaiting distillation"),
+            ("staging", "never indexed: autonomous maintenance evidence and history"),
         ],
         readme: "\
 # todo
@@ -108,9 +108,9 @@ Work state. Ring 4 — the current task, not the finished record.
 Two reserved lanes are never indexed. `scratch/` is disposable working
 material — without the exclusion it drowns the ring it shares, measured at
 12,276 scratch files against 27 files of live task state. `staging/` holds
-ring-5 candidates: captured, quarantined, and promoted only by a deliberate
-act. Both are quarantined by LOCATION, so a file whose frontmatter was
-stripped or hand-edited is still quarantined.
+ring-5 candidates: captured, quarantined, and promoted only through an
+evidence-grounded maintenance transaction. Both are quarantined by LOCATION,
+so a file whose frontmatter was stripped or hand-edited is still quarantined.
 ",
     },
     Dir {
@@ -191,8 +191,8 @@ const GITIGNORE: &str = "\
 /state/
 
 # Ring 5 candidates and disposable working material. Both are working
-# material, not record: they graduate into the tree by a deliberate promotion,
-# and until then they are not history.
+# material, not record: candidates cross into the tree only through the
+# evidence-grounded maintenance gates, and until then they are not history.
 /todo/staging/
 /todo/scratch/
 ";

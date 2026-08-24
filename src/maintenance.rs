@@ -1,11 +1,12 @@
-//! Supervised AI maintenance for the 6 -> 5 -> 2/3 trust crossing.
+//! Autonomous, evidence-grounded maintenance for the 6 -> 5 -> 2/3/4 trust crossing.
 //!
 //! The model-facing half is deliberately narrow: build a bounded evidence
-//! packet and accept a typed proposal into ring-5 quarantine. Only the CLI
-//! exposes the authority-bearing half: deterministic verification, an exact
-//! approval token, reversible application, and finalization after git proves
-//! the proposed bytes are committed. No background process calls a model and
-//! no MCP tool can write trusted memory.
+//! packet and accept a typed proposal into ring-5 quarantine. A separate model
+//! pass reviews the proposal, deterministic gates bind it to current bytes,
+//! and the normal maintenance loop applies it without routine human approval.
+//! Direct Markdown edits remain authoritative: stale work is rejected rather
+//! than rebased over the user's bytes. Manual CLI operations remain available
+//! for inspection, debugging, and exact reversion.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -24,6 +25,7 @@ const MAX_RELEVANT: usize = 12;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_JOURNAL_TEXT_BYTES: usize = 16 * 1024;
 const LOCK_WAIT_MS: u64 = 2_000;
 
 const PENDING: &str = "pending";
@@ -32,6 +34,8 @@ const FINALIZED: &str = "finalized";
 const REJECTED: &str = "rejected";
 const REVERTED: &str = "reverted";
 const REVIEWS: &str = "reviews";
+const HISTORY: &str = "history";
+const PAUSE_FILE: &str = "PAUSED.md";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -211,7 +215,7 @@ pub struct EvidencePacket {
     pub proposal_contract: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Check {
     pub name: String,
     pub ok: bool,
@@ -249,6 +253,59 @@ pub struct FinalizeResult {
     pub proposal_id: String,
     pub candidate_ids: Vec<String>,
     pub already_finalized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventOutcome {
+    Applied,
+    Dismissed,
+    Noop,
+    Reverted,
+    Exception,
+}
+
+/// One immutable, human-readable maintenance event. Proposal and review files
+/// retain the exact evidence and bytes; this is the compact timeline that the
+/// CLI/TUI can read without reconstructing state transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceEvent {
+    pub schema_version: u64,
+    pub id: String,
+    pub created_at: i64,
+    pub created_by_host: String,
+    pub proposal_id: Option<String>,
+    pub candidate_ids: Vec<String>,
+    pub outcome: EventOutcome,
+    pub target: Option<String>,
+    pub before_sha256: Option<String>,
+    pub after_sha256: Option<String>,
+    pub review_id: Option<String>,
+    pub checks: Vec<Check>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RunReport {
+    pub paused: bool,
+    pub examined: usize,
+    pub applied: usize,
+    pub dismissed: usize,
+    pub noops: usize,
+    pub exceptions: usize,
+}
+
+/// The inference boundary is intentionally smaller than the transaction
+/// engine. Production may use local hardware or a configured remote endpoint;
+/// tests and integrations can supply any implementation without weakening the
+/// deterministic gates below it.
+pub trait MaintenanceModel {
+    fn propose(&mut self, packet: &EvidencePacket) -> anyhow::Result<ProposalInput>;
+    fn review(
+        &mut self,
+        packet: &EvidencePacket,
+        proposal: &Proposal,
+    ) -> anyhow::Result<ReviewInput>;
 }
 
 fn now() -> i64 {
@@ -294,6 +351,14 @@ fn proposal_path(brain_root: &Path, state: &str, id: &str) -> PathBuf {
 
 fn review_path(brain_root: &Path, proposal_id: &str) -> PathBuf {
     state_dir(brain_root, REVIEWS).join(format!("{proposal_id}.md"))
+}
+
+fn history_path(brain_root: &Path, event_id: &str) -> PathBuf {
+    state_dir(brain_root, HISTORY).join(format!("{event_id}.md"))
+}
+
+fn pause_path(brain_root: &Path) -> PathBuf {
+    maintenance_root(brain_root).join(PAUSE_FILE)
 }
 
 fn lock(cfg: &Config) -> anyhow::Result<crate::lockfile::Lock> {
@@ -486,7 +551,7 @@ fn effective_ring(rel: &str, after: &str, rules: &RingRules) -> u8 {
 fn target_policy(rel: &str, after: &str, authority: Authority, rules: &RingRules) -> anyhow::Result<u8> {
     anyhow::ensure!(index::indexable_doc(rel, rules), "target is excluded from the recallable Markdown tree");
     let ring = effective_ring(rel, after, rules);
-    anyhow::ensure!((2..=3).contains(&ring), "maintenance may write only rings 2-3; {rel} resolves to ring {ring}");
+    anyhow::ensure!((2..=4).contains(&ring), "maintenance may write only rings 2-4; {rel} resolves to ring {ring}");
     match (ring, authority) {
         (2, Authority::Authorized) => {}
         (2, _) => anyhow::bail!("ring 2 requires authorized authority from a direct operator instruction"),
@@ -579,7 +644,7 @@ fn snapshot_target(candidate: &staging::Candidate, cfg: &Config) -> Option<Targe
 
 pub fn proposal_contract() -> serde_json::Value {
     serde_json::json!({
-        "candidate_ids": ["candidate id(s) from this packet"],
+        "candidate_ids": ["the exact candidate id from this packet"],
         "transition": "add | fold | supersede | revalidate | dismiss | noop",
         "target": "brain-relative .md path; required for content transitions, otherwise null",
         "after": "complete proposed Markdown bytes; required for content transitions, otherwise null",
@@ -665,8 +730,9 @@ fn render(proposal: &Proposal) -> String {
     let json = serde_json::to_string_pretty(proposal).unwrap_or_else(|_| "{}".to_string());
     format!(
         "---\nring: 5\ntype: cfetch-maintenance-proposal\nid: {:?}\ntransition: {:?}\n---\n\n\
-         Quarantined maintenance proposal. It is not recalled or injected. Review the exact\n\
-         evidence and diff with `cfetch maintain verify {}` before approving it.\n\n\
+         Quarantined maintenance proposal. It is not recalled or injected. The automatic and\n\
+         manual paths re-run exact evidence, authority, and target checks before applying it.\n\
+         Inspect those checks with `cfetch maintain verify {}`.\n\n\
          ```json\n{}\n```\n",
         proposal.id,
         format!("{:?}", proposal.transition).to_ascii_lowercase(),
@@ -680,13 +746,146 @@ fn render_review(review: &Review) -> String {
     format!(
         "---\nring: 5\ntype: cfetch-maintenance-review\nid: {:?}\nproposal: {:?}\nverdict: {:?}\n---\n\n\
          Immutable semantic review of a quarantined maintenance proposal. Deterministic\n\
-         gates are re-run separately before any approval token is issued.\n\n\
+         gates are re-run separately before either automatic or manual application.\n\n\
          ```json\n{}\n```\n",
         review.id,
         review.proposal_id,
         format!("{:?}", review.verdict).to_ascii_lowercase(),
         json,
     )
+}
+
+fn render_event(event: &MaintenanceEvent) -> String {
+    let json = serde_json::to_string_pretty(event).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "---\nring: 5\ntype: cfetch-maintenance-event\nid: {:?}\noutcome: {:?}\n---\n\n\
+         Immutable maintenance history. The proposal and review named below retain the\n\
+         complete evidence, snapshots, and rationale.\n\n\
+         ```json\n{}\n```\n",
+        event.id,
+        format!("{:?}", event.outcome).to_ascii_lowercase(),
+        json,
+    )
+}
+
+fn load_event_at(path: &Path) -> anyhow::Result<MaintenanceEvent> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let event: MaintenanceEvent =
+        serde_json::from_value(fenced_json(&text)?).context("decode maintenance event")?;
+    let expected = event_identity(&event)?;
+    anyhow::ensure!(
+        event.id == expected,
+        "maintenance event content address mismatch: expected {expected}"
+    );
+    anyhow::ensure!(
+        path.file_stem().and_then(|name| name.to_str()) == Some(event.id.as_str()),
+        "maintenance event filename does not match its content address"
+    );
+    Ok(event)
+}
+
+fn event_identity(event: &MaintenanceEvent) -> anyhow::Result<String> {
+    let mut identity = event.clone();
+    identity.id.clear();
+    Ok(format!("event-{}", &hash_bytes(serde_json::to_vec(&identity)?)[..16]))
+}
+
+fn write_event(cfg: &Config, mut event: MaintenanceEvent) -> anyhow::Result<MaintenanceEvent> {
+    event.detail = journal_text(&event.detail);
+    for check in &mut event.checks {
+        check.detail = journal_text(&check.detail);
+    }
+    event.id = event_identity(&event)?;
+    let path = history_path(&cfg.brain_root, &event.id);
+    if path.exists() {
+        let existing = load_event_at(&path)?;
+        anyhow::ensure!(existing == event, "maintenance event id collision at {}", path.display());
+        return Ok(existing);
+    }
+    fsutil::atomic_write(&path, render_event(&event))?;
+    Ok(event)
+}
+
+fn journal_text(value: &str) -> String {
+    if let Some(shape) = secret_shape(value) {
+        return format!("detail redacted by the maintenance journal ({shape})");
+    }
+    if value.len() <= MAX_JOURNAL_TEXT_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_JOURNAL_TEXT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [journal detail truncated]", &value[..end])
+}
+
+pub fn history(cfg: &Config) -> Vec<MaintenanceEvent> {
+    let Ok(entries) = std::fs::read_dir(state_dir(&cfg.brain_root, HISTORY)) else {
+        return Vec::new();
+    };
+    let mut events: Vec<_> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .filter_map(|path| load_event_at(&path).ok())
+        .collect();
+    events.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+    events
+}
+
+/// Corrupt or edited history is never accepted as an automatic outcome. The
+/// doctor uses these bounded, brain-relative diagnostics to make tampering or
+/// storage damage visible instead of silently lowering the event count.
+pub fn history_issues(cfg: &Config) -> Vec<String> {
+    let dir = state_dir(&cfg.brain_root, HISTORY);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => return vec![format!("history directory unreadable: {error}")],
+    };
+    let mut issues = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .filter_map(|path| {
+            load_event_at(&path).err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or("history record")
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    issues.sort();
+    issues
+}
+
+fn event_for(
+    proposal: Option<&Proposal>,
+    outcome: EventOutcome,
+    review_id: Option<String>,
+    checks: Vec<Check>,
+    detail: impl Into<String>,
+    fallback_candidates: Vec<String>,
+) -> MaintenanceEvent {
+    MaintenanceEvent {
+        schema_version: SCHEMA_VERSION,
+        id: String::new(),
+        created_at: now(),
+        created_by_host: paths::host_id(),
+        proposal_id: proposal.map(|proposal| proposal.id.clone()),
+        candidate_ids: proposal
+            .map(|proposal| proposal.candidates.iter().map(|source| source.id.clone()).collect())
+            .unwrap_or(fallback_candidates),
+        outcome,
+        target: proposal.and_then(|proposal| proposal.target.clone()),
+        before_sha256: proposal.and_then(|proposal| proposal.before_sha256.clone()),
+        after_sha256: proposal.and_then(|proposal| proposal.after.as_ref().map(hash_bytes)),
+        review_id,
+        checks,
+        detail: detail.into(),
+    }
 }
 
 fn fenced_json(text: &str) -> anyhow::Result<serde_json::Value> {
@@ -1267,6 +1466,313 @@ pub fn apply(cfg: &Config, id: &str, token: &str) -> anyhow::Result<Proposal> {
     Ok(proposal)
 }
 
+fn frontmatter_pauses_maintenance(text: &str) -> bool {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return false;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if matches!(key.trim(), "cfetch-maintenance" | "cfetch_maintenance")
+            && matches!(
+                value.trim().trim_matches(['\'', '"']).to_ascii_lowercase().as_str(),
+                "pause" | "paused" | "manual" | "off"
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn direct_user_evidence(cfg: &Config, proposal: &Proposal) -> anyhow::Result<bool> {
+    let staging_dir = paths::staging_dir(&cfg.brain_root);
+    let mut found = false;
+    for source in &proposal.candidates {
+        let candidate = find_candidate(&staging_dir, &source.id)?;
+        let direct = matches!(candidate.reason.as_str(), "correction" | "direct-instruction")
+            || candidate
+                .payload
+                .get("authority")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|authority| matches!(authority, "operator" | "user"));
+        if !direct {
+            return Ok(false);
+        }
+        found = true;
+    }
+    Ok(found)
+}
+
+fn verify_automatic_policy(cfg: &Config, proposal: &Proposal) -> anyhow::Result<()> {
+    if let Some(before) = proposal.before.as_deref()
+        && frontmatter_pauses_maintenance(before)
+    {
+        anyhow::bail!("target is paused by frontmatter; edit or remove cfetch-maintenance before retrying");
+    }
+    if let Some(after) = proposal.after.as_deref()
+        && frontmatter_pauses_maintenance(after)
+    {
+        anyhow::bail!("proposed target is paused by frontmatter and cannot be written automatically");
+    }
+    if proposal.transition.changes_memory() {
+        let rel = proposal.target.as_deref().unwrap_or_default();
+        let after = proposal.after.as_deref().unwrap_or_default();
+        if effective_ring(rel, after, &cfg.rings()) == 2 {
+            anyhow::ensure!(
+                direct_user_evidence(cfg, proposal)?,
+                "automatic ring 2 maintenance requires direct user evidence; model-selected authorized authority is insufficient"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Apply a reviewed proposal through the normal autonomous path. There is no
+/// human token and no git dependency: the independent semantic review and all
+/// deterministic gates are re-run under the transaction lock immediately
+/// before the exact bytes are written. The proposal record is retained for
+/// exact reversion.
+pub fn automatic_apply(cfg: &Config, id: &str) -> anyhow::Result<Proposal> {
+    let _lock = lock(cfg)?;
+    let (_, _, proposal) = locate(&cfg.brain_root, id, &[PENDING])?;
+    let verification = verify_proposal(cfg, &proposal, false, true);
+    anyhow::ensure!(
+        verification.valid,
+        "proposal does not pass verification: {}",
+        verification
+            .checks
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| format!("{}: {}", check.name, check.detail))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    verify_automatic_policy(cfg, &proposal)?;
+
+    let mut written_path = None;
+    if proposal.transition.changes_memory() {
+        let path = reject_symlink_path(
+            &cfg.brain_root,
+            proposal.target.as_deref().unwrap_or_default(),
+        )?;
+        fsutil::atomic_write(&path, proposal.after.as_deref().unwrap_or_default())?;
+        written_path = Some(path);
+    }
+    if let Err(error) = move_proposal(&cfg.brain_root, id, PENDING, FINALIZED) {
+        if let Some(path) = written_path.as_deref() {
+            match proposal.before.as_deref() {
+                Some(before) => fsutil::atomic_write(path, before)?,
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        return Err(error.context("automatic state move failed; target was rolled back"));
+    }
+
+    let outcome = match proposal.transition {
+        Transition::Dismiss => EventOutcome::Dismissed,
+        Transition::Noop => EventOutcome::Noop,
+        _ => EventOutcome::Applied,
+    };
+    let review_id = verification.review_id.clone();
+    if let Err(error) = write_event(
+        cfg,
+        event_for(
+            Some(&proposal),
+            outcome,
+            review_id,
+            verification.checks.clone(),
+            "independent semantic review and deterministic gates passed; exact bytes applied automatically",
+            Vec::new(),
+        ),
+    ) {
+        if let Some(path) = written_path.as_deref() {
+            match proposal.before.as_deref() {
+                Some(before) => fsutil::atomic_write(path, before)?,
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        if let Err(move_error) = move_proposal(&cfg.brain_root, id, FINALIZED, PENDING) {
+            if let Some(path) = written_path.as_deref() {
+                fsutil::atomic_write(path, proposal.after.as_deref().unwrap_or_default())?;
+            }
+            return Err(error.context(format!(
+                "write maintenance history; rollback state also failed: {move_error}"
+            )));
+        }
+        return Err(error.context("write maintenance history; automatic target was rolled back"));
+    }
+
+    // Finalized is the commit point. Candidate cleanup is replayable through
+    // `finalize`; a transient log or filesystem problem must not make a
+    // successfully applied edit look unapplied.
+    let _ = settle_candidates(cfg, &proposal);
+    Ok(proposal)
+}
+
+pub fn pause(cfg: &Config, reason: &str) -> anyhow::Result<()> {
+    let reason = reason.trim();
+    anyhow::ensure!(!reason.is_empty(), "pause reason is empty");
+    anyhow::ensure!(reason.len() <= 4 * 1024, "pause reason is too large");
+    if let Some(shape) = secret_shape(reason) {
+        anyhow::bail!("pause reason contains a {shape}");
+    }
+    let _lock = lock(cfg)?;
+    fsutil::atomic_write(
+        &pause_path(&cfg.brain_root),
+        format!(
+            "---\nring: 5\ntype: cfetch-maintenance-pause\n---\n\n# Maintenance paused\n\n{reason}\n"
+        ),
+    )
+}
+
+pub fn pause_reason(cfg: &Config) -> Option<String> {
+    let text = std::fs::read_to_string(pause_path(&cfg.brain_root)).ok()?;
+    text.split_once("# Maintenance paused\n\n")
+        .map(|(_, reason)| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty())
+}
+
+pub fn is_paused(cfg: &Config) -> bool {
+    pause_path(&cfg.brain_root).is_file()
+}
+
+/// Content revision of the actionable candidate set. Background maintenance
+/// uses this as an event signal: polling may be periodic, but model inference
+/// happens only after the evidence set changes (or a bounded retry is due).
+pub fn candidate_revision(cfg: &Config) -> String {
+    let candidates = staging::list(&paths::staging_dir(&cfg.brain_root));
+    hash_bytes(serde_json::to_vec(&candidates).unwrap_or_default())
+}
+
+pub fn resume(cfg: &Config) -> anyhow::Result<()> {
+    let _lock = lock(cfg)?;
+    match std::fs::remove_file(pause_path(&cfg.brain_root)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove maintenance pause marker"),
+    }
+}
+
+fn record_exception(
+    cfg: &Config,
+    proposal: Option<&Proposal>,
+    candidate_ids: Vec<String>,
+    detail: impl Into<String>,
+    checks: Vec<Check>,
+) -> anyhow::Result<MaintenanceEvent> {
+    write_event(
+        cfg,
+        event_for(
+            proposal,
+            EventOutcome::Exception,
+            None,
+            checks,
+            detail,
+            candidate_ids,
+        ),
+    )
+}
+
+/// Records a worker failure that happened before a proposal existed (for
+/// example, endpoint policy or credential resolution). Candidate ids are
+/// bounded and the ordinary journal redaction/content-addressing still apply.
+pub(crate) fn record_background_exception(
+    cfg: &Config,
+    detail: impl Into<String>,
+) -> anyhow::Result<MaintenanceEvent> {
+    let candidate_ids = staging::list(&paths::staging_dir(&cfg.brain_root))
+        .into_iter()
+        .take(cfg.maintenance.max_candidates)
+        .map(|candidate| candidate.id)
+        .collect();
+    record_exception(cfg, None, candidate_ids, detail, Vec::new())
+}
+
+/// Process a bounded batch and continue past per-candidate exceptions. A
+/// healthy cycle needs no human input; failures remain visible in history and
+/// their source candidates remain available for a later, freshly grounded
+/// attempt.
+pub fn run_once_with<M: MaintenanceModel>(
+    cfg: &Config,
+    model: &mut M,
+    limit: usize,
+) -> anyhow::Result<RunReport> {
+    if pause_path(&cfg.brain_root).is_file() {
+        return Ok(RunReport { paused: true, ..RunReport::default() });
+    }
+    let mut report = RunReport::default();
+    let candidates = staging::list(&paths::staging_dir(&cfg.brain_root));
+    for candidate in candidates.into_iter().take(limit.max(1)) {
+        report.examined += 1;
+        let mut submitted: Option<Proposal> = None;
+        let result = (|| -> anyhow::Result<Proposal> {
+            let packet = packet(cfg, &candidate.id)?;
+            let input = model.propose(&packet)?;
+            anyhow::ensure!(
+                input.candidate_ids.len() == 1 && input.candidate_ids[0] == candidate.id,
+                "autonomous proposal must name only packet candidate {}; got {:?}",
+                candidate.id,
+                input.candidate_ids
+            );
+            let proposal = submit(cfg, input)?.proposal;
+            submitted = Some(proposal.clone());
+            let review = model.review(&packet, &proposal)?;
+            let (recorded, _) = submit_review(cfg, &proposal.id, review)?;
+            anyhow::ensure!(
+                recorded.verdict == ReviewVerdict::Pass,
+                "independent semantic review failed: {}",
+                recorded.notes
+            );
+            automatic_apply(cfg, &proposal.id)
+        })();
+
+        match result {
+            Ok(proposal) => match proposal.transition {
+                Transition::Dismiss => report.dismissed += 1,
+                Transition::Noop => report.noops += 1,
+                _ => report.applied += 1,
+            },
+            Err(error) => {
+                report.exceptions += 1;
+                let detail = error.to_string();
+                if let Some(proposal) = submitted.as_ref() {
+                    let verification = verify_proposal(cfg, proposal, false, true);
+                    let _ = record_exception(
+                        cfg,
+                        Some(proposal),
+                        Vec::new(),
+                        detail,
+                        verification.checks,
+                    );
+                    if proposal_path(&cfg.brain_root, PENDING, &proposal.id).is_file() {
+                        let _ = reject(cfg, &proposal.id);
+                    }
+                } else {
+                    let _ = record_exception(
+                        cfg,
+                        None,
+                        vec![candidate.id],
+                        detail,
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 pub fn reject(cfg: &Config, id: &str) -> anyhow::Result<()> {
     let _lock = lock(cfg)?;
     locate(&cfg.brain_root, id, &[PENDING])?;
@@ -1275,7 +1781,7 @@ pub fn reject(cfg: &Config, id: &str) -> anyhow::Result<()> {
 
 pub fn revert(cfg: &Config, id: &str) -> anyhow::Result<Proposal> {
     let _lock = lock(cfg)?;
-    let (_, _, proposal) = locate(&cfg.brain_root, id, &[APPLIED])?;
+    let (state, _, proposal) = locate(&cfg.brain_root, id, &[APPLIED, FINALIZED])?;
     let verification = verify_proposal(cfg, &proposal, true, true);
     anyhow::ensure!(verification.valid, "applied proposal no longer matches the tree: {}", verification.checks.iter().filter(|check| !check.ok).map(|check| format!("{}: {}", check.name, check.detail)).collect::<Vec<_>>().join("; "));
     if proposal.transition.changes_memory() {
@@ -1284,12 +1790,37 @@ pub fn revert(cfg: &Config, id: &str) -> anyhow::Result<Proposal> {
             Some(before) => fsutil::atomic_write(&path, before)?,
             None => std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?,
         }
-        if let Err(error) = move_proposal(&cfg.brain_root, id, APPLIED, REVERTED) {
+        if let Err(error) = move_proposal(&cfg.brain_root, id, &state, REVERTED) {
             fsutil::atomic_write(&path, proposal.after.as_deref().unwrap_or_default())?;
             return Err(error.context("proposal state move failed; applied target was restored"));
         }
     } else {
-        move_proposal(&cfg.brain_root, id, APPLIED, REVERTED)?;
+        move_proposal(&cfg.brain_root, id, &state, REVERTED)?;
+    }
+    if let Err(error) = write_event(
+        cfg,
+        event_for(
+            Some(&proposal),
+            EventOutcome::Reverted,
+            verification.review_id,
+            verification.checks,
+            "exact automatic or manual result was still present and its captured before bytes were restored",
+            Vec::new(),
+        ),
+    ) {
+        if proposal.transition.changes_memory() {
+            let path = reject_symlink_path(
+                &cfg.brain_root,
+                proposal.target.as_deref().unwrap_or_default(),
+            )?;
+            fsutil::atomic_write(&path, proposal.after.as_deref().unwrap_or_default())?;
+        }
+        if let Err(move_error) = move_proposal(&cfg.brain_root, id, REVERTED, &state) {
+            return Err(error.context(format!(
+                "write revert history; restoring proposal state also failed: {move_error}"
+            )));
+        }
+        return Err(error.context("write revert history; reverted bytes and state were rolled back"));
     }
     Ok(proposal)
 }
@@ -1626,7 +2157,7 @@ mod tests {
         assert!(submit(&fixture.cfg, ring_two).is_ok());
 
         let ring_one = fixture.proposal("AGENT.md", "# Policy\n");
-        assert!(submit(&fixture.cfg, ring_one).unwrap_err().to_string().contains("only rings 2-3"));
+        assert!(submit(&fixture.cfg, ring_one).unwrap_err().to_string().contains("only rings 2-4"));
 
         let mut unendorsed = fixture.proposal("knowledge/inference.md", "# Guess\n");
         unendorsed.authority = Authority::Unendorsed;
@@ -1719,5 +2250,281 @@ mod tests {
         apply(&fixture.cfg, &proposal.id, &token).unwrap();
         finalize(&fixture.cfg, &proposal.id).unwrap();
         assert!(staging::dismissed_path(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id).is_file());
+    }
+
+    #[derive(Clone)]
+    struct FakeModel {
+        proposal: ProposalInput,
+        review: ReviewInput,
+        edit_before_review: Option<(PathBuf, String)>,
+    }
+
+    impl MaintenanceModel for FakeModel {
+        fn propose(&mut self, _packet: &EvidencePacket) -> anyhow::Result<ProposalInput> {
+            Ok(self.proposal.clone())
+        }
+
+        fn review(
+            &mut self,
+            _packet: &EvidencePacket,
+            _proposal: &Proposal,
+        ) -> anyhow::Result<ReviewInput> {
+            if let Some((path, bytes)) = self.edit_before_review.take() {
+                std::fs::write(path, bytes)?;
+            }
+            Ok(self.review.clone())
+        }
+    }
+
+    fn passing_review() -> ReviewInput {
+        ReviewInput {
+            verdict: ReviewVerdict::Pass,
+            method: ReviewMethod::IndependentAgent,
+            evidence_coverage: true,
+            factual_faithfulness: true,
+            preservation: true,
+            authority_fit: true,
+            target_fit: true,
+            contradiction_checked: true,
+            notes: "Independent review found the proposed bytes faithful to the evidence.".into(),
+        }
+    }
+
+    #[test]
+    fn automatic_cycle_applies_reviews_finalizes_and_journals_without_human_token_or_git() {
+        let fixture = Fixture::new();
+        let mut model = FakeModel {
+            proposal: fixture.proposal(
+                "knowledge/automatic.md",
+                "---\nring: 3\n---\n\n# Automatically maintained\n",
+            ),
+            review: passing_review(),
+            edit_before_review: None,
+        };
+
+        let report = run_once_with(&fixture.cfg, &mut model, 8).unwrap();
+
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.exceptions, 0);
+        assert_eq!(
+            std::fs::read_to_string(fixture.brain.path().join("knowledge/automatic.md")).unwrap(),
+            "---\nring: 3\n---\n\n# Automatically maintained\n"
+        );
+        assert_eq!(pending_count(&fixture.cfg), 0);
+        assert_eq!(history(&fixture.cfg).len(), 1);
+        let event = &history(&fixture.cfg)[0];
+        assert_eq!(event.outcome, EventOutcome::Applied);
+        assert_eq!(event.target.as_deref(), Some("knowledge/automatic.md"));
+        let expected_hash = hash_bytes("---\nring: 3\n---\n\n# Automatically maintained\n");
+        assert_eq!(
+            event.after_sha256.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert!(event.review_id.is_some());
+        assert!(event.checks.iter().all(|check| check.ok));
+        assert!(!staging::path_of(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id).exists());
+    }
+
+    #[test]
+    fn autonomous_review_cannot_cover_a_candidate_absent_from_its_packet() {
+        let fixture = Fixture::new();
+        let mut proposal = fixture.proposal("knowledge/wrong-packet.md", "# Wrong packet\n");
+        proposal.candidate_ids = vec!["another-pending-candidate".into()];
+        let mut model = FakeModel {
+            proposal,
+            review: passing_review(),
+            edit_before_review: None,
+        };
+
+        let report = run_once_with(&fixture.cfg, &mut model, 8).unwrap();
+
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.exceptions, 1);
+        assert!(!fixture.brain.path().join("knowledge/wrong-packet.md").exists());
+        assert!(
+            staging::path_of(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id)
+                .is_file()
+        );
+        assert!(history(&fixture.cfg)[0].detail.contains("must name only packet candidate"));
+    }
+
+    #[test]
+    fn external_obsidian_edit_wins_and_becomes_a_visible_exception() {
+        let fixture = Fixture::new();
+        let target = fixture.brain.path().join("knowledge/existing.md");
+        std::fs::write(&target, "old\n").unwrap();
+        let mut proposal = fixture.proposal("knowledge/existing.md", "automatic\n");
+        proposal.transition = Transition::Fold;
+        let mut model = FakeModel {
+            proposal,
+            review: passing_review(),
+            edit_before_review: Some((target.clone(), "edited in obsidian\n".into())),
+        };
+
+        let report = run_once_with(&fixture.cfg, &mut model, 8).unwrap();
+
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.exceptions, 1);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "edited in obsidian\n");
+        let events = history(&fixture.cfg);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, EventOutcome::Exception);
+        assert!(events[0].detail.contains("target_boundary"), "{}", events[0].detail);
+        assert!(staging::path_of(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id).is_file());
+    }
+
+    #[test]
+    fn automatic_cycle_skips_a_paused_target() {
+        let fixture = Fixture::new();
+        let target = fixture.brain.path().join("knowledge/paused.md");
+        std::fs::write(
+            &target,
+            "---\nring: 3\ncfetch-maintenance: paused\n---\n\n# Hands off\n",
+        )
+        .unwrap();
+        let mut proposal = fixture.proposal(
+            "knowledge/paused.md",
+            "---\nring: 3\ncfetch-maintenance: paused\n---\n\n# Changed\n",
+        );
+        proposal.transition = Transition::Fold;
+        let mut model = FakeModel {
+            proposal,
+            review: passing_review(),
+            edit_before_review: None,
+        };
+
+        let report = run_once_with(&fixture.cfg, &mut model, 8).unwrap();
+
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.exceptions, 1);
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "---\nring: 3\ncfetch-maintenance: paused\n---\n\n# Hands off\n"
+        );
+        assert!(history(&fixture.cfg)[0].detail.contains("paused by frontmatter"));
+    }
+
+    #[test]
+    fn global_pause_prevents_model_calls_and_is_readable_state() {
+        let fixture = Fixture::new();
+        pause(&fixture.cfg, "debugging an unexpected edit").unwrap();
+        let mut model = FakeModel {
+            proposal: fixture.proposal("knowledge/never.md", "# Never\n"),
+            review: passing_review(),
+            edit_before_review: None,
+        };
+
+        let report = run_once_with(&fixture.cfg, &mut model, 8).unwrap();
+
+        assert!(report.paused);
+        assert_eq!(report.examined, 0);
+        assert_eq!(pause_reason(&fixture.cfg).as_deref(), Some("debugging an unexpected edit"));
+        resume(&fixture.cfg).unwrap();
+        assert!(pause_reason(&fixture.cfg).is_none());
+    }
+
+    #[test]
+    fn automatic_ring_two_requires_direct_user_evidence_while_ring_four_is_allowed() {
+        let fixture = Fixture::new();
+        let mut ring_two = fixture.proposal("mind/memories/automatic.md", "# Behavior\n");
+        ring_two.authority = Authority::Authorized;
+        let proposal = submit(&fixture.cfg, ring_two).unwrap().proposal;
+        fixture.pass_review(&proposal.id);
+        assert!(automatic_apply(&fixture.cfg, &proposal.id)
+            .unwrap_err()
+            .to_string()
+            .contains("direct user evidence"));
+
+        let fixture = Fixture::new();
+        let ring_four = fixture.proposal("todo/current.md", "---\nring: 4\n---\n\n# Current work\n");
+        assert!(submit(&fixture.cfg, ring_four).is_ok());
+    }
+
+    #[test]
+    fn finalized_automatic_change_is_reversible_only_while_its_bytes_still_match() {
+        let fixture = Fixture::new();
+        let proposal = submit(
+            &fixture.cfg,
+            fixture.proposal("knowledge/reversible.md", "# Maintained\n"),
+        )
+        .unwrap()
+        .proposal;
+        fixture.pass_review(&proposal.id);
+        automatic_apply(&fixture.cfg, &proposal.id).unwrap();
+        revert(&fixture.cfg, &proposal.id).unwrap();
+        assert!(!fixture.brain.path().join("knowledge/reversible.md").exists());
+
+        let fixture = Fixture::new();
+        let proposal = submit(
+            &fixture.cfg,
+            fixture.proposal("knowledge/reversible.md", "# Maintained\n"),
+        )
+        .unwrap()
+        .proposal;
+        fixture.pass_review(&proposal.id);
+        automatic_apply(&fixture.cfg, &proposal.id).unwrap();
+        std::fs::write(fixture.brain.path().join("knowledge/reversible.md"), "# Human edit\n").unwrap();
+        assert!(revert(&fixture.cfg, &proposal.id).is_err());
+        assert_eq!(
+            std::fs::read_to_string(fixture.brain.path().join("knowledge/reversible.md")).unwrap(),
+            "# Human edit\n"
+        );
+    }
+
+    #[test]
+    fn journal_details_are_secret_safe_and_bounded() {
+        let redacted = journal_text("endpoint returned sk-123456789012345678901234567890");
+        assert!(redacted.contains("redacted"), "{redacted}");
+        assert!(!redacted.contains("sk-"), "{redacted}");
+
+        let large = "é".repeat(MAX_JOURNAL_TEXT_BYTES);
+        let bounded = journal_text(&large);
+        assert!(bounded.len() <= MAX_JOURNAL_TEXT_BYTES + 64);
+        assert!(bounded.ends_with("[journal detail truncated]"));
+    }
+
+    #[test]
+    fn edited_history_is_rejected_and_reported_for_doctor() {
+        let fixture = Fixture::new();
+        let event = write_event(
+            &fixture.cfg,
+            event_for(
+                None,
+                EventOutcome::Exception,
+                None,
+                Vec::new(),
+                "original exception",
+                vec![fixture.candidate.id.clone()],
+            ),
+        )
+        .unwrap();
+        let path = history_path(fixture.brain.path(), &event.id);
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("original exception", "edited exception");
+        std::fs::write(path, edited).unwrap();
+
+        assert!(history(&fixture.cfg).is_empty());
+        let issues = history_issues(&fixture.cfg);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("content address mismatch"), "{issues:?}");
+    }
+
+    #[test]
+    fn preflight_failure_is_visible_without_a_proposal() {
+        let fixture = Fixture::new();
+
+        let event = record_background_exception(
+            &fixture.cfg,
+            "maintenance.api_key=sk-123456789012345678901234567890",
+        )
+        .unwrap();
+
+        assert_eq!(event.outcome, EventOutcome::Exception);
+        assert!(event.proposal_id.is_none());
+        assert_eq!(event.candidate_ids, vec![fixture.candidate.id.clone()]);
+        assert!(event.detail.contains("redacted"));
+        assert!(!event.detail.contains("sk-"));
     }
 }

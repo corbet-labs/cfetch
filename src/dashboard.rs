@@ -1,5 +1,5 @@
-//! Ratatui terminal dashboard: read-only brain health, live recall, and the
-//! supervised maintenance inbox. One TUI, no daemon required.
+//! Ratatui terminal dashboard: brain health, live recall, autonomous
+//! maintenance activity, and system diagnostics. One TUI, no browser.
 //!
 //! The numbers come from whatever holds this host's index: the LOCAL index on
 //! a storage host, the SERVING host on a none-tier one. It opens a local index
@@ -21,7 +21,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 use crate::config::{ClientServingConfig, Config};
 use crate::maintenance_inbox::{Inbox, Tone};
 use crate::{
-    daemon, doctor, exhaust, heartbeat, index, ledger, maintenance, paths, runtime_status, serve,
+    daemon, doctor, exhaust, heartbeat, index, knowledge_graph, ledger, maintenance, paths,
+    runtime_status, serve,
 };
 
 /// Remote budget for the dashboard's own calls. Deliberately shorter than the
@@ -253,8 +254,8 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             }
         )),
     ];
-    // Ring-5 staging: candidates awaiting a distillation session. Yellow the
-    // moment anything is pending — quarantine must not be invisible.
+    // Ring-5 staging is unfinished evidence, not an approval queue. Yellow the
+    // moment anything is waiting or an old manual transaction is unfinished.
     lines.push(if s.staging_total > 0 {
         let reasons = s
             .staging_by_reason
@@ -264,8 +265,11 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             .join(", ");
         Line::from(Span::styled(
             format!(
-                "staging: {} candidate(s) [{reasons}]   maintenance: {} pending / {} applied",
-                s.staging_total, s.maintenance_pending, s.maintenance_applied
+                "staging: {} candidate(s) [{reasons}]   activity: {} event(s), {} proposed / {} legacy applied",
+                s.staging_total,
+                s.runtime.maintenance.history_events,
+                s.maintenance_pending,
+                s.maintenance_applied
             ),
             Style::default().fg(Color::Yellow),
         ))
@@ -275,22 +279,27 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         // traps, so this zero is the absence of a measurement.
         Line::from(Span::styled(
             format!(
-                "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust written   maintenance: {} pending / {} applied",
-                s.maintenance_pending, s.maintenance_applied
+                "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust written   activity: {} event(s)",
+                s.runtime.maintenance.history_events
             ),
             Style::default().fg(Color::Yellow),
         ))
     } else if s.maintenance_pending > 0 || s.maintenance_applied > 0 {
         Line::from(Span::styled(
             format!(
-                "staging: 0 candidates (measured)   maintenance: {} pending / {} applied",
-                s.maintenance_pending, s.maintenance_applied
+                "staging: 0 candidates (measured)   activity: {} event(s), {} proposed / {} legacy applied",
+                s.runtime.maintenance.history_events,
+                s.maintenance_pending,
+                s.maintenance_applied
             ),
             Style::default().fg(Color::Yellow),
         ))
     } else {
         Line::from(Span::styled(
-            "staging: 0 candidates (measured)   maintenance: 0 pending / 0 applied".to_string(),
+            format!(
+                "staging: 0 candidates (measured)   activity: {} event(s)",
+                s.runtime.maintenance.history_events
+            ),
             Style::default().fg(Color::DarkGray),
         ))
     });
@@ -338,6 +347,8 @@ struct App {
     hits: Vec<serve::WireHit>,
     status: String,
     inbox: Inbox,
+    graph: Result<knowledge_graph::KnowledgeGraph, String>,
+    graph_scroll: u16,
     system: doctor::ReportV1,
     system_scroll: u16,
 }
@@ -345,17 +356,38 @@ struct App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Recall,
-    Maintenance,
+    Activity,
+    Graph,
     System,
 }
 
 impl Pane {
     fn toggle(self) -> Self {
         match self {
-            Self::Recall => Self::Maintenance,
-            Self::Maintenance => Self::System,
+            Self::Recall => Self::Activity,
+            Self::Activity => Self::Graph,
+            Self::Graph => Self::System,
             Self::System => Self::Recall,
         }
+    }
+}
+
+fn graph_view(source: &Source) -> Result<knowledge_graph::KnowledgeGraph, String> {
+    match source {
+        Source::Local { conn, .. } => knowledge_graph::build(conn, None, 60)
+            .map_err(|error| error.to_string()),
+        Source::Served(config) => {
+            let response = served(
+                config,
+                serde_json::json!({"op": "graph", "limit": 60}),
+                REMOTE_STATUS_TIMEOUT,
+            )
+            .map_err(|error| error.to_string())?;
+            response.knowledge_graph.ok_or_else(|| {
+                format!("serving host {} returned no knowledge graph", config.addr)
+            })
+        }
+        Source::Unusable(reason) => Err(reason.clone()),
     }
 }
 
@@ -402,7 +434,7 @@ fn draw_recall(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_maintenance(f: &mut Frame, area: Rect, inbox: &Inbox) {
+fn draw_activity(f: &mut Frame, area: Rect, inbox: &Inbox) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
@@ -443,6 +475,85 @@ fn draw_maintenance(f: &mut Frame, area: Rect, inbox: &Inbox) {
             .wrap(Wrap { trim: false })
             .scroll((inbox.detail_scroll, 0)),
         chunks[1],
+    );
+}
+
+fn draw_graph(f: &mut Frame, area: Rect, app: &App) {
+    let lines = match &app.graph {
+        Err(error) => vec![
+            Line::from(Span::styled(
+                format!("knowledge graph unavailable: {error}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "The graph is derived from the Markdown catalog; no separate graph database is authoritative.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+        Ok(graph) => {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "{} document(s) · {} curated link(s) · {} unresolved reference(s) · generation {}",
+                        graph.total_nodes,
+                        graph.total_edges,
+                        graph.unresolved_references,
+                        graph.generation,
+                    ),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "Markdown and Obsidian links are authoritative; this is a rebuildable view.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Most connected documents",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+            ];
+            lines.extend(graph.nodes.iter().map(|node| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("r{} ", node.ring),
+                        Style::default().fg(ring_color(node.ring)),
+                    ),
+                    Span::styled(
+                        format!("←{:<3} →{:<3} ", node.inbound, node.outbound),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(
+                        format!("{:<12} ", node.kind),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(node.path.clone()),
+                ])
+            }));
+            if !graph.edges.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Curated links in this view",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.extend(graph.edges.iter().map(|edge| {
+                    Line::from(format!("{} → {}", edge.from, edge.to))
+                }));
+                if graph.omitted_edges > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("… {} more link(s) omitted", graph.omitted_edges),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            lines
+        }
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" knowledge graph "))
+            .wrap(Wrap { trim: false })
+            .scroll((app.graph_scroll, 0)),
+        area,
     );
 }
 
@@ -491,11 +602,12 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
         chunks[0],
     );
     f.render_widget(
-        Tabs::new(["Recall", "Maintenance inbox", "System"])
+        Tabs::new(["Recall", "Activity", "Graph", "System"])
             .select(match app.pane {
                 Pane::Recall => 0,
-                Pane::Maintenance => 1,
-                Pane::System => 2,
+                Pane::Activity => 1,
+                Pane::Graph => 2,
+                Pane::System => 3,
             })
             .block(Block::default().borders(Borders::ALL).title(" Tab switches view "))
             .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -503,13 +615,17 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
     );
     match app.pane {
         Pane::Recall => draw_recall(f, chunks[2], app),
-        Pane::Maintenance => draw_maintenance(f, chunks[2], &app.inbox),
+        Pane::Activity => draw_activity(f, chunks[2], &app.inbox),
+        Pane::Graph => draw_graph(f, chunks[2], app),
         Pane::System => draw_system(f, chunks[2], app),
     }
     let help = match app.pane {
-        Pane::Recall => " Tab inbox · Enter search · Backspace edit · Esc/Ctrl-C quit ",
-        Pane::Maintenance => {
-            " Tab system · ↑/↓ or j/k select · PgUp/PgDn scroll · r refresh · Esc/Ctrl-C quit "
+        Pane::Recall => " Tab activity · Enter search · Backspace edit · Esc/Ctrl-C quit ",
+        Pane::Activity => {
+            " Tab graph · ↑/↓ or j/k select · PgUp/PgDn scroll · r refresh · Esc/Ctrl-C quit "
+        }
+        Pane::Graph => {
+            " Tab system · ↑/↓ or j/k scroll · PgUp/PgDn scroll · r rebuild view · Esc/Ctrl-C quit "
         }
         Pane::System => {
             " Tab recall · ↑/↓ or j/k scroll · PgUp/PgDn scroll · r probe now · Esc/Ctrl-C quit "
@@ -548,12 +664,15 @@ fn run_with_pane(initial_pane: Pane, probe_network: bool) -> anyhow::Result<()> 
         hits: Vec::new(),
         status: "no query yet".into(),
         inbox: Inbox::load(&cfg, can_verify_locally),
+        graph: graph_view(&source),
+        graph_scroll: 0,
         system: doctor::gather_with(&cfg, &state, None, probe_network),
         system_scroll: 0,
     };
     let mut stats = gather(&cfg, &source, &state);
     let mut last_refresh = std::time::Instant::now();
     let mut last_system_refresh = std::time::Instant::now();
+    let mut last_graph_refresh = std::time::Instant::now();
 
     let result: anyhow::Result<()> = loop {
         if last_refresh.elapsed() > Duration::from_secs(2) {
@@ -563,6 +682,10 @@ fn run_with_pane(initial_pane: Pane, probe_network: bool) -> anyhow::Result<()> 
         if last_system_refresh.elapsed() > Duration::from_secs(5) {
             app.system = doctor::gather_with(&cfg, &state, None, probe_network);
             last_system_refresh = std::time::Instant::now();
+        }
+        if last_graph_refresh.elapsed() > Duration::from_secs(5) {
+            app.graph = graph_view(&source);
+            last_graph_refresh = std::time::Instant::now();
         }
         if let Err(e) = terminal.draw(|f| draw(f, &stats, &app)) {
             break Err(e.into());
@@ -593,28 +716,47 @@ fn run_with_pane(initial_pane: Pane, probe_network: bool) -> anyhow::Result<()> 
                         app.query.pop();
                     }
                     KeyCode::Char(c) if app.pane == Pane::Recall => app.query.push(c),
-                    KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Maintenance => {
+                    KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Activity => {
                         app.inbox.select_next(&cfg, can_verify_locally);
                     }
-                    KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Maintenance => {
+                    KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Activity => {
                         app.inbox.select_previous(&cfg, can_verify_locally);
                     }
-                    KeyCode::Home if app.pane == Pane::Maintenance => {
+                    KeyCode::Home if app.pane == Pane::Activity => {
                         app.inbox.select_first(&cfg, can_verify_locally);
                     }
-                    KeyCode::End if app.pane == Pane::Maintenance => {
+                    KeyCode::End if app.pane == Pane::Activity => {
                         app.inbox.select_last(&cfg, can_verify_locally);
                     }
-                    KeyCode::PageDown if app.pane == Pane::Maintenance => {
+                    KeyCode::PageDown if app.pane == Pane::Activity => {
                         app.inbox.scroll_down(12);
                     }
-                    KeyCode::PageUp if app.pane == Pane::Maintenance => {
+                    KeyCode::PageUp if app.pane == Pane::Activity => {
                         app.inbox.scroll_up(12);
                     }
-                    KeyCode::Char('r') if app.pane == Pane::Maintenance => {
+                    KeyCode::Char('r') if app.pane == Pane::Activity => {
                         app.inbox.refresh(&cfg, can_verify_locally);
                         stats = gather(&cfg, &source, &state);
                         last_refresh = std::time::Instant::now();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Graph => {
+                        app.graph_scroll = app.graph_scroll.saturating_add(1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Graph => {
+                        app.graph_scroll = app.graph_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Home if app.pane == Pane::Graph => {
+                        app.graph_scroll = 0;
+                    }
+                    KeyCode::PageDown if app.pane == Pane::Graph => {
+                        app.graph_scroll = app.graph_scroll.saturating_add(12);
+                    }
+                    KeyCode::PageUp if app.pane == Pane::Graph => {
+                        app.graph_scroll = app.graph_scroll.saturating_sub(12);
+                    }
+                    KeyCode::Char('r') if app.pane == Pane::Graph => {
+                        app.graph = graph_view(&source);
+                        last_graph_refresh = std::time::Instant::now();
                     }
                     KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::System => {
                         app.system_scroll = app.system_scroll.saturating_add(1);
@@ -973,7 +1115,10 @@ mod tests {
             "got: {text}"
         );
         assert!(text.contains("exhaust: 4.2 MiB"), "got: {text}");
-        assert!(text.contains("maintenance: 2 pending / 1 applied"), "got: {text}");
+        assert!(
+            text.contains("activity: 0 event(s), 2 proposed / 1 legacy applied"),
+            "got: {text}"
+        );
         let staging_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("staging:")))

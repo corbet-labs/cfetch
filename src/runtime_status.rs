@@ -140,10 +140,40 @@ pub struct InferenceStatus {
     pub last_used: Option<InferenceAttempt>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub route: Option<InferenceRoute>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub last_model_activity: Option<String>,
+    #[serde(default)]
+    pub last_model_success: Option<bool>,
+    #[serde(default)]
+    pub last_model_at: Option<u64>,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub candidates: u64,
+    /// Quarantined proposals awaiting an automatic or debugging action.
+    #[serde(default)]
     pub pending: u64,
+    /// Legacy manual proposals written but not git-finalized.
+    #[serde(default)]
     pub applied: u64,
+    #[serde(default)]
+    pub history_events: u64,
+    #[serde(default)]
+    pub exceptions: u64,
+    #[serde(default)]
+    pub last_event_at: Option<u64>,
+    #[serde(default)]
+    pub last_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,10 +225,7 @@ impl Default for RuntimeStatusV1 {
                 selected: None,
                 last_used: None,
             },
-            maintenance: MaintenanceStatus {
-                pending: 0,
-                applied: 0,
-            },
+            maintenance: MaintenanceStatus::default(),
             failures: Vec::new(),
         }
     }
@@ -399,6 +426,23 @@ fn update(mutate: impl FnOnce(&mut RuntimeStatusV1)) -> Option<RuntimeStatusV1> 
 
 fn normalize(status: &mut RuntimeStatusV1) {
     status.memory_route.origin_label = origin_label(status.memory_route.mode);
+    status.maintenance.model = status
+        .maintenance
+        .model
+        .as_deref()
+        .and_then(safe_model_label);
+    status.maintenance.last_model_activity = status
+        .maintenance
+        .last_model_activity
+        .as_deref()
+        .and_then(safe_maintenance_activity);
+    if !status.maintenance.configured {
+        status.maintenance.route = None;
+        status.maintenance.model = None;
+        status.maintenance.last_model_activity = None;
+        status.maintenance.last_model_success = None;
+        status.maintenance.last_model_at = None;
+    }
     if let Some(selected) = &mut status.inference.selected {
         selected.backend = safe_backend_label(&selected.backend);
         selected.device_class = selected
@@ -466,6 +510,18 @@ fn canonical_failure(code: &str) -> Option<RuntimeFailure> {
             FailureSeverity::Warning,
             "check inference credentials and endpoint policy",
         ),
+        "maintenance_unconfigured" => (
+            FailureSeverity::Warning,
+            "configure maintenance.endpoint and maintenance.model or run cfetch maintain pause",
+        ),
+        "maintenance_exception" => (
+            FailureSeverity::Warning,
+            "run cfetch maintain history and inspect the latest exception",
+        ),
+        "maintenance_model_unavailable" => (
+            FailureSeverity::Warning,
+            "check maintenance model configuration and endpoint policy",
+        ),
         _ => return None,
     };
     Some(RuntimeFailure {
@@ -511,8 +567,60 @@ pub fn refresh_static() -> anyhow::Result<RuntimeStatusV1> {
     let status = update(|status| match &cfg {
         Ok(cfg) => {
             apply_config(status, cfg);
+            let events = maintenance::history(cfg);
+            status.maintenance.enabled = cfg.maintenance.enabled;
+            status.maintenance.configured = cfg.maintenance.configured();
+            status.maintenance.route = status
+                .maintenance
+                .configured
+                .then(|| endpoint_route(&cfg.maintenance.endpoint));
+            status.maintenance.model = if status.maintenance.configured {
+                safe_model_label(&cfg.maintenance.model)
+            } else {
+                None
+            };
+            status.maintenance.paused = maintenance::is_paused(cfg);
+            status.maintenance.candidates =
+                crate::staging::pending_count(&paths::staging_dir(&cfg.brain_root)) as u64;
             status.maintenance.pending = maintenance::pending_count(cfg) as u64;
             status.maintenance.applied = maintenance::applied_count(cfg) as u64;
+            status.maintenance.history_events = events.len() as u64;
+            status.maintenance.exceptions = events
+                .iter()
+                .filter(|event| event.outcome == maintenance::EventOutcome::Exception)
+                .count() as u64;
+            status.maintenance.last_event_at =
+                events.first().map(|event| event.created_at.max(0) as u64);
+            status.maintenance.last_outcome = events
+                .first()
+                .map(|event| format!("{:?}", event.outcome).to_ascii_lowercase());
+            remove_failure(status, "maintenance_unconfigured");
+            remove_failure(status, "maintenance_exception");
+            if !status.maintenance.enabled || !status.maintenance.configured {
+                remove_failure(status, "maintenance_model_unavailable");
+            }
+            if status.maintenance.enabled
+                && !status.maintenance.configured
+                && status.maintenance.candidates > 0
+                && !status.maintenance.paused
+            {
+                upsert_failure(
+                    status,
+                    "maintenance_unconfigured",
+                    FailureSeverity::Warning,
+                    "configure maintenance.endpoint and maintenance.model or pause maintenance",
+                );
+            }
+            if status.maintenance.candidates > 0
+                && status.maintenance.last_outcome.as_deref() == Some("exception")
+            {
+                upsert_failure(
+                    status,
+                    "maintenance_exception",
+                    FailureSeverity::Warning,
+                    "inspect cfetch maintain history",
+                );
+            }
             if cfg.client.serving.is_none() {
                 status.memory_route.generation = None;
                 if cfg.embeddings.enabled {
@@ -749,6 +857,23 @@ fn safe_device_label(value: &str) -> Option<String> {
     .map(str::to_string)
 }
 
+fn safe_model_label(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 80
+        && !value.contains("://")
+        && !value.starts_with('/')
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._/".contains(character)))
+    .then(|| value.to_string())
+}
+
+fn safe_maintenance_activity(value: &str) -> Option<String> {
+    matches!(value, "proposal" | "review").then(|| value.to_string())
+}
+
 pub fn record_inference_attempt(
     configured: InferenceMode,
     route: InferenceRoute,
@@ -768,6 +893,40 @@ pub fn record_inference_attempt(
             success,
         )
     });
+}
+
+pub fn record_maintenance_attempt(
+    route: InferenceRoute,
+    activity: &str,
+    success: bool,
+) {
+    let activity = safe_maintenance_activity(activity);
+    let _ = update(|status| apply_maintenance_attempt(status, route, activity, success));
+}
+
+fn apply_maintenance_attempt(
+    status: &mut RuntimeStatusV1,
+    route: InferenceRoute,
+    activity: Option<String>,
+    success: bool,
+) {
+    status.maintenance.enabled = true;
+    status.maintenance.configured = true;
+    status.maintenance.route = Some(route);
+    status.maintenance.last_model_activity = activity;
+    status.maintenance.last_model_success = Some(success);
+    status.maintenance.last_model_at = Some(now());
+    remove_failure(status, "maintenance_model_unavailable");
+    if success {
+        recover_if_clean(status);
+    } else {
+        upsert_failure(
+            status,
+            "maintenance_model_unavailable",
+            FailureSeverity::Warning,
+            "check maintenance model configuration and endpoint policy",
+        );
+    }
 }
 
 fn apply_inference_attempt(
@@ -984,7 +1143,33 @@ pub fn render_line_with_width(status: &RuntimeStatusV1, width: Option<usize>) ->
         parts.push(coverage);
     }
     parts.push(inference_label(status));
-    parts.push(format!("maint {}", status.maintenance.pending));
+    let maintenance = if !status.maintenance.enabled {
+        "maint:off".to_string()
+    } else if status.maintenance.paused {
+        "maint:paused".to_string()
+    } else if status.maintenance.exceptions > 0
+        && status.maintenance.last_outcome.as_deref() == Some("exception")
+    {
+        format!("maint:exception {}", status.maintenance.exceptions)
+    } else if status.maintenance.last_model_success == Some(false) {
+        "maint:model-failed".to_string()
+    } else if status.maintenance.configured {
+        let route = match status.maintenance.route {
+            Some(InferenceRoute::Local) => " local",
+            Some(InferenceRoute::Remote) => " remote",
+            None => "",
+        };
+        if status.maintenance.candidates == 0 {
+            format!("maint:auto{route} idle")
+        } else {
+            format!("maint:auto{route} {}", status.maintenance.candidates)
+        }
+    } else if status.maintenance.candidates > 0 {
+        format!("maint:setup {}", status.maintenance.candidates)
+    } else {
+        "maint:setup".to_string()
+    };
+    parts.push(maintenance);
     let line = parts.join(" · ");
     truncate_to_width(line, width.unwrap_or(usize::MAX))
 }
@@ -1011,7 +1196,9 @@ pub fn mcp_json() -> anyhow::Result<String> {
 
 /// Fingerprint of model-relevant transitions. Generation, timestamps,
 /// maintenance counts, and successful-use recency are intentionally absent,
-/// so normal catalog churn cannot spam a coding session.
+/// so normal catalog churn cannot spam a coding session. Maintenance mode
+/// changes are included because they change whether staged evidence will be
+/// folded into Markdown without intervention.
 pub fn transition_fingerprint(status: &RuntimeStatusV1) -> String {
     let failures = status
         .failures
@@ -1039,13 +1226,17 @@ pub fn transition_fingerprint(status: &RuntimeStatusV1) -> String {
         .map(|last| format!("{:?}", last.route))
         .unwrap_or_default();
     format!(
-        "{:?}|{:?}|{:?}|{:?}|{}|{}|{}",
+        "{:?}|{:?}|{:?}|{:?}|{}|{}|{}:{}:{:?}:{}|{}",
         status.service.state,
         status.memory_route.mode,
         status.inference.configured,
         status.inference.configured_route,
         selected,
         last_route,
+        status.maintenance.enabled,
+        status.maintenance.configured,
+        status.maintenance.route,
+        status.maintenance.paused,
         failures,
     )
 }
@@ -1062,6 +1253,12 @@ pub fn adaptation_context(status: &RuntimeStatusV1) -> Option<String> {
         "[cfetch degraded: the configured memory route is unavailable; do not claim memory-backed results until it recovers.]"
     } else if codes.contains(&"memory_stale") {
         "[cfetch degraded: the last served memory answer was stale; verify freshness before relying on recent changes.]"
+    } else if codes.contains(&"maintenance_exception") {
+        "[cfetch maintenance exception: captured evidence remains safe in staging and no stale Markdown was overwritten. Use `cfetch maintain history` when debugging matters.]"
+    } else if codes.contains(&"maintenance_unconfigured") {
+        "[cfetch maintenance is not configured: recall and capture still work, but staged evidence is not being folded into Markdown automatically.]"
+    } else if codes.contains(&"maintenance_model_unavailable") {
+        "[cfetch maintenance model is unavailable: captured evidence remains staged and Markdown is unchanged; recall continues normally.]"
     } else if codes.contains(&"retrieval_degraded")
         || codes.contains(&"vector_coverage_none")
         || codes.contains(&"vector_coverage_partial")
@@ -1279,6 +1476,92 @@ mod tests {
     }
 
     #[test]
+    fn older_v1_maintenance_status_still_deserializes() {
+        let mut json = serde_json::to_value(RuntimeStatusV1::default()).unwrap();
+        json["maintenance"] = serde_json::json!({
+            "pending": 2,
+            "applied": 1
+        });
+
+        let status: RuntimeStatusV1 = serde_json::from_value(json).unwrap();
+        assert_eq!(status.maintenance.pending, 2);
+        assert_eq!(status.maintenance.applied, 1);
+        assert!(!status.maintenance.enabled);
+        assert!(!status.maintenance.configured);
+        assert!(status.maintenance.route.is_none());
+        assert!(status.maintenance.model.is_none());
+        assert!(status.maintenance.last_model_activity.is_none());
+        assert!(status.maintenance.last_model_success.is_none());
+        assert!(status.maintenance.last_outcome.is_none());
+    }
+
+    #[test]
+    fn maintenance_line_distinguishes_off_setup_auto_pause_and_exception() {
+        let mut status = RuntimeStatusV1::default();
+        let line = |status: &RuntimeStatusV1| render_line_with_width(status, Some(240));
+        assert!(line(&status).contains("maint:off"));
+
+        status.maintenance.enabled = true;
+        status.maintenance.candidates = 2;
+        assert!(line(&status).contains("maint:setup 2"));
+
+        status.maintenance.configured = true;
+        status.maintenance.route = Some(InferenceRoute::Remote);
+        status.maintenance.candidates = 0;
+        assert!(line(&status).contains("maint:auto remote idle"));
+
+        status.maintenance.paused = true;
+        assert!(line(&status).contains("maint:paused"));
+
+        status.maintenance.paused = false;
+        status.maintenance.exceptions = 3;
+        status.maintenance.last_outcome = Some("exception".into());
+        assert!(line(&status).contains("maint:exception 3"));
+
+        status.maintenance.exceptions = 0;
+        status.maintenance.last_outcome = Some("applied".into());
+        status.maintenance.last_model_success = Some(false);
+        assert!(line(&status).contains("maint:model-failed"));
+    }
+
+    #[test]
+    fn maintenance_model_attempt_does_not_rewrite_embedding_truth() {
+        let mut status = RuntimeStatusV1::default();
+        apply_maintenance_attempt(
+            &mut status,
+            InferenceRoute::Remote,
+            Some("proposal".into()),
+            false,
+        );
+        normalize(&mut status);
+
+        assert_eq!(status.inference.configured, InferenceMode::Disabled);
+        assert_eq!(status.maintenance.last_model_activity.as_deref(), Some("proposal"));
+        assert_eq!(status.maintenance.last_model_success, Some(false));
+        assert!(status
+            .failures
+            .iter()
+            .any(|failure| failure.code == "maintenance_model_unavailable"));
+        assert!(adaptation_context(&status)
+            .unwrap()
+            .contains("Markdown is unchanged"));
+
+        apply_maintenance_attempt(
+            &mut status,
+            InferenceRoute::Remote,
+            Some("review".into()),
+            true,
+        );
+        normalize(&mut status);
+        assert_eq!(status.maintenance.last_model_activity.as_deref(), Some("review"));
+        assert_eq!(status.maintenance.last_model_success, Some(true));
+        assert!(!status
+            .failures
+            .iter()
+            .any(|failure| failure.code == "maintenance_model_unavailable"));
+    }
+
+    #[test]
     fn failed_memory_attempt_preserves_last_successful_answer() {
         let mut status = RuntimeStatusV1::default();
         status.memory_route.generation = Some(41);
@@ -1442,6 +1725,27 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_model_route_does_not_masquerade_as_embeddings() {
+        let mut cfg = Config::default();
+        cfg.maintenance.endpoint = "https://example.invalid/v1".into();
+        cfg.maintenance.model = "memory-maintainer-v1".into();
+        let mut status = RuntimeStatusV1::default();
+        apply_config(&mut status, &cfg);
+        status.maintenance.enabled = cfg.maintenance.enabled;
+        status.maintenance.configured = cfg.maintenance.configured();
+        status.maintenance.route = Some(endpoint_route(&cfg.maintenance.endpoint));
+        status.maintenance.model = safe_model_label(&cfg.maintenance.model);
+        normalize(&mut status);
+
+        assert_eq!(status.inference.configured, InferenceMode::Disabled);
+        assert_eq!(status.maintenance.route, Some(InferenceRoute::Remote));
+        let line = render_line_with_width(&status, Some(240));
+        assert!(line.contains("embed:off"), "{line}");
+        assert!(line.contains("maint:auto remote idle"), "{line}");
+        assert!(!line.contains("vectors"), "{line}");
+    }
+
+    #[test]
     fn disabling_inference_clears_old_inference_degradation() {
         let mut status = RuntimeStatusV1::default();
         status.service.state = ServiceState::Degraded;
@@ -1482,6 +1786,31 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_context_preserves_safe_staging_and_explains_setup() {
+        let mut status = RuntimeStatusV1::default();
+        upsert_failure(
+            &mut status,
+            "maintenance_exception",
+            FailureSeverity::Warning,
+            "ignored",
+        );
+        assert!(adaptation_context(&status)
+            .unwrap()
+            .contains("no stale Markdown was overwritten"));
+
+        remove_failure(&mut status, "maintenance_exception");
+        upsert_failure(
+            &mut status,
+            "maintenance_unconfigured",
+            FailureSeverity::Warning,
+            "ignored",
+        );
+        assert!(adaptation_context(&status)
+            .unwrap()
+            .contains("not being folded into Markdown automatically"));
+    }
+
+    #[test]
     fn cached_line_read_path_stays_under_the_status_line_budget() {
         let dir = tempfile::tempdir().unwrap();
         store_in(dir.path(), &RuntimeStatusV1::default()).unwrap();
@@ -1516,11 +1845,14 @@ mod tests {
             severity: FailureSeverity::Critical,
             action: "read /secret/token".into(),
         });
+        status.maintenance.configured = true;
+        status.maintenance.model = Some("https://private.invalid/model".into());
         normalize(&mut status);
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("://"), "{json}");
         assert!(!json.contains("/sys/"), "{json}");
         assert!(!json.contains("/secret/"), "{json}");
+        assert!(status.maintenance.model.is_none());
         assert!(
             status.failures.is_empty(),
             "unknown failure codes are refused"
@@ -1535,11 +1867,49 @@ mod tests {
         b.memory_route.generation = Some(999);
         b.memory_route.last_answer.observed_at = Some(999);
         b.maintenance.pending = 7;
+        b.maintenance.candidates = 11;
+        b.maintenance.history_events = 19;
+        b.maintenance.exceptions = 3;
+        b.maintenance.last_event_at = Some(999);
+        b.maintenance.last_outcome = Some("exception".into());
         b.retrieval.mode = RetrievalMode::Hybrid;
         b.retrieval.vector_coverage = VectorCoverageState::Complete;
         assert_eq!(transition_fingerprint(&a), transition_fingerprint(&b));
         b.service.state = ServiceState::Degraded;
         assert_ne!(transition_fingerprint(&a), transition_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_notices_maintenance_mode_changes_but_not_counts() {
+        let a = RuntimeStatusV1::default();
+        let mut enabled = a.clone();
+        enabled.maintenance.enabled = true;
+        assert_ne!(transition_fingerprint(&a), transition_fingerprint(&enabled));
+
+        let mut configured = enabled.clone();
+        configured.maintenance.configured = true;
+        assert_ne!(
+            transition_fingerprint(&enabled),
+            transition_fingerprint(&configured)
+        );
+
+        let configured_without_route = transition_fingerprint(&configured);
+        configured.maintenance.route = Some(InferenceRoute::Remote);
+        assert_ne!(
+            configured_without_route,
+            transition_fingerprint(&configured)
+        );
+        let mut paused = configured.clone();
+        paused.maintenance.paused = true;
+        assert_ne!(
+            transition_fingerprint(&configured),
+            transition_fingerprint(&paused)
+        );
+
+        let paused_mode = transition_fingerprint(&paused);
+        paused.maintenance.candidates = 12;
+        paused.maintenance.history_events = 40;
+        assert_eq!(paused_mode, transition_fingerprint(&paused));
     }
 
     #[test]

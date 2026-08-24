@@ -593,9 +593,17 @@ fn import_peer_artifacts(
     Ok(imported)
 }
 
-/// CLI entry for `cfetch embed-index`.
-pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
-    let cfg = Config::load()?;
+/// Brings the local vector cache and shared content-addressed store up to the
+/// current Markdown generation. Both the CLI and the daemon's change-driven
+/// worker use this exact path.
+pub fn sync_configured(
+    cfg: &Config,
+    batch: usize,
+) -> anyhow::Result<(EmbedIndexReport, usize)> {
+    anyhow::ensure!(
+        cfg.client.serving.is_none(),
+        "this host delegates its index; vectors are maintained by the storage host"
+    );
     let spec = cfg.embeddings.spec();
     let mut store = vectors::VectorStore::open(&cfg.brain_root, &spec)?;
     let native = crate::paths::native_projects_root();
@@ -627,6 +635,14 @@ pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
         report.imported += shared_imported + peer_imported;
         report
     };
+    Ok((report, store.len()))
+}
+
+/// CLI entry for `cfetch embed-index`.
+pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
+    let cfg = Config::load()?;
+    let spec = cfg.embeddings.spec();
+    let (report, shared_artifacts) = sync_configured(&cfg, batch)?;
     println!(
         "embed-index complete: {} embedded this run, {} imported from existing artifacts, {} block(s) total",
         report.embedded, report.imported, report.total_blocks
@@ -634,7 +650,7 @@ pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
     println!(
         "shared vector store: {} ({} artifact(s), {} at {} dimensions)",
         crate::paths::shared_vector_dir(&cfg.brain_root).display(),
-        store.len(),
+        shared_artifacts,
         spec.precision.as_str(),
         spec.dim
     );

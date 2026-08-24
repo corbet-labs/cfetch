@@ -127,7 +127,7 @@ fn tool_defs() -> Vec<Tool> {
         .with_annotations(read_only()),
         Tool::new(
             "cfetch_maintenance_propose",
-            "Submit one typed maintenance proposal into ring-5 quarantine. This cannot edit recalled or injected memory; it records an idempotent proposal for deterministic verification and explicit CLI approval. Applying and finalizing are intentionally unavailable over MCP, so this tool has no model-output token budget beyond its short receipt.",
+            "Submit one typed maintenance proposal into ring-5 quarantine for debugging or intervention. This cannot edit recalled or injected memory; it records an idempotent proposal on the same deterministic transaction substrate used by autonomous maintenance. Applying and finalizing remain unavailable over MCP.",
             object_schema(json!({
                 "type": "object",
                 "properties": {
@@ -323,7 +323,7 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
             let submitted = maintenance::submit(&cfg, input)?;
             let _ = crate::runtime_status::refresh_static();
             return Ok(format!(
-                "{} {} in ring-5 quarantine; inspect with `cfetch maintain verify {}`. Applying and finalizing require the CLI.",
+                "{} {} in ring-5 quarantine; inspect with `cfetch maintain verify {}`. This MCP tool cannot apply or finalize it.",
                 if submitted.created { "submitted" } else { "already recorded" },
                 submitted.proposal.id,
                 submitted.proposal.id,
@@ -339,7 +339,7 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                 .map_err(|error| anyhow::anyhow!("invalid maintenance review: {error}"))?;
             let (review, created) = maintenance::submit_review(&cfg, proposal_id, input)?;
             return Ok(format!(
-                "{} {} for {} with verdict {:?}; deterministic verification and approval remain CLI-only.",
+                "{} {} for {} with verdict {:?}; deterministic verification and application remain outside this MCP tool.",
                 if created { "recorded" } else { "already recorded" },
                 review.id,
                 review.proposal_id,

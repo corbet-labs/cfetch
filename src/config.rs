@@ -608,6 +608,82 @@ impl Default for EmbeddingsConfig {
     }
 }
 
+/// Continuous second-brain maintenance. The daemon only starts inference when
+/// an endpoint and model are both configured; `enabled` defaults on so a
+/// completed configuration becomes seamless without another feature switch.
+/// Missing endpoint/model remains an explicit "not configured" state, never a
+/// silent network fallback.
+pub const MAX_MAINTENANCE_CANDIDATES: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceConfig {
+    #[serde(default = "default_maintenance_enabled")]
+    pub enabled: bool,
+    /// OpenAI-compatible base URL; `/chat/completions` is appended. Subject to
+    /// the same redirect and SSRF policy as embedding/reranking endpoints.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+    /// Optional distinct reviewer model on the same endpoint. Absent means a
+    /// fresh, isolated pass through `model`; it never means self-approval in
+    /// the proposal call.
+    #[serde(default)]
+    pub review_model: Option<String>,
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// Environment variable NAME holding the bearer key, never the key.
+    #[serde(default)]
+    pub api_key_env: String,
+    #[serde(default = "default_maintenance_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Quiet period after a candidate/tree change before background work.
+    #[serde(default = "default_maintenance_debounce_secs")]
+    pub debounce_secs: u64,
+    /// Per-cycle bound; exceptions do not prevent later candidates in the
+    /// same cycle from being processed.
+    #[serde(default = "default_maintenance_max_candidates")]
+    pub max_candidates: usize,
+}
+
+impl MaintenanceConfig {
+    pub fn configured(&self) -> bool {
+        !self.endpoint.trim().is_empty() && !self.model.trim().is_empty()
+    }
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_maintenance_enabled(),
+            endpoint: String::new(),
+            model: String::new(),
+            review_model: None,
+            allow_hosts: Vec::new(),
+            api_key_env: String::new(),
+            timeout_secs: default_maintenance_timeout_secs(),
+            debounce_secs: default_maintenance_debounce_secs(),
+            max_candidates: default_maintenance_max_candidates(),
+        }
+    }
+}
+
+fn default_maintenance_enabled() -> bool {
+    true
+}
+
+fn default_maintenance_timeout_secs() -> u64 {
+    120
+}
+
+fn default_maintenance_debounce_secs() -> u64 {
+    30
+}
+
+fn default_maintenance_max_candidates() -> usize {
+    4
+}
+
 fn default_embed_timeout_secs() -> u64 {
     10
 }
@@ -798,6 +874,9 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub rerank: RerankConfig,
+    /// Automatic, evidence-grounded Markdown maintenance.
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
     /// Named prefix sets, the unit of composition and sharing. Empty (the
     /// default) means one implicit slice covering everything, which is
     /// exactly today's behavior.
@@ -865,6 +944,7 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             rerank: RerankConfig::default(),
+            maintenance: MaintenanceConfig::default(),
             slices: Vec::new(),
             recall: RecallConfig::default(),
             governance: GovernanceConfig::default(),
@@ -954,6 +1034,21 @@ impl Config {
             );
         }
         cfg.embeddings.validate_profile()?;
+        let maintenance_endpoint = cfg.maintenance.endpoint.trim();
+        let maintenance_model = cfg.maintenance.model.trim();
+        anyhow::ensure!(
+            maintenance_endpoint.is_empty() == maintenance_model.is_empty(),
+            "maintenance.endpoint and maintenance.model must be configured together"
+        );
+        if let Some(review_model) = cfg.maintenance.review_model.as_deref() {
+            anyhow::ensure!(!review_model.trim().is_empty(), "maintenance.review_model may not be empty");
+        }
+        anyhow::ensure!(cfg.maintenance.timeout_secs > 0, "maintenance.timeout_secs must be at least 1");
+        anyhow::ensure!(cfg.maintenance.debounce_secs > 0, "maintenance.debounce_secs must be at least 1");
+        anyhow::ensure!(
+            (1..=MAX_MAINTENANCE_CANDIDATES).contains(&cfg.maintenance.max_candidates),
+            "maintenance.max_candidates must be between 1 and {MAX_MAINTENANCE_CANDIDATES}"
+        );
         Ok(cfg)
     }
 
@@ -1070,6 +1165,46 @@ mod tests {
         assert!(Config::load_from(&p).unwrap().capture.enabled, "partial file: capture on");
         std::fs::write(&p, r#"{"capture": {"enabled": false}}"#).unwrap();
         assert!(!Config::load_from(&p).unwrap().capture.enabled);
+    }
+
+    #[test]
+    fn maintenance_defaults_ready_for_configuration_but_never_invents_a_model_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.maintenance.enabled);
+        assert!(!cfg.maintenance.configured());
+        assert_eq!(cfg.maintenance.timeout_secs, 120);
+        assert_eq!(cfg.maintenance.debounce_secs, 30);
+        assert_eq!(cfg.maintenance.max_candidates, 4);
+
+        std::fs::write(
+            &p,
+            r#"{"maintenance":{"endpoint":"http://127.0.0.1:8080/v1","model":"maintainer","review_model":"reviewer","max_candidates":7}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.maintenance.configured());
+        assert_eq!(cfg.maintenance.review_model.as_deref(), Some("reviewer"));
+        assert_eq!(cfg.maintenance.max_candidates, 7);
+    }
+
+    #[test]
+    fn partial_or_unbounded_maintenance_configuration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        for raw in [
+            r#"{"maintenance":{"endpoint":"https://example.invalid/v1"}}"#,
+            r#"{"maintenance":{"model":"maintainer"}}"#,
+            r#"{"maintenance":{"timeout_secs":0}}"#,
+            r#"{"maintenance":{"debounce_secs":0}}"#,
+            r#"{"maintenance":{"max_candidates":0}}"#,
+            r#"{"maintenance":{"max_candidates":33}}"#,
+            r#"{"maintenance":{"review_model":""}}"#,
+        ] {
+            std::fs::write(&p, raw).unwrap();
+            assert!(Config::load_from(&p).is_err(), "must refuse {raw}");
+        }
     }
 
     #[test]

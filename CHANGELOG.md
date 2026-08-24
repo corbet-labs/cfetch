@@ -5,15 +5,30 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
-- **Supervised AI maintenance.** `cfetch maintain` turns a staged signal into
-  a bounded evidence packet, typed proposal, immutable independent review, and
-  exact Markdown diff. Deterministic authority, citation, path, secret, expiry,
-  and stale-file gates protect apply; changes are reversible, and the candidate
-  is finalized only after git contains the approved bytes. MCP may inspect and
-  write ring-5 proposal/review records, but apply and finalization remain
-  explicit CLI actions. A read-only dashboard inbox shows candidates, proposal
-  lifecycles, review gates, verification failures, bounded diff previews, and
-  revision-bound next commands without calling a model or applying a proposal.
+- **Autonomous AI memory maintenance.** A configured daemon reacts to changed
+  ring-5 evidence, runs bounded proposal and isolated review passes, rechecks
+  deterministic authority, citation, path, secret, expiry, and exact-byte
+  gates under a transaction lock, and applies Markdown without routine
+  approval. Direct Obsidian edits win every race. Immutable activity and
+  exception history, global and per-file pause controls, exact safe revert,
+  manual debugging commands, and the terminal Activity pane keep the process
+  inspectable without turning maintenance into a human queue.
+- **Obsidian knowledge graph.** `cfetch graph` and the terminal Graph pane expose
+  the rebuildable wikilink graph with focused neighborhoods, ambiguity-safe
+  note resolution, ring and degree metadata, bounded JSON, and local, serving,
+  or authenticated slice-scoped remote access. Markdown remains the only
+  authoritative relationship store.
+- **Continuous derived-state upkeep.** Every storage daemon watches direct
+  Markdown edits regardless of whether it serves clients. Catalog generations
+  rebuild lexical and graph views, while a resident vector worker hydrates
+  compatible shared or authorized-peer artifacts before deriving only missing
+  content hashes. Joined peers and newly appearing shared artifacts take effect
+  without restarting the daemon.
+- **Maintenance-aware diagnostics.** RuntimeStatusV1, Claude's status line,
+  Codex transition notices, MCP status, `cfetch doctor`, and the terminal System
+  pane distinguish maintenance configuration, local or remote route, proposal
+  and review models, last attempt, paused/degraded state, candidates, outcomes,
+  and exceptions without exposing endpoint or credential details.
 - **One embedding/network ABI for v1.** The v1 profile freezes the pinned
   EmbeddingGemma-300M Q8-QAT source, one static signed-symmetric W8A8 INT8
   graph, official retrieval prompts, full 768 dimensions,

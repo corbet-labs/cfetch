@@ -6,7 +6,7 @@
 //! stream per host at `<brain_root>/logs/cfetch/exhaust-<host>.jsonl` (see
 //! [`crate::jsonl`] for the format, its version envelope and its byte cap).
 //! It used to be a SQLite database in the per-host state dir, which made a
-//! candidate flagged on one machine invisible to a distillation session on
+//! candidate flagged on one machine invisible to maintenance running on
 //! another; the tree is the only storage of record, and this is part of it.
 //! No database survives here: the traps stream the stream.
 //!
@@ -62,7 +62,7 @@ pub const TRAP_WINDOW_BYTES: u64 = 1024 * 1024;
 
 /// Upper bound on PENDING ring-5 candidates. Reaching it stages one explicit
 /// `staging-full` candidate and stops adding more: unlike the old row cap,
-/// nothing a human has not yet reviewed is ever deleted to make room.
+/// no pending evidence is ever deleted merely to make room.
 pub const MAX_STAGED: usize = 2_000;
 
 /// Captured commands are clamped so one line stays small enough to be written
@@ -78,7 +78,7 @@ pub const WITHHELD: &str = "<secret path withheld>";
 pub struct Exhaust {
     /// Where the JSONL streams live (`<brain_root>/logs/cfetch`).
     pub logs_dir: PathBuf,
-    /// Where ring-5 candidates live (`<brain_root>/staging/cfetch`).
+    /// Where ring-5 candidates live (`<brain_root>/todo/staging`).
     pub staging_dir: PathBuf,
     /// This host's identity, stamped into file names and candidates.
     pub host: String,
