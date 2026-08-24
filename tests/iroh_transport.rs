@@ -134,6 +134,10 @@ impl EmbeddingServer {
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // macOS inherits O_NONBLOCK from the listening socket.
+                        // The accepted connection is handled synchronously, so
+                        // make that contract explicit before reading its body.
+                        stream.set_nonblocking(false).unwrap();
                         use std::io::{Read as _, Write as _};
                         let mut raw = Vec::new();
                         let mut buf = [0u8; 4096];
