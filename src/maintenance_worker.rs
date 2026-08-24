@@ -23,7 +23,13 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
     while !stopping() {
         let revision = maintenance::candidate_revision(&cfg);
         let candidates = crate::staging::pending_count(&crate::paths::staging_dir(&cfg.brain_root));
-        if maintenance::is_paused(&cfg) || candidates == 0 {
+        if maintenance::is_paused(&cfg) {
+            // Forget the pre-pause revision. Resuming must schedule the
+            // evidence that was already observed instead of waiting for a
+            // second edit to wake the worker.
+            observed_revision = None;
+            due = None;
+        } else if candidates == 0 {
             due = None;
         } else if observed_revision.as_deref() != Some(revision.as_str()) {
             // Every new edit resets the quiet period, so the packet sees a
@@ -47,7 +53,14 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
                     );
                     let remaining = crate::staging::pending_count(&crate::paths::staging_dir(&cfg.brain_root));
                     observed_revision = Some(maintenance::candidate_revision(&cfg));
-                    due = (remaining > 0).then(|| Instant::now() + FAILURE_RETRY);
+                    due = (remaining > 0).then(|| {
+                        Instant::now()
+                            + if report.exceptions > 0 {
+                                FAILURE_RETRY
+                            } else {
+                                debounce
+                            }
+                    });
                 }
                 Err(error) => {
                     eprintln!("cfetch maintenance degraded: {error:#}");
