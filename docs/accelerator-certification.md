@@ -23,8 +23,8 @@ inference; they are never silently called producers.
 
 | Hardware class | cfetch path | INT8 common-denominator evidence | Producer status |
 |---|---|---|---|
-| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; deterministic compute; precise QMM selects non-saturating U8U8 on pre-VNNI x86 | **Passing reference** with Microsoft's official ORT 1.28.0: physical Ryzen 9 5950X AVX2 and Core Ultra 7 258V VNNI hosts produced the same 11 raw outputs and final records; every actual host remains KAT-gated |
-| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | Previous runs used the superseded candidate KAT; **current schema-2 recertification pending**, so arm64 remains consumer-only |
+| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; deterministic compute; precise QMM selects non-saturating U8U8 on pre-VNNI x86 | **Host-scoped passing reference** with Microsoft's official ORT 1.28.0: physical Ryzen 9 5950X AVX2, physical Core Ultra 7 258V VNNI, and one hosted EPYC 7763 produced the same 11 raw outputs and records. A hosted Xeon 8573C control later passed only 6/11, so no architecture-wide x86 claim is valid; every actual host remains KAT-gated. |
+| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected as a corrected-v1 producer on current hosted evidence**: Neoverse N2 Linux and virtual M1 macOS were stable but failed 0/11. Disabling KleidiAI changed nothing; forcing x86-style unsigned Q/DQ lowering improved both only to 1/11. Physical Apple and additional Linux Arm systems still need testing, but may produce only after an exact host KAT. |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
 | Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning and numerical results are graph/device specific | **CPU passes through ORT CPU precise QMM; OpenVINO GPU/NPU rejected on physical Lunar Lake** because strict ownership failed. The former hybrid vector comparison is superseded; alternative full-graph/exact accelerator paths remain pending |
 | AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
@@ -87,10 +87,36 @@ remote-only. The former profile and all reports against it remain in the
 registry as superseded pre-release evidence. After a v1-capable release or
 producer catalog ships, the same numerical change requires network major 2.
 
-Former hosted x86 and arm64 reports must therefore not be read as current
-passes or failures. Linux arm64 and macOS arm64 remain consumer-only until the
-official packages are rerun against report schema 2. Ordinary production
-always executes the current KAT on the host actually doing work.
+Current schema-2 public run
+[`32773351318`](https://github.com/corbet-labs/cfetch/actions/runs/32773351318)
+then provided the missing hosted boundary. Its AMD EPYC 7763 passed 11/11, but
+Linux Arm Neoverse N2 and virtual macOS Apple M1 were stable failures at 0/11.
+The virtual M1 result is an Arm CPU observation, not a physical Apple or ANE
+certificate. Ordinary production always executes the current KAT on the host
+actually doing work.
+
+ORT source inspection identified one architecture-dependent rule: signed Q/DQ
+fusion is allowed by default on Arm, while eligible x86 signed-activation Q/DQ
+pairs are rewritten to unsigned. Two public controls tested whether that rule
+explained the Arm split:
+
+| Control | Linux Arm | virtual macOS Arm | x86 evidence | Decision |
+|---|---:|---:|---:|---|
+| disable KleidiAI | 0/11 | 0/11 | 11/11 on hosted x86 | rejected; it changed no raw output or vector on Arm |
+| force `session.qdqisint8allowed=0` everywhere | 1/11 | 1/11 | physical Ryzen 11/11; hosted Xeon 8573C 6/11 | rejected; common Q/DQ policy did not produce common bytes |
+
+The second control also exposed a sequence-size split on the Xeon with
+AVX-VNNI, AVX-512 VNNI and AMX-INT8: buckets 32 and 64 matched, while 128
+through 2,048 did not. Linux and macOS Arm agreed on several entire raw outputs
+but diverged again on other shapes. The failures are stable and material, not
+one-bit rounding noise.
+
+The operational distinction is therefore exact: ORT deterministic compute
+makes a selected route repeatable; it does not require different MLAS kernels,
+instruction sets, execution providers, or reduction trees to return identical
+floating-point output bytes. V1 keeps one graph and one vector format, and the
+startup KAT admits individual producer hosts. It does not infer producer status
+from CPU architecture, INT8 ISA flags, or a matching ORT version.
 
 cfetch and its FastEmbed fork normally request ORT C API 18, the lowest API
 used by the built-in provider/session code, while the CPU reference runtime
