@@ -166,7 +166,10 @@ impl Inbox {
         } else if maintenance::is_paused(cfg) {
             "paused"
         } else if cfg.maintenance.configured() {
-            "automatic"
+            match crate::runtime_status::endpoint_route(&cfg.maintenance.endpoint) {
+                crate::runtime_status::InferenceRoute::Local => "automatic · local model",
+                crate::runtime_status::InferenceRoute::Remote => "automatic · remote model",
+            }
         } else {
             "setup needed"
         };

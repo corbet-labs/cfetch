@@ -14,8 +14,8 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::{
-    daemon, embed, embedding_profile, grant, hardware, heartbeat, index, net, paths, rerank,
-    runtime_status, variant, vectors,
+    daemon, embed, embedding_profile, grant, hardware, heartbeat, index, maintenance_model, net,
+    paths, rerank, runtime_status, variant, vectors,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -111,6 +111,7 @@ pub struct InferenceDiagnostic {
     pub build_backend: String,
     pub embeddings: ModelDiagnostic,
     pub reranker: RerankerDiagnostic,
+    pub maintenance: MaintenanceModelDiagnostic,
     pub selected: Option<runtime_status::BackendSelection>,
     pub last_used: Option<runtime_status::InferenceAttempt>,
     pub utilization: UtilizationDiagnostic,
@@ -136,6 +137,20 @@ pub struct RerankerDiagnostic {
     pub route: Option<String>,
     pub model: Option<String>,
     pub candidates: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MaintenanceModelDiagnostic {
+    pub enabled: bool,
+    pub configured: bool,
+    pub state: String,
+    pub route: Option<String>,
+    pub proposal_model: Option<String>,
+    pub review_model: Option<String>,
+    pub candidates: u64,
+    pub history_events: u64,
+    pub exceptions: u64,
+    pub last_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -625,7 +640,7 @@ fn inference_diagnostic(
     findings: &mut Vec<Finding>,
 ) -> InferenceDiagnostic {
     let profile = embedding_profile::manifest();
-    let (embeddings, reranker) = match cfg {
+    let (embeddings, reranker, maintenance) = match cfg {
         Some(cfg) => {
             if cfg.embeddings.enabled
                 && let Err(error) = cfg.embeddings.validate_profile()
@@ -665,6 +680,20 @@ fn inference_diagnostic(
                     ),
                 });
             }
+            if cfg.maintenance.enabled
+                && cfg.maintenance.configured()
+                && let Err(error) = maintenance_model::MaintenanceClient::new(&cfg.maintenance)
+            {
+                findings.push(Finding {
+                    code: "maintenance_model_unusable".into(),
+                    severity: FindingSeverity::Warning,
+                    summary: short_error(&error.to_string()),
+                    action: Some(
+                        "repair the maintenance model, host policy, or credential environment"
+                            .into(),
+                    ),
+                });
+            }
             let embeddings = ModelDiagnostic {
                 enabled: cfg.embeddings.enabled,
                 backend: if cfg.embeddings.enabled {
@@ -697,7 +726,42 @@ fn inference_diagnostic(
                 model: cfg.rerank.enabled.then(|| cfg.rerank.model.clone()),
                 candidates: cfg.rerank.enabled.then_some(cfg.rerank.candidates),
             };
-            (embeddings, reranker)
+            let maintenance = MaintenanceModelDiagnostic {
+                enabled: cfg.maintenance.enabled,
+                configured: cfg.maintenance.configured(),
+                state: if !cfg.maintenance.enabled {
+                    "disabled"
+                } else if runtime.maintenance.paused {
+                    "paused"
+                } else if !cfg.maintenance.configured() {
+                    "setup_needed"
+                } else if runtime.maintenance.last_outcome.as_deref() == Some("exception") {
+                    "exception"
+                } else if runtime.maintenance.candidates > 0 {
+                    "processing"
+                } else {
+                    "idle"
+                }
+                .into(),
+                route: cfg.maintenance.configured().then(|| {
+                    route_name(runtime_status::endpoint_route(&cfg.maintenance.endpoint))
+                }),
+                proposal_model: cfg
+                    .maintenance
+                    .configured()
+                    .then(|| cfg.maintenance.model.clone()),
+                review_model: cfg.maintenance.configured().then(|| {
+                    cfg.maintenance
+                        .review_model
+                        .clone()
+                        .unwrap_or_else(|| cfg.maintenance.model.clone())
+                }),
+                candidates: runtime.maintenance.candidates,
+                history_events: runtime.maintenance.history_events,
+                exceptions: runtime.maintenance.exceptions,
+                last_outcome: runtime.maintenance.last_outcome.clone(),
+            };
+            (embeddings, reranker, maintenance)
         }
         None => (
             ModelDiagnostic {
@@ -718,6 +782,18 @@ fn inference_diagnostic(
                 model: None,
                 candidates: None,
             },
+            MaintenanceModelDiagnostic {
+                enabled: false,
+                configured: false,
+                state: "unknown".into(),
+                route: None,
+                proposal_model: None,
+                review_model: None,
+                candidates: runtime.maintenance.candidates,
+                history_events: runtime.maintenance.history_events,
+                exceptions: runtime.maintenance.exceptions,
+                last_outcome: runtime.maintenance.last_outcome.clone(),
+            },
         ),
     };
 
@@ -725,6 +801,7 @@ fn inference_diagnostic(
         build_backend: build_backend.into(),
         embeddings,
         reranker,
+        maintenance,
         selected: runtime.inference.selected.clone(),
         last_used: runtime.inference.last_used.clone(),
         utilization: UtilizationDiagnostic {
@@ -1270,6 +1347,46 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
         },
     ));
     lines.push(DisplayLine::new(
+        match report.inference.maintenance.state.as_str() {
+            "idle" => DisplayTone::Good,
+            "processing" | "setup_needed" | "exception" => DisplayTone::Warning,
+            _ => DisplayTone::Muted,
+        },
+        if report.inference.maintenance.configured {
+            format!(
+                "  maintenance {} ({}) — propose {} · review {} · {} staged / {} event(s) / {} exception(s)",
+                report.inference.maintenance.state,
+                report
+                    .inference
+                    .maintenance
+                    .route
+                    .as_deref()
+                    .unwrap_or("route unknown"),
+                report
+                    .inference
+                    .maintenance
+                    .proposal_model
+                    .as_deref()
+                    .unwrap_or("model not configured"),
+                report
+                    .inference
+                    .maintenance
+                    .review_model
+                    .as_deref()
+                    .unwrap_or("model not configured"),
+                report.inference.maintenance.candidates,
+                report.inference.maintenance.history_events,
+                report.inference.maintenance.exceptions,
+            )
+        } else {
+            format!(
+                "  maintenance {} — {} staged candidate(s)",
+                report.inference.maintenance.state,
+                report.inference.maintenance.candidates,
+            )
+        },
+    ));
+    lines.push(DisplayLine::new(
         if report.inference.selected.is_some() {
             DisplayTone::Good
         } else {
@@ -1573,6 +1690,18 @@ mod tests {
                     route: None,
                     model: None,
                     candidates: None,
+                },
+                maintenance: MaintenanceModelDiagnostic {
+                    enabled: true,
+                    configured: true,
+                    state: "idle".into(),
+                    route: Some("remote".into()),
+                    proposal_model: Some("maintenance-model".into()),
+                    review_model: Some("review-model".into()),
+                    candidates: 0,
+                    history_events: 12,
+                    exceptions: 1,
+                    last_outcome: Some("applied".into()),
                 },
                 selected: None,
                 last_used: None,

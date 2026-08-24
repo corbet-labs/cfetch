@@ -41,7 +41,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, VectorSpec};
 use crate::{
-    grant, heartbeat, hooks, index, ipc, maintenance_worker, net, paths, resident, serve, vectors,
+    grant, heartbeat, hooks, index, ipc, maintenance_worker, net, paths, resident, serve,
+    vector_worker, vectors,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1576,7 +1577,19 @@ pub fn run() -> anyhow::Result<()> {
     // starting a daemon that cannot serve.
     let cfg = Config::load()?;
     let _ = crate::runtime_status::refresh_static();
-    let serve_handle = if cfg.serve.enabled { Some(serve::start(&cfg)?) } else { None };
+    // Every storage host keeps the disposable index synchronized with direct
+    // Obsidian edits. Serving is only one consumer of this watcher; local
+    // recall, graph, and autonomous vector upkeep need the same freshness.
+    let index_handle = if cfg.client.serving.is_none() {
+        Some(serve::start(&cfg)?)
+    } else {
+        None
+    };
+    let serving_state = if cfg.serve.enabled {
+        index_handle.as_ref().map(|handle| handle.state.clone())
+    } else {
+        None
+    };
     let tcp_token = match (&cfg.serve.bind, &cfg.serve.token_file) {
         (Some(_), Some(tf)) => Some(serve::read_token(tf, true)?),
         _ => None,
@@ -1586,7 +1599,7 @@ pub fn run() -> anyhow::Result<()> {
     let local_token = ipc::new_local_token();
     let ctx = Arc::new(Ctx {
         cfg: Arc::new(cfg.clone()),
-        serve: serve_handle.as_ref().map(|h| h.state.clone()),
+        serve: serving_state,
         tcp_token: tcp_token.clone(),
         local_token: local_token.clone(),
         iroh: Mutex::new(None),
@@ -1608,13 +1621,26 @@ pub fn run() -> anyhow::Result<()> {
             .context("start maintenance worker")?;
     }
 
+    if cfg.embeddings.enabled && cfg.client.serving.is_none() {
+        let vector_cfg = cfg.clone();
+        let vector_ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("cfetch-vectors".into())
+            .spawn(move || {
+                vector_worker::run(vector_cfg, || {
+                    vector_ctx.shutdown.load(Ordering::SeqCst)
+                });
+            })
+            .context("start vector maintenance worker")?;
+    }
+
     if let (Some(bind), Some(_)) = (&cfg.serve.bind, &tcp_token) {
         let listener = std::net::TcpListener::bind(bind)?;
         let local = listener.local_addr()?;
         // Record the actual bound address (resolves ":0" configs) for
         // status/selfcheck and the torture harness.
         std::fs::write(paths::state_dir().join("serve.addr"), local.to_string())?;
-        if let Some(h) = &serve_handle {
+        if let Some(h) = &index_handle {
             *h.state.bind_addr.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(local.to_string());
         }
@@ -1632,7 +1658,7 @@ pub fn run() -> anyhow::Result<()> {
 
     // The daemon's own code-scan cadence. Detached: the listener bind below
     // must not wait for a code scan, and neither must any query.
-    if let Some(h) = &serve_handle {
+    if let Some(h) = &index_handle {
         let state = h.state.clone();
         let deadline = Instant::now() + FIRST_SCAN_SETTLE_WAIT;
         std::thread::spawn(move || {

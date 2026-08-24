@@ -77,6 +77,7 @@ mod testhttp;
 mod staging;
 mod transcript;
 mod variant;
+mod vector_worker;
 mod vectors;
 
 use anyhow::Context as _;
