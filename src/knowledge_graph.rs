@@ -143,13 +143,15 @@ pub fn build_matching(
     let link_rows = link_stmt.query_map([], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })?;
-    let visible_links: Vec<(usize, usize)> = link_rows
+    let resolved_links: Vec<(usize, usize)> = link_rows
         .filter_map(Result::ok)
         .filter_map(|(from, to)| Some((*by_id.get(&from)?, *by_id.get(&to)?)))
+        .collect();
+    let resolved_references = resolved_links.len();
+    let mut links: Vec<(usize, usize)> = resolved_links
+        .into_iter()
         .filter(|(from, to)| from != to)
         .collect();
-    let resolved_references = visible_links.len();
-    let mut links = visible_links;
     links.sort_unstable();
     links.dedup();
 

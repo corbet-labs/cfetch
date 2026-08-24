@@ -644,7 +644,7 @@ fn snapshot_target(candidate: &staging::Candidate, cfg: &Config) -> Option<Targe
 
 pub fn proposal_contract() -> serde_json::Value {
     serde_json::json!({
-        "candidate_ids": ["candidate id(s) from this packet"],
+        "candidate_ids": ["the exact candidate id from this packet"],
         "transition": "add | fold | supersede | revalidate | dismiss | noop",
         "target": "brain-relative .md path; required for content transitions, otherwise null",
         "after": "complete proposed Markdown bytes; required for content transitions, otherwise null",
@@ -1661,7 +1661,14 @@ pub fn run_once_with<M: MaintenanceModel>(
         let mut submitted: Option<Proposal> = None;
         let result = (|| -> anyhow::Result<Proposal> {
             let packet = packet(cfg, &candidate.id)?;
-            let proposal = submit(cfg, model.propose(&packet)?)?.proposal;
+            let input = model.propose(&packet)?;
+            anyhow::ensure!(
+                input.candidate_ids.len() == 1 && input.candidate_ids[0] == candidate.id,
+                "autonomous proposal must name only packet candidate {}; got {:?}",
+                candidate.id,
+                input.candidate_ids
+            );
+            let proposal = submit(cfg, input)?.proposal;
             submitted = Some(proposal.clone());
             let review = model.review(&packet, &proposal)?;
             let (recorded, _) = submit_review(cfg, &proposal.id, review)?;
@@ -1733,7 +1740,7 @@ pub fn revert(cfg: &Config, id: &str) -> anyhow::Result<Proposal> {
     } else {
         move_proposal(&cfg.brain_root, id, &state, REVERTED)?;
     }
-    write_event(
+    if let Err(error) = write_event(
         cfg,
         event_for(
             Some(&proposal),
@@ -1743,7 +1750,21 @@ pub fn revert(cfg: &Config, id: &str) -> anyhow::Result<Proposal> {
             "exact automatic or manual result was still present and its captured before bytes were restored",
             Vec::new(),
         ),
-    )?;
+    ) {
+        if proposal.transition.changes_memory() {
+            let path = reject_symlink_path(
+                &cfg.brain_root,
+                proposal.target.as_deref().unwrap_or_default(),
+            )?;
+            fsutil::atomic_write(&path, proposal.after.as_deref().unwrap_or_default())?;
+        }
+        if let Err(move_error) = move_proposal(&cfg.brain_root, id, REVERTED, &state) {
+            return Err(error.context(format!(
+                "write revert history; restoring proposal state also failed: {move_error}"
+            )));
+        }
+        return Err(error.context("write revert history; reverted bytes and state were rolled back"));
+    }
     Ok(proposal)
 }
 
@@ -2246,6 +2267,29 @@ mod tests {
         assert!(event.review_id.is_some());
         assert!(event.checks.iter().all(|check| check.ok));
         assert!(!staging::path_of(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id).exists());
+    }
+
+    #[test]
+    fn autonomous_review_cannot_cover_a_candidate_absent_from_its_packet() {
+        let fixture = Fixture::new();
+        let mut proposal = fixture.proposal("knowledge/wrong-packet.md", "# Wrong packet\n");
+        proposal.candidate_ids = vec!["another-pending-candidate".into()];
+        let mut model = FakeModel {
+            proposal,
+            review: passing_review(),
+            edit_before_review: None,
+        };
+
+        let report = run_once_with(&fixture.cfg, &mut model, 8).unwrap();
+
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.exceptions, 1);
+        assert!(!fixture.brain.path().join("knowledge/wrong-packet.md").exists());
+        assert!(
+            staging::path_of(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id)
+                .is_file()
+        );
+        assert!(history(&fixture.cfg)[0].detail.contains("must name only packet candidate"));
     }
 
     #[test]
