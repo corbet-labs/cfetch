@@ -11,7 +11,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$outputPath = [IO.Path]::GetFullPath((Join-Path (Get-Location) $Output))
+$outputPath = if ([IO.Path]::IsPathFullyQualified($Output)) {
+    [IO.Path]::GetFullPath($Output)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path (Get-Location) $Output))
+}
 if (Test-Path -LiteralPath $outputPath) {
     throw "output already exists: $outputPath"
 }

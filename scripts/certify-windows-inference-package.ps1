@@ -21,7 +21,12 @@ param(
 $ErrorActionPreference = "Stop"
 $packagePath = (Resolve-Path -LiteralPath $Package).Path
 $bundlePath = (Resolve-Path -LiteralPath $Bundle).Path
-$reportPath = [IO.Path]::GetFullPath((Join-Path (Get-Location) $Report))
+$reportPath = if ([IO.Path]::IsPathFullyQualified($Report)) {
+    [IO.Path]::GetFullPath($Report)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path (Get-Location) $Report))
+}
 $manifestPath = Join-Path $packagePath "runtime-manifest.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if ($manifest.schema_version -ne 1 -or $manifest.provider -notin @("directml", "qnn", "vitis")) {

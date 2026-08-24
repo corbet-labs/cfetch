@@ -614,7 +614,7 @@ fn set_fixed_padding(model: &mut TextEmbedding, bucket: usize) -> anyhow::Result
 
 fn execution_provider(
     requested: &str,
-    fixed_bucket: Option<usize>,
+    _fixed_bucket: Option<usize>,
 ) -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
     let requested = requested.trim().to_ascii_lowercase();
     let requested = requested.as_str();
@@ -626,7 +626,7 @@ fn execution_provider(
         #[cfg(feature = "inference-qnn")]
         return qnn_provider();
         #[cfg(all(not(feature = "inference-qnn"), feature = "inference-vitis"))]
-        return vitis_provider(fixed_bucket);
+        return vitis_provider(_fixed_bucket);
         #[cfg(all(
             not(feature = "inference-qnn"),
             not(feature = "inference-vitis"),
@@ -727,7 +727,7 @@ fn execution_provider(
         #[cfg(feature = "inference-qnn")]
         "qnn" => qnn_provider(),
         #[cfg(feature = "inference-vitis")]
-        "vitis" => vitis_provider(fixed_bucket),
+        "vitis" => vitis_provider(_fixed_bucket),
         #[cfg(feature = "inference-cuda")]
         "cuda" => Ok(cuda_provider()),
         #[cfg(feature = "inference-tensorrt")]
