@@ -35,7 +35,7 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
         } else if observed_revision.as_deref() != Some(revision.as_str()) {
             // Every new edit resets the quiet period, so the packet sees a
             // settled batch rather than racing a burst of hook writes.
-            observed_revision = Some(revision);
+            observed_revision = Some(revision.clone());
             due = Some(Instant::now() + debounce);
             journaled_preflight_failure = None;
         }
