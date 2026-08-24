@@ -26,7 +26,7 @@ inference; they are never silently called producers.
 | x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; deterministic compute; precise QMM selects non-saturating U8U8 on pre-VNNI x86 | **Host-scoped passing reference** with Microsoft's official ORT 1.28.0: physical Ryzen 9 5950X AVX2, physical Core Ultra 7 258V VNNI, and one hosted EPYC 7763 produced the same 11 raw outputs and records. A hosted Xeon 8573C control later passed only 6/11, so no architecture-wide x86 claim is valid; every actual host remains KAT-gated. |
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected as a corrected-v1 producer on current hosted evidence**: Neoverse N2 Linux and virtual M1 macOS were stable but failed 0/11. Disabling KleidiAI changed nothing; forcing x86-style unsigned Q/DQ lowering improved both only to 1/11. Physical Apple and additional Linux Arm systems still need testing, but may produce only after an exact host KAT. |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
-| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning and numerical results are graph/device specific | **CPU passes through ORT CPU precise QMM; OpenVINO GPU/NPU rejected on physical Lunar Lake** because strict ownership failed. The former hybrid vector comparison is superseded; alternative full-graph/exact accelerator paths remain pending |
+| Intel CPU / GPU / NPU | ORT OpenVINO EP; native OpenVINO diagnostic | OpenVINO exposes INT8 execution across supported devices, but partitioning and numerical results are graph/device specific | **CPU passes only through the ORT CPU precise-QMM reference. OpenVINO is rejected on physical Lunar Lake:** strict ORT sessions could not own the graph; native OpenVINO 2026.3 then owned and executed the unchanged graph on CPU, Arc GPU, and Intel AI Boost NPU but each path passed 0/11 corrected-v1 vectors, including `ACCURACY` controls and an explicit FP32 GPU control |
 | AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
 | AMD GPU | ORT MIGraphX EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX emitted digest `2639d019…`, not corrected-v1 `20e16438…`; ORT's older ROCm EP was removed in 1.23 and is not a second current path |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
@@ -182,17 +182,33 @@ Linux distributions the system compiler's loader/glibc ABI must be bridged
 and recorded explicitly.
 
 That current lane was exercised on a physical Core Ultra 7 258V with Arc 140V
-GPU and Lunar Lake NPU. Native OpenVINO 2026.3 compiled the unchanged frozen
-1x32 graph for both `GPU.0` and `NPU`, proving that neither device nor graph
-compilation was the immediate blocker. Strict cfetch sessions nevertheless
-failed because the ORT provider requested forbidden CPU remainder. A
-controlled diagnostic then enabled that remainder explicitly to test the only
-remaining shortcut; it exercised all 11 inputs and seven buckets but produced
-vectors incompatible with the superseded candidate KAT. Those numerical
-comparisons are not current certificates. The strict ownership failure remains
-current because the graph did not change, and production remains no-fallback.
-Each Intel accelerator still needs an alternative route that both owns the
-full graph and passes the corrected bytes.
+GPU and Lunar Lake NPU. Strict cfetch sessions failed because the ORT provider
+requested forbidden CPU remainder. Native OpenVINO 2026.3 was then tested as a
+vendor adapter instead of allowing that remainder. It admitted the exact
+released model digest, reproduced every frozen tokenizer-tensor digest,
+compiled all seven static buckets, and reported only `CPU`, `GPU.0`, or `NPU`
+as the execution device for the corresponding run.
+
+The full-ownership result was still 0/11 on all three devices against the
+corrected v1 record. The GPU runtime model contained 291 `i8` and 29–31 `u8`
+nodes, so the failure is not explained by simple dequantization of the whole
+model. OpenVINO `ACCURACY` mode changed none of the CPU or NPU vectors. Arc
+also remained 0/11 when `ACCURACY` was combined with an explicit FP32
+inference hint, ruling out its default FP16 hint as the sole cause. The NPU
+compiler exposes its finished graph as an opaque six-node runtime model and
+retains an FP16 inference hint; full-device execution is proven, but an INT8
+kernel-placement claim cannot be extracted from that view.
+
+The exact reports have SHA-256 digests
+`05798d5dd33ec5bf98ff5cd259596488820a1a1b0b1ec7e63463c4b0ed691a85`
+(CPU accuracy),
+`ecd334d7ce3776948b8bf3cec680d5b2c041d547806f8a2df9933636f66bce21`
+(GPU accuracy/FP32), and
+`11b0b5528d0e48a72ea3b8414a9fb2bf5a0b6885fc6444b549c014b7074673c7`
+(NPU accuracy). The reusable native probe is
+`experiments/accelerators/openvino_direct_kat.py`. OpenVINO is therefore an
+exhausted rejected v1 route on this hardware/runtime, not an untested
+alternative path.
 
 Public runs
 [`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
@@ -482,11 +498,11 @@ Run
 [`32693600516`](https://github.com/corbet-labs/cfetch/actions/runs/32693600516)
 reproduced the same ownership rejection with both Linux and Windows evidence
 packages; its Windows host was also AMD. The later physical Lunar Lake run is
-the first Intel GPU/NPU evidence: both current devices compiled the graph but
-were rejected by strict ownership. Their deliberately non-certifying hybrid
-diagnostic predates the corrected KAT and must not be quoted as a current
-byte-count result. First-generation Intel NPU, discrete GPU, and alternative
-runtime/graph paths remain open.
+the first Intel GPU/NPU evidence. Its strict ORT route was rejected at
+ownership, and the subsequent native OpenVINO full-device route failed the
+corrected KAT 0/11 on CPU, GPU, and NPU. First-generation Intel NPU, discrete
+GPU, and materially different future runtime implementations remain open; the
+tested OpenVINO 2026.3 route does not.
 
 On physical Linux AMD systems, `nix build .#cfetch-test-migraphx` builds the
 locked ORT/MIGraphX/ROCm evidence package. Its first RX 6800 result is rejected

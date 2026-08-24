@@ -491,12 +491,12 @@ did not own the complete frozen graph, so this is an evidence package only.
 For current Intel drivers, `cfetch-test-openvino-current` instead pins ORT
 1.27.1 and OpenVINO 2026.3 from the locked Nix input. A physical Core Ultra 7
 258V probe compiled the frozen graph on both Arc 140V and its NPU, but strict
-sessions still required forbidden CPU remainder. An explicit diagnostic that
-allowed the remainder produced vectors incompatible with the then-current
-candidate KAT on both devices. The graph is unchanged, so the strict ownership
-rejection remains current; the hybrid comparison must be rerun against the
-corrected KAT before being quoted numerically. These are rejected routes, not
-producer support; production remains fail-closed.
+sessions still required forbidden CPU remainder. A native OpenVINO diagnostic
+subsequently owned the unchanged corrected-v1 graph completely on the Core
+Ultra CPU, Arc GPU, and Intel NPU across all seven buckets. Each passed 0/11
+exact vectors, including conservative `ACCURACY` controls and an FP32-hint GPU
+control. These are rejected routes, not producer support; production remains
+fail-closed.
 Windows x64 testers can create the equivalent hash-pinned NuGet evidence
 package with `scripts/build-windows-inference-package.ps1 -Provider
 openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by

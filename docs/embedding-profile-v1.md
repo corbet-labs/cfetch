@@ -153,14 +153,16 @@ across kernels. It also rules out bypassing ORT with direct MIGraphX as a v1
 producer.
 
 A physical Intel Lunar Lake probe reached the same boundary from the NPU side.
-OpenVINO 2026.3 compiled the unchanged graph for both its Arc 140V GPU and NPU,
-but strict ORT/OpenVINO sessions could not own the complete graph. A temporary,
-explicit hybrid diagnostic allowed the CPU remainder only to test that
-hypothesis; both devices produced incompatible vectors under the superseded
-candidate KAT. The strict full-graph rejection remains current because the
-model graph did not change. This shows that current INT8 hardware and
-successful graph compilation are still insufficient: exact final bytes remain
-the admission boundary.
+Strict ORT/OpenVINO sessions could not own the complete graph. A native
+OpenVINO 2026.3 adapter then removed that ambiguity: it compiled every static
+bucket and executed the unchanged corrected-v1 graph wholly on the Core Ultra
+CPU, Arc 140V GPU, and Intel AI Boost NPU. All three paths failed 0/11 final
+records. The Arc runtime graph did contain hundreds of `i8`/`u8` nodes, and an
+`ACCURACY` plus FP32-hint control was still 0/11, so neither real integer work
+nor avoiding its default FP16 hint made the outputs interchangeable. This
+shows that current INT8 hardware, complete graph ownership, and successful
+compilation are still insufficient: exact final bytes remain the admission
+boundary.
 
 The physical RX 6800 WebGPU probe further isolated the issue from temperature.
 Three executions produced identical raw-output and vector hashes while the GPU
