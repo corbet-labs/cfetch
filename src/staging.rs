@@ -1,7 +1,7 @@
-//! Ring-5 staging as FILES in the tree: `<brain_root>/staging/cfetch/<id>.md`.
+//! Ring-5 staging as FILES in the tree: `<brain_root>/todo/staging/<id>.md`.
 //!
 //! A staged candidate is the ladder's only inward crossing, so it must be
-//! visible to whichever host runs the distillation — a row in one machine's
+//! visible to whichever host runs maintenance — a row in one machine's
 //! database never was. Each candidate is one markdown file with frontmatter
 //! (`ring: 5`, the trap reason, the session and host it came from) and the
 //! captured payload in the body: readable in Obsidian, greppable, and
@@ -17,7 +17,7 @@
 //! same recurring failure derive the same id, and the second one finds the
 //! file already there.
 //!
-//! `consume` deletes the file — distillation has taken the content into a
+//! `consume` deletes the file — maintenance has taken the content into a
 //! curated ring-2/3 file, so the candidate is redundant. `dismiss` MOVES it to
 //! `dismissed/`, because nothing in the ladder may be silently destroyed.
 //!
@@ -33,7 +33,7 @@ use sha2::{Digest as _, Sha256};
 /// Subdirectory holding dismissed candidates. Kept, never deleted.
 pub const DISMISSED: &str = "dismissed";
 
-/// One ring-5 candidate awaiting a distillation session.
+/// One ring-5 candidate awaiting autonomous maintenance or manual debugging.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {
     pub id: String,
@@ -79,7 +79,7 @@ pub fn dismissed_path(dir: &Path, id: &str) -> PathBuf {
 }
 
 /// Has this candidate already been staged — pending OR dismissed? A dismissed
-/// candidate must never come back: the human already ruled on it.
+/// candidate must never come back: maintenance already settled it.
 pub fn exists(dir: &Path, id: &str) -> bool {
     path_of(dir, id).exists() || dismissed_path(dir, id).exists()
 }
@@ -101,7 +101,7 @@ pub fn write(dir: &Path, c: &Candidate) -> anyhow::Result<bool> {
 }
 
 /// Pending candidates from EVERY host, newest first. Unparseable files are
-/// skipped — a hand-edited candidate is the human's business, not a crash.
+/// skipped — a direct Markdown edit is authoritative, not a reason to crash.
 pub fn list(dir: &Path) -> Vec<Candidate> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut out: Vec<Candidate> = rd
@@ -198,8 +198,9 @@ pub fn render(c: &Candidate) -> String {
     format!(
         "---\nring: 5\nid: {}\nflag_reason: {}\nsession: {}\nhost: {}\nts: {}\nkind: {}\n---\n\n\
          Auto-flagged ring-5 candidate from session exhaust. Never injected and never\n\
-         recalled; a distillation session promotes it into a curated file or dismisses it:\n\
-         `cfetch staging consume {}` / `cfetch staging dismiss {}`.\n\n\
+         recalled; autonomous maintenance reviews and settles it after deterministic gates.\n\
+         Manual debugging remains available with `cfetch maintain packet {}` or\n\
+         `cfetch staging dismiss {}`.\n\n\
          ```json\n{payload}\n```\n",
         yaml_str(&c.id),
         yaml_str(&c.reason),

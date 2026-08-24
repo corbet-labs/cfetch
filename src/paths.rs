@@ -171,8 +171,8 @@ pub fn logs_dir(brain_root: &Path) -> PathBuf {
 }
 
 /// Ring-5 staging: one markdown file per candidate, shared across hosts.
-/// A lane under `todo/`, because a queue of pending distillation IS work
-/// state — and because a reserved name already carries "never indexed"
+/// A lane under `todo/`, because pending maintenance evidence IS work state —
+/// and because a reserved name already carries "never indexed"
 /// without needing a top-level directory of its own.
 pub fn staging_dir(brain_root: &Path) -> PathBuf {
     brain_root.join("todo/staging")
