@@ -40,6 +40,19 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
             .is_some_and(|rows| !rows.is_empty()),
         "the CPU floor must always be visible: {report}"
     );
+    let build_backend = report["build"]["inference_backend"].as_str().unwrap();
+    let cpu_binding = report["hardware"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["token"] == "cpu")
+        .and_then(|row| row["binding"].as_str())
+        .unwrap();
+    let expected_cpu_binding = match build_backend {
+        "cpu" | "openvino" | "coreml" => "available_not_selected",
+        _ => "not_supported_by_build",
+    };
+    assert_eq!(cpu_binding, expected_cpu_binding);
     assert!(
         !state.join("endpoint.key").exists(),
         "reading diagnostics must not create a network identity"
@@ -55,10 +68,13 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("Detected hardware"), "{text}");
-    if cfg!(feature = "inference-ort") {
+    if matches!(build_backend, "cpu" | "openvino" | "coreml") {
         assert!(text.contains("CPU [cpu] — available, not selected"), "{text}");
     } else {
-        assert!(text.contains("not supported by this build"), "{text}");
+        assert!(
+            text.contains("CPU [cpu] — not supported by this build"),
+            "{text}"
+        );
     }
     assert!(text.contains("live utilization: not reported"), "{text}");
     assert!(text.contains("peer artifacts iroh-blobs"), "{text}");

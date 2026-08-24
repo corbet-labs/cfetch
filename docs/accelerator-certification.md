@@ -23,12 +23,12 @@ inference; they are never silently called producers.
 
 | Hardware class | cfetch path | INT8 common-denominator evidence | Producer status |
 |---|---|---|---|
-| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified reference host** with Microsoft's official ORT 1.28.0 release, 11/11 exact; a later hosted x86-64 run of the same bytes failed 0/11, so every host remains KAT-gated |
-| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: public physical runs passed bundle/runtime loading but failed 0/11 exact vectors; alternative runtime pending |
-| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; alternative runtime/graph route and physical-device certificates pending |
+| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified only on named hosts** with Microsoft's official ORT 1.28.0 release, 11/11 exact; a hosted run of the same bytes failed 0/11, so every host remains KAT-gated |
+| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: hardware-identified public runs loaded and executed but failed 0/11 exact vectors; alternative runtime pending |
+| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
 | Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official `cfetch-test-openvino` runtime package integrated for Linux x86-64; local CPU probe rejected because OpenVINO did not own the complete frozen graph; public reproduction and physical GPU/NPU certificates pending |
 | AMD XDNA2 NPU | ORT Vitis AI or a reviewed Ryzen AI adapter | XDNA2 exposes INT8, but Ryzen AI 1.8 documents INT8 for CNN and BF16 for NLP, an ORT 1.16 Vitis path, and automatic CPU partitioning | Rust session surface integrated, but no compatible cfetch runtime package yet; an AMD adapter/runtime update and physical KAT/placement proof are required |
-| AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX accepts quantized ONNX paths on supported consumer/server GPUs; actual operator coverage varies | Session path integrated; AMD's current prebuilt MIGraphX runtime is within cfetch's API floor; RDNA/CDNA packaging and physical certificates pending |
+| AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Session path integrated; runtime packaging and oldest/current architecture certificates pending |
 | Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Session path integrated; Microsoft publishes Windows QNN packages; Snapdragon package/KAT/placement pending |
 | Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Session path integrated; DirectML runtime package and physical certificate pending |
@@ -63,8 +63,13 @@ Ordinary production always executes the KAT on the host actually doing work.
 Run
 [`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
 subsequently passed 11/11 again with the same package. Because that workflow
-also predates hardware capture, this is a second run-scoped passing result—not
-grounds for an architecture-wide package.
+also predates hardware capture, this is a second run-scoped passing result.
+Run
+[`32681875052`](https://github.com/corbet-labs/cfetch/actions/runs/32681875052)
+then passed 11/11 on a recorded AMD EPYC 7763 Azure VM while the same official
+runtime again failed 0/11 on recorded Arm Neoverse-N2 Linux and virtual Apple
+M1 macOS runners. Hardware capture makes each observation reproducible; it
+still does not turn a passing host into an architecture-wide package.
 
 The ort-sys bundled/static 1.28 build was deliberately rejected after failing
 all 11 records. ORT version strings are therefore informational; distribution
@@ -110,15 +115,55 @@ that documented suggestion is not a hidden working route. The public job
 reproduces the failure boundary; each selected Intel device still requires a
 compatible full-graph path, exact bytes and placement review.
 
-Public run
+Public runs
 [`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
+and
+[`32681875052`](https://github.com/corbet-labs/cfetch/actions/runs/32681875052)
 also exercised the actual CoreML GPU and NPU routes. Core ML compiled both
 MLPrograms, but each plan placed all 2,212 operations on
 `MLCPUComputeDevice`: zero selected GPU or Neural Engine. Additional graph
 nodes remained assigned to ORT CPU. Because fallback is forbidden, cfetch
 stopped at session initialization before emitting any vector. Both evidence
-artifacts are registry-pinned; this rejects those hosted routes and does not
-generalize to untested Apple models.
+artifacts are registry-pinned. The newer runner identifies itself as
+`VirtualMac2,1` / `Apple M1 (Virtual)`, so it is useful rejection evidence but
+cannot prove anything about physical Metal or ANE execution.
+
+## Physical AMD RDNA2 result
+
+The pinned flake now exposes `cfetch-test-migraphx` on Linux x86-64. It builds
+ONNX Runtime 1.27.1 and MIGraphX/ROCm 7.2.3 from the locked nixpkgs revision.
+Nixpkgs' ORT derivation required RTTI to be restored because ORT's MIGraphX
+stream bridge uses `dynamic_cast`; every other input remains locked. The
+loaded ORT library SHA-256 is
+`8b84c85c1e7419c04dd523f7a1313eb9044b24b68c621cd1d00516242b7a0795`
+and its MIGraphX provider library SHA-256 is
+`20a42d36996d4fb14cca478b306dbaccf48cf8b59f09fa4a63ace57934c40f88`.
+The package's full test suite passed before the device probe.
+
+On a physical AMD Radeon RX 6800 (`gfx1030`, Navi 21/RDNA2), the normal
+FastEmbed → ORT → MIGraphX route was rejected at session construction because
+MIGraphX EP did not own every graph node and ORT CPU fallback was disabled.
+This is an ORT partitioner/operator-coverage boundary, not a conclusion that
+RDNA2 lacks INT8 execution.
+
+To test that distinction, standalone MIGraphX 2.15.0 parsed, compiled and ran
+the complete fixed 1x32 graph on the same GPU without recalibration or another
+quantizer. Its compiled program contained 512 `gpu::code_object` occurrences,
+168 `mlir_quant_dot` occurrences, one `quant_gemm`, and no `cpu::`
+instruction. The exact public first-KAT tensors were used. The resulting
+canonical record was
+`2639d01960d3a05431eaa6b6b03207f5e0e69ae9b0ce26513fca6472f5d530d9`,
+not the required
+`7e67364be4c574340d3693b2743c32d0f8841bf9e723bda821d4ab0c85e32984`;
+729 of 768 components changed. Thus RDNA2 does accelerate this graph, but a
+direct MIGraphX backend is not a compatible v1 producer and is not a useful
+escape from ORT's partitioning failure. The registry records all runtime,
+hardware, input, output and compiled-program hashes.
+
+The MIGraphX package is intentionally an explicit certification target rather
+than a default flake check: compiling the ROCm closure on every public CPU-only
+CI run would consume substantial time while proving no GPU execution. It must
+be built and exercised on the actual AMD device under test.
 
 ## Running a certificate
 
@@ -141,6 +186,9 @@ FastEmbed and ORT identities, pinned runtime distribution/archive, provider,
 fallback policy, graph settings, tokenizer tensor digests, raw model-output
 digests, exact encoded vectors and pass/fail results. It contains no hostname,
 username, private path, credentials, environment dump or private model input.
+For source-built Nix provider packages, the schema's legacy
+`onnxruntime_archive_sha256` field carries the fixed-output ORT source digest;
+the loaded shared library is still hashed independently.
 
 For CPU, exact KAT plus an admitted runtime is sufficient because the
 canonical graph audit establishes W8A8 coverage. For every accelerator, exact
@@ -193,7 +241,16 @@ non-catalogue Intel evidence package. The public runner exercises
 `openvino-gpu` or `openvino-npu`. The package disables dynamic shapes and uses
 one stream/thread, while the seven frozen cfetch buckets remain unchanged. The
 first local CPU attempt was rejected at full-graph ownership; the package is a
-reproducible evidence tool, not a producer.
+reproducible evidence tool, not a producer. Public run
+[`32681875052`](https://github.com/corbet-labs/cfetch/actions/runs/32681875052)
+reproduced that boundary on a recorded AMD EPYC 7763 hosted VM. That validates
+the package and rejection path, not Intel CPU/GPU/NPU support.
+
+On physical Linux AMD systems, `nix build .#cfetch-test-migraphx` builds the
+locked ORT/MIGraphX/ROCm evidence package. Its first RX 6800 result is rejected
+and registry-pinned as described above. Current RDNA/CDNA devices and a
+different compatible runtime path remain open; no AMD GPU producer is
+advertised.
 
 The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,

@@ -29,8 +29,13 @@
                 "cfetch"
                 "cfetch-local-cpu"
                 "cfetch-test-coreml"
+                "cfetch-test-migraphx"
                 "cfetch-test-openvino"
               ];
+            # Nixpkgs only builds ONNX Runtime's MIGraphX provider when the
+            # ROCm package set is enabled. Keep that expensive closure scoped
+            # to the one platform on which the certification package exists.
+            config.rocmSupport = system == "x86_64-linux";
           })
         );
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
@@ -99,6 +104,22 @@
             runHook postInstall
           '';
         };
+        # Build the AMD provider from the same pinned nixpkgs input as cfetch.
+        # Nixpkgs 7.2.3 otherwise disables RTTI while ORT 1.27.1's MIGraphX
+        # stream-handle bridge uses dynamic_cast, so the unmodified derivation
+        # fails to compile. This override is the smallest upstream-compatible
+        # correction and retains the complete input-addressed ROCm closure.
+        migraphxOrt = (pkgs.onnxruntime.override {
+          pythonSupport = false;
+          openvinoSupport = false;
+          coremlSupport = false;
+          cudaSupport = false;
+          rocmSupport = true;
+        }).overrideAttrs (old: {
+          cmakeFlags = old.cmakeFlags ++ [
+            (pkgs.lib.cmakeBool "onnxruntime_DISABLE_RTTI" false)
+          ];
+        });
         mkCfetch =
           {
             pname,
@@ -208,6 +229,18 @@
           runtime = openvinoOrt;
           runtimeDistribution = "pypi-onnxruntime-openvino-${openvinoVersion}";
           runtimeArchiveSha256 = openvinoWheelSha256;
+        };
+        # AMD GPU evidence package. The distribution string pins every build
+        # input through flake.lock; the recorded SHA-256 is the Nix-fixed ORT
+        # source hash. The certification report separately hashes the exact
+        # libonnxruntime loaded at execution time.
+        cfetch-test-migraphx = mkCfetch {
+          pname = "cfetch-test-migraphx";
+          localInference = true;
+          inferenceFeature = "inference-migraphx";
+          runtime = migraphxOrt;
+          runtimeDistribution = "nixpkgs-${nixpkgs.rev}-onnxruntime-1.27.1-migraphx-7.2.3";
+          runtimeArchiveSha256 = "8b6bbf2677db27fb2bb196370136f662c0415c48531a16adb2bdfef5e1d55773";
         };
       });
 

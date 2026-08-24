@@ -105,6 +105,23 @@ They are rejected producers, not “probably compatible” CPU packages. This is
 why shared vectors are derived once and distributed, and why an architecture
 name or matching runtime version cannot bypass the KAT.
 
+A physical AMD Radeon RX 6800 produced the complementary accelerator result.
+ORT's MIGraphX provider could not own the whole graph with CPU fallback
+disabled. Standalone MIGraphX did compile and run the complete frozen W8A8
+graph on RDNA2 INT8-capable kernels, but its first encoded result changed 729
+of 768 components. This proves that “same ONNX Q/DQ graph” and “real INT8
+acceleration” still do not imply identical output arithmetic across kernels.
+It also rules out bypassing ORT with direct MIGraphX as a v1 producer.
+
+These results settle the apparent common-denominator problem at the correct
+boundary. V1 has one logical W8A8 model and one canonical signed `INT8x768`
+record, but it cannot honestly promise that every vendor kernel derives those
+bytes independently. A device is a producer only if its exact host/runtime
+passes the byte KAT; every other device consumes the same already-derived
+record or uses a certified remote producer. That consumer path is fully
+interoperable across CPU, GPU and NPU because inference precision is never
+part of the shared record. There is no approximate compatibility mode.
+
 Run the real packaged path with:
 
 ```console
