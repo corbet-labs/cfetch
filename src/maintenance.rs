@@ -1684,6 +1684,21 @@ fn record_exception(
     )
 }
 
+/// Records a worker failure that happened before a proposal existed (for
+/// example, endpoint policy or credential resolution). Candidate ids are
+/// bounded and the ordinary journal redaction/content-addressing still apply.
+pub(crate) fn record_background_exception(
+    cfg: &Config,
+    detail: impl Into<String>,
+) -> anyhow::Result<MaintenanceEvent> {
+    let candidate_ids = staging::list(&paths::staging_dir(&cfg.brain_root))
+        .into_iter()
+        .take(cfg.maintenance.max_candidates)
+        .map(|candidate| candidate.id)
+        .collect();
+    record_exception(cfg, None, candidate_ids, detail, Vec::new())
+}
+
 /// Process a bounded batch and continue past per-candidate exceptions. A
 /// healthy cycle needs no human input; failures remain visible in history and
 /// their source candidates remain available for a later, freshly grounded
@@ -2494,5 +2509,22 @@ mod tests {
         let issues = history_issues(&fixture.cfg);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].contains("content address mismatch"), "{issues:?}");
+    }
+
+    #[test]
+    fn preflight_failure_is_visible_without_a_proposal() {
+        let fixture = Fixture::new();
+
+        let event = record_background_exception(
+            &fixture.cfg,
+            "maintenance.api_key=sk-123456789012345678901234567890",
+        )
+        .unwrap();
+
+        assert_eq!(event.outcome, EventOutcome::Exception);
+        assert!(event.proposal_id.is_none());
+        assert_eq!(event.candidate_ids, vec![fixture.candidate.id.clone()]);
+        assert!(event.detail.contains("redacted"));
+        assert!(!event.detail.contains("sk-"));
     }
 }
