@@ -97,6 +97,14 @@ The Rust/FastEmbed binding uses the older ORT C API 18 surface so compatible
 vendor runtimes are not excluded merely by a newer compile-time ABI request;
 the loaded runtime's exact distribution and bytes still have to be certified.
 
+The same official ORT 1.28 build commit was then exercised on public Linux
+arm64 and macOS arm64 runners. Both loaded and ran successfully but matched
+none of the 11 x86 reference records. Hundreds of components changed in every
+answer, and the two arm64 OS runtimes themselves diverged on five answers.
+They are rejected producers, not “probably compatible” CPU packages. This is
+why shared vectors are derived once and distributed, and why an architecture
+name or matching runtime version cannot bypass the KAT.
+
 Run the real packaged path with:
 
 ```console
@@ -109,6 +117,14 @@ the canonical codec, and compares all 11 records byte for byte. Accelerator
 packages additionally disable ORT CPU fallback. A passing accelerator vector
 test still needs reviewed placement/profiler evidence that learned W8A8
 regions actually used the claimed INT8 device kernels.
+
+The ordinary local embedding path enforces the same gate before it can answer
+or write a vector. A bundle or session that merely loads is not admitted. On a
+host whose runtime produces different bytes, local initialization fails with a
+consumer-only message. Existing shared records and a separately configured
+certified remote producer remain the compatible routes. `inference-certify`
+deliberately remains available on such a host so it can emit the failure report
+needed to add or reject that runtime.
 
 ## Canonical vector codec
 

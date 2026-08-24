@@ -28,6 +28,11 @@
       "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
       "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
       "onnxruntime_build_commit": "da9b5e364c",
+      "ort_c_api": 18,
+      "fastembed": "6.0.0 + cfetch session-controls 234fc39af5b010de0cb0c5688d138492e690fa68",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32678932373",
+      "report_artifact_id": 9503739953,
+      "report_sha256": "23866923e294a27fd8e8f239c2fc529c94273e03a43d9c1ae88bb1bd57ed4e32",
       "artifact_verified": true,
       "exact_known_answers_passed": 11,
       "exact_known_answers_failed": 0,
@@ -35,9 +40,39 @@
       "note": "The public model-v1 bundle and Nix package on main are usable directly; catalog admission stays false until they are assembled and reviewed as a standalone local release variant."
     }
   ],
+  "rejected_attempts": [
+    {
+      "id": "linux-aarch64-cpu-microsoft-ort-1.28.0",
+      "status": "rejected-vector-incompatibility",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32678932373",
+      "artifact_id": 9503686154,
+      "report_sha256": "df2123aa06cf01078ff56a17958f4cc7813b1a0839090f2721cf2825297d12a6",
+      "onnxruntime_archive_sha256": "e15ff8b5d85afe6c144d97c6fd432254bf76a219daaf17658087d6ecb3e8f0bb",
+      "onnxruntime_library_sha256": "f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7",
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 11,
+      "changed_components_per_vector": "622..736 of 768",
+      "cosine_to_x86_reference": "0.969643..0.982644",
+      "note": "The exact bundle and official runtime executed successfully, but the resulting records are not network-major-1 vectors. This runtime remains consumer-only."
+    },
+    {
+      "id": "macos-aarch64-cpu-microsoft-ort-1.28.0",
+      "status": "rejected-vector-incompatibility",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32678932373",
+      "artifact_id": 9503692514,
+      "report_sha256": "04fa71ea5bd2b4cf0f605982ea6fa8244000f70cbbc54c8c92f8cf4d30511212",
+      "onnxruntime_archive_sha256": "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
+      "onnxruntime_library_sha256": "dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d",
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 11,
+      "changed_components_per_vector": "410..736 of 768",
+      "cosine_to_x86_reference": "0.972391..0.980638",
+      "note": "The exact bundle and official runtime executed successfully, but the resulting records are not network-major-1 vectors. This runtime remains consumer-only."
+    }
+  ],
   "pending_physical_families": [
-    "linux-aarch64-cpu",
-    "macos-aarch64-cpu",
+    "linux-aarch64-cpu-alternative-runtime",
+    "macos-aarch64-cpu-alternative-runtime",
     "apple-metal",
     "apple-ane",
     "intel-openvino-cpu",

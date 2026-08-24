@@ -24,7 +24,7 @@ inference; they are never silently called producers.
 | Hardware class | cfetch path | INT8 common-denominator evidence | Producer status |
 |---|---|---|---|
 | x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified reference** on the tested x86-64 host with Microsoft's official ORT 1.28.0 release, 11/11 exact |
-| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | Integrated, physical KAT pending |
+| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: public physical runs passed bundle/runtime loading but failed 0/11 exact vectors; alternative runtime pending |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | Session path integrated; macOS EP runtime package and physical Metal/ANE certificates pending |
 | Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Session path integrated; Intel publishes EP runtimes; physical per-device certificates pending |
 | AMD XDNA2 NPU | ORT Vitis AI or a reviewed Ryzen AI adapter | XDNA2 exposes INT8, but Ryzen AI 1.8 documents INT8 for CNN and BF16 for NLP, an ORT 1.16 Vitis path, and automatic CPU partitioning | Rust session surface integrated, but no compatible cfetch runtime package yet; an AMD adapter/runtime update and physical KAT/placement proof are required |
@@ -56,8 +56,15 @@ The admitted x86-64 package uses Microsoft's official
 The ort-sys bundled/static 1.28 build was deliberately rejected after failing
 all 11 records. ORT version strings are therefore informational; distribution
 and archive digests are part of producer admission. Linux arm64 and macOS
-arm64 packages pin Microsoft's official archives too, but that is packaging
-evidence only until those binaries execute the KAT on their target machines.
+arm64 packages pin Microsoft's official archives too. Public run
+[`32678932373`](https://github.com/corbet-labs/cfetch/actions/runs/32678932373)
+executed both on their target architectures and rejected both: 0/11 records
+matched. Linux arm64 changed 622–736 components per 768-byte answer and macOS
+arm64 changed 410–736; cosine to the x86 records remained about 0.97–0.98.
+The two arm64 runtimes agreed exactly on six answers and disagreed on five.
+This is architecture/runtime numerical divergence, not a one-bit codec edge.
+Neither package may produce v1 vectors; a different runtime must pass from
+scratch.
 
 cfetch and its FastEmbed fork request ORT C API 18, the lowest API used by the
 provider/session code, while the certified CPU runtime remains Microsoft's

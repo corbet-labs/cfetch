@@ -219,7 +219,7 @@ impl EmbedClient {
         } else {
             #[cfg(feature = "inference-ort")]
             {
-                EmbedBackend::Local(Box::new(crate::local_embed::LocalEmbedder::load(
+                EmbedBackend::Local(Box::new(crate::local_embed::LocalEmbedder::load_for_production(
                     std::path::Path::new(&cfg.model_dir),
                     &cfg.execution_provider,
                 )?))

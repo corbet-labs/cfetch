@@ -475,11 +475,13 @@ $ ./result/bin/cfetch inference-certify \
     --model-dir ./cfetch-embeddinggemma-300m-a8w8-v1 --provider auto --json
 ```
 
-The x86-64 package is the current certified CPU reference. Linux arm64 and
-macOS arm64 use pinned official runtime archives but remain producer-ineligible
-until public physical runs pass the exact-vector certificate. The release
-catalog therefore remains remote-only; direct evaluation is not a hardware
-support claim. See the [frozen profile](docs/embedding-profile-v1.md) and
+The x86-64 package is the current certified CPU reference. Public Linux arm64
+and macOS arm64 runs of their pinned official runtimes failed all 11 exact
+vectors, so those runtimes are explicitly consumer-only; an alternative must
+pass from scratch. The release catalog therefore remains remote-only. Ordinary
+local loading runs the same admission gate and fails closed before writing
+vectors on an incompatible host. See the
+[frozen profile](docs/embedding-profile-v1.md) and
 [certification matrix](docs/accelerator-certification.md).
 
 ### Build the development branch

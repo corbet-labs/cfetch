@@ -200,7 +200,7 @@ impl std::fmt::Debug for LocalEmbedder {
 }
 
 impl LocalEmbedder {
-    pub fn load(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
+    fn load_unadmitted(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
         let bundle = VerifiedBundle::load(model_dir)?;
         let (provider, device_class, dispatch) = execution_provider(requested_provider)?;
         let mut length_tokenizer = tokenizers::Tokenizer::from_bytes(bundle.tokenizer.clone())
@@ -228,6 +228,20 @@ impl LocalEmbedder {
             length_tokenizer,
             model: Mutex::new(model),
         })
+    }
+
+    /// Load a local producer only after this package/runtime passes the
+    /// released byte KAT. Certification itself deliberately bypasses this
+    /// admission so new and incompatible hardware can still emit evidence.
+    pub fn load_for_production(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
+        let embedder = Self::load_unadmitted(model_dir, requested_provider)?;
+        let report = certify_loaded(&embedder, Instant::now())?;
+        ensure_production_admission(
+            report.provider,
+            report.exact_vector_conformance,
+            report.producer_eligible_without_external_review,
+        )?;
+        Ok(embedder)
     }
 
     pub fn provider(&self) -> &'static str {
@@ -354,6 +368,19 @@ impl LocalEmbedder {
     }
 }
 
+fn ensure_production_admission(provider: &str, exact: bool, eligible: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        exact,
+        "{provider} provider output is incompatible with {} on this host; local production is disabled, but shared/remote vectors remain usable",
+        crate::embedding_profile::PROFILE_ID
+    );
+    anyhow::ensure!(
+        eligible,
+        "{provider} provider has no production admission for this runtime/device; run `cfetch inference-certify` and submit the report plus required placement evidence"
+    );
+    Ok(())
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -396,7 +423,14 @@ fn runtime_library_sha256() -> anyhow::Result<String> {
 /// regions internally.
 pub fn certify(model_dir: &Path, requested_provider: &str) -> anyhow::Result<CertificationReport> {
     let started = Instant::now();
-    let embedder = LocalEmbedder::load(model_dir, requested_provider)?;
+    let embedder = LocalEmbedder::load_unadmitted(model_dir, requested_provider)?;
+    certify_loaded(&embedder, started)
+}
+
+fn certify_loaded(
+    embedder: &LocalEmbedder,
+    started: Instant,
+) -> anyhow::Result<CertificationReport> {
     let mut results = Vec::with_capacity(KNOWN_ANSWERS.len());
     for known in KNOWN_ANSWERS {
         let body = std::iter::repeat_n(known.seed, known.repeats)
@@ -868,5 +902,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not compiled"), "{error}");
+    }
+
+    #[test]
+    fn production_requires_exact_bytes_and_a_runtime_admission() {
+        ensure_production_admission("cpu", true, true).unwrap();
+
+        let drift = ensure_production_admission("cpu", false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(drift.contains("incompatible") && drift.contains("local production is disabled"));
+
+        let unreviewed = ensure_production_admission("qnn", true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(unreviewed.contains("no production admission"));
     }
 }

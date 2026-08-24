@@ -701,7 +701,12 @@ fn inference_diagnostic(
                     ),
                 });
             }
+            // Constructing a local producer now runs the released byte KAT.
+            // Doctor is observation-only and must never invoke inference, so
+            // only validate the endpoint client here; local admission is
+            // reported from the last real selection/certification evidence.
             if cfg.embeddings.enabled
+                && cfg.embeddings.model_dir.trim().is_empty()
                 && let Err(error) = embed::EmbedClient::new(&cfg.embeddings)
             {
                 findings.push(Finding {
