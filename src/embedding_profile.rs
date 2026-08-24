@@ -18,13 +18,12 @@ pub const PROFILE_ID: &str = "cfetch-embedding-v1";
 pub const MODEL: &str = "google/embeddinggemma-300m-qat-q8_0-unquantized";
 pub const MODEL_REVISION: &str = "7b5b24595322ab0ea4d08827066860a6df8cb0aa";
 
-/// One logical quantization across runners. Vendor packages may use their
-/// native container, but not another numerical scheme.
-pub const MODEL_QUANTIZATION: &str = "xint8-w8a8-symmetric-power-of-two-scales";
-pub const MODEL_ARTIFACT_ID: &str = "cfetch-embeddinggemma-300m-xint8-v1";
-/// Filled only after the calibrated graph passes semantic quality and byte
-/// conformance. An ID without immutable bytes is not a released artifact.
-pub const MODEL_ARTIFACT_SHA256: Option<&str> = None;
+/// One logical quantization across runners. Vendor packages may compile this
+/// graph into a native cache, but may not recalibrate it or choose new scales.
+pub const MODEL_QUANTIZATION: &str = "a8w8-s8s8-symmetric-qdq-opset18";
+pub const MODEL_ARTIFACT_ID: &str = "cfetch-embeddinggemma-300m-a8w8-v1";
+pub const MODEL_ARTIFACT_SHA256: Option<&str> =
+    Some("ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1");
 pub const TOKENIZER_JSON_SHA256: &str =
     "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e";
 pub const TOKENIZER_CONFIG_SHA256: &str =
@@ -49,7 +48,7 @@ pub const ORT_EXECUTION_MODE: &str = "sequential";
 pub const QUERY_PREFIX: &str = "task: search result | query: ";
 pub const DOCUMENT_PREFIX: &str = "title: none | text: ";
 pub const POOLING: &str = "attention-mask-weighted-mean-include-prompt";
-pub const GRAPH_OPTIMIZATION: &str = "ort-level3";
+pub const GRAPH_OPTIMIZATION: &str = "ort-enable-all";
 pub const NORMALIZATION: &str = "l2-then-i8-maxabs-rne";
 pub const VECTOR_ENCODING: &str = "signed-int8x768";
 
@@ -182,11 +181,11 @@ mod tests {
         assert_eq!(m.ort_intra_threads, 1);
         assert_eq!(m.ort_execution_mode, "sequential");
         assert!(m.model.contains("embeddinggemma-300m"));
-        assert!(m.model_artifact_sha256.is_none());
         assert_eq!(
-            m.model_quantization,
-            "xint8-w8a8-symmetric-power-of-two-scales"
+            m.model_artifact_sha256,
+            Some("ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1")
         );
+        assert_eq!(m.model_quantization, "a8w8-s8s8-symmetric-qdq-opset18");
     }
 
     #[test]

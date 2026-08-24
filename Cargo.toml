@@ -22,6 +22,7 @@ include = [
   "/LICENSE.md",
   "/THIRD-PARTY-LICENSES.txt",
   "/release/variants.json",
+  "/release/inference-certifications.json",
 ]
 
 [features]
@@ -34,14 +35,9 @@ inference-ort = [
   "dep:tokenizers",
   "ort/load-dynamic",
 ]
-# Convenience build for Cargo/GitHub archives. Nix and vendor-runtime packages
-# use `inference-ort` with their own immutable ORT library instead.
-inference-ort-bundled = [
-  "inference-ort",
-  "ort/copy-dylibs",
-  "ort/download-binaries",
-  "ort/tls-rustls",
-]
+# There is intentionally no ORT download/bundled feature. The ort-sys 1.28
+# static archive failed the v1 byte KAT while Microsoft's official 1.28 shared
+# release passed it; local producer packages must pin an admitted runtime.
 inference-coreml = ["inference-ort", "ort/coreml"]
 inference-directml = ["inference-ort", "ort/directml"]
 inference-openvino = ["inference-ort", "ort/openvino"]
@@ -74,7 +70,7 @@ crossterm = "0.29.0"
 # https://github.com/Anush008/fastembed-rs/pull/280. This preserves FastEmbed's
 # pipeline while allowing cfetch to prohibit CPU fallback and specialize QNN
 # sessions to the profile's fixed shapes.
-fastembed = { version = "=6.0.0", git = "https://github.com/corbet-labs/fastembed-rs", rev = "ba8f8361ed81ff718edbadd26e23eecf202ecd1d", default-features = false, optional = true }
+fastembed = { version = "=6.0.0", git = "https://github.com/corbet-labs/fastembed-rs", rev = "f8bb355369340dc81e43979b23d23eddab0a40c4", default-features = false, optional = true }
 ignore = "0.4"
 iroh = "1.0.3"
 # BLAKE3-verified, resumable artifact transfer over the daemon's existing

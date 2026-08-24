@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::Digest as _;
+
 struct Host {
     _root: tempfile::TempDir,
     home: PathBuf,
@@ -111,6 +113,16 @@ struct EmbeddingServer {
 
 impl EmbeddingServer {
     fn start() -> Self {
+        let profile_output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
+            .args(["embedding-profile", "--json"])
+            .output()
+            .unwrap();
+        assert!(profile_output.status.success());
+        let profile: serde_json::Value = serde_json::from_slice(&profile_output.stdout).unwrap();
+        let profile_manifest_sha256 = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&profile).unwrap())
+        );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -162,11 +174,12 @@ impl EmbeddingServer {
                             .map(|index| serde_json::json!({"index": index, "embedding": embedding}))
                             .collect();
                         let body = serde_json::to_vec(&serde_json::json!({
-                            "model": "google/embeddinggemma-300m-qat-q8_0-unquantized",
-                            "cfetch_profile": "cfetch-embedding-v1",
-                            "cfetch_model_revision": "7b5b24595322ab0ea4d08827066860a6df8cb0aa",
-                            "cfetch_model_quantization": "xint8-w8a8-symmetric-power-of-two-scales",
-                            "cfetch_model_artifact": "cfetch-embeddinggemma-300m-xint8-v1",
+                            "model": profile["model"],
+                            "cfetch_profile": profile["profile_id"],
+                            "cfetch_profile_manifest_sha256": profile_manifest_sha256,
+                            "cfetch_model_revision": profile["model_revision"],
+                            "cfetch_model_quantization": profile["model_quantization"],
+                            "cfetch_model_artifact": profile["model_artifact_id"],
                             "data": data,
                         }))
                         .unwrap();

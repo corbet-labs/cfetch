@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "network_major": 1,
+  "profile_id": "cfetch-embedding-v1",
+  "profile_manifest_sha256": "09e8c7c15c09fb273da3f5f639b38869ee27992d62b30b3f0da9350f37a7e3aa",
+  "artifact_id": "cfetch-embeddinggemma-300m-a8w8-v1",
+  "artifact_sha256": "ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1",
+  "bundle_sha256": "12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1",
+  "policy": {
+    "exact_known_answers_required": 11,
+    "accelerator_cpu_fallback_forbidden": true,
+    "accelerator_int8_placement_review_required": true,
+    "uncertified_devices_are_consumers_only": true
+  },
+  "certifications": [
+    {
+      "id": "linux-x86_64-cpu-microsoft-ort-1.28.0",
+      "status": "passing-reference",
+      "catalog_admitted": false,
+      "catalog_blocker": "the separately licensed v1 model bundle is not yet a public release asset",
+      "os": "linux",
+      "arch": "x86_64",
+      "provider": "cpu",
+      "device_class": "cpu",
+      "package": "nix:cfetch-local-cpu",
+      "onnxruntime_distribution": "microsoft-github-release-v1.28.0",
+      "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+      "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+      "onnxruntime_build_commit": "da9b5e364c",
+      "artifact_verified": true,
+      "exact_known_answers_passed": 11,
+      "exact_known_answers_failed": 0,
+      "int8_evidence": "canonical QDQ graph audit: 171 learned nodes covered; no floating-point shadow learned weights",
+      "note": "Catalog admission stays false until model distribution and the complete release package exist."
+    }
+  ],
+  "pending_physical_families": [
+    "linux-aarch64-cpu",
+    "macos-aarch64-cpu",
+    "apple-metal",
+    "apple-ane",
+    "intel-openvino-cpu",
+    "intel-openvino-gpu",
+    "intel-openvino-npu",
+    "amd-xdna2",
+    "amd-migraphx-rdna",
+    "amd-rocm",
+    "nvidia-cuda",
+    "nvidia-tensorrt",
+    "qualcomm-qnn-htp",
+    "windows-directml",
+    "webgpu-vulkan-class"
+  ]
+}

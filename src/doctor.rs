@@ -483,9 +483,43 @@ fn compiled_backend() -> String {
     {
         return release.backend.clone();
     }
-    // The current source tree contains only endpoint inference. An
-    // unidentified developer build must describe what was compiled, not
-    // borrow an accelerator identity from the host it happens to run on.
+    // Local and certification packages are intentionally absent from the
+    // public release catalog until their report is reviewed. They still need
+    // to describe what was actually compiled instead of masquerading as the
+    // endpoint-only archive.
+    if cfg!(feature = "inference-qnn") {
+        return "qnn".into();
+    }
+    if cfg!(feature = "inference-vitis") {
+        return "vitis".into();
+    }
+    if cfg!(feature = "inference-openvino") {
+        return "openvino".into();
+    }
+    if cfg!(feature = "inference-coreml") {
+        return "coreml".into();
+    }
+    if cfg!(feature = "inference-tensorrt") {
+        return "tensorrt".into();
+    }
+    if cfg!(feature = "inference-cuda") {
+        return "cuda".into();
+    }
+    if cfg!(feature = "inference-migraphx") {
+        return "migraphx".into();
+    }
+    if cfg!(feature = "inference-rocm") {
+        return "rocm".into();
+    }
+    if cfg!(feature = "inference-directml") {
+        return "directml".into();
+    }
+    if cfg!(feature = "inference-webgpu") {
+        return "webgpu".into();
+    }
+    if cfg!(feature = "inference-ort") {
+        return "cpu".into();
+    }
     "endpoint".into()
 }
 
@@ -743,8 +777,12 @@ fn hardware_diagnostics(
         .into_iter()
         .map(|found| {
             let class = format!("{:?}", found.device.class()).to_lowercase();
-            let usability = found.usable();
-            let caveat = found.caveat();
+            let caveat = found.caveat().or_else(|| {
+                (found.device.class() != hardware::Class::Cpu).then(|| {
+                    "device discovery is not v1 producer certification; run the exact KAT and review provider placement"
+                        .into()
+                })
+            });
             let selected = runtime
                 .inference
                 .selected
@@ -753,7 +791,31 @@ fn hardware_diagnostics(
                     selection.route == Some(runtime_status::InferenceRoute::Local)
                         && selection.device_class.as_deref() == Some(class.as_str())
                 });
-            let supported = build_backend != "endpoint" && usability.is_ok();
+            // Discovery does not decide whether this exact graph/runtime is
+            // usable. Provider initialization and inference certification are
+            // the evidence boundary; do not blacklist or bless silicon from a
+            // PCI/device name alone.
+            let supported = match build_backend {
+                "cpu" => found.device == hardware::Device::Cpu,
+                "qnn" => found.device == hardware::Device::QualcommNpu,
+                "vitis" => found.device == hardware::Device::AmdNpu,
+                "openvino" => matches!(
+                    found.device,
+                    hardware::Device::IntelNpu
+                        | hardware::Device::IntelGpu
+                        | hardware::Device::Cpu
+                ),
+                "coreml" => matches!(
+                    found.device,
+                    hardware::Device::AppleNeuralEngine
+                        | hardware::Device::AppleGpu
+                        | hardware::Device::Cpu
+                ),
+                "cuda" | "tensorrt" => found.device == hardware::Device::NvidiaGpu,
+                "migraphx" | "rocm" => found.device == hardware::Device::AmdGpu,
+                "directml" | "webgpu" => found.device.class() == hardware::Class::Gpu,
+                _ => false,
+            };
             let binding = if selected {
                 BindingState::Selected
             } else if supported {
@@ -766,8 +828,8 @@ fn hardware_diagnostics(
                 token: found.device.token().into(),
                 class,
                 evidence: found.evidence,
-                architecturally_usable: usability.is_ok(),
-                unusable_reason: usability.err().map(|error| error.reason().into()),
+                architecturally_usable: true,
+                unusable_reason: None,
                 caveat,
                 binding,
                 selected,

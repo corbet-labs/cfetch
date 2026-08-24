@@ -33,6 +33,44 @@
     {
       packages = forAllSystems (pkgs:
         let
+        # Pin Microsoft's official ORT release bytes. Two builds that both
+        # reported "1.28.0" produced different W8A8 vectors in the adverse
+        # test; runtime provenance is therefore part of producer admission.
+        ortVersion = "1.28.0";
+        ortAsset = {
+          x86_64-linux = {
+            file = "onnxruntime-linux-x64-${ortVersion}.tgz";
+            hash = "sha256-o+G3nXuxvwlpbOZ19J5AZObIH2ICuCJWJP/w6T+NZAc=";
+            sha256 = "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407";
+          };
+          aarch64-linux = {
+            file = "onnxruntime-linux-aarch64-${ortVersion}.tgz";
+            hash = "sha256-4V/4tdha/mwUTZfG/UMiVL92ohnarxdlgIfW7LPo8Ls=";
+            sha256 = "e15ff8b5d85afe6c144d97c6fd432254bf76a219daaf17658087d6ecb3e8f0bb";
+          };
+          aarch64-darwin = {
+            file = "onnxruntime-osx-arm64-${ortVersion}.tgz";
+            hash = "sha256-EmizWXGAmb3izttVeH8YKhMAZ7xPMejIhHjERbhQ09g=";
+            sha256 = "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8";
+          };
+        }.${pkgs.stdenv.hostPlatform.system};
+        certifiedOrt = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cfetch-certified-onnxruntime";
+          version = ortVersion;
+          src = pkgs.fetchurl {
+            url = "https://github.com/microsoft/onnxruntime/releases/download/v${ortVersion}/${ortAsset.file}";
+            inherit (ortAsset) hash;
+          };
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            cp -R include lib "$out/"
+            install -Dm644 LICENSE "$out/share/licenses/onnxruntime/LICENSE"
+            install -Dm644 ThirdPartyNotices.txt \
+              "$out/share/licenses/onnxruntime/ThirdPartyNotices.txt"
+            runHook postInstall
+          '';
+        };
         mkCfetch =
           {
             pname,
@@ -49,10 +87,13 @@
             # Git dependency inside the sandbox.
             outputHashes = {
               "fastembed-6.0.0" =
-                "sha256-uDLesOjegkXWUzjOlGFUdoAO2m/p85PGSl2zuC89eHM=";
+                "sha256-rW6wq3wASoKBXvBHnia0cECYPtD8po1EPXV1gx2rg7E=";
             };
           };
           buildFeatures = pkgs.lib.optionals localInference [ "inference-ort" ];
+          CFETCH_ORT_DISTRIBUTION =
+            if localInference then "microsoft-github-release-v${ortVersion}" else null;
+          CFETCH_ORT_ARCHIVE_SHA256 = if localInference then ortAsset.sha256 else null;
           CFETCH_VARIANT =
             if localInference then
               null
@@ -76,12 +117,13 @@
           '' + pkgs.lib.optionalString localInference ''
             wrapProgram "$out/bin/cfetch" \
               --set-default ORT_DYLIB_PATH \
-              "${pkgs.onnxruntime}/lib/${
+              "${certifiedOrt}/lib/${
                 if pkgs.stdenv.hostPlatform.isDarwin then
                   "libonnxruntime.dylib"
                 else
                   "libonnxruntime.so"
-              }"
+              }"${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " \\
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]}"}
           '';
 
           meta = {

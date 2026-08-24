@@ -1,151 +1,152 @@
 # cfetch embedding profile v1
 
-cfetch has one embedding and network compatibility profile per major. A major
-is a data-format boundary, not a marketing label: changing the model,
-checkpoint, tokenizer, quantization, prompts, pooling, normalization,
-dimensions, or vector codec changes the meaning of every stored vector.
+cfetch has exactly one embedding space per network major. Network major 1 is
+the immutable profile below: one model, one tokenizer and prompt pipeline, one
+quantized graph, and one 768-byte vector record. CPU, GPU and NPU are runners
+for that profile. They are not allowed to choose their own model or
+quantization.
 
-Such a change requires a new cfetch network major and a coordinated
-re-embedding. Peers from different majors do not connect, exchange slices, or
-rank each other's vectors. This compatibility major is independent of the
-pre-1.0 Cargo package version.
+A change to the checkpoint, tokenizer, prompts, context or shape policy,
+pooling, graph quantization, dimensions, normalization, or vector codec is a
+breaking data change. It requires network major 2, 3, and so on, a separate
+store namespace, and re-embedding every record. Different majors never
+connect, exchange slices, or rank each other's vectors. This network major is
+independent of cfetch's pre-1.0 software version.
 
-Run `cfetch embedding-profile` (or `--json`) to read the executable contract.
+`cfetch embedding-profile --json` prints the executable contract.
 
-## Frozen v1 contract
+## Frozen contract
 
-| Field | v1 value |
+| Field | Network-major-1 value |
 |---|---|
-| Network/profile | `1` / `cfetch-embedding-v1` |
+| Profile | `cfetch-embedding-v1` |
 | Model source | `google/embeddinggemma-300m-qat-q8_0-unquantized` |
 | Source revision | `7b5b24595322ab0ea4d08827066860a6df8cb0aa` |
-| Model execution | XINT8: signed symmetric INT8 W8A8 with power-of-two scales |
-| Canonical artifact | `cfetch-embeddinggemma-300m-xint8-v1` |
-| Tokenizer | tokenizer at the same pinned source revision |
+| Canonical graph | `cfetch-embeddinggemma-300m-a8w8-v1` |
+| Graph SHA-256 | `ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1` |
+| Model quantization | static signed-symmetric W8A8 INT8, S8S8 Q/DQ, ONNX opset 18 |
+| Weights | INT8 per output channel |
+| Activations | INT8 per tensor with frozen calibration scales |
+| Accumulators | INT32 |
+| Dimensions | full 768; no Matryoshka truncation |
 | Context | at most 2,048 tokens |
-| Sequence shapes | fixed next-power-of-two buckets: 32, 64, 128, 256, 512, 1,024, 2,048 |
-| Inference batch | exactly one input per model execution |
-| ORT CPU intra-op threads | exactly one |
-| ORT execution mode | sequential |
+| Shapes | batch 1; sequence buckets 32, 64, 128, 256, 512, 1,024, 2,048 |
 | Query input | `task: search result \| query: {content}` |
 | Document input | `title: none \| text: {content}` |
-| Pooling | attention-mask-weighted mean, prompt included |
-| Runtime graph optimization | ONNX Runtime Level 3 (FastEmbed default) |
-| Output normalization | L2, then canonical INT8 vector encoding |
-| Dimensions | full 768; no Matryoshka truncation |
-| Interchange vector | exactly 768 signed INT8 components / 768 bytes |
+| Model output | graph-owned pooling, projection and L2-normalized `sentence_embedding` |
+| ORT execution | sequential, one CPU intra-op thread, `ORT_ENABLE_ALL` graph optimization |
+| Interchange vector | signed `INT8x768`, exactly 768 bytes |
 
-There are two distinct uses of INT8 here. The model contract is XINT8 W8A8:
-weights and activations are signed symmetric INT8 and use power-of-two scales.
-The interchange contract is the final `INT8×768` vector. The pinned Google
-repository is a Q8_0-QAT *source* checkpoint with unquantized tensors; it is
-not itself the deployed XINT8 artifact. The exact quantized tensors, scales,
-operator set, calibration manifest, and canonical ONNX Q/DQ artifact are part
-of the v1 release artifact and may not be regenerated independently.
+The source repository is Google's full 300M EmbeddingGemma Q8-QAT source. Its
+tensors are unquantized; it is not the deployed runtime. The separately
+licensed cfetch artifact is a deterministic static W8A8 export of that source.
+No training, fine-tuning, distillation, pruning, or task-specific model change
+is part of the build.
 
-An accelerator may use its native container (OpenVINO IR, Core ML package,
-QNN context, TensorRT engine, and so on), but it must be derived from that
-canonical artifact and produce the same canonical output bytes. Container
-conversion is packaging, not permission to choose another model or quantizer.
-In particular, AMD's published Ryzen AI 1.8 EmbeddingGemma package is not the
-v1 model: AMD documents it as asymmetric UINT4 weights with BFP16 activations.
-cfetch requires its own XINT8 export and certification for XDNA2.
+The model bundle is deterministic and separately licensed under the included
+Gemma terms. Its current archive SHA-256 is
+`12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1`.
+The archive includes the graph, tokenizer, source card, build report,
+retrieval audit, artifact lock, terms, modification notice, and per-file
+checksums. The graph digest above, rather than the archive filename or URL, is
+the network identity.
+
+## What “one INT8 model” means
+
+All learned embedding and MatMul inputs in the canonical graph are covered by
+INT8 Q/DQ nodes, and the artifact contains no floating-point shadow copy of
+the learned weights. W8A8 execution still requires INT32 accumulation and
+floating-point-domain residual, nonlinear, normalization, and final-output
+operations. Those are arithmetic inside this single frozen graph, not an
+FP16/FP32 model alternative or fallback.
+
+S8S8 Q/DQ is the canonical ONNX representation because it is the documented
+ONNX Runtime CPU/GPU default and matches TensorRT's signed explicit-INT8 path.
+It is not a claim that every vendor consumes the same integer container.
+Qualcomm HTP, for example, exposes important native operators as unsigned
+quantized pairs. A vendor converter may lower the frozen semantics into a
+native container, but it may not recalibrate, change scales, requantize the
+model, or substitute a different precision. The only proof that a lowering is
+compatible is the released byte-level known-answer test.
+
+This avoids the false choice between one file format and one vector space:
+v1 freezes one numerical graph and one final record. Provider-specific
+containers are admitted only when they reproduce that record exactly.
+
+## Deterministic execution boundary
+
+FastEmbed owns the tokenizer and common model API. ONNX Runtime owns graph
+execution and vendor execution-provider integration. cfetch selects the
+graph's named `sentence_embedding` output directly; it does not let a library
+guess a token output, pool it again, or normalize it again.
+
+Each input is prefixed, tokenized, truncated, padded to its smallest allowed
+bucket, and executed alone. Batch-longest padding is forbidden: testing found
+that changing an unrelated neighbor's shape can alter integer graph fusion
+and therefore the final byte. CPU reductions are sequential and
+single-threaded. Accelerator sessions use fixed batch and sequence dimensions.
+
+Runtime provenance is certification evidence. An ort-sys static build and
+Microsoft's official shared build both reported ONNX Runtime 1.28.0, but the
+static build failed all 11 v1 vector answers while Microsoft's release passed
+all 11. The Nix local-CPU package therefore pins Microsoft's exact archive
+bytes and records their digest. “Same ORT version” is not sufficient.
+
+Run the real packaged path with:
+
+```console
+cfetch inference-certify --model-dir ./cfetch-embeddinggemma-300m-a8w8-v1 --provider auto --json
+```
+
+The command verifies every bundle file before loading ONNX, runs public inputs
+covering every sequence bucket and multiple languages/content types, applies
+the canonical codec, and compares all 11 records byte for byte. Accelerator
+packages additionally disable ORT CPU fallback. A passing accelerator vector
+test still needs reviewed placement/profiler evidence that learned W8A8
+regions actually used the claimed INT8 device kernels.
 
 ## Canonical vector codec
 
-For one finite, non-zero 768-component model output:
+The graph's named output is already L2-normalized. For one finite, non-zero
+768-component graph output, the vector codec:
 
-1. L2-normalize the output.
-2. Find the largest absolute component `m`.
-3. Encode each component as
+1. Finds the largest absolute component `m`.
+2. Encodes each component as
    `round_ties_even(clamp(component / m * 127, -127, 127))`.
-4. Store the signed values in component order as their 768 raw bytes.
+3. Stores the signed values in component order as their 768 raw bytes.
 
-The per-vector factor is not serialized. Cosine similarity is invariant under
-that positive factor, so an FP16 scale trailer would add a second format
-without adding ranking information. cfetch compares INT8 cosine order by
-integer dot products and squared norms, using `u128` cross multiplication.
-Square roots and floating-point comparison therefore cannot reorder ties on
-different CPUs.
+The positive per-vector factor is not serialized because cosine similarity is
+invariant under it. cfetch compares INT8 cosine order using integer dot
+products, squared norms and `u128` cross multiplication, so floating-point
+square roots cannot reorder ties on different hosts.
 
-The shared store is the record. A producer writes a content-addressed vector
-once; every other participant fetches those exact bytes and never re-embeds
-that content. If a second producer ever supplies the same content hash under
-the same profile, cfetch compares the canonical record byte-for-byte and
-rejects a mismatch as cross-runner drift.
+The shared store is the record. A producer derives a content-addressed vector
+once; peers fetch those exact bytes rather than re-embedding the content. If a
+second producer supplies a different record for the same content and profile,
+cfetch rejects it as drift. Store headers, endpoint attestations, iroh ALPN,
+invites, grants and memberships all carry the major/profile boundary and fail
+closed on a mismatch.
 
-Across storage groups, `embed-index` resolves artifacts in this order: the
-local shared store, authorized joined origins, then the configured embedding
-endpoint. The origin first applies the normal authenticated slice grant and
-offers only requested content hashes that occur inside that slice. The vector
-record then travels through iroh-blobs as a BLAKE3-verified blob. Its capability
-hash is salted and stored per authenticated peer, so content addressing is not
-mistaken for access control. The receiver checks this profile, the requested
-content hash, the exact 768-byte record width, and the non-degenerate vector
-guard before making the bytes durable.
+Uncertified hardware remains fully useful as a consumer: it can search shared
+vectors or request inference from a certified producer. It must not advertise
+local producer capability. The release catalog remains remote-only until a
+complete local package, model distribution and reviewed certificate exist.
 
-The current iroh-1-compatible `iroh-blobs` release is explicitly described by
-its upstream maintainers as pre-production. cfetch therefore exact-pins it,
-uses it only as a bounded transfer layer, keeps the durable artifact record in
-its own crash-consistent store, and marks this capability as next-release
-until the cross-platform acceptance matrix stays green. This dependency does
-not become cfetch's database or authorization system.
+Reranking is deliberately outside this boundary. It is transient per query,
+never stored or exchanged as vector truth, and may use a different model or be
+disabled without changing the network major.
 
-Accelerator releases must additionally pass the profile's checked-in
-known-answer conformance set before they are allowed to publish vectors.
-That set is generated once with the canonical v1 artifact and released with
-the first certified runner; no accelerator package is a producer before both
-exist. Merely loading a graph, returning finite numbers, or using a vendor's
-feature named “INT8” is not sufficient. Until a backend has that proof, it may
-consume shared vectors and request remote inference, but it is not a v1
-producer.
+## Creating the next major
 
-Batch composition is not an input to the vector. After tokenization and
-truncation, each text is padded to the smallest v1 sequence bucket that holds
-it and executed individually. Batch-longest padding is forbidden because ORT integer fusion was observed to change
-canonical bytes when an unrelated longer text changed the tensor shape.
-Network-major-1 producers also execute one input at a time. This deliberately
-trades bulk throughput for a batch dimension that cannot vary across hosts;
-future majors may change that transaction only with new vectors and a full
-re-embedding. ORT uses sequential execution and CPU reductions use one
-intra-op thread so the host's core count cannot select another accumulation
-order.
+A successor profile is one coordinated transaction:
 
-The endpoint path enforces the same admission boundary. A successful OpenAI-
-shaped response must also return `cfetch_profile`, `cfetch_model_revision`,
-`cfetch_profile_manifest_sha256`, `cfetch_model_quantization`, and
-`cfetch_model_artifact` fields equal to the executable manifest, plus the
-requested `model`. An unattested generic endpoint cannot publish v1 data.
-
-## Compatibility enforcement
-
-The profile identity is recorded in both the local cache metadata and the
-shared vector-store header. Old configurable stores use different filenames
-and formats and are not treated as v1 data. Configuration that requests a
-different model, width, precision, or prompt is rejected with an error naming
-the required major-version/re-embedding operation.
-
-Remote TCP requests carry `network_major: 1`. iroh uses a major-specific ALPN,
-and invites, grants, and remembered memberships carry the same major. Missing
-or different values fail closed before data is served. Package patch/minor
-versions within network major 1 may interoperate only while they implement
-this exact profile.
-
-Reranking is deliberately outside this boundary. It is computed per query,
-is never stored or exchanged as vector truth, and may use another model or be
-disabled without changing the embedding/network major.
-
-## Creating v2 or later
-
-A profile change is one coordinated transaction:
-
-1. Freeze the complete successor manifest and its conformance vectors.
-2. Assign the next network major; never mutate an existing profile ID.
-3. Build and certify every producer backend against the new byte outputs.
-4. Stop cross-major networking and create a separate shared-store namespace.
-5. Re-embed every content hash once and distribute the new records.
-6. Upgrade all participants, then enable the new network together.
+1. Freeze its complete manifest, model artifact and known-answer bytes.
+2. Assign the next major; never mutate `cfetch-embedding-v1`.
+3. Build and certify producer backends against the new answers.
+4. Prevent cross-major networking and create a new store namespace.
+5. Re-embed each content hash once and distribute the new records.
+6. Upgrade every participant before enabling the new network.
 7. Retain or remove the old store explicitly; never reinterpret it in place.
 
-Store size determines how long step 5 takes. That cost is why no field in a
-published major is “just configuration.”
+The re-embedding cost grows with store size. That is why every major is
+intentionally breaking and why no v1 field is user-configurable.

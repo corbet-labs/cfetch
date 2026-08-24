@@ -1769,7 +1769,11 @@ pub fn vector_coverage(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<(
     Ok((v as usize, b as usize))
 }
 
-/// Caches one content hash's embedding, L2-normalized, at the spec's width.
+/// Caches one content hash's embedding at the spec's width. INT8 must use the
+/// exact same max-absolute codec as the shared record; an extra floating-point
+/// normalization here could otherwise put different bytes in the disposable
+/// cache than in the authoritative store. Legacy F16/F32 caches retain their
+/// normalized representation.
 pub fn insert_vector(
     conn: &Connection,
     content_hash: &str,
@@ -1783,13 +1787,18 @@ pub fn insert_vector(
         spec.profile_id,
         spec.dim
     );
-    let mut v = embedding.to_vec();
-    l2_normalize(&mut v);
+    let encoded = if spec.precision == Precision::I8 {
+        vec_to_blob(embedding, spec.precision)
+    } else {
+        let mut normalized = embedding.to_vec();
+        l2_normalize(&mut normalized);
+        vec_to_blob(&normalized, spec.precision)
+    };
     conn.execute(
         "INSERT INTO vectors(content_hash, model, dim, embedding) VALUES(?1, ?2, ?3, ?4)
          ON CONFLICT(content_hash) DO UPDATE SET
            model=excluded.model, dim=excluded.dim, embedding=excluded.embedding",
-        rusqlite::params![content_hash, spec.model, spec.dim as i64, vec_to_blob(&v, spec.precision)],
+        rusqlite::params![content_hash, spec.model, spec.dim as i64, encoded],
     )?;
     Ok(())
 }
@@ -3105,7 +3114,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_normalizes_and_roundtrips_through_db() {
+    fn int8_insert_uses_the_exact_shared_record_codec() {
         let dir = brain(&[("knowledge/a.md", "- one\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
@@ -3119,8 +3128,13 @@ mod tests {
         let blob: Vec<u8> = conn
             .query_row("SELECT embedding FROM vectors WHERE content_hash=?1", [&missing[0].0], |r| r.get(0))
             .unwrap();
+        assert_eq!(
+            blob,
+            vec_to_blob(&[3.0, 4.0], Precision::I8),
+            "the disposable cache must preserve the authoritative shared bytes"
+        );
         let stored = blob_to_vec(&blob, Precision::I8);
-        assert!((stored[0] - 0.6).abs() < 2e-3, "normalized at insert");
+        assert!((stored[0] - 0.6).abs() < 2e-3, "decoded view is normalized");
         assert!((stored[1] - 0.8).abs() < 2e-3);
         assert!(hashes_without_vectors(&conn, &spec, 10).unwrap().is_empty());
         assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 1));

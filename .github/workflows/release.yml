@@ -83,7 +83,8 @@ jobs:
           else
             cp "target/release/${{ matrix.binary }}" "dist/$package/${{ matrix.binary }}"
           fi
-          cp LICENSE.md THIRD-PARTY-LICENSES.txt release/variants.json "dist/$package/"
+          cp LICENSE.md THIRD-PARTY-LICENSES.txt release/variants.json \
+            release/inference-certifications.json "dist/$package/"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             (cd dist && 7z a "$package.zip" "$package" >/dev/null)
           else
@@ -112,6 +113,7 @@ jobs:
           cp LICENSE.md dist/LICENSE.md
           cp THIRD-PARTY-LICENSES.txt dist/THIRD-PARTY-LICENSES.txt
           cp release/variants.json dist/variants.json
+          cp release/inference-certifications.json dist/inference-certifications.json
           ls -la dist
       # Published as a release asset because downstream packaging consumes it
       # rather than re-hashing: the Homebrew tap regenerates its formula from

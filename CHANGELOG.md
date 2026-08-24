@@ -15,10 +15,14 @@ listed here is a fix or an internal change with no effect on behavior.
   lifecycles, review gates, verification failures, bounded diff previews, and
   revision-bound next commands without calling a model or applying a proposal.
 - **One embedding/network ABI for v1.** The v1 profile freezes the pinned
-  EmbeddingGemma-300M Q8-QAT source, XINT8 W8A8 execution, official
-  retrieval prompts, full 768 dimensions, pooling/normalization, and an exact
-  768-byte signed-INT8 vector. Model-pipeline changes now require a new network
-  major and coordinated re-embedding; configuration drift is refused.
+  EmbeddingGemma-300M Q8-QAT source, one static signed-symmetric W8A8 INT8
+  graph, official retrieval prompts, full 768 dimensions,
+  pooling/normalization, and an exact 768-byte signed-INT8 vector.
+  FastEmbed/ORT local execution now verifies the frozen model bundle and all
+  11 known-answer records; accelerator sessions disable CPU fallback and
+  remain catalog-gated until profiler evidence is reviewed. Model-pipeline
+  changes require a new network major and coordinated re-embedding;
+  configuration drift is refused.
 - **Byte-stable shared vectors.** INT8 records no longer carry an FP16 scale
   trailer. Ranking uses integer-defined cosine order, repeated producers must
   match an existing content hash byte-for-byte, and store/cache headers include

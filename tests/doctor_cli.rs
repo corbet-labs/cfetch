@@ -55,7 +55,11 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("Detected hardware"), "{text}");
-    assert!(text.contains("not supported by this build"), "{text}");
+    if cfg!(feature = "inference-ort") {
+        assert!(text.contains("CPU [cpu] — available, not selected"), "{text}");
+    } else {
+        assert!(text.contains("not supported by this build"), "{text}");
+    }
     assert!(text.contains("live utilization: not reported"), "{text}");
     assert!(text.contains("peer artifacts iroh-blobs"), "{text}");
     assert!(text.contains("no network identity yet"), "{text}");

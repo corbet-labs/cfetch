@@ -7,12 +7,15 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Instant;
+use std::{fs::File, io::Read as _};
 
 use anyhow::Context as _;
 use fastembed::{
     InitOptionsUserDefined, OutputKey, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 use ort::ep::ExecutionProviderDispatch;
+use sha2::Digest as _;
 use tokenizers::{PaddingStrategy, TruncationParams};
 
 use crate::model_artifact::VerifiedBundle;
@@ -23,6 +26,156 @@ pub struct LocalEmbedder {
     length_tokenizer: tokenizers::Tokenizer,
     model: Mutex<ModelState>,
 }
+
+#[derive(Debug, serde::Serialize)]
+pub struct CertificationReport {
+    pub schema: u32,
+    pub cfetch_version: &'static str,
+    pub network_major: u32,
+    pub profile_id: &'static str,
+    pub profile_manifest_sha256: String,
+    pub artifact_id: &'static str,
+    pub artifact_sha256: &'static str,
+    pub model_quantization: &'static str,
+    pub vector_encoding: &'static str,
+    pub provider: &'static str,
+    pub device_class: &'static str,
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub ort_crate: &'static str,
+    pub onnxruntime_build_info: &'static str,
+    pub onnxruntime_distribution: &'static str,
+    pub onnxruntime_archive_sha256: &'static str,
+    pub onnxruntime_library_sha256: String,
+    pub fastembed: &'static str,
+    pub graph_optimization: &'static str,
+    pub inference_batch_size: usize,
+    pub ort_intra_threads: usize,
+    pub ort_execution_mode: &'static str,
+    pub cpu_fallback_disabled: bool,
+    pub graph_ownership_enforced: bool,
+    pub int8_kernel_evidence: &'static str,
+    pub exact_vector_conformance: bool,
+    pub producer_eligible_without_external_review: bool,
+    pub known_answers: Vec<KnownAnswerResult>,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct KnownAnswerResult {
+    pub label: &'static str,
+    pub kind: &'static str,
+    pub sequence_bucket: usize,
+    pub vector_sha256: String,
+    pub vector_hex: String,
+    pub model_output_f32_le_sha256: String,
+    pub model_output_preview: Vec<f32>,
+    pub expected_vector_sha256: &'static str,
+    pub input_ids_sha256: String,
+    pub attention_mask_sha256: String,
+    pub passed: bool,
+    pub latency_ms: u128,
+}
+
+struct KnownAnswer {
+    label: &'static str,
+    kind: &'static str,
+    seed: &'static str,
+    repeats: usize,
+    expected_bucket: usize,
+    expected_sha256: &'static str,
+}
+
+const KNOWN_ANSWERS: &[KnownAnswer] = &[
+    KnownAnswer {
+        label: "short-query",
+        kind: "query",
+        seed: "Which files define cfetch's embedding compatibility boundary?",
+        repeats: 1,
+        expected_bucket: 32,
+        expected_sha256: "7e67364be4c574340d3693b2743c32d0f8841bf9e723bda821d4ab0c85e32984",
+    },
+    KnownAnswer {
+        label: "profile-document",
+        kind: "document",
+        seed: "The embedding profile pins the model, tokenizer, prompts, pooling, dimensions, quantization, and vector codec.",
+        repeats: 1,
+        expected_bucket: 32,
+        expected_sha256: "f9fde22be9dce6cee9ff9e4bad7d6ad36f8d47e7fe697f3536ac3fa822985ce7",
+    },
+    KnownAnswer {
+        label: "source-code",
+        kind: "document",
+        seed: "fn main() { println!(\"deterministic vectors\"); }",
+        repeats: 1,
+        expected_bucket: 32,
+        expected_sha256: "9c4f0753a787d4e28feaa6e02b445ff4e53e4402343e6d1390c19bf7ceddf4d4",
+    },
+    KnownAnswer {
+        label: "german-query",
+        kind: "query",
+        seed: "Wie werden inkompatible Vektoren im Netzwerk verhindert?",
+        repeats: 1,
+        expected_bucket: 32,
+        expected_sha256: "e1b939cf65256191e909881ec3067dedc7ddd3f0f92541c6183d6040e8da97f0",
+    },
+    KnownAnswer {
+        label: "japanese-document",
+        kind: "document",
+        seed: "同じコンテンツハッシュに異なるベクトルが届いた場合、保存を拒否します。",
+        repeats: 1,
+        expected_bucket: 32,
+        expected_sha256: "44f0b8754226feae1b0ee996a77f2288c893871c9ae326625c3cdd0b61410f03",
+    },
+    KnownAnswer {
+        label: "bucket-64",
+        kind: "document",
+        seed: "The canonical vector store rejects conflicting bytes for identical content.",
+        repeats: 3,
+        expected_bucket: 64,
+        expected_sha256: "f29f4ace39dce50732523a425194ccb0a1806c20f38f594658cd38653ff8a95e",
+    },
+    KnownAnswer {
+        label: "bucket-128",
+        kind: "document",
+        seed: "fn verify(hash: &str, vector: &[i8]) { assert_eq!(vector.len(), 768); }",
+        repeats: 2,
+        expected_bucket: 128,
+        expected_sha256: "074b2c41449eab85b0adcdc7258c6a01946c8c95245de7d05ccb6d2bfd134554",
+    },
+    KnownAnswer {
+        label: "bucket-256",
+        kind: "query",
+        seed: "Warum müssen alle Teilnehmer genau dasselbe Einbettungsprofil verwenden?",
+        repeats: 9,
+        expected_bucket: 256,
+        expected_sha256: "9c0107c38c797b699877ab5776416dcef11f8d4cf4643099a6ce71be88489eca",
+    },
+    KnownAnswer {
+        label: "bucket-512",
+        kind: "document",
+        seed: "同じコンテンツハッシュに異なるベクトルが届いた場合、保存を拒否します。",
+        repeats: 14,
+        expected_bucket: 512,
+        expected_sha256: "d9722be728ca18586796b418c53cf48ae8aa477346c48f5ab8b075a9b60f8c50",
+    },
+    KnownAnswer {
+        label: "bucket-1024",
+        kind: "document",
+        seed: "يجب أن تستخدم جميع الأجهزة النموذج نفسه وخط المعالجة نفسه حتى تبقى المتجهات قابلة للتبادل.",
+        repeats: 19,
+        expected_bucket: 1024,
+        expected_sha256: "97cb541fd8bf2b9a996e305743dc63cad654a41e0d26d3880559a49331761653",
+    },
+    KnownAnswer {
+        label: "bucket-2048",
+        kind: "document",
+        seed: "{\"network_major\":1,\"dimensions\":768,\"precision\":\"int8\",\"compatible\":true}",
+        repeats: 45,
+        expected_bucket: 2048,
+        expected_sha256: "f6ff965cf3907110de5569bf441275b8423567d0b74eb1e0557858fc2c8064da",
+    },
+];
 
 enum ModelState {
     Dynamic(TextEmbedding),
@@ -112,22 +265,266 @@ impl LocalEmbedder {
                 }
             };
             set_fixed_padding(model, bucket)?;
-            let mut vector = model
-                .embed([*text], Some(crate::embedding_profile::INFERENCE_BATCH_SIZE))
+            let batches = model
+                .transform(
+                    [*text],
+                    Some(crate::embedding_profile::INFERENCE_BATCH_SIZE),
+                )
                 .with_context(|| {
                     format!(
                         "run verified model with ORT {} provider at sequence bucket {bucket}",
                         self.provider
                     )
                 })?;
+            let raw = batches.into_raw();
+            anyhow::ensure!(
+                raw.len() == 1,
+                "verified local model returned {} batches",
+                raw.len()
+            );
+            let precedence = &OutputKey::ByName("sentence_embedding");
+            let selected = raw[0]
+                .select_output(&precedence)
+                .context("select frozen sentence_embedding output")?;
+            anyhow::ensure!(
+                selected.ndim() == 2 && selected.shape()[0] == 1,
+                "verified sentence_embedding output has shape {:?}, expected [1, {}]",
+                selected.shape(),
+                crate::embedding_profile::DIMENSIONS
+            );
             outputs.push(
-                vector
-                    .pop()
-                    .context("verified local model returned no embedding")?,
+                selected
+                    .rows()
+                    .into_iter()
+                    .next()
+                    .context("verified sentence_embedding output has no row")?
+                    .to_vec(),
             );
         }
         Ok(outputs)
     }
+
+    fn bucket_for_text(&self, text: &str) -> anyhow::Result<usize> {
+        let token_count = self
+            .length_tokenizer
+            .encode(text, true)
+            .map_err(|error| anyhow::anyhow!("tokenize known-answer input: {error}"))?
+            .len();
+        Ok(crate::embedding_profile::sequence_bucket(token_count))
+    }
+
+    fn token_tensor_digests(&self, text: &str, bucket: usize) -> anyhow::Result<(String, String)> {
+        let mut state = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("local embedding model lock poisoned"))?;
+        let model = match &mut *state {
+            ModelState::Dynamic(model) => model,
+            ModelState::StaticAccelerator { current, .. } => {
+                &mut current
+                    .as_mut()
+                    .context("accelerator known-answer session was not initialized")?
+                    .1
+            }
+        };
+        set_fixed_padding(model, bucket)?;
+        let encoding = model
+            .tokenizer
+            .encode(text, true)
+            .map_err(|error| anyhow::anyhow!("tokenize known-answer tensors: {error}"))?;
+        anyhow::ensure!(
+            encoding.len() == bucket,
+            "known-answer tokenizer emitted {} values for bucket {bucket}",
+            encoding.len()
+        );
+        let ids = encoding
+            .get_ids()
+            .iter()
+            .flat_map(|value| i64::from(*value).to_le_bytes())
+            .collect::<Vec<_>>();
+        let mask = encoding
+            .get_attention_mask()
+            .iter()
+            .flat_map(|value| i64::from(*value).to_le_bytes())
+            .collect::<Vec<_>>();
+        Ok((
+            format!("{:x}", sha2::Sha256::digest(ids)),
+            format!("{:x}", sha2::Sha256::digest(mask)),
+        ))
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn runtime_library_sha256() -> anyhow::Result<String> {
+    let Some(path) = std::env::var_os("ORT_DYLIB_PATH") else {
+        return Ok("unrecorded".into());
+    };
+    let canonical =
+        std::fs::canonicalize(&path).context("resolve packaged ONNX Runtime library")?;
+    anyhow::ensure!(
+        canonical.is_file(),
+        "packaged ONNX Runtime library is not a regular file"
+    );
+    let mut file = File::open(&canonical).context("open packaged ONNX Runtime library")?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .context("hash packaged ONNX Runtime library")?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Run the released public known-answer corpus through the actual
+/// FastEmbed/ORT path. A successful accelerator session also proves that ORT
+/// assigned the complete graph without CPU fallback; vendor profiler evidence
+/// is still required to prove that its kernels did not dequantize learned
+/// regions internally.
+pub fn certify(model_dir: &Path, requested_provider: &str) -> anyhow::Result<CertificationReport> {
+    let started = Instant::now();
+    let embedder = LocalEmbedder::load(model_dir, requested_provider)?;
+    let mut results = Vec::with_capacity(KNOWN_ANSWERS.len());
+    for known in KNOWN_ANSWERS {
+        let body = std::iter::repeat_n(known.seed, known.repeats)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prefix = if known.kind == "query" {
+            crate::embedding_profile::QUERY_PREFIX
+        } else {
+            crate::embedding_profile::DOCUMENT_PREFIX
+        };
+        let input = format!("{prefix}{body}");
+        let bucket = embedder.bucket_for_text(&input)?;
+        anyhow::ensure!(
+            bucket == known.expected_bucket,
+            "known-answer {} tokenized to bucket {bucket}, profile requires {}",
+            known.label,
+            known.expected_bucket
+        );
+        let run_started = Instant::now();
+        let vector = embedder
+            .embed(&[input.as_str()])?
+            .pop()
+            .context("known-answer execution returned no vector")?;
+        anyhow::ensure!(
+            vector.len() == crate::embedding_profile::DIMENSIONS,
+            "known-answer {} returned {} dimensions, profile requires {}",
+            known.label,
+            vector.len(),
+            crate::embedding_profile::DIMENSIONS
+        );
+        anyhow::ensure!(
+            vector.iter().all(|component| component.is_finite()),
+            "known-answer {} returned a non-finite component",
+            known.label
+        );
+        let (input_ids_sha256, attention_mask_sha256) =
+            embedder.token_tensor_digests(&input, bucket)?;
+        let raw_bytes = vector
+            .iter()
+            .flat_map(|component| component.to_le_bytes())
+            .collect::<Vec<_>>();
+        let raw_digest = format!("{:x}", sha2::Sha256::digest(raw_bytes));
+        let preview = vector.iter().take(8).copied().collect();
+        let bytes = crate::index::vec_to_blob(&vector, crate::config::Precision::I8);
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        results.push(KnownAnswerResult {
+            label: known.label,
+            kind: known.kind,
+            sequence_bucket: bucket,
+            passed: digest == known.expected_sha256,
+            vector_sha256: digest,
+            vector_hex: hex_bytes(&bytes),
+            model_output_f32_le_sha256: raw_digest,
+            model_output_preview: preview,
+            expected_vector_sha256: known.expected_sha256,
+            input_ids_sha256,
+            attention_mask_sha256,
+            latency_ms: run_started.elapsed().as_millis(),
+        });
+    }
+    let exact = results.iter().all(|result| result.passed);
+    let accelerator = embedder.provider() != "cpu";
+    let runtime_distribution = option_env!("CFETCH_ORT_DISTRIBUTION").unwrap_or("unrecorded");
+    let runtime_archive_sha256 = option_env!("CFETCH_ORT_ARCHIVE_SHA256").unwrap_or("unrecorded");
+    let runtime_library_sha256 = runtime_library_sha256()?;
+    let admitted_cpu_runtime = runtime_distribution == "microsoft-github-release-v1.28.0"
+        && matches!(
+            (
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                runtime_archive_sha256,
+                runtime_library_sha256.as_str(),
+            ),
+            (
+                "linux",
+                "x86_64",
+                "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+                "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+            ) | (
+                "linux",
+                "aarch64",
+                "e15ff8b5d85afe6c144d97c6fd432254bf76a219daaf17658087d6ecb3e8f0bb",
+                "f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7",
+            ) | (
+                "macos",
+                "aarch64",
+                "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
+                "dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d",
+            )
+        );
+    let artifact_sha256 = crate::embedding_profile::MODEL_ARTIFACT_SHA256
+        .expect("published profile always names its artifact");
+    Ok(CertificationReport {
+        schema: 1,
+        cfetch_version: env!("CARGO_PKG_VERSION"),
+        network_major: crate::embedding_profile::NETWORK_MAJOR,
+        profile_id: crate::embedding_profile::PROFILE_ID,
+        profile_manifest_sha256: crate::embedding_profile::manifest_sha256(),
+        artifact_id: crate::embedding_profile::MODEL_ARTIFACT_ID,
+        artifact_sha256,
+        model_quantization: crate::embedding_profile::MODEL_QUANTIZATION,
+        vector_encoding: crate::embedding_profile::VECTOR_ENCODING,
+        provider: embedder.provider(),
+        device_class: embedder.device_class(),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        ort_crate: "2.0.0-rc.13 (API 24)",
+        onnxruntime_build_info: ort::info(),
+        onnxruntime_distribution: runtime_distribution,
+        onnxruntime_archive_sha256: runtime_archive_sha256,
+        onnxruntime_library_sha256: runtime_library_sha256,
+        fastembed: "6.0.0 + cfetch session-controls f8bb355369340dc81e43979b23d23eddab0a40c4",
+        graph_optimization: crate::embedding_profile::GRAPH_OPTIMIZATION,
+        inference_batch_size: crate::embedding_profile::INFERENCE_BATCH_SIZE,
+        ort_intra_threads: crate::embedding_profile::ORT_INTRA_THREADS,
+        ort_execution_mode: crate::embedding_profile::ORT_EXECUTION_MODE,
+        cpu_fallback_disabled: accelerator,
+        graph_ownership_enforced: accelerator,
+        int8_kernel_evidence: if accelerator {
+            "external-vendor-profiler-review-required"
+        } else {
+            "canonical-QDQ-graph-audit-and-ORT-CPU-reference"
+        },
+        exact_vector_conformance: exact,
+        producer_eligible_without_external_review: exact && !accelerator && admitted_cpu_runtime,
+        known_answers: results,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
 }
 
 fn build_model(
@@ -142,7 +539,11 @@ fn build_model(
         special_tokens_map_file: bundle.special_tokens_map,
         tokenizer_config_file: bundle.tokenizer_config,
     };
-    let mut user_model = UserDefinedEmbeddingModel::new(bundle.model, tokenizer_files);
+    let mut user_model = UserDefinedEmbeddingModel::new(bundle.model, tokenizer_files)
+        // The exported SentenceTransformers graph owns L2 normalization.
+        // A second library-side reduction would be another floating-point
+        // pipeline step outside the frozen artifact.
+        .with_output_normalization(false);
     // The exported graph owns pooling, projection and L2 normalization.
     // Selecting this named 2-D output prevents FastEmbed from guessing a
     // token-level output and applying a second, backend-dependent pool.

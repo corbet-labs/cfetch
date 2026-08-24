@@ -472,7 +472,8 @@ endpoint; keep the credential in an environment variable, never in JSON.
 
 On `main` for the next release, the model pipeline is no longer configurable:
 network major 1 fixes EmbeddingGemma-300M,
-XINT8 W8A8 execution, full 768 dimensions, the prompts/pooling/normalization,
+static signed-symmetric W8A8 INT8 execution, full 768 dimensions, the
+prompts/pooling/normalization,
 and one 768-byte signed-INT8 vector format. A producer endpoint must attest the
 exact cfetch profile, pinned model revision, quantizer, and artifact ID in its response;
 plain OpenAI wire shape alone is not permission to publish shared vectors:
@@ -504,7 +505,11 @@ calls.
 Run `cfetch embedding-profile --json` for the executable manifest. Changing
 any model-pipeline field is a new incompatible network major and requires every
 participant to upgrade plus a full re-embedding; different majors do not
-network with each other. See [embedding profile v1](docs/embedding-profile-v1.md).
+network with each other. Local packages use FastEmbed and ONNX Runtime, and
+`cfetch inference-certify` verifies the actual provider against all released
+vector bytes before it can be admitted as a producer. See
+[embedding profile v1](docs/embedding-profile-v1.md) and
+[accelerator certification](docs/accelerator-certification.md).
 
 Named slices limit recall and sharing by path:
 

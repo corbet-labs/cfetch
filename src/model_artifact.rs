@@ -106,10 +106,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unpublished_artifact_fails_before_accepting_arbitrary_bytes() {
+    fn missing_bundle_fails_before_accepting_arbitrary_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let error = VerifiedBundle::load(temp.path()).err().unwrap().to_string();
-        assert!(error.contains("has not been published"), "{error}");
+        assert!(error.contains("model.onnx"), "{error}");
     }
 
     #[test]

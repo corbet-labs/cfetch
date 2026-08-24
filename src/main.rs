@@ -221,6 +221,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Certify this package/provider against the exact v1 vector answers
+    InferenceCertify {
+        /// Extracted, separately licensed v1 model bundle directory
+        #[arg(long, value_name = "PATH")]
+        model_dir: std::path::PathBuf,
+        /// ORT execution provider packaged in this binary
+        #[arg(long, default_value = "auto")]
+        provider: String,
+        /// Print the complete portable certification report
+        #[arg(long)]
+        json: bool,
+    },
     /// Show this host's network identity (created on first use)
     Identity {
         #[arg(long)]
@@ -2473,6 +2485,59 @@ fn main() {
                 println!("document prefix: {:?}", profile.document_prefix);
                 println!("pooling: {}; graph optimization: {}", profile.pooling, profile.graph_optimization);
                 println!("normalization: {}", profile.normalization);
+            }
+        }
+        Command::InferenceCertify {
+            model_dir,
+            provider,
+            json,
+        } => {
+            #[cfg(feature = "inference-ort")]
+            match local_embed::certify(&model_dir, &provider) {
+                Ok(report) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .expect("certification report serializes")
+                        );
+                    } else {
+                        println!(
+                            "{} / {}: {}/{} exact v1 known answers in {} ms",
+                            report.provider,
+                            report.device_class,
+                            report.known_answers.iter().filter(|answer| answer.passed).count(),
+                            report.known_answers.len(),
+                            report.elapsed_ms
+                        );
+                        if report.exact_vector_conformance
+                            && !report.producer_eligible_without_external_review
+                        {
+                            println!(
+                                "vector conformance passed; accelerator publication still requires reviewed INT8-kernel profiler evidence"
+                            );
+                        }
+                    }
+                    if !report.exact_vector_conformance {
+                        eprintln!(
+                            "cfetch inference-certify: provider output is incompatible with network major {}",
+                            embedding_profile::NETWORK_MAJOR
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("cfetch inference-certify: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "inference-ort"))]
+            {
+                let _ = (model_dir, provider, json);
+                eprintln!(
+                    "cfetch inference-certify: this package has no local ORT inference; use a local-inference provider package"
+                );
+                std::process::exit(1);
             }
         }
         Command::Identity { json } => {
