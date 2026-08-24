@@ -1259,7 +1259,7 @@ dependencies = [
 [[package]]
 name = "fastembed"
 version = "6.0.0"
-source = "git+https://github.com/corbet-labs/fastembed-rs?rev=287979571394afe50b5617cc9c30140be51e444d#287979571394afe50b5617cc9c30140be51e444d"
+source = "git+https://github.com/corbet-labs/fastembed-rs?rev=5dac3bca305617c4bb1b561cd83c97294a92ebec#5dac3bca305617c4bb1b561cd83c97294a92ebec"
 dependencies = [
  "ndarray",
  "ort",

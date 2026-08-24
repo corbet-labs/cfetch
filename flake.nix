@@ -295,7 +295,7 @@
             # Git dependency inside the sandbox.
             outputHashes = {
               "fastembed-6.0.0" =
-                "sha256-T9z53ifWXmPUd3ujWkcgwn1OEB7JsCC4IlH86+s+Fsk=";
+                "sha256-IBBbYG1iClOKdSTML6dgrt9lt5kkHqVUllJ+gRYQdew=";
             };
           };
           buildFeatures = pkgs.lib.optionals localInference [ inferenceFeature ];

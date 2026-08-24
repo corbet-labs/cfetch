@@ -293,7 +293,10 @@ the package manifest and certificate.
 Plugin EPs use ORT's device API, so only this evidence package raises the Rust
 binding surface from C API 18 to API 22. The core runtime remains 1.28 and the
 frozen graph, FastEmbed pipeline, optimizer, static buckets, fallback rule,
-and vector codec do not change. A local AMD host without an installed Vulkan
+and vector codec do not change. FastEmbed selects one concrete registered
+WebGPU device for each session: ORT rejects a single session configured with
+devices originating from separate adapter factories even when they expose the
+same EP name. A local AMD host without an installed Vulkan
 ICD loaded the exact plugin and then failed with `No supported adapters`; that
 is a useful fail-closed package probe, not a GPU result.
 

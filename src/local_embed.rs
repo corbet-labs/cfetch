@@ -569,7 +569,7 @@ fn certify_loaded(
         execution_provider_plugin_distribution: plugin_distribution,
         execution_provider_plugin_archive_sha256: plugin_archive_sha256,
         execution_provider_plugin_library_sha256: plugin_library_sha256,
-        fastembed: "6.0.0 + cfetch session-controls 287979571394afe50b5617cc9c30140be51e444d",
+        fastembed: "6.0.0 + cfetch session-controls 5dac3bca305617c4bb1b561cd83c97294a92ebec",
         graph_optimization: crate::embedding_profile::GRAPH_OPTIMIZATION,
         inference_batch_size: crate::embedding_profile::INFERENCE_BATCH_SIZE,
         ort_intra_threads: crate::embedding_profile::ORT_INTRA_THREADS,
