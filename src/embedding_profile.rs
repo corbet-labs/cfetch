@@ -12,6 +12,9 @@ use crate::config::{EmbeddingsConfig, Precision};
 /// coordinated re-embedding of every shared store.
 pub const NETWORK_MAJOR: u32 = 1;
 pub const PROFILE_ID: &str = "cfetch-embedding-v1";
+#[cfg_attr(not(any(feature = "inference-ort", test)), allow(dead_code))]
+pub const PROFILE_MANIFEST_SHA256: &str =
+    "3a7645ee84a5fe21bf0befaf6b68f51a5ff61ad22b0c10c40aaec0a1f63d7a53";
 
 /// Immutable upstream source. The revision pins the model, tokenizer,
 /// SentenceTransformers pooling and projection heads as one artifact.
@@ -45,6 +48,12 @@ pub const INFERENCE_BATCH_SIZE: usize = 1;
 /// order. Accelerator providers may schedule their own certified kernels.
 pub const ORT_INTRA_THREADS: usize = 1;
 pub const ORT_EXECUTION_MODE: &str = "sequential";
+/// Ask ORT to select deterministic kernels wherever it provides a choice.
+pub const ORT_DETERMINISTIC_COMPUTE: bool = true;
+/// Avoid ORT's saturating U8S8 matrix-multiplication fast path on pre-VNNI
+/// x86-64. This makes AVX2 hosts use the same non-saturating arithmetic as
+/// VNNI hosts instead of making an overflow-prone optimization canonical.
+pub const ORT_PRECISE_QMM: bool = true;
 pub const QUERY_PREFIX: &str = "task: search result | query: ";
 pub const DOCUMENT_PREFIX: &str = "title: none | text: ";
 pub const POOLING: &str = "attention-mask-weighted-mean-include-prompt";
@@ -72,6 +81,8 @@ pub struct Manifest {
     pub inference_batch_size: usize,
     pub ort_intra_threads: usize,
     pub ort_execution_mode: &'static str,
+    pub ort_deterministic_compute: bool,
+    pub ort_precise_qmm: bool,
     pub query_prefix: &'static str,
     pub document_prefix: &'static str,
     pub pooling: &'static str,
@@ -101,6 +112,8 @@ pub const fn manifest() -> Manifest {
         inference_batch_size: INFERENCE_BATCH_SIZE,
         ort_intra_threads: ORT_INTRA_THREADS,
         ort_execution_mode: ORT_EXECUTION_MODE,
+        ort_deterministic_compute: ORT_DETERMINISTIC_COMPUTE,
+        ort_precise_qmm: ORT_PRECISE_QMM,
         query_prefix: QUERY_PREFIX,
         document_prefix: DOCUMENT_PREFIX,
         pooling: POOLING,
@@ -180,6 +193,8 @@ mod tests {
         assert_eq!(m.inference_batch_size, 1);
         assert_eq!(m.ort_intra_threads, 1);
         assert_eq!(m.ort_execution_mode, "sequential");
+        assert!(m.ort_deterministic_compute);
+        assert!(m.ort_precise_qmm);
         assert!(m.model.contains("embeddinggemma-300m"));
         assert_eq!(
             m.model_artifact_sha256,
@@ -200,8 +215,11 @@ mod tests {
     #[test]
     fn profile_digest_is_stable_sha256() {
         let digest = manifest_sha256();
-        assert_eq!(digest.len(), 64);
-        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(digest, PROFILE_MANIFEST_SHA256);
+
+        let registry: serde_json::Value =
+            serde_json::from_str(include_str!("../release/inference-certifications.json")).unwrap();
+        assert_eq!(registry["profile_manifest_sha256"], PROFILE_MANIFEST_SHA256);
     }
 
     #[test]

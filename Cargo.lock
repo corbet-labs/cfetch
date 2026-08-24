@@ -1216,7 +1216,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1259,7 +1259,7 @@ dependencies = [
 [[package]]
 name = "fastembed"
 version = "6.0.0"
-source = "git+https://github.com/corbet-labs/fastembed-rs?rev=5dac3bca305617c4bb1b561cd83c97294a92ebec#5dac3bca305617c4bb1b561cd83c97294a92ebec"
+source = "git+https://github.com/corbet-labs/fastembed-rs?rev=1d9b6381354c23d7a17f61b0486fdabca1a724b0#1d9b6381354c23d7a17f61b0486fdabca1a724b0"
 dependencies = [
  "ndarray",
  "ort",
@@ -4335,7 +4335,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4393,7 +4393,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4961,7 +4961,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

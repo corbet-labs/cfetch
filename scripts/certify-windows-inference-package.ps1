@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Report,
 
-    [string]$BundleSha256 = "12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1",
+    [string]$BundleSha256 = "be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f",
 
     [ValidateSet("X1", "X2")]
     [string]$VitisTarget = "X2",
@@ -199,7 +199,11 @@ try {
 
     $certificate = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
     $passed = @($certificate.known_answers | Where-Object { $_.passed }).Count
-    if ($certificate.profile_id -ne "cfetch-embedding-v1" -or
+    if ($certificate.schema -ne 2 -or
+        $certificate.profile_id -ne "cfetch-embedding-v1" -or
+        $certificate.profile_manifest_sha256 -ne "3a7645ee84a5fe21bf0befaf6b68f51a5ff61ad22b0c10c40aaec0a1f63d7a53" -or
+        -not $certificate.ort_deterministic_compute -or
+        -not $certificate.ort_precise_qmm -or
         $certificate.provider -ne $manifest.provider -or
         $certificate.os -ne "windows" -or
         $certificate.onnxruntime_distribution -ne $manifest.onnxruntime_distribution -or

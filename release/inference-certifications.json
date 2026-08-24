@@ -1,25 +1,30 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "network_major": 1,
   "profile_id": "cfetch-embedding-v1",
-  "profile_manifest_sha256": "09e8c7c15c09fb273da3f5f639b38869ee27992d62b30b3f0da9350f37a7e3aa",
+  "profile_manifest_sha256": "3a7645ee84a5fe21bf0befaf6b68f51a5ff61ad22b0c10c40aaec0a1f63d7a53",
+  "kat_generation": "precise-qmm-pre-release-reset",
   "artifact_id": "cfetch-embeddinggemma-300m-a8w8-v1",
   "artifact_sha256": "ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1",
   "bundle_url": "https://github.com/corbet-labs/cfetch/releases/download/model-v1/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz",
-  "bundle_sha256": "12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1",
+  "bundle_sha256": "be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f",
   "policy": {
     "exact_known_answers_required": 11,
     "accelerator_cpu_fallback_forbidden": true,
     "accelerator_int8_placement_review_required": true,
-    "uncertified_devices_are_consumers_only": true
+    "uncertified_devices_are_consumers_only": true,
+    "certification_report_schema": 2,
+    "deterministic_compute_required": true,
+    "precise_qmm_required": true,
+    "old_profile_reports_rejected": true
   },
   "certifications": [
     {
-      "id": "linux-x86_64-cpu-microsoft-ort-1.28.0",
+      "id": "linux-x86_64-cpu-microsoft-ort-1.28.0-precise-qmm",
       "status": "passing-reference",
-      "scope": "exact package/runtime and each passing host represented by a named run; not an architecture-wide claim",
+      "scope": "Microsoft official ORT 1.28.0 with deterministic compute and precise QMM; exact admission still runs on every actual host",
       "catalog_admitted": false,
-      "catalog_blocker": "a generic x86-64 release cannot be admitted because a later host using the same package/runtime failed 0/11; production remains host-KAT-gated",
+      "catalog_blocker": "public hosted schema-2 recertification and final release-package publication are pending",
       "os": "linux",
       "arch": "x86_64",
       "provider": "cpu",
@@ -30,57 +35,27 @@
       "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
       "onnxruntime_build_commit": "da9b5e364c",
       "ort_c_api": 18,
-      "fastembed": "6.0.0 + cfetch session-controls 234fc39af5b010de0cb0c5688d138492e690fa68",
-      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32678932373",
-      "report_artifact_id": 9503739953,
-      "report_sha256": "23866923e294a27fd8e8f239c2fc529c94273e03a43d9c1ae88bb1bd57ed4e32",
-      "additional_passing_runs": [
-        {
-          "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680584417",
-          "report_artifact_id": 9504237996,
-          "report_sha256": "f4cb5693343734631901e1465a896c71fb579f2ff1f933df0ab54120dcd19088",
-          "note": "11/11 exact on a later hosted x86-64 runner; this workflow predates hardware-model capture and therefore adds run-scoped evidence only"
-        },
-        {
-          "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32681875052",
-          "report_artifact_id": 9504620491,
-          "report_artifact_digest": "sha256:3351e2ca7ff8e066249e556c06505eef1708974093397401f35fbd2cf5b7a0f5",
-          "report_sha256": "c9f288fbc59a695693a28ffd78312d5b587efbba3c97ad67bac62d8f1b99e00f",
-          "hardware_sha256": "b9480dac067c6571d3cdca9d672f61de2f6387d5ec0b20ad9ec7d1015a3db973",
-          "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 7763; Microsoft hypervisor; runner image 20260816.277.1",
-          "note": "11/11 exact with the hardware identity captured separately; the certificate remains scoped to this run and host environment"
-        },
-        {
-          "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
-          "report_artifact_id": 9508350456,
-          "report_artifact_digest": "sha256:fa5c1dc65386ad3ec93847b5e01c1113c43f848322967466b2594a34bbdc05c8",
-          "report_sha256": "5b89ccfcee22c9570b3e5c0fb9178214cf2b31c009c7b3aafe463302ebe59079",
-          "hardware_sha256": "b9480dac067c6571d3cdca9d672f61de2f6387d5ec0b20ad9ec7d1015a3db973",
-          "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 7763; Microsoft hypervisor; runner image 20260816.277.1",
-          "fastembed": "6.0.0 + cfetch session-controls 5dac3bca305617c4bb1b561cd83c97294a92ebec",
-          "note": "11/11 exact reproduction after the provider-device selector work; the passing scope remains this recorded host/runtime"
-        },
-        {
-          "evidence_scope": "physical local run recorded by public commit; no architecture-wide or catalog admission",
-          "hardware_sha256": "c83ec99a6cf7d6c39c6287ca11d1ebf66fc8e82e519159c4439dcf71d459054e",
-          "hardware": "Physical Linux x86-64 host; AMD Ryzen 9 5950X; family 25 model 33 stepping 0; AVX/AVX2/FMA",
-          "package": "nix:cfetch-local-cpu@92066ad5ec03081e875d39843899272f2d3ad698",
-          "report_sha256": "dbb39bd261b895f2aa5bb916124015402a22853f774333a0837c358b409898d5",
-          "onnxruntime_distribution": "microsoft-github-release-v1.28.0",
-          "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
-          "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
-          "fastembed": "6.0.0 + cfetch session-controls 5dac3bca305617c4bb1b561cd83c97294a92ebec",
-          "exact_known_answers_passed": 11,
-          "exact_known_answers_failed": 0,
-          "sequence_buckets_exercised": [32, 64, 128, 256, 512, 1024, 2048],
-          "note": "The freshly rebuilt public Nix package verified every model-bundle file and passed 11/11 on this physical Zen 3 host. Production admission remains scoped to this exact host/runtime after its ordinary startup KAT."
-        }
-      ],
-      "artifact_verified": true,
+      "ort_deterministic_compute": true,
+      "ort_precise_qmm": true,
+      "fastembed": "6.0.0 + cfetch session-controls 1d9b6381354c23d7a17f61b0486fdabca1a724b0",
       "exact_known_answers_passed": 11,
       "exact_known_answers_failed": 0,
+      "physical_runs": [
+        {
+          "hardware": "Physical Linux x86-64 host; AMD Ryzen 9 5950X; AVX/AVX2/FMA; no VNNI",
+          "hardware_sha256": "c83ec99a6cf7d6c39c6287ca11d1ebf66fc8e82e519159c4439dcf71d459054e",
+          "report_sha256": "cddf55f783ae5d7a256f1d09be3087f6d2c25a49d4adef2c0e6245180b9c07b5",
+          "result": "11/11 exact through the rebuilt Nix package; non-saturating U8U8 lowering"
+        },
+        {
+          "hardware": "Physical Linux x86-64 host; Intel Core Ultra 7 258V; AVX2/VNNI",
+          "hardware_sha256": "c437e642a844f919f182869ab2e8d686dd87b57634b4998127d9c0d0e2944c49",
+          "report_sha256": "af48bdb87317241155e5e8cba18a206ca80e19d59fd338af75a6063c5ddbe538",
+          "result": "11/11 exact with the Ryzen raw outputs and INT8x768 bytes"
+        }
+      ],
       "int8_evidence": "canonical QDQ graph audit: 171 learned nodes covered; no floating-point shadow learned weights",
-      "note": "This is the canonical passing host, not proof that all x86-64 CPUs produce the same bytes. Ordinary local loading reruns the KAT on the actual host."
+      "note": "Controlled isolation showed that deterministic_compute alone preserved the former AVX2 bytes, while precise_qmm made all 11 Ryzen raw outputs and records exactly equal the Intel VNNI path."
     }
   ],
   "rejected_attempts": [
@@ -107,7 +82,8 @@
         "hardware_sha256": "069fc6d45377d3204494d65f12b745198ca58d4c87bfea0d1740606e15fd82e0",
         "hardware": "GitHub standard macos-15 virtual runner; VirtualMac2,1; Apple M1 (Virtual); image 20260727.0256.1",
         "note": "Reproduced the same CPU-only Core ML placement on a runner that explicitly identifies itself as virtual; this is not physical Metal evidence"
-      }
+      },
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "macos-aarch64-coreml-npu-run-32680584417",
@@ -132,7 +108,8 @@
         "hardware_sha256": "069fc6d45377d3204494d65f12b745198ca58d4c87bfea0d1740606e15fd82e0",
         "hardware": "GitHub standard macos-15 virtual runner; VirtualMac2,1; Apple M1 (Virtual); image 20260727.0256.1",
         "note": "Reproduced the same CPU-only Core ML placement; the virtual runner exposes no physical ANE and therefore cannot certify one"
-      }
+      },
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "linux-x86_64-openvino-cpu-run-32681875052",
@@ -148,7 +125,8 @@
       "onnxruntime_library_sha256": "a88c790b82c5bdfd4740ebe3018e52009851097f97fbd9e5e3fd3249fcdb9ed7",
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 0,
-      "note": "The public package reproduced the local session-construction rejection: OpenVINO could not own the complete frozen graph, so ORT attempted to assign nodes to its forbidden default CPU EP. This AMD CPU run validates the evidence package and failure boundary, not Intel device support."
+      "note": "The public package reproduced the local session-construction rejection: OpenVINO could not own the complete frozen graph, so ORT attempted to assign nodes to its forbidden default CPU EP. This AMD CPU run validates the evidence package and failure boundary, not Intel device support.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "windows-x86_64-openvino-cpu-run-32693600516",
@@ -161,7 +139,8 @@
       "onnxruntime_distribution": "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1",
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 0,
-      "note": "The pinned Windows package reached OpenVINO session initialization, but OpenVINO did not own the complete frozen graph and ORT rejected the forbidden CPU assignment. The hosted AMD CPU validates the Windows package/failure boundary, not an Intel device."
+      "note": "The pinned Windows package reached OpenVINO session initialization, but OpenVINO did not own the complete frozen graph and ORT rejected the forbidden CPU assignment. The hosted AMD CPU validates the Windows package/failure boundary, not an Intel device.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "linux-x86_64-openvino-gpu-intel-arc-140v-physical",
@@ -184,12 +163,21 @@
         "report_sha256": "a21f21c55e8639d96a864d6610c9635925a28ec05eabe6bb60e569f59ccb0b9c",
         "exact_known_answers_passed": 0,
         "exact_known_answers_failed": 11,
-        "sequence_buckets_exercised": [32, 64, 128, 256, 512, 1024, 2048],
+        "sequence_buckets_exercised": [
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048
+        ],
         "changed_components_per_vector": "734..752 of 768",
         "cosine_to_x86_reference": "0.522204..0.913078",
         "note": "A controlled instrumentation build allowed the CPU remainder only to test whether partitioning was the sole blocker. It executed every KAT but matched none. Its report ownership booleans are not certificate claims; production source was restored to mandatory no-fallback behavior immediately afterward."
       },
-      "note": "The current Intel GPU and driver can compile the frozen graph, but strict ORT/OpenVINO session construction requested forbidden CPU remainder. The controlled hybrid diagnostic then disproved that remainder as a v1 solution by failing all exact vectors."
+      "note": "The current Intel GPU and driver can compile the frozen graph, but strict ORT/OpenVINO session construction requested forbidden CPU remainder. The controlled hybrid diagnostic then disproved that remainder as a v1 solution by failing all exact vectors.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "linux-x86_64-openvino-npu-intel-lunar-lake-physical",
@@ -212,12 +200,21 @@
         "report_sha256": "2f9cb100aec759cb1e12e03378897a6d0583b15de4bc0a41163f1e144685ee7d",
         "exact_known_answers_passed": 0,
         "exact_known_answers_failed": 11,
-        "sequence_buckets_exercised": [32, 64, 128, 256, 512, 1024, 2048],
+        "sequence_buckets_exercised": [
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048
+        ],
         "changed_components_per_vector": "687..752 of 768",
         "cosine_to_x86_reference": "0.827648..0.983283",
         "note": "A controlled instrumentation build allowed the CPU remainder only to test whether partitioning was the sole blocker. It executed every KAT but matched none. Its report ownership booleans are not certificate claims; production source was restored to mandatory no-fallback behavior immediately afterward."
       },
-      "note": "The current Intel NPU and compiler can compile the frozen graph, but strict ORT/OpenVINO session construction requested forbidden CPU remainder. The controlled hybrid diagnostic then disproved that remainder as a v1 solution by failing all exact vectors."
+      "note": "The current Intel NPU and compiler can compile the frozen graph, but strict ORT/OpenVINO session construction requested forbidden CPU remainder. The controlled hybrid diagnostic then disproved that remainder as a v1 solution by failing all exact vectors.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "windows-arm64-qnn-htp-run-32693600516",
@@ -230,7 +227,8 @@
       "onnxruntime_distribution": "nuget-Microsoft.ML.OnnxRuntime.QNN-1.24.4",
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 0,
-      "note": "The native ARM64 package loaded, but QNN HTP reported QNN_BACKEND_ERROR_CANNOT_INITIALIZE and remaining nodes would have used forbidden ORT CPU fallback. This is useful fail-closed hosted evidence, not Snapdragon/HTP hardware evidence."
+      "note": "The native ARM64 package loaded, but QNN HTP reported QNN_BACKEND_ERROR_CANNOT_INITIALIZE and remaining nodes would have used forbidden ORT CPU fallback. This is useful fail-closed hosted evidence, not Snapdragon/HTP hardware evidence.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "windows-x86_64-directml-run-32693600516",
@@ -243,7 +241,8 @@
       "onnxruntime_distribution": "nuget-Microsoft.ML.OnnxRuntime.DirectML-1.24.4",
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 0,
-      "note": "DirectML reported that no device matched the filter criteria. The hosted virtual display is not a physical DirectML adapter; package construction and the fail-closed boundary were exercised only."
+      "note": "DirectML reported that no device matched the filter criteria. The hosted virtual display is not a physical DirectML adapter; package construction and the fail-closed boundary were exercised only.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "windows-x86_64-webgpu-run-32693600516",
@@ -257,7 +256,8 @@
       "ort_c_api": 22,
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 0,
-      "note": "The native WebGPU plugin registered one concrete device and reached session initialization, but it left graph nodes on forbidden ORT CPU fallback. The only exposed adapter was Microsoft Hyper-V Video, so this is adverse hosted evidence rather than a physical D3D12/Vulkan certificate."
+      "note": "The native WebGPU plugin registered one concrete device and reached session initialization, but it left graph nodes on forbidden ORT CPU fallback. The only exposed adapter was Microsoft Hyper-V Video, so this is adverse hosted evidence rather than a physical D3D12/Vulkan certificate.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "linux-x86_64-webgpu-no-adapter-run-32693600516",
@@ -272,7 +272,8 @@
       "ort_c_api": 22,
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 0,
-      "note": "The exact plugin loaded, Dawn found no Vulkan driver, and WebGPU failed with No supported adapters. No software renderer was substituted, so the package correctly failed closed without making a GPU claim."
+      "note": "The exact plugin loaded, Dawn found no Vulkan driver, and WebGPU failed with No supported adapters. No software renderer was substituted, so the package correctly failed closed without making a GPU claim.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "macos-aarch64-webgpu-run-32695710770",
@@ -290,7 +291,8 @@
       "ort_c_api": 22,
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 0,
-      "note": "The pinned universal macOS WebGPU plugin loaded and reached session initialization, but the frozen graph left nodes on forbidden ORT CPU fallback. No KAT vector was emitted. The runner is explicitly virtual, so this is adverse hosted package/graph-coverage evidence rather than a physical Metal certificate."
+      "note": "The pinned universal macOS WebGPU plugin loaded and reached session initialization, but the frozen graph left nodes on forbidden ORT CPU fallback. No KAT vector was emitted. The runner is explicitly virtual, so this is adverse hosted package/graph-coverage evidence rather than a physical Metal certificate.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
       "id": "linux-x86_64-amd-rdna2-migraphx-rx6800",
@@ -319,110 +321,202 @@
         "attention_mask_sha256": "9b5ec5a4f100cf4aa2d5a985a66f90bda63382cbd084854cc16a116675663826",
         "model_output_f32_le_sha256": "8417adfb29b6641c5743f939c71c648219396e1e332194596bfb5e23f01c9e02",
         "canonical_vector_sha256": "2639d01960d3a05431eaa6b6b03207f5e0e69ae9b0ce26513fca6472f5d530d9",
-        "expected_vector_sha256": "7e67364be4c574340d3693b2743c32d0f8841bf9e723bda821d4ab0c85e32984",
-        "changed_components": "729 of 768 on the first KAT",
+        "expected_vector_sha256": "20e164382888d264f9a8db999c8f375740c18f0df384ca4335a2d1b75e2971b1",
+        "changed_components": "not recomputed; the output digest differs from the corrected first KAT",
         "compiled_program_sha256": "3044ade7383c6770bd14f33496463c5709986e843b852fe780f01ec52338c7bb"
       },
-      "note": "This isolates two separate facts: ORT's MIGraphX partitioner cannot own the graph, while MIGraphX itself can accelerate the full W8A8 graph on RDNA2 but produces incompatible v1 bytes. A direct MIGraphX backend is therefore not an admissible workaround."
+      "note": "This isolates two separate facts: ORT's MIGraphX partitioner cannot own the graph, while MIGraphX itself can accelerate the full W8A8 graph on RDNA2 but produces incompatible v1 bytes. A direct MIGraphX backend is therefore not an admissible workaround.",
+      "evidence_profile_status": "The model graph is unchanged, so strict placement/initialization evidence remains current; any recorded comparison against the former KAT is superseded."
     },
     {
-      "id": "linux-x86_64-cpu-microsoft-ort-1.28.0-run-32680098981",
-      "status": "rejected-vector-incompatibility",
-      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680098981",
-      "report_artifact_id": 9504034655,
-      "report_sha256": "18b53e3b076a44ba6f87d2b9341a526da634d66ce1c21bcabd493310939c9cbc",
-      "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
-      "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+      "id": "linux-x86_64-amd-rdna2-webgpu-rx6800",
+      "status": "rejected-accelerator-graph-coverage-and-float-lowering",
+      "evidence_scope": "physical local run; no catalog admission",
+      "hardware": "AMD Radeon RX 6800; Navi 21 RDNA2; gfx1030; Linux x86_64",
+      "hardware_sha256": "c83ec99a6cf7d6c39c6287ca11d1ebf66fc8e82e519159c4439dcf71d459054e",
+      "package": "nix:cfetch-test-webgpu",
+      "strict_execution_log_sha256": "5ea13b421ccf342dfb1e9460072377d3acd37f8da54eaa35c3751c348c853fc8",
+      "hybrid_execution_log_sha256": "bd19c803501ba3429f748de0fa90abfceb6e933f90c728618fcfee349bdb4e5d",
+      "hybrid_report_sha256": "70f0449c41bd22e2a084b856c045bb25afbc0bc7820e73a8118ffde9dbd47411",
       "exact_known_answers_passed": 0,
       "exact_known_answers_failed": 11,
-      "changed_components_per_vector": "412..739 of 768",
-      "cosine_to_x86_reference": "0.970912..0.982675",
-      "note": "A later public x86-64 runner loaded the exact passing package/runtime but produced a third vector family. The older workflow did not record its CPU model, so this rejection is scoped to the run rather than an inferred processor family."
-    },
-    {
-      "id": "linux-x86_64-cpu-intel-xeon-8573c-run-32692516880",
-      "status": "rejected-vector-incompatibility",
-      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32692516880",
-      "report_artifact_id": 9507958541,
-      "report_artifact_digest": "sha256:bda9eb4d052cdccf0fee85922c524da38bd01600d98c6cc560ceab0a6009aec9",
-      "report_sha256": "ee157f1efe7f1b6923ba63c17466818344ca41f7ce2f4eaaaca876b9f75d020f",
-      "hardware_sha256": "d6c98d2112212721b1f98529479a0eea856940f2646ee5718be1101018f160e2",
-      "hardware": "GitHub standard ubuntu-24.04 VM; Intel Xeon Platinum 8573C; AVX2/AVX-512/VNNI/AMX-INT8; Microsoft hypervisor; runner image 20260816.277.1",
-      "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
-      "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
-      "exact_known_answers_passed": 0,
-      "exact_known_answers_failed": 11,
-      "changed_components_per_vector": "412..739 of 768",
-      "cosine_to_x86_reference": "0.970912..0.982675",
-      "note": "The exact official runtime and model executed on a recorded modern Intel host with extensive INT8 ISA support, but none of the 11 canonical records matched. AVX/VNNI/AMX availability is therefore not a producer certificate; the ordinary host KAT correctly rejects this environment."
-    },
-    {
-      "id": "linux-x86_64-cpu-intel-core-ultra-7-258v-physical",
-      "status": "rejected-vector-incompatibility",
-      "evidence_scope": "physical local run recorded by public commit; no architecture-wide or catalog admission",
-      "hardware_sha256": "c437e642a844f919f182869ab2e8d686dd87b57634b4998127d9c0d0e2944c49",
-      "hardware": "Physical Linux x86-64 host; Intel Core Ultra 7 258V; family 6 model 189 stepping 1; AVX/AVX2/VNNI",
-      "package": "nix:cfetch-local-cpu@92066ad5ec03081e875d39843899272f2d3ad698",
-      "report_sha256": "f7c32d71b1445d08c6113c4acfbc9a0548b071d155f75e72815786377a8ca4fa",
-      "onnxruntime_distribution": "microsoft-github-release-v1.28.0",
-      "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
-      "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
-      "exact_known_answers_passed": 0,
-      "exact_known_answers_failed": 11,
-      "sequence_buckets_exercised": [32, 64, 128, 256, 512, 1024, 2048],
-      "changed_components_per_vector": "401..739 of 768",
-      "cosine_to_x86_reference": "0.972206..0.982775",
-      "note": "The physical Lunar Lake CPU loaded the exact official runtime and frozen bundle but failed every exact record. This independently confirms that advertised INT8/VNNI capability does not establish v1 producer compatibility."
-    },
-    {
-      "id": "linux-aarch64-cpu-microsoft-ort-1.28.0",
-      "status": "rejected-vector-incompatibility",
-      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32681875052",
-      "report_artifact_id": 9504532057,
-      "report_artifact_digest": "sha256:0c09e4086666b31ff0f0b52d5488e198d66ef033bd4e4d5cb0bde175235e3486",
-      "report_sha256": "88879b6921a348013af821e6c3690519e52b5b0375dd1e9e2462b00ab90b7c1e",
-      "hardware_sha256": "5fdfad8cd43342c7bd65a5e0f7e6f641dfff6c7718799223b9136b531c98197e",
-      "hardware": "GitHub standard ubuntu-24.04-arm VM; Arm Neoverse-N2; runner image 20260817.96.1",
-      "onnxruntime_archive_sha256": "e15ff8b5d85afe6c144d97c6fd432254bf76a219daaf17658087d6ecb3e8f0bb",
-      "onnxruntime_library_sha256": "f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7",
-      "exact_known_answers_passed": 0,
-      "exact_known_answers_failed": 11,
-      "changed_components_per_vector": "622..736 of 768",
-      "cosine_to_x86_reference": "0.969643..0.982644",
-      "note": "The exact bundle and official runtime executed successfully, but the resulting records are not network-major-1 vectors. The hardware-confirmed run reproduces the earlier run 32678932373; this runtime remains consumer-only."
-    },
-    {
-      "id": "macos-aarch64-cpu-microsoft-ort-1.28.0",
-      "status": "rejected-vector-incompatibility",
-      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32681875052",
-      "report_artifact_id": 9504601586,
-      "report_artifact_digest": "sha256:e5f8b38b9822a1917ca40f636df010bd584f84a220b12fbd82a3a145f15232d8",
-      "report_sha256": "9875416fac4fa7083e09abdf6934c2bf5d4d81b7acb1395406c734cadc41a468",
-      "hardware_sha256": "069fc6d45377d3204494d65f12b745198ca58d4c87bfea0d1740606e15fd82e0",
-      "hardware": "GitHub standard macos-15 virtual runner; VirtualMac2,1; Apple M1 (Virtual); image 20260727.0256.1",
-      "onnxruntime_archive_sha256": "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
-      "onnxruntime_library_sha256": "dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d",
-      "exact_known_answers_passed": 0,
-      "exact_known_answers_failed": 11,
-      "changed_components_per_vector": "410..736 of 768",
-      "cosine_to_x86_reference": "0.972391..0.980638",
-      "note": "The exact bundle and official runtime executed successfully, but the resulting records are not network-major-1 vectors. The hardware-confirmed virtual run reproduces the earlier run 32678932373 and cannot stand in for a physical Apple device; this runtime remains consumer-only."
+      "result": "Strict session rejected unsupported QuantizeLinear and other CPU nodes. Controlled hybrid output was byte-stable across three runs, but WebGPU dequantized learned tensors and executed f32 MatMul shaders instead of W8A8 kernels.",
+      "note": "Temperature changed by several degrees without changing any raw-output or final-vector byte; this is deterministic provider lowering, not heat instability."
     }
   ],
-  "pending_physical_families": [
-    "linux-x86_64-cpu-additional-hosts",
-    "linux-aarch64-cpu-alternative-runtime",
-    "macos-aarch64-cpu-alternative-runtime",
-    "apple-metal-alternative-runtime-or-graph-path",
-    "apple-ane-alternative-runtime-or-graph-path",
-    "intel-openvino-alternative-full-graph-and-exact-vector-path",
-    "intel-openvino-first-generation-npu-and-discrete-gpu",
-    "amd-xdna2",
-    "amd-migraphx-rdna-current-generation-and-alternative-runtime",
-    "nvidia-cuda",
-    "nvidia-tensorrt",
-    "qualcomm-qnn-htp",
-    "windows-directml-physical-adapters",
-    "webgpu-vulkan-d3d12-metal-physical-adapters"
-  ]
+  "superseded_pre_release_kat_evidence": {
+    "profile_manifest_sha256": "09e8c7c15c09fb273da3f5f639b38869ee27992d62b30b3f0da9350f37a7e3aa",
+    "reason": "The former KAT canonized ORT AVX2 U8S8 VPMADDUBSW saturation. It was reset before any tagged cfetch release or local catalog producer carried network-major-1 inference.",
+    "certification": [
+      {
+        "id": "linux-x86_64-cpu-microsoft-ort-1.28.0",
+        "status": "passing-reference",
+        "scope": "exact package/runtime and each passing host represented by a named run; not an architecture-wide claim",
+        "catalog_admitted": false,
+        "catalog_blocker": "a generic x86-64 release cannot be admitted because a later host using the same package/runtime failed 0/11; production remains host-KAT-gated",
+        "os": "linux",
+        "arch": "x86_64",
+        "provider": "cpu",
+        "device_class": "cpu",
+        "package": "nix:cfetch-local-cpu",
+        "onnxruntime_distribution": "microsoft-github-release-v1.28.0",
+        "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+        "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+        "onnxruntime_build_commit": "da9b5e364c",
+        "ort_c_api": 18,
+        "fastembed": "6.0.0 + cfetch session-controls 234fc39af5b010de0cb0c5688d138492e690fa68",
+        "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32678932373",
+        "report_artifact_id": 9503739953,
+        "report_sha256": "23866923e294a27fd8e8f239c2fc529c94273e03a43d9c1ae88bb1bd57ed4e32",
+        "additional_passing_runs": [
+          {
+            "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680584417",
+            "report_artifact_id": 9504237996,
+            "report_sha256": "f4cb5693343734631901e1465a896c71fb579f2ff1f933df0ab54120dcd19088",
+            "note": "11/11 exact on a later hosted x86-64 runner; this workflow predates hardware-model capture and therefore adds run-scoped evidence only"
+          },
+          {
+            "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32681875052",
+            "report_artifact_id": 9504620491,
+            "report_artifact_digest": "sha256:3351e2ca7ff8e066249e556c06505eef1708974093397401f35fbd2cf5b7a0f5",
+            "report_sha256": "c9f288fbc59a695693a28ffd78312d5b587efbba3c97ad67bac62d8f1b99e00f",
+            "hardware_sha256": "b9480dac067c6571d3cdca9d672f61de2f6387d5ec0b20ad9ec7d1015a3db973",
+            "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 7763; Microsoft hypervisor; runner image 20260816.277.1",
+            "note": "11/11 exact with the hardware identity captured separately; the certificate remains scoped to this run and host environment"
+          },
+          {
+            "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
+            "report_artifact_id": 9508350456,
+            "report_artifact_digest": "sha256:fa5c1dc65386ad3ec93847b5e01c1113c43f848322967466b2594a34bbdc05c8",
+            "report_sha256": "5b89ccfcee22c9570b3e5c0fb9178214cf2b31c009c7b3aafe463302ebe59079",
+            "hardware_sha256": "b9480dac067c6571d3cdca9d672f61de2f6387d5ec0b20ad9ec7d1015a3db973",
+            "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 7763; Microsoft hypervisor; runner image 20260816.277.1",
+            "fastembed": "6.0.0 + cfetch session-controls 5dac3bca305617c4bb1b561cd83c97294a92ebec",
+            "note": "11/11 exact reproduction after the provider-device selector work; the passing scope remains this recorded host/runtime"
+          },
+          {
+            "evidence_scope": "physical local run recorded by public commit; no architecture-wide or catalog admission",
+            "hardware_sha256": "c83ec99a6cf7d6c39c6287ca11d1ebf66fc8e82e519159c4439dcf71d459054e",
+            "hardware": "Physical Linux x86-64 host; AMD Ryzen 9 5950X; family 25 model 33 stepping 0; AVX/AVX2/FMA",
+            "package": "nix:cfetch-local-cpu@92066ad5ec03081e875d39843899272f2d3ad698",
+            "report_sha256": "dbb39bd261b895f2aa5bb916124015402a22853f774333a0837c358b409898d5",
+            "onnxruntime_distribution": "microsoft-github-release-v1.28.0",
+            "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+            "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+            "fastembed": "6.0.0 + cfetch session-controls 5dac3bca305617c4bb1b561cd83c97294a92ebec",
+            "exact_known_answers_passed": 11,
+            "exact_known_answers_failed": 0,
+            "sequence_buckets_exercised": [
+              32,
+              64,
+              128,
+              256,
+              512,
+              1024,
+              2048
+            ],
+            "note": "The freshly rebuilt public Nix package verified every model-bundle file and passed 11/11 on this physical Zen 3 host. Production admission remains scoped to this exact host/runtime after its ordinary startup KAT."
+          }
+        ],
+        "artifact_verified": true,
+        "exact_known_answers_passed": 11,
+        "exact_known_answers_failed": 0,
+        "int8_evidence": "canonical QDQ graph audit: 171 learned nodes covered; no floating-point shadow learned weights",
+        "note": "This is the canonical passing host, not proof that all x86-64 CPUs produce the same bytes. Ordinary local loading reruns the KAT on the actual host."
+      }
+    ],
+    "rejected_attempts": [
+      {
+        "id": "linux-x86_64-cpu-microsoft-ort-1.28.0-run-32680098981",
+        "status": "rejected-vector-incompatibility",
+        "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680098981",
+        "report_artifact_id": 9504034655,
+        "report_sha256": "18b53e3b076a44ba6f87d2b9341a526da634d66ce1c21bcabd493310939c9cbc",
+        "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+        "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11,
+        "changed_components_per_vector": "412..739 of 768",
+        "cosine_to_x86_reference": "0.970912..0.982675",
+        "note": "A later public x86-64 runner loaded the exact passing package/runtime but produced a third vector family. The older workflow did not record its CPU model, so this rejection is scoped to the run rather than an inferred processor family."
+      },
+      {
+        "id": "linux-x86_64-cpu-intel-xeon-8573c-run-32692516880",
+        "status": "rejected-vector-incompatibility",
+        "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32692516880",
+        "report_artifact_id": 9507958541,
+        "report_artifact_digest": "sha256:bda9eb4d052cdccf0fee85922c524da38bd01600d98c6cc560ceab0a6009aec9",
+        "report_sha256": "ee157f1efe7f1b6923ba63c17466818344ca41f7ce2f4eaaaca876b9f75d020f",
+        "hardware_sha256": "d6c98d2112212721b1f98529479a0eea856940f2646ee5718be1101018f160e2",
+        "hardware": "GitHub standard ubuntu-24.04 VM; Intel Xeon Platinum 8573C; AVX2/AVX-512/VNNI/AMX-INT8; Microsoft hypervisor; runner image 20260816.277.1",
+        "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+        "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11,
+        "changed_components_per_vector": "412..739 of 768",
+        "cosine_to_x86_reference": "0.970912..0.982675",
+        "note": "The exact official runtime and model executed on a recorded modern Intel host with extensive INT8 ISA support, but none of the 11 canonical records matched. AVX/VNNI/AMX availability is therefore not a producer certificate; the ordinary host KAT correctly rejects this environment."
+      },
+      {
+        "id": "linux-x86_64-cpu-intel-core-ultra-7-258v-physical",
+        "status": "rejected-vector-incompatibility",
+        "evidence_scope": "physical local run recorded by public commit; no architecture-wide or catalog admission",
+        "hardware_sha256": "c437e642a844f919f182869ab2e8d686dd87b57634b4998127d9c0d0e2944c49",
+        "hardware": "Physical Linux x86-64 host; Intel Core Ultra 7 258V; family 6 model 189 stepping 1; AVX/AVX2/VNNI",
+        "package": "nix:cfetch-local-cpu@92066ad5ec03081e875d39843899272f2d3ad698",
+        "report_sha256": "f7c32d71b1445d08c6113c4acfbc9a0548b071d155f75e72815786377a8ca4fa",
+        "onnxruntime_distribution": "microsoft-github-release-v1.28.0",
+        "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+        "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11,
+        "sequence_buckets_exercised": [
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048
+        ],
+        "changed_components_per_vector": "401..739 of 768",
+        "cosine_to_x86_reference": "0.972206..0.982775",
+        "note": "The physical Lunar Lake CPU loaded the exact official runtime and frozen bundle but failed every exact record. This independently confirms that advertised INT8/VNNI capability does not establish v1 producer compatibility."
+      },
+      {
+        "id": "linux-aarch64-cpu-microsoft-ort-1.28.0",
+        "status": "rejected-vector-incompatibility",
+        "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32681875052",
+        "report_artifact_id": 9504532057,
+        "report_artifact_digest": "sha256:0c09e4086666b31ff0f0b52d5488e198d66ef033bd4e4d5cb0bde175235e3486",
+        "report_sha256": "88879b6921a348013af821e6c3690519e52b5b0375dd1e9e2462b00ab90b7c1e",
+        "hardware_sha256": "5fdfad8cd43342c7bd65a5e0f7e6f641dfff6c7718799223b9136b531c98197e",
+        "hardware": "GitHub standard ubuntu-24.04-arm VM; Arm Neoverse-N2; runner image 20260817.96.1",
+        "onnxruntime_archive_sha256": "e15ff8b5d85afe6c144d97c6fd432254bf76a219daaf17658087d6ecb3e8f0bb",
+        "onnxruntime_library_sha256": "f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11,
+        "changed_components_per_vector": "622..736 of 768",
+        "cosine_to_x86_reference": "0.969643..0.982644",
+        "note": "The exact bundle and official runtime executed successfully, but the resulting records are not network-major-1 vectors. The hardware-confirmed run reproduces the earlier run 32678932373; this runtime remains consumer-only."
+      },
+      {
+        "id": "macos-aarch64-cpu-microsoft-ort-1.28.0",
+        "status": "rejected-vector-incompatibility",
+        "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32681875052",
+        "report_artifact_id": 9504601586,
+        "report_artifact_digest": "sha256:e5f8b38b9822a1917ca40f636df010bd584f84a220b12fbd82a3a145f15232d8",
+        "report_sha256": "9875416fac4fa7083e09abdf6934c2bf5d4d81b7acb1395406c734cadc41a468",
+        "hardware_sha256": "069fc6d45377d3204494d65f12b745198ca58d4c87bfea0d1740606e15fd82e0",
+        "hardware": "GitHub standard macos-15 virtual runner; VirtualMac2,1; Apple M1 (Virtual); image 20260727.0256.1",
+        "onnxruntime_archive_sha256": "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
+        "onnxruntime_library_sha256": "dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11,
+        "changed_components_per_vector": "410..736 of 768",
+        "cosine_to_x86_reference": "0.972391..0.980638",
+        "note": "The exact bundle and official runtime executed successfully, but the resulting records are not network-major-1 vectors. The hardware-confirmed virtual run reproduces the earlier run 32678932373 and cannot stand in for a physical Apple device; this runtime remains consumer-only."
+      }
+    ]
+  }
 }

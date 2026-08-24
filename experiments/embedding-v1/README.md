@@ -17,10 +17,12 @@ digest and is not part of the cfetch software binary.
 | Calibration | Entropy, 16 deterministic samples, 256 tokens, SmoothQuant `0.65` |
 | Graph | ONNX opset 18; 171 learned nodes covered by Q/DQ |
 | Output | full 768 dimensions, then the canonical signed `INT8x768` codec |
+| Runtime | sequential, one thread, deterministic compute, precise/non-saturating QMM |
 
 `v1-artifact-lock.json` is the human- and machine-readable release decision.
-It pins the model, build report, retrieval audit, source export, and known-answer
-digests. The bundler verifies that lock before producing an archive.
+It pins the model, build report, retrieval audit, runtime KAT, executable
+profile, source export, runtime controls, and known-answer digests. The bundler
+verifies every one before producing an archive.
 
 The source checkpoint contains floating-point tensors even though Google
 trained it as a Q8-QAT source. The exported full-precision ONNX graph is used
@@ -84,9 +86,38 @@ second build produced the exact same ONNX and build-report bytes.
 ## Evaluation, not training
 
 `runtime_kat.py` derives the eleven public known-answer records. It executes
-one input at a time, pads to the profile's fixed buckets, and applies the final
-signed `INT8x768` codec. ORT `1.25.1` and `1.28.0` produced the same eleven
-vector digests on CPU.
+one input at a time, pads to the profile's fixed buckets, enables deterministic
+compute plus precise QMM, and applies the final signed `INT8x768` codec. Python
+ORT 1.28, the packaged Rust/FastEmbed path on a Ryzen 9 5950X without VNNI,
+and that same Rust binary on a Core Ultra 7 258V with VNNI produced the same
+eleven raw outputs and vector bytes.
+
+The earlier candidate KAT used ORT's default U8S8 AVX2 lowering. A controlled
+test proved that its `VPMADDUBSW` pairwise saturation—not temperature,
+threading, the model, or the codec—caused the x86 discrepancy. The precise QMM
+setting selects non-saturating U8U8 on pre-VNNI x86 and made all eleven Ryzen
+answers exactly equal the Intel VNNI path. Because no tagged cfetch release or
+catalogued local producer had shipped network-major-1 inference, the candidate
+KAT was reset before activation. The graph SHA-256 stayed unchanged; the KAT,
+profile manifest and bundle metadata changed.
+
+Generate the frozen report with the executable policy:
+
+```bash
+uv run --python 3.12 \
+  --with 'onnxruntime==1.28.0' \
+  --with 'transformers==4.57.1' \
+  --with 'numpy==2.5.2' \
+  experiments/embedding-v1/runtime_kat.py \
+  --model candidate.onnx \
+  --tokenizer "$MODEL_ROOT/source/7b5b24595322ab0ea4d08827066860a6df8cb0aa" \
+  --output runtime-kat.json
+```
+
+`package_bundle.py` requires that report explicitly. It refuses a report whose
+model digest, runtime controls, profile digest, or eleven answers differ from
+`v1-artifact-lock.json`. The package is reproducible: two invocations with the
+same admitted inputs must produce the same gzip bytes and SHA-256.
 
 `retrieval_eval.py` is a diagnostic retrieval benchmark on the complete
 SciFact test split at revision

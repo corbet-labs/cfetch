@@ -59,6 +59,8 @@ pub struct CertificationReport {
     pub inference_batch_size: usize,
     pub ort_intra_threads: usize,
     pub ort_execution_mode: &'static str,
+    pub ort_deterministic_compute: bool,
+    pub ort_precise_qmm: bool,
     pub cpu_fallback_disabled: bool,
     pub graph_ownership_enforced: bool,
     pub int8_kernel_evidence: &'static str,
@@ -100,7 +102,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "Which files define cfetch's embedding compatibility boundary?",
         repeats: 1,
         expected_bucket: 32,
-        expected_sha256: "7e67364be4c574340d3693b2743c32d0f8841bf9e723bda821d4ab0c85e32984",
+        expected_sha256: "20e164382888d264f9a8db999c8f375740c18f0df384ca4335a2d1b75e2971b1",
     },
     KnownAnswer {
         label: "profile-document",
@@ -108,7 +110,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "The embedding profile pins the model, tokenizer, prompts, pooling, dimensions, quantization, and vector codec.",
         repeats: 1,
         expected_bucket: 32,
-        expected_sha256: "f9fde22be9dce6cee9ff9e4bad7d6ad36f8d47e7fe697f3536ac3fa822985ce7",
+        expected_sha256: "2d1b07a4baa02517f41d18204ff9c82b1ecc949d3b75afac6e0e79911ca0b7b8",
     },
     KnownAnswer {
         label: "source-code",
@@ -116,7 +118,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "fn main() { println!(\"deterministic vectors\"); }",
         repeats: 1,
         expected_bucket: 32,
-        expected_sha256: "9c4f0753a787d4e28feaa6e02b445ff4e53e4402343e6d1390c19bf7ceddf4d4",
+        expected_sha256: "b59d9d873849c7387ba4f153006a8a3b8ae69104b044623bd5949c578a5cf14a",
     },
     KnownAnswer {
         label: "german-query",
@@ -124,7 +126,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "Wie werden inkompatible Vektoren im Netzwerk verhindert?",
         repeats: 1,
         expected_bucket: 32,
-        expected_sha256: "e1b939cf65256191e909881ec3067dedc7ddd3f0f92541c6183d6040e8da97f0",
+        expected_sha256: "5720264eac4e9a977ad289109c11e9ab87699206e48f476fea992e293655fd9f",
     },
     KnownAnswer {
         label: "japanese-document",
@@ -132,7 +134,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "同じコンテンツハッシュに異なるベクトルが届いた場合、保存を拒否します。",
         repeats: 1,
         expected_bucket: 32,
-        expected_sha256: "44f0b8754226feae1b0ee996a77f2288c893871c9ae326625c3cdd0b61410f03",
+        expected_sha256: "6a61828885789b40358a773d31deab1d21fbde927c66cce1b33fcbf674549f24",
     },
     KnownAnswer {
         label: "bucket-64",
@@ -140,7 +142,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "The canonical vector store rejects conflicting bytes for identical content.",
         repeats: 3,
         expected_bucket: 64,
-        expected_sha256: "f29f4ace39dce50732523a425194ccb0a1806c20f38f594658cd38653ff8a95e",
+        expected_sha256: "66e60d40b9e5153da1ee13b5da545522dd324f8600661b0f50be40021c765444",
     },
     KnownAnswer {
         label: "bucket-128",
@@ -148,7 +150,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "fn verify(hash: &str, vector: &[i8]) { assert_eq!(vector.len(), 768); }",
         repeats: 2,
         expected_bucket: 128,
-        expected_sha256: "074b2c41449eab85b0adcdc7258c6a01946c8c95245de7d05ccb6d2bfd134554",
+        expected_sha256: "a6a1c4f90acd55441fdf4e911967ae624eb876207d6a9aa9c1ebd4cd1c8ef59c",
     },
     KnownAnswer {
         label: "bucket-256",
@@ -156,7 +158,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "Warum müssen alle Teilnehmer genau dasselbe Einbettungsprofil verwenden?",
         repeats: 9,
         expected_bucket: 256,
-        expected_sha256: "9c0107c38c797b699877ab5776416dcef11f8d4cf4643099a6ce71be88489eca",
+        expected_sha256: "91e408fa2d0acebce0a1634336562c8dea6937511bf9835e88acb7e8b42ca1cf",
     },
     KnownAnswer {
         label: "bucket-512",
@@ -164,7 +166,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "同じコンテンツハッシュに異なるベクトルが届いた場合、保存を拒否します。",
         repeats: 14,
         expected_bucket: 512,
-        expected_sha256: "d9722be728ca18586796b418c53cf48ae8aa477346c48f5ab8b075a9b60f8c50",
+        expected_sha256: "881ea45e551fbb696afa2bd4420a7dcb82f06e97a7a3cf04cd45bb3d54acd56a",
     },
     KnownAnswer {
         label: "bucket-1024",
@@ -172,7 +174,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "يجب أن تستخدم جميع الأجهزة النموذج نفسه وخط المعالجة نفسه حتى تبقى المتجهات قابلة للتبادل.",
         repeats: 19,
         expected_bucket: 1024,
-        expected_sha256: "97cb541fd8bf2b9a996e305743dc63cad654a41e0d26d3880559a49331761653",
+        expected_sha256: "97ddc4bc0911156158f6333afcc51099da70690ad36c4451fe427cfc85c890dc",
     },
     KnownAnswer {
         label: "bucket-2048",
@@ -180,7 +182,7 @@ const KNOWN_ANSWERS: &[KnownAnswer] = &[
         seed: "{\"network_major\":1,\"dimensions\":768,\"precision\":\"int8\",\"compatible\":true}",
         repeats: 45,
         expected_bucket: 2048,
-        expected_sha256: "f6ff965cf3907110de5569bf441275b8423567d0b74eb1e0557858fc2c8064da",
+        expected_sha256: "a28785b70630e80a522ae66e7ed48c801ad1c780df4be40073097c1bdec8a348",
     },
 ];
 
@@ -544,11 +546,11 @@ fn certify_loaded(
     let artifact_sha256 = crate::embedding_profile::MODEL_ARTIFACT_SHA256
         .expect("published profile always names its artifact");
     Ok(CertificationReport {
-        schema: 1,
+        schema: 2,
         cfetch_version: env!("CARGO_PKG_VERSION"),
         network_major: crate::embedding_profile::NETWORK_MAJOR,
         profile_id: crate::embedding_profile::PROFILE_ID,
-        profile_manifest_sha256: crate::embedding_profile::manifest_sha256(),
+        profile_manifest_sha256: crate::embedding_profile::PROFILE_MANIFEST_SHA256.into(),
         artifact_id: crate::embedding_profile::MODEL_ARTIFACT_ID,
         artifact_sha256,
         model_quantization: crate::embedding_profile::MODEL_QUANTIZATION,
@@ -569,11 +571,13 @@ fn certify_loaded(
         execution_provider_plugin_distribution: plugin_distribution,
         execution_provider_plugin_archive_sha256: plugin_archive_sha256,
         execution_provider_plugin_library_sha256: plugin_library_sha256,
-        fastembed: "6.0.0 + cfetch session-controls 5dac3bca305617c4bb1b561cd83c97294a92ebec",
+        fastembed: "6.0.0 + cfetch session-controls 1d9b6381354c23d7a17f61b0486fdabca1a724b0",
         graph_optimization: crate::embedding_profile::GRAPH_OPTIMIZATION,
         inference_batch_size: crate::embedding_profile::INFERENCE_BATCH_SIZE,
         ort_intra_threads: crate::embedding_profile::ORT_INTRA_THREADS,
         ort_execution_mode: crate::embedding_profile::ORT_EXECUTION_MODE,
+        ort_deterministic_compute: crate::embedding_profile::ORT_DETERMINISTIC_COMPUTE,
+        ort_precise_qmm: crate::embedding_profile::ORT_PRECISE_QMM,
         cpu_fallback_disabled: accelerator,
         graph_ownership_enforced: accelerator,
         int8_kernel_evidence: if accelerator {
@@ -612,6 +616,8 @@ fn build_model(
     let mut options = InitOptionsUserDefined::new()
         .with_max_length(crate::embedding_profile::MAX_TOKENS)
         .with_intra_threads(crate::embedding_profile::ORT_INTRA_THREADS)
+        .with_deterministic_compute(crate::embedding_profile::ORT_DETERMINISTIC_COMPUTE)
+        .with_precise_qmm(crate::embedding_profile::ORT_PRECISE_QMM)
         // A registered EP is not proof that it owns the graph. Accelerator
         // packages fail session creation if ORT would place even one node on
         // its default CPU fallback.
@@ -995,5 +1001,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(unreviewed.contains("no production admission"));
+    }
+
+    #[test]
+    fn artifact_lock_and_executable_use_the_same_precise_known_answers() {
+        let lock: serde_json::Value = serde_json::from_str(include_str!(
+            "../experiments/embedding-v1/v1-artifact-lock.json"
+        ))
+        .unwrap();
+        let locked = lock["known_answer_vector_sha256"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let executable = KNOWN_ANSWERS
+            .iter()
+            .map(|answer| answer.expected_sha256)
+            .collect::<Vec<_>>();
+        assert_eq!(locked, executable);
+        assert_eq!(
+            lock["profile_manifest_sha256"],
+            crate::embedding_profile::PROFILE_MANIFEST_SHA256
+        );
+        assert_eq!(lock["runtime_contract"]["deterministic_compute"], true);
+        assert_eq!(lock["runtime_contract"]["precise_qmm"], true);
     }
 }

@@ -34,7 +34,7 @@ independent of cfetch's pre-1.0 software version.
 | Query input | `task: search result \| query: {content}` |
 | Document input | `title: none \| text: {content}` |
 | Model output | graph-owned pooling, projection and L2-normalized `sentence_embedding` |
-| ORT execution | sequential, one CPU intra-op thread, `ORT_ENABLE_ALL` graph optimization |
+| ORT execution | sequential, one CPU intra-op thread, deterministic compute, precise/non-saturating QMM, `ORT_ENABLE_ALL` graph optimization |
 | Interchange vector | signed `INT8x768`, exactly 768 bytes |
 
 The source repository is Google's full 300M EmbeddingGemma Q8-QAT source. Its
@@ -45,13 +45,13 @@ is part of the build.
 
 The model bundle is deterministic and separately licensed under the included
 Gemma terms. Its current archive SHA-256 is
-`12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1`.
+`be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f`.
 The immutable archive is published in the public
 [`model-v1` release](https://github.com/corbet-labs/cfetch/releases/tag/model-v1).
 The archive includes the graph, tokenizer, source card, build report,
-retrieval audit, artifact lock, terms, modification notice, and per-file
-checksums. The graph digest above, rather than the archive filename or URL, is
-the network identity.
+retrieval audit, executable runtime KAT, artifact lock, terms, modification
+notice, and per-file checksums. The graph digest above, rather than the archive
+filename or URL, is the network identity.
 
 ## What “one INT8 model” means
 
@@ -86,7 +86,9 @@ Each input is prefixed, tokenized, truncated, padded to its smallest allowed
 bucket, and executed alone. Batch-longest padding is forbidden: testing found
 that changing an unrelated neighbor's shape can alter integer graph fusion
 and therefore the final byte. CPU reductions are sequential and
-single-threaded. Accelerator sessions use fixed batch and sequence dimensions.
+single-threaded, ORT deterministic compute is enabled, and the x86 quantized
+matmul policy is precise/non-saturating. Accelerator sessions use fixed batch
+and sequence dimensions.
 
 Runtime provenance is certification evidence. An ort-sys static build and
 Microsoft's official shared build both reported ONNX Runtime 1.28.0, but the
@@ -100,37 +102,53 @@ plugin device discovery requires it. The loaded runtime's exact distribution
 and bytes still have to be certified; neither API surface changes the frozen
 graph or vector contract.
 
-The same official ORT 1.28 build commit was then exercised on public Linux
-arm64 and macOS arm64 runners. Both loaded and ran successfully but matched
-none of the 11 x86 reference records. Hundreds of components changed in every
-answer, and the two arm64 OS runtimes themselves diverged on five answers.
-They are rejected producers, not “probably compatible” CPU packages. This is
-why shared vectors are derived once and distributed, and why an architecture
-name or matching runtime version cannot bypass the KAT.
+Pre-release cross-host testing exposed one missing runtime field. ORT's
+default U8S8 path on x86 without VNNI uses `VPMADDUBSW`, whose paired products
+may saturate to 16 bits. The first candidate KAT had therefore frozen an
+overflow-prone Ryzen AVX2 optimization rather than the intended INT32 result.
+Enabling ORT deterministic compute alone changed no byte. Enabling its precise
+QMM policy made every raw output and final vector on a physical Ryzen 9 5950X
+match a physical Intel Core Ultra 7 258V/VNNI host exactly: 11 of 11.
 
-The same conclusion holds inside x86-64. Recorded AMD EPYC 7763 and physical
-Ryzen 9 5950X hosts passed all 11 answers, while a recorded Intel Xeon
-Platinum 8573C with AVX-512, VNNI and AMX-INT8 and a physical Core Ultra 7
-258V with AVX2/VNNI both failed all 11 with identical model/runtime bytes. The
-v1 contract therefore names passing hosts, never an ISA marketing feature as
-a producer guarantee.
+The profile now freezes that non-saturating policy explicitly. The model graph
+and quantization did not change. The candidate answers and bundle metadata did.
+This correction happened before any tagged cfetch release could produce v1
+vectors and while the release catalog was still remote-only. Once a
+v1-capable software release or producer catalog ships, an equivalent change is
+forbidden in place and requires network major 2.
+
+All earlier CPU reports are retained as superseded diagnostic evidence, not
+current certificates. In particular, the former Linux/macOS arm64 and hosted
+x86 results must be rerun against report schema 2 and the precise profile.
+Architecture names and matching runtime versions still cannot bypass the KAT.
 
 A physical AMD Radeon RX 6800 produced the complementary accelerator result.
 ORT's MIGraphX provider could not own the whole graph with CPU fallback
 disabled. Standalone MIGraphX did compile and run the complete frozen W8A8
 graph on RDNA2 INT8-capable kernels, but its first encoded result changed 729
-of 768 components. This proves that “same ONNX Q/DQ graph” and “real INT8
-acceleration” still do not imply identical output arithmetic across kernels.
-It also rules out bypassing ORT with direct MIGraphX as a v1 producer.
+of 768 components against the superseded candidate KAT and its digest also
+differs from the corrected reference. This proves that “same ONNX Q/DQ graph”
+and “real INT8 acceleration” still do not imply identical output arithmetic
+across kernels. It also rules out bypassing ORT with direct MIGraphX as a v1
+producer.
 
 A physical Intel Lunar Lake probe reached the same boundary from the NPU side.
 OpenVINO 2026.3 compiled the unchanged graph for both its Arc 140V GPU and NPU,
 but strict ORT/OpenVINO sessions could not own the complete graph. A temporary,
 explicit hybrid diagnostic allowed the CPU remainder only to test that
-hypothesis; both devices executed every bucket but matched 0/11 vectors. The
-production implementation was restored immediately to mandatory no-fallback.
-This shows that current INT8 hardware and successful graph compilation are
-still insufficient: exact final bytes remain the admission boundary.
+hypothesis; both devices produced incompatible vectors under the superseded
+candidate KAT. The strict full-graph rejection remains current because the
+model graph did not change. This shows that current INT8 hardware and
+successful graph compilation are still insufficient: exact final bytes remain
+the admission boundary.
+
+The physical RX 6800 WebGPU probe further isolated the issue from temperature.
+Three executions produced identical raw-output and vector hashes while the GPU
+temperature changed. Strict execution rejected hundreds of unsupported
+`QuantizeLinear` nodes. A controlled hybrid trace showed WebGPU
+`DequantizeLinear` followed by `f32` MatMul shaders, not a native W8A8 learned
+path. WebGPU is therefore rejected for this graph until its operator coverage
+and arithmetic change; the stable mismatch is not thermal noise.
 
 AMD's current NPU material illustrates why v1 cannot accept a vendor-specific
 "optimized EmbeddingGemma" by name alone. Ryzen AI 1.8's classic compiler has

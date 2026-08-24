@@ -86,8 +86,14 @@ def main() -> None:
     def open_session(bucket: int | None) -> ort.InferenceSession:
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1
+        options.use_deterministic_compute = True
+        # ORT's default U8S8 AVX2/AVX-512 fast path can saturate paired
+        # products to 16 bits. V1 instead freezes the non-saturating U8U8
+        # lowering so pre-VNNI and VNNI x86 CPUs share one reference.
+        options.add_session_config_entry("session.x64quantprecision", "1")
         if bucket is not None:
             options.add_free_dimension_override_by_name("batch_size", 1)
             options.add_free_dimension_override_by_name("sequence_length", bucket)
@@ -131,7 +137,7 @@ def main() -> None:
     output_matrix = np.stack(outputs)
     vectors = [canonical_vector(vector) for vector in output_matrix]
     report = {
-        "schema": 1,
+        "schema": 2,
         "model_sha256": sha256_file(args.model),
         "onnxruntime": importlib.metadata.version("onnxruntime"),
         "requested_provider": args.provider,
@@ -140,10 +146,12 @@ def main() -> None:
         "ort_intra_threads": 1,
         "ort_inter_threads": 1,
         "ort_execution_mode": "sequential",
+        "ort_deterministic_compute": True,
+        "ort_precise_qmm": True,
         "sequence_buckets": list(SEQUENCE_BUCKETS),
         "fixed_padding_override": args.pad_to,
         "fixed_session_dimensions": args.fix_session_dimensions,
-        "graph_optimization": "ORT_ENABLE_ALL (FastEmbed Level 3)",
+        "graph_optimization": "ORT_ENABLE_ALL",
         "known_answers": [
             {
                 "label": case.label,

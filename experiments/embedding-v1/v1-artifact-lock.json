@@ -5,7 +5,8 @@
   "artifact_sha256": "ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1",
   "build_report_sha256": "cf1855e542448fe69d3eb9894db13ec98530057e105f3aba8b523a5b84acc283",
   "retrieval_report_sha256": "597bca4031c27f8d172cf6a45eefa36482a9e7e4172e58e71cb9d954acf85e7b",
-  "runtime_kat_report_sha256": "0fd6b1c87f9d65360d7c9271f7074b24ce8e8f188d7eca360cdec33df9689484",
+  "runtime_kat_report_sha256": "bed9f5f7fe3a3016491f0445ca373a23663cd9c6d5bfc47b6cc14dd99ba70ffa",
+  "profile_manifest_sha256": "3a7645ee84a5fe21bf0befaf6b68f51a5ff61ad22b0c10c40aaec0a1f63d7a53",
   "source": {
     "model": "google/embeddinggemma-300m-qat-q8_0-unquantized",
     "revision": "7b5b24595322ab0ea4d08827066860a6df8cb0aa",
@@ -21,6 +22,14 @@
     "learned_nodes": 171,
     "learned_inputs_qdq_covered": true,
     "hardware_specific_optimization": false
+  },
+  "runtime_contract": {
+    "execution_mode": "sequential",
+    "intra_op_threads": 1,
+    "graph_optimization": "ORT_ENABLE_ALL",
+    "deterministic_compute": true,
+    "precise_qmm": true,
+    "x86_quantized_matmul": "non-saturating U8U8 lowering on pre-VNNI CPUs"
   },
   "retrieval_audit": {
     "dataset": "mteb/scifact",
@@ -43,17 +52,17 @@
     "mean_source_candidate_top10_overlap": 0.7720000000000001
   },
   "known_answer_vector_sha256": [
-    "7e67364be4c574340d3693b2743c32d0f8841bf9e723bda821d4ab0c85e32984",
-    "f9fde22be9dce6cee9ff9e4bad7d6ad36f8d47e7fe697f3536ac3fa822985ce7",
-    "9c4f0753a787d4e28feaa6e02b445ff4e53e4402343e6d1390c19bf7ceddf4d4",
-    "e1b939cf65256191e909881ec3067dedc7ddd3f0f92541c6183d6040e8da97f0",
-    "44f0b8754226feae1b0ee996a77f2288c893871c9ae326625c3cdd0b61410f03",
-    "f29f4ace39dce50732523a425194ccb0a1806c20f38f594658cd38653ff8a95e",
-    "074b2c41449eab85b0adcdc7258c6a01946c8c95245de7d05ccb6d2bfd134554",
-    "9c0107c38c797b699877ab5776416dcef11f8d4cf4643099a6ce71be88489eca",
-    "d9722be728ca18586796b418c53cf48ae8aa477346c48f5ab8b075a9b60f8c50",
-    "97cb541fd8bf2b9a996e305743dc63cad654a41e0d26d3880559a49331761653",
-    "f6ff965cf3907110de5569bf441275b8423567d0b74eb1e0557858fc2c8064da"
+    "20e164382888d264f9a8db999c8f375740c18f0df384ca4335a2d1b75e2971b1",
+    "2d1b07a4baa02517f41d18204ff9c82b1ecc949d3b75afac6e0e79911ca0b7b8",
+    "b59d9d873849c7387ba4f153006a8a3b8ae69104b044623bd5949c578a5cf14a",
+    "5720264eac4e9a977ad289109c11e9ab87699206e48f476fea992e293655fd9f",
+    "6a61828885789b40358a773d31deab1d21fbde927c66cce1b33fcbf674549f24",
+    "66e60d40b9e5153da1ee13b5da545522dd324f8600661b0f50be40021c765444",
+    "a6a1c4f90acd55441fdf4e911967ae624eb876207d6a9aa9c1ebd4cd1c8ef59c",
+    "91e408fa2d0acebce0a1634336562c8dea6937511bf9835e88acb7e8b42ca1cf",
+    "881ea45e551fbb696afa2bd4420a7dcb82f06e97a7a3cf04cd45bb3d54acd56a",
+    "97ddc4bc0911156158f6333afcc51099da70690ad36c4451fe427cfc85c890dc",
+    "a28785b70630e80a522ae66e7ed48c801ad1c780df4be40073097c1bdec8a348"
   ],
   "rationale": [
     "Network major 1 requires one model quantization and forbids a higher-precision runtime alternative.",

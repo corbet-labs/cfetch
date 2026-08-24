@@ -78,8 +78,12 @@ PY
   --json > "$report"
 
 jq -e '
+  .schema == 2 and
   .profile_id == "cfetch-embedding-v1" and
+  .profile_manifest_sha256 == "3a7645ee84a5fe21bf0befaf6b68f51a5ff61ad22b0c10c40aaec0a1f63d7a53" and
   .artifact_sha256 == "ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1" and
+  .ort_deterministic_compute == true and
+  .ort_precise_qmm == true and
   .exact_vector_conformance == true and
   (.provider != "cpu" or .producer_eligible_without_external_review == true) and
   (.known_answers | length == 11) and

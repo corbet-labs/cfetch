@@ -459,9 +459,9 @@ catalog used to build the release.
 
 ### Evaluate the frozen v1 local CPU path
 
-The source flake exposes the certified local CPU package on x86-64 Linux,
-arm64 Linux, and Apple silicon. The separately licensed, immutable model bundle
-is published in the public
+The source flake exposes the local CPU package on x86-64 Linux, arm64 Linux,
+and Apple silicon. Each actual host must still pass the embedded byte gate.
+The separately licensed, immutable model bundle is published in the public
 [`model-v1` release](https://github.com/corbet-labs/cfetch/releases/tag/model-v1):
 
 ```console
@@ -469,7 +469,7 @@ $ nix build github:corbet-labs/cfetch#cfetch-local-cpu
 $ curl --proto '=https' --tlsv1.2 --location --fail --output model-v1.tar.gz \
     https://github.com/corbet-labs/cfetch/releases/download/model-v1/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz
 $ test "$(nix hash file --type sha256 --base16 model-v1.tar.gz)" = \
-    12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+    be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f
 $ tar -xzf model-v1.tar.gz
 $ ./result/bin/cfetch inference-certify \
     --model-dir ./cfetch-embeddinggemma-300m-a8w8-v1 --provider auto --json
@@ -492,8 +492,11 @@ For current Intel drivers, `cfetch-test-openvino-current` instead pins ORT
 1.27.1 and OpenVINO 2026.3 from the locked Nix input. A physical Core Ultra 7
 258V probe compiled the frozen graph on both Arc 140V and its NPU, but strict
 sessions still required forbidden CPU remainder. An explicit diagnostic that
-allowed the remainder then failed all 11 exact vectors on both devices. These
-are rejected routes, not producer support; production remains fail-closed.
+allowed the remainder produced vectors incompatible with the then-current
+candidate KAT on both devices. The graph is unchanged, so the strict ownership
+rejection remains current; the hybrid comparison must be rerun against the
+corrected KAT before being quoted numerically. These are rejected routes, not
+producer support; production remains fail-closed.
 Windows x64 testers can create the equivalent hash-pinned NuGet evidence
 package with `scripts/build-windows-inference-package.ps1 -Provider
 openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
@@ -511,13 +514,19 @@ Hyper-V Video, where WebGPU could not own the complete graph. The isolated
 macOS retry reached the pinned plugin on a virtual Apple M1 but likewise left
 nodes on forbidden CPU fallback. None is a physical GPU certificate.
 
-Recorded EPYC 7763 and physical Ryzen 9 5950X hosts pass the current CPU
-reference; recorded Xeon 8573C and physical Core Ultra 7 258V hosts using the
-same package/runtime failed all 11 vectors. Public Linux arm64 and macOS arm64
-runs failed all 11 too. These are host/runtime certificates, never
-architecture-wide promises. The release catalog therefore remains
-remote-only. Ordinary local loading runs the same admission gate on the actual
-host and fails closed before writing incompatible vectors. See the
+A physical Radeon RX 6800 added the missing Vulkan-class evidence. Strict
+WebGPU execution rejected unsupported `QuantizeLinear` and other CPU nodes. A
+controlled hybrid trace dequantized learned tensors and emitted `f32` MatMul
+shaders rather than W8A8 kernels. Three runs produced identical wrong bytes as
+the GPU warmed by several degrees, ruling out temperature instability.
+
+The corrected CPU reference freezes ORT deterministic compute and precise QMM.
+It produced identical raw outputs and final vectors on a physical Ryzen 9
+5950X AVX2 host and a physical Core Ultra 7 258V VNNI host: 11/11 on both. The
+former AVX2 KAT had accidentally canonized ORT's saturating U8S8 fast path and
+all earlier CPU reports are superseded until rerun against report schema 2.
+Ordinary local loading runs the same admission gate on the actual host and
+fails closed before writing incompatible vectors. See the
 [frozen profile](docs/embedding-profile-v1.md) and
 [certification matrix](docs/accelerator-certification.md).
 

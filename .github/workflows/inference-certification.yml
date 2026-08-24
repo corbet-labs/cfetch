@@ -13,7 +13,7 @@ on:
       bundle_sha256:
         description: SHA-256 of the complete model bundle archive
         required: true
-        default: 12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+        default: be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f
         type: string
 
 permissions:
@@ -35,7 +35,7 @@ jobs:
           BUNDLE_URL: ${{ inputs.bundle_url }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
         run: |
-          test "$BUNDLE_SHA256" = 12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+          test "$BUNDLE_SHA256" = be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f
           case "$BUNDLE_URL" in
             https://github.com/corbet-labs/cfetch/releases/download/*/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz) ;;
             *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
@@ -88,7 +88,7 @@ jobs:
           BUNDLE_URL: ${{ inputs.bundle_url }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
         run: |
-          test "$BUNDLE_SHA256" = 12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+          test "$BUNDLE_SHA256" = be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f
           case "$BUNDLE_URL" in
             https://github.com/corbet-labs/cfetch/releases/download/*/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz) ;;
             *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
@@ -138,7 +138,7 @@ jobs:
           BUNDLE_URL: ${{ inputs.bundle_url }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
         run: |
-          test "$BUNDLE_SHA256" = 12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+          test "$BUNDLE_SHA256" = be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f
           case "$BUNDLE_URL" in
             https://github.com/corbet-labs/cfetch/releases/download/*/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz) ;;
             *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
@@ -191,7 +191,7 @@ jobs:
           BUNDLE_URL: ${{ inputs.bundle_url }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
         run: |
-          test "$BUNDLE_SHA256" = 12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+          test "$BUNDLE_SHA256" = be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f
           case "$BUNDLE_URL" in
             https://github.com/corbet-labs/cfetch/releases/download/*/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz) ;;
             *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
@@ -253,7 +253,7 @@ jobs:
           BUNDLE_URL: ${{ inputs.bundle_url }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
         run: |
-          if ($env:BUNDLE_SHA256 -ne "12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1") {
+          if ($env:BUNDLE_SHA256 -ne "be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f") {
             throw "unexpected model bundle digest"
           }
           $uri = [Uri]$env:BUNDLE_URL

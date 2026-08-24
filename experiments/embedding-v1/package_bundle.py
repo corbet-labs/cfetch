@@ -14,6 +14,15 @@ import tarfile
 ARTIFACT_ID = "cfetch-embeddinggemma-300m-a8w8-v1"
 SOURCE_MODEL = "google/embeddinggemma-300m-qat-q8_0-unquantized"
 SOURCE_REVISION = "7b5b24595322ab0ea4d08827066860a6df8cb0aa"
+PROFILE_MANIFEST_SHA256 = "3a7645ee84a5fe21bf0befaf6b68f51a5ff61ad22b0c10c40aaec0a1f63d7a53"
+RUNTIME_CONTRACT = {
+    "execution_mode": "sequential",
+    "intra_op_threads": 1,
+    "graph_optimization": "ORT_ENABLE_ALL",
+    "deterministic_compute": True,
+    "precise_qmm": True,
+    "x86_quantized_matmul": "non-saturating U8U8 lowering on pre-VNNI CPUs",
+}
 TOKENIZER_FILES = {
     "tokenizer.json": "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e",
     "tokenizer_config.json": "9076840490613047bc9115963ee96b7702018b0d26ba644240bf856efda93118",
@@ -64,6 +73,7 @@ def main() -> None:
     parser.add_argument("--source-dir", required=True, type=Path)
     parser.add_argument("--build-report", required=True, type=Path)
     parser.add_argument("--retrieval-report", required=True, type=Path)
+    parser.add_argument("--runtime-kat-report", required=True, type=Path)
     parser.add_argument("--artifact-lock", required=True, type=Path)
     parser.add_argument("--gemma-terms", required=True, type=Path)
     parser.add_argument("--prohibited-use-policy", required=True, type=Path)
@@ -74,18 +84,25 @@ def main() -> None:
         raise SystemExit(f"refusing to overwrite existing bundle: {args.output}")
     build = json.loads(args.build_report.read_text())
     retrieval = json.loads(args.retrieval_report.read_text())
+    runtime_kat = json.loads(args.runtime_kat_report.read_text())
     lock = json.loads(args.artifact_lock.read_text())
     model_hash = sha256_file(args.model)
     if lock.get("decision") != "accepted-as-network-major-1":
         raise SystemExit("artifact lock does not record the network-major-1 decision")
     if lock.get("artifact_id") != ARTIFACT_ID:
         raise SystemExit("artifact lock names a different artifact ID")
+    if lock.get("profile_manifest_sha256") != PROFILE_MANIFEST_SHA256:
+        raise SystemExit("artifact lock names a different executable profile")
+    if lock.get("runtime_contract") != RUNTIME_CONTRACT:
+        raise SystemExit("artifact lock names a different runtime contract")
     if lock.get("artifact_sha256") != model_hash:
         raise SystemExit("artifact lock does not admit the supplied model digest")
     if lock.get("build_report_sha256") != sha256_file(args.build_report):
         raise SystemExit("artifact lock does not admit the supplied build report")
     if lock.get("retrieval_report_sha256") != sha256_file(args.retrieval_report):
         raise SystemExit("artifact lock does not admit the supplied retrieval report")
+    if lock.get("runtime_kat_report_sha256") != sha256_file(args.runtime_kat_report):
+        raise SystemExit("artifact lock does not admit the supplied runtime KAT report")
     if build.get("artifact_sha256") != model_hash:
         raise SystemExit("build report does not name the supplied model digest")
     candidate_hash = retrieval.get("results", {}).get("candidate", {}).get(
@@ -93,11 +110,23 @@ def main() -> None:
     )
     if candidate_hash != model_hash:
         raise SystemExit("retrieval report does not evaluate the supplied model digest")
+    if runtime_kat.get("schema") != 2 or runtime_kat.get("model_sha256") != model_hash:
+        raise SystemExit("runtime KAT report does not identify the v1 model and schema")
+    if not runtime_kat.get("ort_deterministic_compute") or not runtime_kat.get(
+        "ort_precise_qmm"
+    ):
+        raise SystemExit("runtime KAT report does not use the frozen precise ORT policy")
+    runtime_vectors = [
+        answer.get("vector_sha256") for answer in runtime_kat.get("known_answers", [])
+    ]
+    if runtime_vectors != lock.get("known_answer_vector_sha256"):
+        raise SystemExit("runtime KAT report does not reproduce the locked vector answers")
 
     payload: dict[str, Path] = {
         "model.onnx": args.model,
         "model.onnx.build.json": args.build_report,
         "scifact.json": args.retrieval_report,
+        "runtime-kat.json": args.runtime_kat_report,
         "v1-artifact-lock.json": args.artifact_lock,
         "GEMMA_TERMS.html": args.gemma_terms,
         "GEMMA_PROHIBITED_USE_POLICY.html": args.prohibited_use_policy,
@@ -146,14 +175,17 @@ def main() -> None:
     file_hashes["MODIFICATIONS.md"] = hashlib.sha256(modification).hexdigest()
     file_hashes["Notice"] = hashlib.sha256(NOTICE.encode()).hexdigest()
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "artifact_id": ARTIFACT_ID,
         "artifact_sha256": model_hash,
         "network_major": 1,
         "profile_id": "cfetch-embedding-v1",
+        "profile_manifest_sha256": PROFILE_MANIFEST_SHA256,
         "source_model": SOURCE_MODEL,
         "source_revision": SOURCE_REVISION,
         "model_license": "Gemma Terms of Use (included; separate from cfetch)",
+        "runtime_contract": RUNTIME_CONTRACT,
+        "known_answer_vector_sha256": runtime_vectors,
         "files": file_hashes,
     }
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()

@@ -23,16 +23,16 @@ inference; they are never silently called producers.
 
 | Hardware class | cfetch path | INT8 common-denominator evidence | Producer status |
 |---|---|---|---|
-| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified only on named hosts** with Microsoft's official ORT 1.28.0 release: recorded EPYC 7763 and physical Ryzen 9 5950X hosts passed 11/11; hosted Xeon 8573C and physical Core Ultra 7 258V hosts failed 0/11; every host remains KAT-gated |
-| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: hardware-identified public runs loaded and executed but failed 0/11 exact vectors; alternative runtime pending |
+| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; deterministic compute; precise QMM selects non-saturating U8U8 on pre-VNNI x86 | **Passing reference** with Microsoft's official ORT 1.28.0: physical Ryzen 9 5950X AVX2 and Core Ultra 7 258V VNNI hosts produced the same 11 raw outputs and final records; every actual host remains KAT-gated |
+| arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | Previous runs used the superseded candidate KAT; **current schema-2 recertification pending**, so arm64 remains consumer-only |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
-| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning and numerical results are graph/device specific | **Rejected on physical Lunar Lake**: OpenVINO 2026.3 compiled the unchanged graph for Arc 140V and NPU, strict ORT ownership failed, and an explicit hybrid diagnostic produced 0/11 exact vectors on both; alternative full-graph/exact paths remain pending |
+| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning and numerical results are graph/device specific | **CPU passes through ORT CPU precise QMM; OpenVINO GPU/NPU rejected on physical Lunar Lake** because strict ownership failed. The former hybrid vector comparison is superseded; alternative full-graph/exact accelerator paths remain pending |
 | AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
-| AMD GPU | ORT MIGraphX EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT; ORT's older ROCm EP was removed in 1.23 and is not a second current path |
+| AMD GPU | ORT MIGraphX EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX emitted digest `2639d019…`, not corrected-v1 `20e16438…`; ORT's older ROCm EP was removed in 1.23 and is not a second current path |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
 | Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Microsoft QNN 1.24.4 Windows ARM64 evidence package integrated; a hosted Cobalt ARM VM had no HTP and rejected backend initialization, so physical Snapdragon HTP KAT/placement remains pending |
 | Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Microsoft DirectML 1.24.4 x64/ARM64 evidence package integrated; the hosted Hyper-V display exposed no matching DirectML device, so each physical adapter still needs exact KAT and placement evidence |
-| WebGPU / Vulkan, D3D12, Metal fallback | ORT native WebGPU plugin EP | one official cross-vendor plugin targets Linux/Vulkan, Windows D3D12/Vulkan and macOS/Metal; quantized kernels exist but full W8A8 graph coverage and exact arithmetic are not assumed | Hash-pinned Linux/macOS Nix and Windows evidence packages integrated; hosted Linux had no Vulkan adapter, while hosted Windows and virtual macOS left nodes on forbidden CPU fallback; physical minimum/current adapter certificates remain pending |
+| WebGPU / Vulkan, D3D12, Metal fallback | ORT native WebGPU plugin EP | one official cross-vendor plugin targets Linux/Vulkan, Windows D3D12/Vulkan and macOS/Metal, but this Q/DQ graph needs unsupported `QuantizeLinear` | **Rejected on physical RDNA2**: strict ownership failed; hybrid tracing showed dequantization plus `f32` MatMul shaders and stable incompatible bytes. Hosted Windows/virtual macOS also left CPU nodes; this is not a W8A8 producer path today |
 
 There is no single native 8-bit container that every vendor accelerates.
 S8S8, U8U8, layout, fusion and kernel coverage differ. The common denominator
@@ -42,7 +42,7 @@ container representation only when it preserves all released bytes.
 
 ## Known-good CPU floor
 
-The admitted x86-64 package uses Microsoft's official
+The x86-64 reference package uses Microsoft's official
 `onnxruntime-linux-x64-1.28.0.tgz` archive:
 
 - archive SHA-256:
@@ -50,76 +50,55 @@ The admitted x86-64 package uses Microsoft's official
 - loaded `libonnxruntime.so` SHA-256:
   `1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab`;
 - ONNX Runtime build commit reported by that binary: `da9b5e364c`;
-- result: all 11 sequence/language/content KAT records passed through the
+- deterministic compute: enabled;
+- precise QMM: enabled;
+- result: all 11 sequence/language/content KAT records pass through the
   actual Rust → FastEmbed → ORT → cfetch codec path.
 
-That pass is a reference-host certificate, not an x86-64-wide promise. Public
-run [`32680098981`](https://github.com/corbet-labs/cfetch/actions/runs/32680098981)
-later loaded the exact same x86 package, archive and library but failed 0/11;
-412–739 components changed per answer and cosine remained 0.971–0.983. The
-older workflow did not record its CPU model, so the attempt is rejected at run
-scope. New reports include a separate non-identifying hardware evidence file.
-Ordinary production always executes the KAT on the host actually doing work.
-Run
-[`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
-subsequently passed 11/11 again with the same package. Because that workflow
-also predates hardware capture, this is a second run-scoped passing result.
-Run
-[`32681875052`](https://github.com/corbet-labs/cfetch/actions/runs/32681875052)
-then passed 11/11 on a recorded AMD EPYC 7763 Azure VM while the same official
-runtime again failed 0/11 on recorded Arm Neoverse-N2 Linux and virtual Apple
-M1 macOS runners. Hardware capture makes each observation reproducible; it
-still does not turn a passing host into an architecture-wide package.
-Run
-[`32692516880`](https://github.com/corbet-labs/cfetch/actions/runs/32692516880)
-then failed 0/11 on a recorded Intel Xeon Platinum 8573C despite AVX2,
-AVX-512, VNNI and AMX-INT8; 412–739 bytes changed per answer. Run
-[`32693600516`](https://github.com/corbet-labs/cfetch/actions/runs/32693600516)
-reproduced 11/11 on the recorded EPYC 7763. The ISA's advertised integer
-instructions are therefore not sufficient admission metadata: the exact host
-executes the KAT and either produces or fails closed.
+The precise-QMM field is load-bearing. ORT documents that U8S8 quantized
+matmul on AVX2 and AVX-512 without VNNI may use `VPMADDUBSW`; each pair of
+products is clamped to a signed 16-bit intermediate and can saturate. Its
+`session.x64quantprecision` option selects slower U8U8 arithmetic to avoid
+that overflow. The first pre-release KAT accidentally canonized the saturating
+path on a Ryzen 9 5950X.
 
-A fresh build of `nix:cfetch-local-cpu` at commit `92066ad` then verified the
-released archive and passed 11/11 on a physical AMD Ryzen 9 5950X (Zen 3,
-AVX/AVX2/FMA), covering all seven static sequence buckets. The bounded report
-SHA-256 is
-`dbb39bd261b895f2aa5bb916124015402a22853f774333a0837c358b409898d5`;
-the non-identifying hardware capture SHA-256 is
+A controlled four-way test isolated the cause:
+
+| Path | Result |
+|---|---|
+| Ryzen AVX2, former defaults | reproducible former candidate bytes |
+| Ryzen AVX2, deterministic compute only | identical former candidate bytes |
+| Ryzen AVX2, deterministic compute + precise QMM | corrected 11/11 reference |
+| Intel Core Ultra 7 258V with VNNI | byte-identical to corrected Ryzen, including every raw float output |
+
+The rebuilt Nix package's physical Ryzen report SHA-256 is
+`cddf55f783ae5d7a256f1d09be3087f6d2c25a49d4adef2c0e6245180b9c07b5`;
+its hardware capture SHA-256 is
 `c83ec99a6cf7d6c39c6287ca11d1ebf66fc8e82e519159c4439dcf71d459054e`.
-This is a second named CPU host certificate, not a Zen or x86-wide promise.
+The physical Intel report SHA-256 is
+`af48bdb87317241155e5e8cba18a206ca80e19d59fd338af75a6063c5ddbe538`;
+its hardware capture SHA-256 is
+`c437e642a844f919f182869ab2e8d686dd87b57634b4998127d9c0d0e2944c49`.
 
-The same official CPU package then failed 0/11 on a physical Intel Core Ultra
-7 258V (Lunar Lake), changing 401–739 of 768 bytes per record despite its
-AVX2/VNNI support. Report SHA-256
-`f7c32d71b1445d08c6113c4acfbc9a0548b071d155f75e72815786377a8ca4fa`
-and hardware-capture SHA-256
-`c437e642a844f919f182869ab2e8d686dd87b57634b4998127d9c0d0e2944c49`
-are registry-pinned. This is physical confirmation of the host-specific gate,
-not a claim about every Lunar Lake configuration.
+The graph itself did not change. The runtime policy, KAT, executable profile
+digest and bundle metadata did. This reset occurred before any tagged cfetch
+release could produce network-major-1 vectors and while the catalog remained
+remote-only. The former profile and all reports against it remain in the
+registry as superseded pre-release evidence. After a v1-capable release or
+producer catalog ships, the same numerical change requires network major 2.
 
-The ort-sys bundled/static 1.28 build was deliberately rejected after failing
-all 11 records. ORT version strings are therefore informational; distribution
-and archive digests are part of producer admission. Linux arm64 and macOS
-arm64 packages pin Microsoft's official archives too. Public run
-[`32678932373`](https://github.com/corbet-labs/cfetch/actions/runs/32678932373)
-executed both on their target architectures and rejected both: 0/11 records
-matched. Linux arm64 changed 622–736 components per 768-byte answer and macOS
-arm64 changed 410–736; cosine to the x86 records remained about 0.97–0.98.
-The two arm64 runtimes agreed exactly on six answers and disagreed on five.
-This is architecture/runtime numerical divergence, not a one-bit codec edge.
-Neither package may produce v1 vectors; a different runtime must pass from
-scratch.
+Former hosted x86 and arm64 reports must therefore not be read as current
+passes or failures. Linux arm64 and macOS arm64 remain consumer-only until the
+official packages are rerun against report schema 2. Ordinary production
+always executes the current KAT on the host actually doing work.
 
 cfetch and its FastEmbed fork normally request ORT C API 18, the lowest API
-used by the built-in provider/session code, while the certified CPU runtime
+used by the built-in provider/session code, while the CPU reference runtime
 remains Microsoft's 1.28.0 release. The C API is backward-compatible, so this
 lowers only the minimum loadable vendor-runtime ABI; it does not change the
 graph, optimizer, or vector bytes. It covers current 1.23-class MIGraphX and
 QNN packages. The WebGPU-only package requests API 22 because plugin device
-discovery does not exist below that surface. The
-old ORT 1.16 statement still visible near the bottom of AMD's cumulative
-release history describes an earlier VOE release, not the current Ryzen AI
-1.8 deployment contract, and is not used as the present XDNA blocker.
+discovery does not exist below that surface.
 
 ## AMD XDNA evidence package and precision boundary
 
@@ -182,12 +161,12 @@ GPU and Lunar Lake NPU. Native OpenVINO 2026.3 compiled the unchanged frozen
 compilation was the immediate blocker. Strict cfetch sessions nevertheless
 failed because the ORT provider requested forbidden CPU remainder. A
 controlled diagnostic then enabled that remainder explicitly to test the only
-remaining shortcut; it exercised all 11 inputs and seven buckets but matched
-0/11 on both devices. The NPU changed 687–752 components per vector and the
-GPU 734–752. Those diagnostic reports are not certificates, and production
-source remains no-fallback. The registry pins the hardware, strict logs,
-runtime and diagnostic report hashes. Each Intel device therefore still needs
-an alternative route that both owns the full graph and passes exact bytes.
+remaining shortcut; it exercised all 11 inputs and seven buckets but produced
+vectors incompatible with the superseded candidate KAT. Those numerical
+comparisons are not current certificates. The strict ownership failure remains
+current because the graph did not change, and production remains no-fallback.
+Each Intel accelerator still needs an alternative route that both owns the
+full graph and passes the corrected bytes.
 
 Public runs
 [`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
@@ -228,11 +207,11 @@ instruction. The exact public first-KAT tensors were used. The resulting
 canonical record was
 `2639d01960d3a05431eaa6b6b03207f5e0e69ae9b0ce26513fca6472f5d530d9`,
 not the required
-`7e67364be4c574340d3693b2743c32d0f8841bf9e723bda821d4ab0c85e32984`;
-729 of 768 components changed. Thus RDNA2 does accelerate this graph, but a
-direct MIGraphX backend is not a compatible v1 producer and is not a useful
-escape from ORT's partitioning failure. The registry records all runtime,
-hardware, input, output and compiled-program hashes.
+`20e164382888d264f9a8db999c8f375740c18f0df384ca4335a2d1b75e2971b1`.
+The old 729-component comparison is retained only as superseded evidence; the
+distinct current digest is enough to reject exact conformance. Thus RDNA2 does
+accelerate this graph, but a direct MIGraphX backend is not a compatible v1
+producer and is not a useful escape from ORT's partitioning failure.
 
 The MIGraphX package is intentionally an explicit certification target rather
 than a default flake check: compiling the ROCm closure on every public CPU-only
@@ -380,6 +359,17 @@ so cfetch rejected it before emitting a KAT vector. These results prove package
 loading and fail-closed selection only; they do not certify a physical Vulkan,
 D3D12 or Metal adapter.
 
+The same package was then exercised on a physical Radeon RX 6800 through
+Vulkan. Strict initialization failed because WebGPU had no kernel for
+`QuantizeLinear` and several graph-shaping operators; ORT would have assigned
+those nodes to CPU. A controlled hybrid diagnostic was used only to inspect
+the remaining GPU work. Its generated MatMul shader declared `f32` inputs,
+output and accumulation after `DequantizeLinear`; it was not executing the
+learned regions as W8A8. Three complete runs produced identical raw-output and
+final-vector hashes as the reported GPU temperature changed from roughly
+39–41°C to 41–43°C. The mismatch is deterministic operator lowering, not heat,
+and native WebGPU is rejected for this v1 graph today.
+
 ## Running a certificate
 
 Use the actual package and extracted, separately licensed model bundle:
@@ -396,10 +386,11 @@ one selected accelerator route; the generic local package selects CPU. Explicit
 provider names are available for test packages. Accelerator sessions use
 static shapes and fail initialization if ORT would fall back to CPU.
 
-The report records the profile/artifact digests, OS/architecture, cfetch,
+Report schema 2 records the profile/artifact digests, OS/architecture, cfetch,
 FastEmbed and ORT identities, pinned runtime distribution/archive, provider,
-fallback policy, graph settings, tokenizer tensor digests, raw model-output
-digests, exact encoded vectors and pass/fail results. It contains no hostname,
+fallback policy, deterministic-compute and precise-QMM settings, graph
+settings, tokenizer tensor digests, raw model-output digests, exact encoded
+vectors and pass/fail results. It contains no hostname,
 username, private path, credentials, environment dump or private model input.
 For source-built Nix provider packages, the schema's legacy
 `onnxruntime_archive_sha256` field carries the fixed-output ORT source digest;
@@ -466,9 +457,10 @@ Run
 reproduced the same ownership rejection with both Linux and Windows evidence
 packages; its Windows host was also AMD. The later physical Lunar Lake run is
 the first Intel GPU/NPU evidence: both current devices compiled the graph but
-were rejected by strict ownership and then failed 0/11 in the deliberately
-non-certifying hybrid diagnostic. First-generation Intel NPU, discrete GPU,
-and alternative runtime/graph paths remain open.
+were rejected by strict ownership. Their deliberately non-certifying hybrid
+diagnostic predates the corrected KAT and must not be quoted as a current
+byte-count result. First-generation Intel NPU, discrete GPU, and alternative
+runtime/graph paths remain open.
 
 On physical Linux AMD systems, `nix build .#cfetch-test-migraphx` builds the
 locked ORT/MIGraphX/ROCm evidence package. Its first RX 6800 result is rejected
