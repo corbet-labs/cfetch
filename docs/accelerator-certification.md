@@ -28,11 +28,11 @@ inference; they are never silently called producers.
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
 | Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official Linux Nix and Windows NuGet evidence packages integrated; Linux CPU probes rejected because OpenVINO did not own the complete frozen graph; Windows adverse execution and physical Intel CPU/GPU/NPU certificates pending |
 | AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
-| AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT |
+| AMD GPU | ORT MIGraphX EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT; ORT's older ROCm EP was removed in 1.23 and is not a second current path |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
 | Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Microsoft QNN 1.24.4 Windows ARM64 evidence package and public job integrated; physical Snapdragon HTP KAT/placement remains pending |
 | Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Microsoft DirectML 1.24.4 x64/ARM64 evidence package and public job integrated; each physical adapter still needs exact KAT and placement evidence |
-| WebGPU / Vulkan-class fallback | ORT WebGPU EP where available | useful coverage for older GPUs is possible, but native W8A8 placement is not assumed | Experimental session path; runtime package and producer certificate pending |
+| WebGPU / Vulkan, D3D12, Metal fallback | ORT native WebGPU plugin EP | one official cross-vendor plugin targets Linux/Vulkan, Windows D3D12/Vulkan and macOS/Metal; quantized kernels exist but full W8A8 graph coverage and exact arithmetic are not assumed | Hash-pinned Linux/macOS Nix and Windows evidence packages integrated; local no-adapter rejection verified; hosted adverse and physical minimum/current adapter certificates pending |
 
 There is no single native 8-bit container that every vendor accelerates.
 S8S8, U8U8, layout, fusion and kernel coverage differ. The common denominator
@@ -84,11 +84,13 @@ This is architecture/runtime numerical divergence, not a one-bit codec edge.
 Neither package may produce v1 vectors; a different runtime must pass from
 scratch.
 
-cfetch and its FastEmbed fork request ORT C API 18, the lowest API used by the
-provider/session code, while the certified CPU runtime remains Microsoft's
-1.28.0 release. The C API is backward-compatible, so this lowers only the
-minimum loadable vendor-runtime ABI; it does not change the graph, optimizer,
-or vector bytes. It covers current 1.23-class MIGraphX and QNN packages. The
+cfetch and its FastEmbed fork normally request ORT C API 18, the lowest API
+used by the built-in provider/session code, while the certified CPU runtime
+remains Microsoft's 1.28.0 release. The C API is backward-compatible, so this
+lowers only the minimum loadable vendor-runtime ABI; it does not change the
+graph, optimizer, or vector bytes. It covers current 1.23-class MIGraphX and
+QNN packages. The WebGPU-only package requests API 22 because plugin device
+discovery does not exist below that surface. The
 old ORT 1.16 statement still visible near the bottom of AMD's cumulative
 release history describes an earlier VOE release, not the current Ryzen AI
 1.8 deployment contract, and is not used as the present XDNA blocker.
@@ -258,6 +260,43 @@ deliberately contains only OS/build, CPU name, GPU name/vendor/driver, and
 compute-accelerator friendly name/status—never PnP IDs, PCI addresses, UUIDs
 or serials.
 
+## Cross-vendor native WebGPU evidence package
+
+ONNX Runtime's native WebGPU EP is now an official plugin rather than an
+experimental provider compiled into the core runtime. Version 0.2.1 requires
+ORT 1.24.4 or newer and uses Dawn to reach Vulkan on Linux, D3D12 or Vulkan on
+Windows, and Metal on macOS. This is the best maintained single route for
+older mixed-vendor GPUs, but cross-vendor API coverage is not cross-vendor
+numerical identity.
+
+`cfetch-test-webgpu` combines Microsoft's official ORT 1.28 core with
+`Microsoft.ML.OnnxRuntime.EP.WebGpu` 0.2.1. The plugin NuGet SHA-256 is
+`a707557c86eb1eee0a604146ac4edc473d5af0bfe2fc77fd632217755cbfb282`;
+the extracted Linux x86-64 plugin library SHA-256 is
+`45e1c7465ada0d85f63565358b4c8350d8b0f523948a0e2c7d0d20697f8918e9`,
+and the macOS universal library SHA-256 is
+`8fac874a60f32f0127c74cb7def915807fcc8a6c30b77629e45f8cee60272eae`.
+The Nix package includes the Vulkan loader on Linux but never substitutes a
+software renderer or a driver. Microsoft's current plugin has no Linux ARM64
+binary, so that platform is explicitly absent instead of being mislabeled.
+
+The Windows builder pairs the plugin with
+`Microsoft.ML.OnnxRuntime` 1.28.0, archive SHA-256
+`769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db`.
+The x64 and ARM64 plugin library SHA-256 values are respectively
+`be2ebcc0a96d1558d9123c04e75c2851260fe45c9dbc8959cb2cd8d11b83abbe`
+and
+`63cfef0e7fb8fdc2238f69cd8e804f50fda393b2b60c448daec73e031de75058`.
+Both the core archive and plugin archive/library identities are recorded in
+the package manifest and certificate.
+
+Plugin EPs use ORT's device API, so only this evidence package raises the Rust
+binding surface from C API 18 to API 22. The core runtime remains 1.28 and the
+frozen graph, FastEmbed pipeline, optimizer, static buckets, fallback rule,
+and vector codec do not change. A local AMD host without an installed Vulkan
+ICD loaded the exact plugin and then failed with `No supported adapters`; that
+is a useful fail-closed package probe, not a GPU result.
+
 ## Running a certificate
 
 Use the actual package and extracted, separately licensed model bundle:
@@ -301,7 +340,7 @@ The minimum useful tester pool is deliberately explicit:
 | Apple | oldest and newest supported Apple silicon; Metal and ANE placement separately |
 | Intel | OpenVINO CPU, integrated/discrete GPU, first and current NPU generations |
 | AMD NPU | Phoenix/Hawk Point XDNA (`X1`) and Strix/Krackan XDNA2 (`X2`) through the real Ryzen AI/Vitis runtime |
-| AMD GPU | an older supported RDNA consumer GPU and a current RDNA/CDNA device; Linux MIGraphX/ROCm and Windows path separately |
+| AMD GPU | an older supported RDNA consumer GPU and a current RDNA/CDNA device; current Linux MIGraphX, native WebGPU and Windows paths separately |
 | NVIDIA | oldest supported and current CUDA architecture; CUDA and TensorRT separately |
 | Qualcomm | Snapdragon X-class Windows arm64 device using QNN HTP |
 | Older/mixed GPU | each advertised DirectML, WebGPU or Vulkan-class package on its minimum adapter |
@@ -384,6 +423,13 @@ use `openvino-cpu`, `openvino-gpu`, or `openvino-npu` to test Intel's pinned
 OpenVINO package. A physical accelerator submission must also attach the
 relevant HTP, DirectML or OpenVINO placement/profiling evidence.
 
+On Linux x86-64 or Apple Silicon, build the cross-vendor package with
+`nix build .#cfetch-test-webgpu` and certify `webgpu`. On Windows x64 or ARM64,
+use `webgpu` with the same PowerShell commands above. Record the actual Dawn
+backend and adapter in profiler/debug output. A software Vulkan renderer, a
+virtual display adapter, or successful plugin registration without a device
+does not count as physical GPU evidence.
+
 The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,
 runs the KAT, and uploads the JSON report. No secret or private runner is
@@ -411,3 +457,6 @@ Primary implementation references:
 - [Windows ML VitisAI model support](https://ryzenai.docs.amd.com/projects/WinML/en/latest/model_support.html)
 - [MIGraphX execution provider](https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html)
 - [DirectML execution provider](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html)
+- [Native WebGPU execution provider](https://onnxruntime.ai/docs/execution-providers/WebGPU-ExecutionProvider.html)
+- [Microsoft WebGPU plugin package](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.EP.WebGpu)
+- [ROCm provider removal and MIGraphX migration](https://onnxruntime.ai/docs/execution-providers/ROCm-ExecutionProvider.html)

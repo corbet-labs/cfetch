@@ -30,7 +30,7 @@ else {
 $manifestPath = Join-Path $packagePath "runtime-manifest.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if ($manifest.schema_version -ne 1 -or $manifest.provider -notin @(
-        "directml", "qnn", "vitis", "openvino-cpu", "openvino-gpu", "openvino-npu"
+        "directml", "qnn", "vitis", "openvino-cpu", "openvino-gpu", "openvino-npu", "webgpu"
     )) {
     throw "unsupported Windows inference package manifest"
 }
@@ -65,6 +65,24 @@ $publishedRuntimes = @{
     "openvino-npu" = @{
         Distribution = "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1"
         Sha256 = "f53ad5f90e3d616970a5c65e4880ebbe92c9774e9727020661db591cea74a110"
+    }
+    webgpu = @{
+        Distribution = "nuget-Microsoft.ML.OnnxRuntime-1.28.0"
+        Sha256 = "769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db"
+    }
+}
+$publishedPlugins = @{
+    webgpu = @{
+        Distribution = "nuget-Microsoft.ML.OnnxRuntime.EP.WebGpu-0.2.1"
+        Sha256 = "a707557c86eb1eee0a604146ac4edc473d5af0bfe2fc77fd632217755cbfb282"
+    }
+}
+if ($publishedPlugins.ContainsKey($manifest.provider)) {
+    $published = $publishedPlugins[$manifest.provider]
+    if ($manifest.execution_provider_plugin_distribution -ne $published.Distribution -or
+        $manifest.execution_provider_plugin_archive_sha256 -ne $published.Sha256 -or
+        [string]::IsNullOrWhiteSpace($manifest.execution_provider_plugin_library_sha256)) {
+        throw "Windows package does not use the published pinned $($manifest.provider) plugin"
     }
 }
 if ($publishedRuntimes.ContainsKey($manifest.provider)) {
@@ -119,6 +137,9 @@ try {
     $env:PATH = "$runtime;$env:PATH"
     if ($manifest.provider -eq "qnn") {
         $env:CFETCH_QNN_HTP_LIBRARY = Join-Path $runtime "QnnHtp.dll"
+    }
+    if ($manifest.provider -eq "webgpu") {
+        $env:CFETCH_WEBGPU_LIBRARY = Join-Path $runtime "onnxruntime_providers_webgpu.dll"
     }
     if ($manifest.provider -eq "vitis") {
         $env:CFETCH_VITIS_TARGET = $VitisTarget
@@ -179,6 +200,9 @@ try {
         $certificate.onnxruntime_distribution -ne $manifest.onnxruntime_distribution -or
         $certificate.onnxruntime_archive_sha256 -ne $manifest.onnxruntime_archive_sha256 -or
         $certificate.onnxruntime_library_sha256 -ne $manifest.onnxruntime_library_sha256 -or
+        $certificate.execution_provider_plugin_distribution -ne $manifest.execution_provider_plugin_distribution -or
+        $certificate.execution_provider_plugin_archive_sha256 -ne $manifest.execution_provider_plugin_archive_sha256 -or
+        $certificate.execution_provider_plugin_library_sha256 -ne $manifest.execution_provider_plugin_library_sha256 -or
         -not $certificate.cpu_fallback_disabled -or
         -not $certificate.graph_ownership_enforced -or
         -not $certificate.exact_vector_conformance -or

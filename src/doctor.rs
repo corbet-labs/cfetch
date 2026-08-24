@@ -524,9 +524,6 @@ fn compiled_backend() -> String {
     if cfg!(feature = "inference-migraphx") {
         return "migraphx".into();
     }
-    if cfg!(feature = "inference-rocm") {
-        return "rocm".into();
-    }
     if cfg!(feature = "inference-directml") {
         return "directml".into();
     }

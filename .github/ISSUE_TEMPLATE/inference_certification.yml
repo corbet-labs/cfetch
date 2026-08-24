@@ -20,7 +20,6 @@ body:
         - Intel OpenVINO NPU
         - AMD XDNA / XDNA2 NPU
         - AMD MIGraphX GPU
-        - AMD ROCm GPU
         - NVIDIA CUDA GPU
         - NVIDIA TensorRT GPU
         - Qualcomm QNN HTP NPU

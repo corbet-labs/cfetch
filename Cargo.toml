@@ -50,8 +50,12 @@ inference-tensorrt = ["inference-ort", "ort/tensorrt"]
 # MIGraphX's calibration-table quantizer, which would create incompatible
 # scales.
 inference-migraphx = ["inference-ort", "ort/migraphx"]
-inference-rocm = ["inference-ort", "ort/rocm"]
-inference-webgpu = ["inference-ort", "ort/webgpu"]
+# ORT removed its ROCm EP in 1.23; MIGraphX is the maintained AMD GPU path.
+inference-webgpu = [
+  "inference-ort",
+  "fastembed/ort-ep-device",
+  "ort/api-22",
+]
 
 [dependencies]
 # Exact-pinned harness configuration adapter. cfetch decides which surfaces
@@ -70,7 +74,7 @@ crossterm = "0.29.0"
 # https://github.com/Anush008/fastembed-rs/pull/280. This preserves FastEmbed's
 # pipeline while allowing cfetch to prohibit CPU fallback and specialize QNN
 # sessions to the profile's fixed shapes.
-fastembed = { version = "=6.0.0", git = "https://github.com/corbet-labs/fastembed-rs", rev = "234fc39af5b010de0cb0c5688d138492e690fa68", default-features = false, optional = true }
+fastembed = { version = "=6.0.0", git = "https://github.com/corbet-labs/fastembed-rs", rev = "287979571394afe50b5617cc9c30140be51e444d", default-features = false, optional = true }
 ignore = "0.4"
 iroh = "1.0.3"
 # BLAKE3-verified, resumable artifact transfer over the daemon's existing
@@ -79,8 +83,8 @@ iroh = "1.0.3"
 iroh-blobs = { version = "=0.103.0", default-features = false }
 notify = "8"
 # Kept exact with FastEmbed's own pin so provider features unify onto one ORT.
-# API 18 is the oldest surface used by the session/provider code. A lower ABI
-# floor broadens vendor-runtime loading without changing the frozen v1 graph.
+# API 18 is the floor for normal provider packages. The WebGPU plugin feature
+# raises only its evidence package to API 22 for registered-device discovery.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["api-18", "ndarray", "std"], optional = true }
 ratatui = "0.30.2"
 tokenizers = { version = "=0.22.2", default-features = false, optional = true }

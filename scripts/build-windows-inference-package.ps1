@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("directml", "qnn", "openvino-cpu", "openvino-gpu", "openvino-npu")]
+    [ValidateSet("directml", "qnn", "openvino-cpu", "openvino-gpu", "openvino-npu", "webgpu")]
     [string]$Provider,
 
     [Parameter(Mandatory = $true)]
@@ -49,6 +49,19 @@ $packages = @{
         Sha256 = "f53ad5f90e3d616970a5c65e4880ebbe92c9774e9727020661db591cea74a110"
         Distribution = "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1"
     }
+    webgpu = @{
+        Feature = "inference-webgpu"
+        Runtime = "win-$architecture"
+        Url = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.28.0/microsoft.ml.onnxruntime.1.28.0.nupkg"
+        Sha256 = "769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db"
+        Distribution = "nuget-Microsoft.ML.OnnxRuntime-1.28.0"
+        Plugin = @{
+            Url = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.ep.webgpu/0.2.1/microsoft.ml.onnxruntime.ep.webgpu.0.2.1.nupkg"
+            Sha256 = "a707557c86eb1eee0a604146ac4edc473d5af0bfe2fc77fd632217755cbfb282"
+            Distribution = "nuget-Microsoft.ML.OnnxRuntime.EP.WebGpu-0.2.1"
+            Library = "onnxruntime_providers_webgpu.dll"
+        }
+    }
 }
 $packageKey = if ($Provider.StartsWith("openvino-", [StringComparison]::Ordinal)) {
     "openvino"
@@ -85,8 +98,32 @@ try {
         throw "verified runtime contains no $($package.Runtime)/native/onnxruntime.dll"
     }
 
+    $pluginExpanded = $null
+    if ($package.ContainsKey("Plugin")) {
+        $pluginArchive = Join-Path $work "plugin.nupkg"
+        Invoke-WebRequest -Uri $package.Plugin.Url -OutFile $pluginArchive
+        $pluginArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pluginArchive).Hash.ToLowerInvariant()
+        if ($pluginArchiveHash -ne $package.Plugin.Sha256) {
+            throw "provider plugin archive SHA-256 $pluginArchiveHash does not match $($package.Plugin.Sha256)"
+        }
+        $pluginExpanded = Join-Path $work "plugin-expanded"
+        New-Item -ItemType Directory -Path $pluginExpanded | Out-Null
+        & tar.exe -xf $pluginArchive -C $pluginExpanded
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to extract the verified provider plugin NuGet"
+        }
+        $pluginNative = Join-Path $pluginExpanded "runtimes/$($package.Runtime)/native"
+        if (-not (Test-Path -LiteralPath (Join-Path $pluginNative $package.Plugin.Library))) {
+            throw "verified provider plugin contains no $($package.Runtime)/native/$($package.Plugin.Library)"
+        }
+    }
+
     $env:CFETCH_ORT_DISTRIBUTION = $package.Distribution
     $env:CFETCH_ORT_ARCHIVE_SHA256 = $package.Sha256
+    if ($package.ContainsKey("Plugin")) {
+        $env:CFETCH_EP_PLUGIN_DISTRIBUTION = $package.Plugin.Distribution
+        $env:CFETCH_EP_PLUGIN_ARCHIVE_SHA256 = $package.Plugin.Sha256
+    }
     Push-Location $root
     try {
         & cargo build --release --locked --no-default-features --features $package.Feature
@@ -103,12 +140,23 @@ try {
     New-Item -ItemType Directory -Path $runtimeOut, $licenseOut | Out-Null
     Copy-Item -LiteralPath (Join-Path $root "target/release/cfetch.exe") -Destination $outputPath
     Copy-Item -Path (Join-Path $native "*") -Destination $runtimeOut -Recurse
+    if ($package.ContainsKey("Plugin")) {
+        Copy-Item -Path (Join-Path $pluginNative "*") -Destination $runtimeOut -Recurse
+    }
     Copy-Item -LiteralPath (Join-Path $root "LICENSE.md") -Destination (Join-Path $licenseOut "cfetch-LICENSE.md")
     Copy-Item -LiteralPath (Join-Path $root "THIRD-PARTY-LICENSES.txt") -Destination $licenseOut
     foreach ($notice in @("LICENSE", "ThirdPartyNotices.txt", "Privacy.md", "Qualcomm_LICENSE.pdf")) {
         $source = Join-Path $expanded $notice
         if (Test-Path -LiteralPath $source) {
             Copy-Item -LiteralPath $source -Destination $licenseOut
+        }
+    }
+    if ($package.ContainsKey("Plugin")) {
+        foreach ($notice in @("LICENSE", "ThirdPartyNotices.txt")) {
+            $source = Join-Path $pluginExpanded $notice
+            if (Test-Path -LiteralPath $source) {
+                Copy-Item -LiteralPath $source -Destination (Join-Path $licenseOut "WebGPU-$notice")
+            }
         }
     }
 
@@ -131,6 +179,11 @@ try {
         onnxruntime_archive_sha256 = $package.Sha256
         onnxruntime_library_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtimeOut "onnxruntime.dll")).Hash.ToLowerInvariant()
         files = $files
+    }
+    if ($package.ContainsKey("Plugin")) {
+        $manifest.execution_provider_plugin_distribution = $package.Plugin.Distribution
+        $manifest.execution_provider_plugin_archive_sha256 = $package.Plugin.Sha256
+        $manifest.execution_provider_plugin_library_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtimeOut $package.Plugin.Library)).Hash.ToLowerInvariant()
     }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outputPath "runtime-manifest.json") -Encoding utf8NoBOM
     Write-Output $outputPath

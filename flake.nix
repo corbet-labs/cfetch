@@ -36,6 +36,7 @@
                 "cfetch-test-migraphx"
                 "cfetch-test-openvino"
                 "cfetch-test-tensorrt"
+                "cfetch-test-webgpu"
                 "cfetch-cudnn-runtime"
                 "cfetch-tensorrt-runtime"
                 "libcublas"
@@ -89,6 +90,51 @@
               "$out/share/licenses/onnxruntime/ThirdPartyNotices.txt"
             runHook postInstall
           '';
+        };
+        webgpuPluginVersion = "0.2.1";
+        webgpuPluginArchiveSha256 = "a707557c86eb1eee0a604146ac4edc473d5af0bfe2fc77fd632217755cbfb282";
+        webgpuAsset = {
+          x86_64-linux = {
+            runtime = "linux-x64";
+            library = "libonnxruntime_providers_webgpu.so";
+          };
+          aarch64-darwin = {
+            runtime = "osx-arm64";
+            library = "libonnxruntime_providers_webgpu.dylib";
+          };
+        }.${pkgs.stdenv.hostPlatform.system};
+        # Native WebGPU is an independently versioned plugin EP. Microsoft's
+        # official NuGet carries the Vulkan, D3D12 and Metal libraries plus
+        # the corresponding notices.
+        webgpuPlugin = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cfetch-onnxruntime-webgpu-plugin";
+          version = webgpuPluginVersion;
+          src = pkgs.fetchurl {
+            url = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.ep.webgpu/${webgpuPluginVersion}/microsoft.ml.onnxruntime.ep.webgpu.${webgpuPluginVersion}.nupkg";
+            hash = "sha256-pwdVfIbrHu4KYEFGrE7cRz1a8L/i/Hf9YyIXdVy/soI=";
+          };
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.unzip ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/lib" "$out/share/licenses/onnxruntime-webgpu"
+            unzip -j "$src" \
+              'runtimes/${webgpuAsset.runtime}/native/${webgpuAsset.library}' \
+              -d "$out/lib"
+            unzip -p "$src" LICENSE \
+              > "$out/share/licenses/onnxruntime-webgpu/LICENSE"
+            unzip -p "$src" ThirdPartyNotices.txt \
+              > "$out/share/licenses/onnxruntime-webgpu/ThirdPartyNotices.txt"
+            runHook postInstall
+          '';
+          meta.license = pkgs.lib.licenses.mit;
+        };
+        webgpuOrt = pkgs.symlinkJoin {
+          name = "cfetch-webgpu-onnxruntime-${ortVersion}-${webgpuPluginVersion}";
+          paths = [ certifiedOrt webgpuPlugin ]
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              (pkgs.lib.getLib pkgs.vulkan-loader)
+            ];
         };
         openvinoVersion = "1.24.1";
         openvinoWheelSha256 = "2c3bb73e68ac27f4891af8a595c1faf574ec68b772e6583c90a0b997a1822782";
@@ -234,6 +280,9 @@
             runtime ? certifiedOrt,
             runtimeDistribution ? "microsoft-github-release-v${ortVersion}",
             runtimeArchiveSha256 ? ortAsset.sha256,
+            pluginDistribution ? null,
+            pluginArchiveSha256 ? null,
+            pluginLibrary ? null,
           }:
           pkgs.rustPlatform.buildRustPackage {
           inherit pname;
@@ -246,13 +295,15 @@
             # Git dependency inside the sandbox.
             outputHashes = {
               "fastembed-6.0.0" =
-                "sha256-wM3644tWbej0NJX+k7utXNtAMlMe6vFpe0iYPu0fczE=";
+                "sha256-T9z53ifWXmPUd3ujWkcgwn1OEB7JsCC4IlH86+s+Fsk=";
             };
           };
           buildFeatures = pkgs.lib.optionals localInference [ inferenceFeature ];
           CFETCH_ORT_DISTRIBUTION =
             if localInference then runtimeDistribution else null;
           CFETCH_ORT_ARCHIVE_SHA256 = if localInference then runtimeArchiveSha256 else null;
+          CFETCH_EP_PLUGIN_DISTRIBUTION = pluginDistribution;
+          CFETCH_EP_PLUGIN_ARCHIVE_SHA256 = pluginArchiveSha256;
           CFETCH_VARIANT =
             if localInference then
               null
@@ -282,7 +333,8 @@
                 else
                   "libonnxruntime.so"
               }"${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " \\
-              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ runtime pkgs.stdenv.cc.cc.lib pkgs.zlib ]}"}
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ runtime pkgs.stdenv.cc.cc.lib pkgs.zlib ]}"}${pkgs.lib.optionalString (pluginLibrary != null) " \\
+              --set-default CFETCH_WEBGPU_LIBRARY ${pluginLibrary}"}
           '';
 
           meta = {
@@ -319,6 +371,16 @@
           pname = "cfetch-test-coreml";
           localInference = true;
           inferenceFeature = "inference-coreml";
+        };
+        cfetch-test-webgpu = mkCfetch {
+          pname = "cfetch-test-webgpu";
+          localInference = true;
+          inferenceFeature = "inference-webgpu";
+          runtime = webgpuOrt;
+          runtimeDistribution = "microsoft-github-release-v${ortVersion}+webgpu-plugin-${webgpuPluginVersion}";
+          pluginDistribution = "nuget-Microsoft.ML.OnnxRuntime.EP.WebGpu-${webgpuPluginVersion}";
+          pluginArchiveSha256 = webgpuPluginArchiveSha256;
+          pluginLibrary = "${webgpuPlugin}/lib/${webgpuAsset.library}";
         };
       } // pkgs.lib.optionalAttrs (
         pkgs.stdenv.hostPlatform.isLinux
@@ -366,6 +428,16 @@
           runtime = tensorrtOrt;
           runtimeDistribution = "microsoft-github-release-v${ortVersion}-cuda12+nixpkgs-cuda12.9-tensorrt10.16";
           runtimeArchiveSha256 = "ea6bd2b65d7dfabbeb92c4af5dd8f12e5aed8601e544ad378d2f872275438b1a";
+        };
+        cfetch-test-webgpu = mkCfetch {
+          pname = "cfetch-test-webgpu";
+          localInference = true;
+          inferenceFeature = "inference-webgpu";
+          runtime = webgpuOrt;
+          runtimeDistribution = "microsoft-github-release-v${ortVersion}+webgpu-plugin-${webgpuPluginVersion}";
+          pluginDistribution = "nuget-Microsoft.ML.OnnxRuntime.EP.WebGpu-${webgpuPluginVersion}";
+          pluginArchiveSha256 = webgpuPluginArchiveSha256;
+          pluginLibrary = "${webgpuPlugin}/lib/${webgpuAsset.library}";
         };
       });
 

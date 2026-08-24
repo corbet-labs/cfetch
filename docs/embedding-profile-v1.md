@@ -93,9 +93,12 @@ Microsoft's official shared build both reported ONNX Runtime 1.28.0, but the
 static build failed all 11 v1 vector answers while Microsoft's release passed
 all 11. The Nix local-CPU package therefore pins Microsoft's exact archive
 bytes and records their digest. “Same ORT version” is not sufficient.
-The Rust/FastEmbed binding uses the older ORT C API 18 surface so compatible
-vendor runtimes are not excluded merely by a newer compile-time ABI request;
-the loaded runtime's exact distribution and bytes still have to be certified.
+The Rust/FastEmbed binding normally uses the older ORT C API 18 surface so
+compatible vendor runtimes are not excluded merely by a newer compile-time ABI
+request. The native WebGPU plugin evidence package alone uses API 22 because
+plugin device discovery requires it. The loaded runtime's exact distribution
+and bytes still have to be certified; neither API surface changes the frozen
+graph or vector contract.
 
 The same official ORT 1.28 build commit was then exercised on public Linux
 arm64 and macOS arm64 runners. Both loaded and ran successfully but matched

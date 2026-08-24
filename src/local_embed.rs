@@ -7,6 +7,8 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+#[cfg(feature = "inference-webgpu")]
+use std::sync::OnceLock;
 use std::time::Instant;
 use std::{fs::File, io::Read as _};
 
@@ -49,6 +51,9 @@ pub struct CertificationReport {
     pub onnxruntime_distribution: &'static str,
     pub onnxruntime_archive_sha256: &'static str,
     pub onnxruntime_library_sha256: String,
+    pub execution_provider_plugin_distribution: Option<&'static str>,
+    pub execution_provider_plugin_archive_sha256: Option<&'static str>,
+    pub execution_provider_plugin_library_sha256: Option<String>,
     pub fastembed: &'static str,
     pub graph_optimization: &'static str,
     pub inference_batch_size: usize,
@@ -204,6 +209,7 @@ impl std::fmt::Debug for LocalEmbedder {
 impl LocalEmbedder {
     fn load_unadmitted(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
         let bundle = VerifiedBundle::load(model_dir)?;
+        prepare_registered_plugin(requested_provider)?;
         let (provider, device_class, dispatch) = execution_provider(requested_provider, None)?;
         let mut length_tokenizer = tokenizers::Tokenizer::from_bytes(bundle.tokenizer.clone())
             .map_err(|error| anyhow::anyhow!("load verified tokenizer: {error}"))?;
@@ -393,29 +399,37 @@ fn hex_bytes(bytes: &[u8]) -> String {
     output
 }
 
-fn runtime_library_sha256() -> anyhow::Result<String> {
-    let Some(path) = std::env::var_os("ORT_DYLIB_PATH") else {
-        return Ok("unrecorded".into());
+fn library_sha256_from_env(variable: &str, description: &str) -> anyhow::Result<Option<String>> {
+    let Some(path) = std::env::var_os(variable) else {
+        return Ok(None);
     };
-    let canonical =
-        std::fs::canonicalize(&path).context("resolve packaged ONNX Runtime library")?;
+    let canonical = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolve packaged {description} library"))?;
     anyhow::ensure!(
         canonical.is_file(),
-        "packaged ONNX Runtime library is not a regular file"
+        "packaged {description} library is not a regular file"
     );
-    let mut file = File::open(&canonical).context("open packaged ONNX Runtime library")?;
+    let mut file =
+        File::open(&canonical).with_context(|| format!("open packaged {description} library"))?;
     let mut digest = sha2::Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
-            .context("hash packaged ONNX Runtime library")?;
+            .with_context(|| format!("hash packaged {description} library"))?;
         if count == 0 {
             break;
         }
         digest.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(Some(format!("{:x}", digest.finalize())))
+}
+
+fn runtime_library_sha256() -> anyhow::Result<String> {
+    let Some(digest) = library_sha256_from_env("ORT_DYLIB_PATH", "ONNX Runtime")? else {
+        return Ok("unrecorded".into());
+    };
+    Ok(digest)
 }
 
 /// Run the released public known-answer corpus through the actual
@@ -498,6 +512,10 @@ fn certify_loaded(
     let runtime_distribution = option_env!("CFETCH_ORT_DISTRIBUTION").unwrap_or("unrecorded");
     let runtime_archive_sha256 = option_env!("CFETCH_ORT_ARCHIVE_SHA256").unwrap_or("unrecorded");
     let runtime_library_sha256 = runtime_library_sha256()?;
+    let plugin_distribution = option_env!("CFETCH_EP_PLUGIN_DISTRIBUTION");
+    let plugin_archive_sha256 = option_env!("CFETCH_EP_PLUGIN_ARCHIVE_SHA256");
+    let plugin_library_sha256 =
+        library_sha256_from_env("CFETCH_WEBGPU_LIBRARY", "WebGPU execution-provider plugin")?;
     let admitted_cpu_runtime = runtime_distribution == "microsoft-github-release-v1.28.0"
         && matches!(
             (
@@ -539,12 +557,19 @@ fn certify_loaded(
         device_class: embedder.device_class(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
-        ort_crate: "2.0.0-rc.13 (API 18)",
+        ort_crate: if cfg!(feature = "inference-webgpu") {
+            "2.0.0-rc.13 (API 22 plugin-device surface)"
+        } else {
+            "2.0.0-rc.13 (API 18)"
+        },
         onnxruntime_build_info: ort::info(),
         onnxruntime_distribution: runtime_distribution,
         onnxruntime_archive_sha256: runtime_archive_sha256,
         onnxruntime_library_sha256: runtime_library_sha256,
-        fastembed: "6.0.0 + cfetch session-controls 234fc39af5b010de0cb0c5688d138492e690fa68",
+        execution_provider_plugin_distribution: plugin_distribution,
+        execution_provider_plugin_archive_sha256: plugin_archive_sha256,
+        execution_provider_plugin_library_sha256: plugin_library_sha256,
+        fastembed: "6.0.0 + cfetch session-controls 287979571394afe50b5617cc9c30140be51e444d",
         graph_optimization: crate::embedding_profile::GRAPH_OPTIMIZATION,
         inference_batch_size: crate::embedding_profile::INFERENCE_BATCH_SIZE,
         ort_intra_threads: crate::embedding_profile::ORT_INTRA_THREADS,
@@ -566,7 +591,7 @@ fn certify_loaded(
 fn build_model(
     bundle: VerifiedBundle,
     provider: &'static str,
-    dispatch: ExecutionProviderDispatch,
+    dispatch: Option<ExecutionProviderDispatch>,
     fixed_bucket: Option<usize>,
 ) -> anyhow::Result<TextEmbedding> {
     let tokenizer_files = TokenizerFiles {
@@ -590,8 +615,14 @@ fn build_model(
         // A registered EP is not proof that it owns the graph. Accelerator
         // packages fail session creation if ORT would place even one node on
         // its default CPU fallback.
-        .with_disable_cpu_fallback(provider != "cpu")
-        .with_execution_providers(vec![dispatch]);
+        .with_disable_cpu_fallback(provider != "cpu");
+    if let Some(dispatch) = dispatch {
+        options = options.with_execution_providers(vec![dispatch]);
+    }
+    #[cfg(feature = "inference-webgpu")]
+    if provider == "webgpu" {
+        options = options.with_execution_provider_device("WebGpuExecutionProvider");
+    }
     if let Some(bucket) = fixed_bucket {
         options = options
             .with_dimension_override("batch_size", 1)
@@ -615,7 +646,7 @@ fn set_fixed_padding(model: &mut TextEmbedding, bucket: usize) -> anyhow::Result
 fn execution_provider(
     requested: &str,
     _fixed_bucket: Option<usize>,
-) -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
+) -> anyhow::Result<(&'static str, &'static str, Option<ExecutionProviderDispatch>)> {
     let requested = requested.trim().to_ascii_lowercase();
     let requested = requested.as_str();
 
@@ -675,18 +706,6 @@ fn execution_provider(
             not(feature = "inference-tensorrt"),
             not(feature = "inference-cuda"),
             not(feature = "inference-migraphx"),
-            feature = "inference-rocm"
-        ))]
-        return Ok(rocm_provider());
-        #[cfg(all(
-            not(feature = "inference-qnn"),
-            not(feature = "inference-vitis"),
-            not(feature = "inference-openvino"),
-            not(feature = "inference-coreml"),
-            not(feature = "inference-tensorrt"),
-            not(feature = "inference-cuda"),
-            not(feature = "inference-migraphx"),
-            not(feature = "inference-rocm"),
             feature = "inference-directml"
         ))]
         return Ok(directml_provider());
@@ -698,7 +717,6 @@ fn execution_provider(
             not(feature = "inference-tensorrt"),
             not(feature = "inference-cuda"),
             not(feature = "inference-migraphx"),
-            not(feature = "inference-rocm"),
             not(feature = "inference-directml"),
             feature = "inference-webgpu"
         ))]
@@ -711,7 +729,6 @@ fn execution_provider(
             feature = "inference-tensorrt",
             feature = "inference-cuda",
             feature = "inference-migraphx",
-            feature = "inference-rocm",
             feature = "inference-directml",
             feature = "inference-webgpu"
         )))]
@@ -734,8 +751,6 @@ fn execution_provider(
         "tensorrt" => Ok(tensorrt_provider()),
         #[cfg(feature = "inference-migraphx")]
         "migraphx" => Ok(migraphx_provider()),
-        #[cfg(feature = "inference-rocm")]
-        "rocm" => Ok(rocm_provider()),
         #[cfg(feature = "inference-directml")]
         "directml" => Ok(directml_provider()),
         #[cfg(feature = "inference-webgpu")]
@@ -746,16 +761,16 @@ fn execution_provider(
     }
 }
 
-fn cpu_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
+fn cpu_provider() -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
     (
         "cpu",
         "cpu",
-        ort::ep::CPU::default().build().error_on_failure(),
+        Some(ort::ep::CPU::default().build().error_on_failure()),
     )
 }
 
 #[cfg(feature = "inference-coreml")]
-fn coreml_provider(name: &str) -> (&'static str, &'static str, ExecutionProviderDispatch) {
+fn coreml_provider(name: &str) -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
     use ort::ep::coreml::{ComputeUnits, ModelFormat};
 
     let (name, units, class) = match name {
@@ -767,7 +782,7 @@ fn coreml_provider(name: &str) -> (&'static str, &'static str, ExecutionProvider
     (
         name,
         class,
-        ort::ep::CoreML::default()
+        Some(ort::ep::CoreML::default()
             .with_compute_units(units)
             .with_model_format(ModelFormat::MLProgram)
             .with_static_input_shapes(true)
@@ -776,12 +791,12 @@ fn coreml_provider(name: &str) -> (&'static str, &'static str, ExecutionProvider
             .with_profile_compute_plan(true)
             .with_low_precision_accumulation_on_gpu(false)
             .build()
-            .error_on_failure(),
+            .error_on_failure()),
     )
 }
 
 #[cfg(feature = "inference-openvino")]
-fn openvino_provider(name: &str) -> (&'static str, &'static str, ExecutionProviderDispatch) {
+fn openvino_provider(name: &str) -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
     let (name, device, class) = match name {
         "openvino-gpu" => ("openvino-gpu", "GPU", "gpu"),
         "openvino-cpu" => ("openvino-cpu", "CPU", "cpu"),
@@ -790,18 +805,18 @@ fn openvino_provider(name: &str) -> (&'static str, &'static str, ExecutionProvid
     (
         name,
         class,
-        ort::ep::OpenVINO::default()
+        Some(ort::ep::OpenVINO::default()
             .with_device_type(device)
             .with_num_threads(crate::embedding_profile::ORT_INTRA_THREADS)
             .with_num_streams(1)
             .with_dynamic_shapes(false)
             .build()
-            .error_on_failure(),
+            .error_on_failure()),
     )
 }
 
 #[cfg(feature = "inference-qnn")]
-fn qnn_provider() -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
+fn qnn_provider() -> anyhow::Result<(&'static str, &'static str, Option<ExecutionProviderDispatch>)> {
     let backend = std::env::var("CFETCH_QNN_HTP_LIBRARY").unwrap_or_else(|_| {
         if cfg!(windows) {
             "QnnHtp.dll".to_string()
@@ -812,17 +827,17 @@ fn qnn_provider() -> anyhow::Result<(&'static str, &'static str, ExecutionProvid
     Ok((
         "qnn",
         "npu",
-        ort::ep::QNN::default()
+        Some(ort::ep::QNN::default()
             .with_backend_path(backend)
             .build()
-            .error_on_failure(),
+            .error_on_failure()),
     ))
 }
 
 #[cfg(feature = "inference-vitis")]
 fn vitis_provider(
     fixed_bucket: Option<usize>,
-) -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
+) -> anyhow::Result<(&'static str, &'static str, Option<ExecutionProviderDispatch>)> {
     let target = std::env::var("CFETCH_VITIS_TARGET").unwrap_or_else(|_| "X2".to_string());
     anyhow::ensure!(
         matches!(target.as_str(), "X1" | "X2"),
@@ -862,63 +877,78 @@ fn vitis_provider(
             .with_arbitrary_config("ai_analyzer_profiling", "true");
     }
 
-    Ok(("vitis", "npu", provider.build().error_on_failure()))
+    Ok(("vitis", "npu", Some(provider.build().error_on_failure())))
 }
 
 #[cfg(feature = "inference-cuda")]
-fn cuda_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
+fn cuda_provider() -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
     (
         "cuda",
         "gpu",
-        ort::ep::CUDA::default().build().error_on_failure(),
+        Some(ort::ep::CUDA::default().build().error_on_failure()),
     )
 }
 
 #[cfg(feature = "inference-tensorrt")]
-fn tensorrt_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
+fn tensorrt_provider() -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
     (
         "tensorrt",
         "gpu",
-        ort::ep::TensorRT::default().build().error_on_failure(),
+        Some(ort::ep::TensorRT::default().build().error_on_failure()),
     )
 }
 
 #[cfg(feature = "inference-migraphx")]
-fn migraphx_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
+fn migraphx_provider() -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
     // Do not call `with_int8(true)`: that asks MIGraphX to calibrate and
     // quantize the input graph again. v1 supplies its immutable Q/DQ scales.
     (
         "migraphx",
         "gpu",
-        ort::ep::MIGraphX::default().build().error_on_failure(),
-    )
-}
-
-#[cfg(feature = "inference-rocm")]
-fn rocm_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
-    (
-        "rocm",
-        "gpu",
-        ort::ep::ROCm::default().build().error_on_failure(),
+        Some(ort::ep::MIGraphX::default().build().error_on_failure()),
     )
 }
 
 #[cfg(feature = "inference-directml")]
-fn directml_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
+fn directml_provider() -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
     (
         "directml",
         "gpu",
-        ort::ep::DirectML::default().build().error_on_failure(),
+        Some(ort::ep::DirectML::default().build().error_on_failure()),
     )
 }
 
 #[cfg(feature = "inference-webgpu")]
-fn webgpu_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
-    (
-        "webgpu",
-        "gpu",
-        ort::ep::WebGPU::default().build().error_on_failure(),
-    )
+fn webgpu_provider() -> (&'static str, &'static str, Option<ExecutionProviderDispatch>) {
+    ("webgpu", "gpu", None)
+}
+
+#[cfg(feature = "inference-webgpu")]
+fn prepare_registered_plugin(requested_provider: &str) -> anyhow::Result<()> {
+    if !matches!(
+        requested_provider.trim().to_ascii_lowercase().as_str(),
+        "auto" | "webgpu"
+    ) {
+        return Ok(());
+    }
+    static REGISTRATION: OnceLock<Result<(), String>> = OnceLock::new();
+    let registration = REGISTRATION.get_or_init(|| {
+        let path = std::env::var_os("CFETCH_WEBGPU_LIBRARY").ok_or_else(|| {
+            "CFETCH_WEBGPU_LIBRARY is not set by this evidence package".to_string()
+        })?;
+        let environment =
+            ort::environment::Environment::current().map_err(|error| error.to_string())?;
+        environment
+            .register_ep_library("cfetch_webgpu_ep", path)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    });
+    registration.clone().map_err(anyhow::Error::msg)
+}
+
+#[cfg(not(feature = "inference-webgpu"))]
+fn prepare_registered_plugin(_requested_provider: &str) -> anyhow::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -935,7 +965,6 @@ mod tests {
             feature = "inference-tensorrt",
             feature = "inference-cuda",
             feature = "inference-migraphx",
-            feature = "inference-rocm",
             feature = "inference-directml",
             feature = "inference-webgpu"
         )))]

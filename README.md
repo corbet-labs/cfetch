@@ -494,6 +494,13 @@ openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
 replacing the provider suffix. The public hosted runner exercises CPU only and
 does not stand in for physical Intel GPU or NPU hardware.
 
+Mixed-vendor GPU testers use `nix build
+github:corbet-labs/cfetch#cfetch-test-webgpu` on Linux x86-64 or Apple Silicon,
+or the Windows package builder with `-Provider webgpu`. This pins Microsoft's
+native WebGPU plugin across Vulkan, D3D12, and Metal. It remains an evidence
+route: the actual adapter must pass exact bytes and placement review, and no
+Linux ARM64 plugin binary is currently published upstream.
+
 One tested x86-64 host is the current certified CPU reference; a later public
 x86-64 host using the exact same package/runtime failed all 11 vectors. Public
 Linux arm64 and macOS arm64 runs failed all 11 too. These are host/runtime

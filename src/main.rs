@@ -2737,7 +2737,33 @@ fn main() {
             json,
         } => {
             #[cfg(feature = "inference-ort")]
-            match local_embed::certify(&model_dir, &provider) {
+            let certification = {
+                #[cfg(windows)]
+                {
+                    // Windows' primary thread has a much smaller default stack
+                    // than the worker threads used by the Unix builds. ORT's
+                    // large quantized-graph initialization can exhaust it
+                    // before provider placement begins, which would turn a
+                    // harness limitation into a false hardware result.
+                    match std::thread::Builder::new()
+                        .name("cfetch-inference-certify".into())
+                        .stack_size(64 * 1024 * 1024)
+                        .spawn(move || local_embed::certify(&model_dir, &provider))
+                    {
+                        Ok(worker) => worker.join().unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("Windows certification worker panicked"))
+                        }),
+                        Err(error) => Err(anyhow::Error::new(error)
+                            .context("start Windows certification worker")),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    local_embed::certify(&model_dir, &provider)
+                }
+            };
+            #[cfg(feature = "inference-ort")]
+            match certification {
                 Ok(report) => {
                     if json {
                         println!(
