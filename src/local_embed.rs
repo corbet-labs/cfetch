@@ -571,7 +571,7 @@ fn certify_loaded(
         execution_provider_plugin_distribution: plugin_distribution,
         execution_provider_plugin_archive_sha256: plugin_archive_sha256,
         execution_provider_plugin_library_sha256: plugin_library_sha256,
-        fastembed: "6.0.0 + cfetch session-controls 1d9b6381354c23d7a17f61b0486fdabca1a724b0",
+        fastembed: "6.0.0 + cfetch session-controls 0421d587b52101b60cbb31e458ee4c949d2bac3b",
         graph_optimization: crate::embedding_profile::GRAPH_OPTIMIZATION,
         inference_batch_size: crate::embedding_profile::INFERENCE_BATCH_SIZE,
         ort_intra_threads: crate::embedding_profile::ORT_INTRA_THREADS,
@@ -618,6 +618,10 @@ fn build_model(
         .with_intra_threads(crate::embedding_profile::ORT_INTRA_THREADS)
         .with_deterministic_compute(crate::embedding_profile::ORT_DETERMINISTIC_COMPUTE)
         .with_precise_qmm(crate::embedding_profile::ORT_PRECISE_QMM)
+        // Controlled schema-2 diagnostic: ORT 1.28 exposes this session flag
+        // to select its MLAS fallback instead of Arm KleidiAI kernels. It is
+        // inert on x86 and may resolve the current arm64 byte split.
+        .with_disable_kleidiai(true)
         // A registered EP is not proof that it owns the graph. Accelerator
         // packages fail session creation if ORT would place even one node on
         // its default CPU fallback.
