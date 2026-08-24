@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const OFFICIAL_REPOSITORY: &str = "https://github.com/julian-corbet/nixcards-corbet-ch.git";
-const CATALOG_BRANCH: &str = "catalog";
+const CATALOG_BRANCH: &str = "cards";
 const CATALOG_INDEX_FILE: &str = "catalog.json";
 const CATALOG_SCHEMA: u32 = 1;
 const STORE_LOCK: &str = ".nixcards-store.lock";
@@ -173,7 +173,7 @@ fn sync(store: &Path, json: bool) -> anyhow::Result<()> {
     let dirty = git_output(store, ["status", "--porcelain", "--untracked-files=no"])?;
     ensure!(
         dirty.trim().is_empty(),
-        "catalogue checkout has local changes; edit the source repository instead"
+        "catalogue checkout has local changes; commit them on a topic branch or restore them before syncing"
     );
     git(
         store,
@@ -507,7 +507,7 @@ mod tests {
         git_ok(
             Command::new("git")
                 .arg("init")
-                .arg("--initial-branch=catalog")
+                .arg("--initial-branch=cards")
                 .arg(&source),
         );
         git_ok(Command::new("git").arg("-C").arg(&source).args([
@@ -556,7 +556,7 @@ mod tests {
             Command::new("git")
                 .arg("-C")
                 .arg(&source)
-                .args(["push", "origin", "catalog"]),
+                .args(["push", "origin", "cards"]),
         );
 
         let store = fixture.path().join("brain/knowledge/cards");

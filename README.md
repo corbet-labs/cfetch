@@ -177,7 +177,7 @@ shell tools, and code review continue to work.
 
 ### Selective nixcards knowledge
 
-`cfetch cards init` creates a `blob:none` partial clone of the public nixcards catalogue at
+`cfetch cards init` creates a `blob:none` partial clone of the canonical nixcards `cards` branch at
 `<brain_root>/knowledge/cards`. The checkout's Git sparse-checkout list is the only local selection
 record: cfetch and the nixcards Ratatui interface read and update the same state, so neither tool can
 overwrite a shadow configuration owned by the other.
@@ -195,6 +195,10 @@ local so either interface can show the complete taxonomy; only the selected set 
 their Markdown blobs materialize. `cards sync` fast-forwards the catalogue without changing that
 selection. Store mutations share one bounded cross-platform lock, and the daemon watches selected
 files even when the outer brain repository ignores the nested checkout.
+
+This managed checkout is also the contribution source. A correction made while reading under
+`knowledge/cards` is an ordinary Git change that can be committed on a topic branch and proposed
+directly against nixcards' `cards` branch. `cards sync` refuses to overwrite local changes.
 
 The cards carry no cfetch trust setting. Their physical `knowledge/cards/...` paths pass through
 the brain's normal ordered `ring_rules`, exactly like manually written knowledge. The nixcards
