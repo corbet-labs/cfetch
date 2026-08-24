@@ -25,14 +25,14 @@ inference; they are never silently called producers.
 |---|---|---|---|
 | x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified reference** on the tested x86-64 host with Microsoft's official ORT 1.28.0 release, 11/11 exact |
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | Integrated, physical KAT pending |
-| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | Integrated, physical Metal and ANE certificates pending |
-| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Integrated, physical per-device certificates pending |
-| AMD XDNA2 NPU | ORT Vitis AI or reviewed Ryzen AI lowering | XDNA2/Ryzen AI exposes INT8; AMD's published UINT4/BFP16 EmbeddingGemma is not the v1 artifact | Integrated ORT path, physical XDNA2 conversion/KAT/placement pending |
-| AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX accepts quantized ONNX paths on supported consumer/server GPUs; actual operator coverage varies | Integrated, physical RDNA/CDNA certificates pending |
-| NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Integrated, oldest/current architecture certificates pending |
-| Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Integrated, physical Snapdragon certificate and exact lowering pending |
-| Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Integrated, physical certificate pending |
-| WebGPU / Vulkan-class fallback | ORT WebGPU EP where available | useful coverage for older GPUs is possible, but native W8A8 placement is not assumed | Experimental integration, no producer certificate |
+| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | Session path integrated; macOS EP runtime package and physical Metal/ANE certificates pending |
+| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Session path integrated; Intel publishes EP runtimes; physical per-device certificates pending |
+| AMD XDNA2 NPU | ORT Vitis AI or a reviewed Ryzen AI adapter | XDNA2 exposes INT8, but Ryzen AI 1.8 documents INT8 for CNN and BF16 for NLP, an ORT 1.16 Vitis path, and automatic CPU partitioning | Rust session surface integrated, but no compatible cfetch runtime package yet; an AMD adapter/runtime update and physical KAT/placement proof are required |
+| AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX accepts quantized ONNX paths on supported consumer/server GPUs; actual operator coverage varies | Session path integrated; AMD's current prebuilt MIGraphX runtime is within cfetch's API floor; RDNA/CDNA packaging and physical certificates pending |
+| NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Session path integrated; runtime packaging and oldest/current architecture certificates pending |
+| Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Session path integrated; Microsoft publishes Windows QNN packages; Snapdragon package/KAT/placement pending |
+| Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Session path integrated; DirectML runtime package and physical certificate pending |
+| WebGPU / Vulkan-class fallback | ORT WebGPU EP where available | useful coverage for older GPUs is possible, but native W8A8 placement is not assumed | Experimental session path; runtime package and producer certificate pending |
 
 There is no single native 8-bit container that every vendor accelerates.
 S8S8, U8U8, layout, fusion and kernel coverage differ. The common denominator
@@ -58,6 +58,17 @@ all 11 records. ORT version strings are therefore informational; distribution
 and archive digests are part of producer admission. Linux arm64 and macOS
 arm64 packages pin Microsoft's official archives too, but that is packaging
 evidence only until those binaries execute the KAT on their target machines.
+
+cfetch and its FastEmbed fork request ORT C API 18, the lowest API used by the
+provider/session code, while the certified CPU runtime remains Microsoft's
+1.28.0 release. The C API is backward-compatible, so this lowers only the
+minimum loadable vendor-runtime ABI; it does not change the graph, optimizer,
+or vector bytes. It covers current 1.23-class MIGraphX and QNN packages.
+AMD's Ryzen AI 1.8 documentation still identifies its Vitis EP as ORT 1.16,
+below this Rust binding's provider floor. That row therefore needs an updated
+AMD plugin or a small provider-specific adapter before physical testing can
+begin; compiling cfetch's `inference-vitis` feature alone is not a runnable
+XDNA package.
 
 ## Running a certificate
 
@@ -121,7 +132,8 @@ The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,
 runs the KAT, and uploads the JSON report. No secret or private runner is
 required. Hosted runners can certify only hardware actually exposed to them;
-physical testers use the same command and attach the profiler evidence.
+physical testers use the same command and attach the profiler evidence through
+the public [inference hardware certificate form](https://github.com/corbet-labs/cfetch/issues/new?template=inference_certification.yml).
 
 Primary implementation references:
 

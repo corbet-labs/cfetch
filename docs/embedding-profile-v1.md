@@ -93,6 +93,9 @@ Microsoft's official shared build both reported ONNX Runtime 1.28.0, but the
 static build failed all 11 v1 vector answers while Microsoft's release passed
 all 11. The Nix local-CPU package therefore pins Microsoft's exact archive
 bytes and records their digest. “Same ORT version” is not sufficient.
+The Rust/FastEmbed binding uses the older ORT C API 18 surface so compatible
+vendor runtimes are not excluded merely by a newer compile-time ABI request;
+the loaded runtime's exact distribution and bytes still have to be certified.
 
 Run the real packaged path with:
 

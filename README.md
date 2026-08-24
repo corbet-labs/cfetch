@@ -72,9 +72,10 @@ for this screen or for routine approval.
 
 The latest tagged release is v0.9.9. Features added since that tag are clearly
 marked **Main — next release**; install from source to try them before the next
-release. Optional semantic search and reranking require an OpenAI-compatible
-inference endpoint; lexical recall, code navigation, hooks, capture, and
-measurement do not.
+release. Optional semantic search can use the frozen v1 local model package or
+a certified OpenAI-compatible producer; optional reranking still uses an
+OpenAI-compatible endpoint and is outside the shared-vector ABI. Lexical
+recall, code navigation, hooks, capture, and measurement need neither.
 
 | Area | Availability | What you experience | Main surfaces |
 |---|---|---|---|

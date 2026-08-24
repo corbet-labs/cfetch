@@ -1,0 +1,89 @@
+name: Inference hardware certificate
+description: Submit a physical CPU, GPU, or NPU run for cfetch embedding profile v1.
+title: "[Inference certificate]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A device is not a v1 producer merely because the model loads or its vendor advertises INT8. Submit the exact cfetch certificate plus accelerator placement evidence described in [the certification guide](https://github.com/corbet-labs/cfetch/blob/main/docs/accelerator-certification.md). Do not include secrets, private model inputs, usernames, hostnames, or private paths.
+  - type: dropdown
+    id: family
+    attributes:
+      label: Hardware family
+      options:
+        - CPU x86-64
+        - CPU arm64
+        - Apple Metal
+        - Apple Neural Engine
+        - Intel OpenVINO CPU
+        - Intel OpenVINO GPU
+        - Intel OpenVINO NPU
+        - AMD XDNA2 NPU
+        - AMD MIGraphX GPU
+        - AMD ROCm GPU
+        - NVIDIA CUDA GPU
+        - NVIDIA TensorRT GPU
+        - Qualcomm QNN HTP NPU
+        - Windows DirectML GPU
+        - WebGPU or Vulkan-class GPU
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Exact physical device
+      description: Vendor, model, architecture or generation, and relevant accelerator identifier.
+      placeholder: "AMD Ryzen AI 9 HX 370; XDNA2 NPU"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and driver
+      description: Include OS version, architecture, accelerator driver, and vendor runtime versions.
+      placeholder: "Windows 11 24H2 arm64; Qualcomm driver ...; QNN ..."
+    validations:
+      required: true
+  - type: input
+    id: package
+    attributes:
+      label: cfetch package identity
+      description: Commit, package/variant name, and build source. Do not report an uncommitted binary.
+      placeholder: "commit d3aea70; cfetch-local-...; built from the public flake"
+    validations:
+      required: true
+  - type: textarea
+    id: certificate
+    attributes:
+      label: Certificate JSON
+      description: Drag in the complete `cfetch-inference-certificate.json`, or paste it. The command is designed not to record private inputs or host identity.
+    validations:
+      required: true
+  - type: textarea
+    id: placement
+    attributes:
+      label: Placement and INT8-kernel evidence
+      description: For GPU/NPU runs, attach the vendor profiler, compute plan, or equivalent export proving full graph ownership and INT8 learned-region kernels. Explain how to inspect it. CPU certificates may state that this is not applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction commands
+      description: Include the exact public package/model download and certification commands.
+      render: shell
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: The run used the public model-v1 bundle without recalibration, conversion that changes semantics, fine-tuning, distillation, pruning, or another quantization.
+          required: true
+        - label: All 11 known-answer vectors passed byte for byte.
+          required: true
+        - label: If this is an accelerator run, ORT CPU fallback was disabled and provider-internal placement is covered by the attached evidence.
+          required: true
+        - label: I removed credentials, private inputs, usernames, hostnames, private paths, and unrelated machine data.
+          required: true
