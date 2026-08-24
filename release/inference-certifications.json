@@ -204,6 +204,24 @@
       "note": "The exact plugin loaded, Dawn found no Vulkan driver, and WebGPU failed with No supported adapters. No software renderer was substituted, so the package correctly failed closed without making a GPU claim."
     },
     {
+      "id": "macos-aarch64-webgpu-run-32695710770",
+      "status": "rejected-accelerator-graph-coverage-on-virtual-host",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32695710770",
+      "evidence_artifact_id": 9508960854,
+      "evidence_artifact_digest": "sha256:a03d921d011902d607277e95229237e0a3f96c472203c39e4cf4645ac5a04abb",
+      "execution_log_sha256": "f2a0876f5c6ca7b6adc724dd391ab514f3f27d0ddfb48f2836beb7991ed9b509",
+      "hardware_sha256": "069fc6d45377d3204494d65f12b745198ca58d4c87bfea0d1740606e15fd82e0",
+      "hardware": "GitHub standard macos-15 virtual runner; VirtualMac2,1; Apple M1 (Virtual); image 20260727.0256.1",
+      "onnxruntime_distribution": "microsoft-github-release-v1.28.0-plus-EP.WebGpu-0.2.1",
+      "onnxruntime_archive_sha256": "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
+      "onnxruntime_library_sha256": "dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d",
+      "webgpu_plugin_library_sha256": "8fac874a60f32f0127c74cb7def915807fcc8a6c30b77629e45f8cee60272eae",
+      "ort_c_api": 22,
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "The pinned universal macOS WebGPU plugin loaded and reached session initialization, but the frozen graph left nodes on forbidden ORT CPU fallback. No KAT vector was emitted. The runner is explicitly virtual, so this is adverse hosted package/graph-coverage evidence rather than a physical Metal certificate."
+    },
+    {
       "id": "linux-x86_64-amd-rdna2-migraphx-rx6800",
       "status": "rejected-ort-graph-coverage-and-direct-vector-incompatibility",
       "evidence_scope": "physical local run recorded by public commit; no catalog admission",

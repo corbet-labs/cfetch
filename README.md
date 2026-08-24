@@ -501,8 +501,9 @@ native WebGPU plugin across Vulkan, D3D12, and Metal. It remains an evidence
 route: the actual adapter must pass exact bytes and placement review, and no
 Linux ARM64 plugin binary is currently published upstream. Public hosted
 probes failed closed: Linux exposed no Vulkan adapter and Windows exposed only
-Hyper-V Video, where WebGPU could not own the complete graph. Neither is a
-physical GPU certificate.
+Hyper-V Video, where WebGPU could not own the complete graph. The isolated
+macOS retry reached the pinned plugin on a virtual Apple M1 but likewise left
+nodes on forbidden CPU fallback. None is a physical GPU certificate.
 
 Recorded EPYC 7763 hosts pass the current CPU reference; a recorded Xeon 8573C
 with AVX-512, VNNI and AMX-INT8 using the exact same package/runtime failed all

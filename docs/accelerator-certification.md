@@ -32,7 +32,7 @@ inference; they are never silently called producers.
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
 | Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Microsoft QNN 1.24.4 Windows ARM64 evidence package integrated; a hosted Cobalt ARM VM had no HTP and rejected backend initialization, so physical Snapdragon HTP KAT/placement remains pending |
 | Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Microsoft DirectML 1.24.4 x64/ARM64 evidence package integrated; the hosted Hyper-V display exposed no matching DirectML device, so each physical adapter still needs exact KAT and placement evidence |
-| WebGPU / Vulkan, D3D12, Metal fallback | ORT native WebGPU plugin EP | one official cross-vendor plugin targets Linux/Vulkan, Windows D3D12/Vulkan and macOS/Metal; quantized kernels exist but full W8A8 graph coverage and exact arithmetic are not assumed | Hash-pinned Linux/macOS Nix and Windows evidence packages integrated; hosted Linux had no Vulkan adapter and hosted Windows left nodes on forbidden CPU fallback; physical minimum/current adapter certificates remain pending |
+| WebGPU / Vulkan, D3D12, Metal fallback | ORT native WebGPU plugin EP | one official cross-vendor plugin targets Linux/Vulkan, Windows D3D12/Vulkan and macOS/Metal; quantized kernels exist but full W8A8 graph coverage and exact arithmetic are not assumed | Hash-pinned Linux/macOS Nix and Windows evidence packages integrated; hosted Linux had no Vulkan adapter, while hosted Windows and virtual macOS left nodes on forbidden CPU fallback; physical minimum/current adapter certificates remain pending |
 
 There is no single native 8-bit container that every vendor accelerates.
 S8S8, U8U8, layout, fusion and kernel coverage differ. The common denominator
@@ -330,8 +330,13 @@ reached the real provider boundary on Windows: the plugin registered a
 concrete device, but the frozen graph left nodes on forbidden ORT CPU fallback
 when the VM exposed only Microsoft Hyper-V Video. Linux loaded the same plugin
 and rejected `No supported adapters` because the runner had no Vulkan driver.
-These results prove package loading and fail-closed selection only; they do not
-certify a physical Vulkan or D3D12 adapter.
+The isolated macOS probe in run
+[`32695710770`](https://github.com/corbet-labs/cfetch/actions/runs/32695710770)
+loaded the pinned universal plugin on a recorded virtual Apple M1 and reached
+session initialization. It too left graph nodes on forbidden ORT CPU fallback,
+so cfetch rejected it before emitting a KAT vector. These results prove package
+loading and fail-closed selection only; they do not certify a physical Vulkan,
+D3D12 or Metal adapter.
 
 ## Running a certificate
 
