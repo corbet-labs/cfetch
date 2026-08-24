@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::{embed, index, paths, runtime_status};
+use crate::{embed, grant, index, paths, runtime_status, vectors};
 
 const GENERATION_POLL: Duration = Duration::from_secs(2);
 const SETTLE_DELAY: Duration = Duration::from_secs(2);
@@ -22,14 +22,37 @@ fn generation() -> Option<u64> {
         .filter(|generation| *generation > 0)
 }
 
+/// A storage host has useful autonomous vector work when it may derive new
+/// vectors, can request them from a joined peer, or already shares compatible
+/// artifacts that this host's disposable cache may need to hydrate. A local
+/// embedding endpoint is deliberately not required for the latter two paths.
+pub(crate) fn sources_available(cfg: &Config, state_dir: &std::path::Path) -> bool {
+    if cfg.client.serving.is_some() {
+        return false;
+    }
+    cfg.embeddings.enabled
+        || grant::memberships(state_dir).is_ok_and(|memberships| !memberships.is_empty())
+        || vectors::VectorStore::open(&cfg.brain_root, &cfg.embeddings.spec())
+            .is_ok_and(|store| !store.is_empty())
+}
+
 pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
-    if !cfg.embeddings.enabled || cfg.client.serving.is_some() {
+    if cfg.client.serving.is_some() {
         return;
     }
     let mut completed_generation = None;
     let mut due: Option<(u64, Instant)> = None;
 
     while !stopping() {
+        // A peer may be joined, or a compatible shared artifact may appear,
+        // after daemon startup. Keep the cheap worker resident so those
+        // events do not require a restart; without a source it performs no
+        // index write or inference call.
+        if !sources_available(&cfg, &paths::state_dir()) {
+            due = None;
+            std::thread::sleep(GENERATION_POLL);
+            continue;
+        }
         if let Some(current) = generation()
             && completed_generation != Some(current)
             && due.map(|(scheduled, _)| scheduled) != Some(current)
@@ -70,9 +93,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_worker_returns_without_waiting() {
+    fn delegated_worker_returns_without_waiting() {
         let started = Instant::now();
-        run(Config::default(), || false);
+        let mut cfg = Config::default();
+        cfg.client.serving = Some(crate::config::ClientServingConfig {
+            addr: "127.0.0.1:1".into(),
+            token_file: std::path::PathBuf::from("unused"),
+        });
+        run(cfg, || false);
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn compatible_shared_artifacts_enable_hydration_without_an_endpoint() {
+        let brain = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            brain_root: brain.path().to_path_buf(),
+            ..Config::default()
+        };
+        assert!(!sources_available(&cfg, state.path()));
+
+        let spec = cfg.embeddings.spec();
+        let mut store = vectors::VectorStore::open(&cfg.brain_root, &spec).unwrap();
+        let mut writer = store.begin_write().unwrap();
+        writer.put("content-hash", &vec![1.0; spec.dim]).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert!(sources_available(&cfg, state.path()));
+
+        cfg.client.serving = Some(crate::config::ClientServingConfig {
+            addr: "127.0.0.1:1".into(),
+            token_file: std::path::PathBuf::from("unused"),
+        });
+        assert!(!sources_available(&cfg, state.path()));
     }
 }

@@ -158,6 +158,9 @@ enum Command {
         /// Center the view on a Markdown path or note name
         #[arg(long)]
         focus: Option<String>,
+        /// Restrict to one local or joined slice and everything nested inside it
+        #[arg(long)]
+        slice: Option<String>,
         /// Maximum documents to return (1-200)
         #[arg(long, default_value_t = 40)]
         limit: usize,
@@ -1081,6 +1084,10 @@ fn print_knowledge_graph(graph: &knowledge_graph::KnowledgeGraph) {
     if let Some(requested) = &graph.requested_focus {
         match &graph.resolved_focus {
             Some(path) => println!("focus: {requested:?} → {path}"),
+            None if !graph.ambiguous_focus.is_empty() => println!(
+                "focus: {requested:?} is ambiguous across {} — showing the connected overview",
+                graph.ambiguous_focus.join(", ")
+            ),
             None => println!(
                 "focus: {requested:?} matched no document — showing the connected overview"
             ),
@@ -1113,11 +1120,50 @@ fn print_knowledge_graph(graph: &knowledge_graph::KnowledgeGraph) {
     }
 }
 
-fn graph_cmd(focus: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
+fn graph_cmd(
+    focus: Option<&str>,
+    slice: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!((1..=200).contains(&limit), "--limit must be between 1 and 200");
     let cfg = config::Config::load()?;
+    if let Some(slice) = slice
+        && let Some(membership) = grant::membership_for_slice(&paths::state_dir(), slice)?
+    {
+        let response = daemon::call_iroh(
+            &membership.origin,
+            serde_json::json!({
+                "op": "graph",
+                "focus": focus,
+                "limit": limit,
+                "slice": membership.slice,
+            }),
+        )?;
+        let graph = response.knowledge_graph.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("joined origin returned no knowledge graph for slice {slice:?}")
+        })?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "graph": graph,
+                    "origin": response.origin,
+                    "generation": response.generation,
+                    "fresh": response.fresh,
+                    "stale_note": response.stale_note,
+                }))?
+            );
+        } else {
+            print_knowledge_graph(graph);
+            print_served_by(&response);
+        }
+        return Ok(());
+    }
     if let Some(cs) = &cfg.client.serving {
-        let body = serde_json::json!({"op": "graph", "focus": focus, "limit": limit});
+        let body = serde_json::json!({
+            "op": "graph", "focus": focus, "limit": limit, "slice": slice,
+        });
         let response = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
         let graph = response.knowledge_graph.as_ref().ok_or_else(|| {
             anyhow::anyhow!("serving host {} returned no knowledge graph", cs.addr)
@@ -1145,7 +1191,18 @@ fn graph_cmd(focus: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()
         Some(&paths::native_projects_root()),
         &cfg.rings(),
     )?;
-    let graph = knowledge_graph::build(&conn, focus, limit)?;
+    let graph = if let Some(slice) = slice {
+        let slices = cfg.slice_model()?;
+        anyhow::ensure!(
+            slice == config::ROOT_SLICE || slices.names().any(|name| name == slice),
+            "unknown slice {slice:?}"
+        );
+        knowledge_graph::build_matching(&conn, focus, limit, |path| {
+            slices.contains(slice, path)
+        })?
+    } else {
+        knowledge_graph::build(&conn, focus, limit)?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&graph)?);
     } else {
@@ -1581,6 +1638,13 @@ fn maintain_cmd(action: MaintainAction) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     match action {
         MaintainAction::Run { limit, json } => {
+            if let Some(limit) = limit {
+                anyhow::ensure!(
+                    (1..=config::MAX_MAINTENANCE_CANDIDATES).contains(&limit),
+                    "--limit must be between 1 and {}",
+                    config::MAX_MAINTENANCE_CANDIDATES
+                );
+            }
             let mut model = maintenance_model::MaintenanceClient::new(&cfg.maintenance)?;
             let report = maintenance::run_once_with(
                 &cfg,
@@ -2749,8 +2813,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Graph { focus, limit, json } => {
-            if let Err(e) = graph_cmd(focus.as_deref(), limit, json) {
+        Command::Graph { focus, slice, limit, json } => {
+            if let Err(e) = graph_cmd(focus.as_deref(), slice.as_deref(), limit, json) {
                 eprintln!("cfetch graph: {e}");
                 std::process::exit(1);
             }

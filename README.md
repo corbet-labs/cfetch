@@ -265,6 +265,7 @@ graph database or make hidden relationships authoritative.
 $ cfetch graph
 $ cfetch graph --focus deployment --limit 30
 $ cfetch graph --focus knowledge/runbooks/deployment.md --json
+$ cfetch graph --slice engineering --focus deployment
 ```
 
 Vectors follow the same rule. They are keyed by statement content hashes and

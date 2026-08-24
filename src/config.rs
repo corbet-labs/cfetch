@@ -601,6 +601,8 @@ impl Default for EmbeddingsConfig {
 /// completed configuration becomes seamless without another feature switch.
 /// Missing endpoint/model remains an explicit "not configured" state, never a
 /// silent network fallback.
+pub const MAX_MAINTENANCE_CANDIDATES: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceConfig {
     #[serde(default = "default_maintenance_enabled")]
@@ -1027,7 +1029,10 @@ impl Config {
         }
         anyhow::ensure!(cfg.maintenance.timeout_secs > 0, "maintenance.timeout_secs must be at least 1");
         anyhow::ensure!(cfg.maintenance.debounce_secs > 0, "maintenance.debounce_secs must be at least 1");
-        anyhow::ensure!(cfg.maintenance.max_candidates > 0, "maintenance.max_candidates must be at least 1");
+        anyhow::ensure!(
+            (1..=MAX_MAINTENANCE_CANDIDATES).contains(&cfg.maintenance.max_candidates),
+            "maintenance.max_candidates must be between 1 and {MAX_MAINTENANCE_CANDIDATES}"
+        );
         Ok(cfg)
     }
 
@@ -1178,6 +1183,7 @@ mod tests {
             r#"{"maintenance":{"timeout_secs":0}}"#,
             r#"{"maintenance":{"debounce_secs":0}}"#,
             r#"{"maintenance":{"max_candidates":0}}"#,
+            r#"{"maintenance":{"max_candidates":33}}"#,
             r#"{"maintenance":{"review_model":""}}"#,
         ] {
             std::fs::write(&p, raw).unwrap();

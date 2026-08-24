@@ -1467,9 +1467,22 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
         "graph" => {
             let focus = req.focus.as_deref();
             let limit = req.limit.unwrap_or(40);
+            let slice = req.slice.clone();
             (
                 serve_query(ctx, |conn| {
-                    let graph = crate::knowledge_graph::build(conn, focus, limit)?;
+                    let graph = if let Some(slice) = slice.as_deref() {
+                        let model = ctx.cfg.slice_model()?;
+                        anyhow::ensure!(
+                            slice == crate::config::ROOT_SLICE
+                                || model.names().any(|name| name == slice),
+                            "unknown slice {slice:?}"
+                        );
+                        crate::knowledge_graph::build_matching(conn, focus, limit, |path| {
+                            model.contains(slice, path)
+                        })?
+                    } else {
+                        crate::knowledge_graph::build(conn, focus, limit)?
+                    };
                     Ok(Response {
                         knowledge_graph: Some(graph),
                         ..Response::default()
@@ -1621,7 +1634,7 @@ pub fn run() -> anyhow::Result<()> {
             .context("start maintenance worker")?;
     }
 
-    if cfg.embeddings.enabled && cfg.client.serving.is_none() {
+    if cfg.client.serving.is_none() {
         let vector_cfg = cfg.clone();
         let vector_ctx = ctx.clone();
         std::thread::Builder::new()

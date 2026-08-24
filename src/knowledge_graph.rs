@@ -35,6 +35,11 @@ pub struct KnowledgeGraph {
     pub generation: u64,
     pub requested_focus: Option<String>,
     pub resolved_focus: Option<String>,
+    /// Equally specific matches when a note name is ambiguous. cfetch never
+    /// chooses one by ring or lexical order because that would turn a display
+    /// convenience into a guessed relationship.
+    #[serde(default)]
+    pub ambiguous_focus: Vec<String>,
     pub focus_matched: bool,
     pub total_nodes: usize,
     pub total_edges: usize,
@@ -138,11 +143,13 @@ pub fn build_matching(
     let link_rows = link_stmt.query_map([], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })?;
-    let mut links: Vec<(usize, usize)> = link_rows
+    let visible_links: Vec<(usize, usize)> = link_rows
         .filter_map(Result::ok)
         .filter_map(|(from, to)| Some((*by_id.get(&from)?, *by_id.get(&to)?)))
         .filter(|(from, to)| from != to)
         .collect();
+    let resolved_references = visible_links.len();
+    let mut links = visible_links;
     links.sort_unstable();
     links.dedup();
 
@@ -161,18 +168,30 @@ pub fn build_matching(
     }
 
     let requested_focus = focus.map(str::trim).filter(|value| !value.is_empty());
-    let focused = requested_focus.and_then(|query| {
-        docs.iter()
-            .enumerate()
-            .filter_map(|(index, doc)| focus_score(&doc.path, query).map(|score| (index, score)))
-            .max_by(|(left, left_score), (right, right_score)| {
-                left_score
-                    .cmp(right_score)
-                    .then_with(|| docs[*right].ring.cmp(&docs[*left].ring))
-                    .then_with(|| docs[*right].path.cmp(&docs[*left].path))
-            })
-            .map(|(index, _)| index)
-    });
+    let focus_matches = requested_focus
+        .map(|query| {
+            let scored: Vec<(usize, u8)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, doc)| focus_score(&doc.path, query).map(|score| (index, score)))
+                .collect();
+            let best = scored.iter().map(|(_, score)| *score).max();
+            scored
+                .into_iter()
+                .filter_map(|(index, score)| (Some(score) == best).then_some(index))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let focused = (focus_matches.len() == 1).then(|| focus_matches[0]);
+    let mut ambiguous_focus = if focus_matches.len() > 1 {
+        focus_matches
+            .iter()
+            .map(|index| docs[*index].path.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    ambiguous_focus.sort();
 
     let degree = |index: usize| inbound[index] + outbound[index];
     let mut selected = BTreeSet::new();
@@ -261,10 +280,11 @@ pub fn build_matching(
         generation: crate::index::generation(conn),
         requested_focus: requested_focus.map(str::to_string),
         resolved_focus: focused.map(|index| docs[index].path.clone()),
+        ambiguous_focus,
         focus_matched: requested_focus.is_none() || focused.is_some(),
         total_nodes: docs.len(),
         total_edges: links.len(),
-        unresolved_references: raw_references.saturating_sub(links.len()),
+        unresolved_references: raw_references.saturating_sub(resolved_references),
         nodes,
         edges,
         omitted_edges,
@@ -350,5 +370,43 @@ mod tests {
         assert!(!graph.focus_matched);
         assert!(graph.resolved_focus.is_none());
         assert_eq!(graph.nodes.len(), 2);
+    }
+
+    #[test]
+    fn ambiguous_note_name_is_reported_instead_of_guessed() {
+        let conn = graph_db();
+        conn.execute(
+            "INSERT INTO docs(id, path, ring, mtime, size) VALUES
+             (5, 'projects/other/alpha.md', 2, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let graph = build(&conn, Some("alpha"), 3).unwrap();
+
+        assert!(!graph.focus_matched);
+        assert!(graph.resolved_focus.is_none());
+        assert_eq!(
+            graph.ambiguous_focus,
+            vec!["projects/alpha.md", "projects/other/alpha.md"]
+        );
+        assert!(!graph.nodes.iter().any(|node| node.focused));
+    }
+
+    #[test]
+    fn repeated_links_are_edges_not_false_unresolved_references() {
+        let conn = graph_db();
+        conn.execute("INSERT INTO links(from_doc, to_doc) VALUES (1, 2)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO doc_links(doc_id, target) VALUES (1, 'alpha')",
+            [],
+        )
+        .unwrap();
+
+        let graph = build(&conn, None, 20).unwrap();
+
+        assert_eq!(graph.total_edges, 2);
+        assert_eq!(graph.unresolved_references, 1);
     }
 }
