@@ -789,6 +789,9 @@ fn openvino_provider(name: &str) -> (&'static str, &'static str, ExecutionProvid
         class,
         ort::ep::OpenVINO::default()
             .with_device_type(device)
+            .with_num_threads(crate::embedding_profile::ORT_INTRA_THREADS)
+            .with_num_streams(1)
+            .with_dynamic_shapes(false)
             .build()
             .error_on_failure(),
     )

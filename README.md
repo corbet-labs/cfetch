@@ -478,15 +478,23 @@ $ ./result/bin/cfetch inference-certify \
 Apple Silicon testers can build the non-catalogue CoreML evidence package with
 `nix build github:corbet-labs/cfetch#cfetch-test-coreml`, then certify
 `coreml-gpu` and `coreml-npu` separately. It enables Core ML compute-plan
-logging, but the report and placement trace still require review before either
-route may produce vectors.
+logging. The first hosted GPU and NPU probes were rejected: all logged Core ML
+operations ran on its CPU and ORT still required CPU fallback. A new route must
+pass exact bytes and placement review before it may produce vectors.
 
-The x86-64 package is the current certified CPU reference. Public Linux arm64
-and macOS arm64 runs of their pinned official runtimes failed all 11 exact
-vectors, so those runtimes are explicitly consumer-only; an alternative must
-pass from scratch. The release catalog therefore remains remote-only. Ordinary
-local loading runs the same admission gate and fails closed before writing
-vectors on an incompatible host. See the
+Linux x86-64 Intel testers use
+`nix build github:corbet-labs/cfetch#cfetch-test-openvino` and certify
+`openvino-cpu`, `openvino-gpu`, or `openvino-npu`. The package pins Intel's
+complete official ORT/OpenVINO wheel; exact bytes and per-device placement are
+still mandatory. The available local CPU probe was rejected because OpenVINO
+did not own the complete frozen graph, so this is an evidence package only.
+
+One tested x86-64 host is the current certified CPU reference; a later public
+x86-64 host using the exact same package/runtime failed all 11 vectors. Public
+Linux arm64 and macOS arm64 runs failed all 11 too. These are host/runtime
+certificates, never architecture-wide promises. The release catalog therefore
+remains remote-only. Ordinary local loading runs the same admission gate on
+the actual host and fails closed before writing incompatible vectors. See the
 [frozen profile](docs/embedding-profile-v1.md) and
 [certification matrix](docs/accelerator-certification.md).
 

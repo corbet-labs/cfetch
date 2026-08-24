@@ -29,6 +29,7 @@
                 "cfetch"
                 "cfetch-local-cpu"
                 "cfetch-test-coreml"
+                "cfetch-test-openvino"
               ];
           })
         );
@@ -75,11 +76,37 @@
             runHook postInstall
           '';
         };
+        openvinoVersion = "1.24.1";
+        openvinoWheelSha256 = "2c3bb73e68ac27f4891af8a595c1faf574ec68b772e6583c90a0b997a1822782";
+        openvinoOrt = pkgs.stdenvNoCC.mkDerivation {
+          pname = "cfetch-openvino-onnxruntime";
+          version = openvinoVersion;
+          src = pkgs.fetchurl {
+            url = "https://files.pythonhosted.org/packages/08/07/f225999919f56506b603aaa3ff837ad563ab26f86906ed7fa7e5abcd849e/onnxruntime_openvino-${openvinoVersion}-cp313-cp313-manylinux_2_28_x86_64.whl";
+            hash = "sha256-LDu3PmisJ/SJGvillcH69XTsaLdy5lg8kKC5l6GCJ4I=";
+          };
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.unzip ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/lib" "$out/share/licenses/onnxruntime-openvino"
+            unzip -j "$src" 'onnxruntime/capi/lib*.so*' -d "$out/lib"
+            ln -s libonnxruntime.so.${openvinoVersion} "$out/lib/libonnxruntime.so"
+            unzip -p "$src" onnxruntime/LICENSE \
+              > "$out/share/licenses/onnxruntime-openvino/LICENSE"
+            unzip -p "$src" onnxruntime/ThirdPartyNotices.txt \
+              > "$out/share/licenses/onnxruntime-openvino/ThirdPartyNotices.txt"
+            runHook postInstall
+          '';
+        };
         mkCfetch =
           {
             pname,
             localInference ? false,
             inferenceFeature ? "inference-ort",
+            runtime ? certifiedOrt,
+            runtimeDistribution ? "microsoft-github-release-v${ortVersion}",
+            runtimeArchiveSha256 ? ortAsset.sha256,
           }:
           pkgs.rustPlatform.buildRustPackage {
           inherit pname;
@@ -97,8 +124,8 @@
           };
           buildFeatures = pkgs.lib.optionals localInference [ inferenceFeature ];
           CFETCH_ORT_DISTRIBUTION =
-            if localInference then "microsoft-github-release-v${ortVersion}" else null;
-          CFETCH_ORT_ARCHIVE_SHA256 = if localInference then ortAsset.sha256 else null;
+            if localInference then runtimeDistribution else null;
+          CFETCH_ORT_ARCHIVE_SHA256 = if localInference then runtimeArchiveSha256 else null;
           CFETCH_VARIANT =
             if localInference then
               null
@@ -122,13 +149,13 @@
           '' + pkgs.lib.optionalString localInference ''
             wrapProgram "$out/bin/cfetch" \
               --set-default ORT_DYLIB_PATH \
-              "${certifiedOrt}/lib/${
+              "${runtime}/lib/${
                 if pkgs.stdenv.hostPlatform.isDarwin then
                   "libonnxruntime.dylib"
                 else
                   "libonnxruntime.so"
               }"${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " \\
-              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]}"}
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ runtime pkgs.stdenv.cc.cc.lib pkgs.zlib ]}"}
           '';
 
           meta = {
@@ -166,6 +193,22 @@
           localInference = true;
           inferenceFeature = "inference-coreml";
         };
+      } // pkgs.lib.optionalAttrs (
+        pkgs.stdenv.hostPlatform.isLinux
+        && pkgs.stdenv.hostPlatform.isx86_64
+      ) {
+        # Intel's official wheel is a language-neutral ORT/OpenVINO runtime
+        # distribution despite its wheel container. It includes the CPU, GPU
+        # and NPU plugins. This remains an evidence package until a physical
+        # device passes the KAT and placement review.
+        cfetch-test-openvino = mkCfetch {
+          pname = "cfetch-test-openvino";
+          localInference = true;
+          inferenceFeature = "inference-openvino";
+          runtime = openvinoOrt;
+          runtimeDistribution = "pypi-onnxruntime-openvino-${openvinoVersion}";
+          runtimeArchiveSha256 = openvinoWheelSha256;
+        };
       });
 
       checks = forAllSystems (pkgs: {
@@ -177,6 +220,11 @@
         && pkgs.stdenv.hostPlatform.isAarch64
       ) {
         cfetch-test-coreml = self.packages.${pkgs.stdenv.hostPlatform.system}.cfetch-test-coreml;
+      } // pkgs.lib.optionalAttrs (
+        pkgs.stdenv.hostPlatform.isLinux
+        && pkgs.stdenv.hostPlatform.isx86_64
+      ) {
+        cfetch-test-openvino = self.packages.${pkgs.stdenv.hostPlatform.system}.cfetch-test-openvino;
       });
     };
 }

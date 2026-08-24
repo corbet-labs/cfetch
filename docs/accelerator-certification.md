@@ -23,10 +23,10 @@ inference; they are never silently called producers.
 
 | Hardware class | cfetch path | INT8 common-denominator evidence | Producer status |
 |---|---|---|---|
-| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified reference** on the tested x86-64 host with Microsoft's official ORT 1.28.0 release, 11/11 exact |
+| x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified reference host** with Microsoft's official ORT 1.28.0 release, 11/11 exact; a later hosted x86-64 run of the same bytes failed 0/11, so every host remains KAT-gated |
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: public physical runs passed bundle/runtime loading but failed 0/11 exact vectors; alternative runtime pending |
-| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | Official-runtime `cfetch-test-coreml` package integrated with static MLProgram shapes and compute-plan logging; public Apple Silicon GPU/ANE probes and reviewed physical certificates pending |
-| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Session path integrated; Intel publishes EP runtimes; physical per-device certificates pending |
+| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; alternative runtime/graph route and physical-device certificates pending |
+| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official `cfetch-test-openvino` runtime package integrated for Linux x86-64; local CPU probe rejected because OpenVINO did not own the complete frozen graph; public reproduction and physical GPU/NPU certificates pending |
 | AMD XDNA2 NPU | ORT Vitis AI or a reviewed Ryzen AI adapter | XDNA2 exposes INT8, but Ryzen AI 1.8 documents INT8 for CNN and BF16 for NLP, an ORT 1.16 Vitis path, and automatic CPU partitioning | Rust session surface integrated, but no compatible cfetch runtime package yet; an AMD adapter/runtime update and physical KAT/placement proof are required |
 | AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX accepts quantized ONNX paths on supported consumer/server GPUs; actual operator coverage varies | Session path integrated; AMD's current prebuilt MIGraphX runtime is within cfetch's API floor; RDNA/CDNA packaging and physical certificates pending |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Session path integrated; runtime packaging and oldest/current architecture certificates pending |
@@ -53,6 +53,19 @@ The admitted x86-64 package uses Microsoft's official
 - result: all 11 sequence/language/content KAT records passed through the
   actual Rust → FastEmbed → ORT → cfetch codec path.
 
+That pass is a reference-host certificate, not an x86-64-wide promise. Public
+run [`32680098981`](https://github.com/corbet-labs/cfetch/actions/runs/32680098981)
+later loaded the exact same x86 package, archive and library but failed 0/11;
+412–739 components changed per answer and cosine remained 0.971–0.983. The
+older workflow did not record its CPU model, so the attempt is rejected at run
+scope. New reports include a separate non-identifying hardware evidence file.
+Ordinary production always executes the KAT on the host actually doing work.
+Run
+[`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
+subsequently passed 11/11 again with the same package. Because that workflow
+also predates hardware capture, this is a second run-scoped passing result—not
+grounds for an architecture-wide package.
+
 The ort-sys bundled/static 1.28 build was deliberately rejected after failing
 all 11 records. ORT version strings are therefore informational; distribution
 and archive digests are part of producer admission. Linux arm64 and macOS
@@ -76,6 +89,36 @@ below this Rust binding's provider floor. That row therefore needs an updated
 AMD plugin or a small provider-specific adapter before physical testing can
 begin; compiling cfetch's `inference-vitis` feature alone is not a runnable
 XDNA package.
+
+The Linux x86-64 OpenVINO evidence package extracts only the language-neutral
+runtime libraries and notices from Intel's official
+`onnxruntime_openvino-1.24.1-cp313-cp313-manylinux_2_28_x86_64.whl`. The wheel
+SHA-256 is
+`2c3bb73e68ac27f4891af8a595c1faf574ec68b772e6583c90a0b997a1822782`;
+its loaded `libonnxruntime.so.1.24.1` SHA-256 is
+`a88c790b82c5bdfd4740ebe3018e52009851097f97fbd9e5e3fd3249fcdb9ed7`.
+That distribution includes OpenVINO 2025.4.1 CPU, GPU and NPU plugins. Package
+provenance is established here. A physical package probe on the available AMD
+Ryzen 9 5950X reached OpenVINO session construction but was rejected because
+some nodes remained assigned to ORT's default CPU EP. No vector was produced.
+OpenVINO's own EP documentation recommends disabling ORT's high-level graph
+optimizations for best coverage, but v1 freezes `ort-enable-all` as part of the
+shared executable profile. Silently changing that setting for one vendor would
+no longer be the same pipeline. An isolated diagnostic build nevertheless
+tested `ORT_DISABLE_ALL`; it was rejected at the same full-graph boundary, so
+that documented suggestion is not a hidden working route. The public job
+reproduces the failure boundary; each selected Intel device still requires a
+compatible full-graph path, exact bytes and placement review.
+
+Public run
+[`32680584417`](https://github.com/corbet-labs/cfetch/actions/runs/32680584417)
+also exercised the actual CoreML GPU and NPU routes. Core ML compiled both
+MLPrograms, but each plan placed all 2,212 operations on
+`MLCPUComputeDevice`: zero selected GPU or Neural Engine. Additional graph
+nodes remained assigned to ORT CPU. Because fallback is forbidden, cfetch
+stopped at session initialization before emitting any vector. Both evidence
+artifacts are registry-pinned; this rejects those hosted routes and does not
+generalize to untested Apple models.
 
 ## Running a certificate
 
@@ -139,8 +182,18 @@ On Apple Silicon, `nix build .#cfetch-test-coreml` builds the non-catalogue
 CoreML certification package against the same pinned official ORT archive.
 The workflow probes `coreml-gpu` and `coreml-npu` separately with MLProgram,
 the frozen static sequence buckets, low-precision GPU accumulation disabled,
-and Core ML compute-plan logging enabled. A hosted result can prove only the
-device actually exposed to that runner; it cannot stand in for an absent ANE.
+and Core ML compute-plan logging enabled. The first GPU and NPU probes were
+rejected for CPU-only placement and incomplete provider ownership. A hosted
+result can prove only the device actually exposed to that runner; it cannot
+stand in for another Apple model or an absent accelerator.
+
+On Linux x86-64, `nix build .#cfetch-test-openvino` builds the equivalently
+non-catalogue Intel evidence package. The public runner exercises
+`openvino-cpu`; physical Intel systems use that same binary with
+`openvino-gpu` or `openvino-npu`. The package disables dynamic shapes and uses
+one stream/thread, while the seven frozen cfetch buckets remain unchanged. The
+first local CPU attempt was rejected at full-graph ownership; the package is a
+reproducible evidence tool, not a producer.
 
 The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,

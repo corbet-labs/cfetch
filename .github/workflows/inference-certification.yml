@@ -41,6 +41,8 @@ jobs:
             *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
           esac
       - uses: cachix/install-nix-action@v31
+      - name: Record non-identifying hardware evidence
+        run: bash scripts/certification-hardware.sh | tee "$RUNNER_TEMP/cfetch-hardware.txt"
       - name: Build the pinned local CPU package
         run: nix build .#cfetch-local-cpu --out-link "$RUNNER_TEMP/cfetch-local"
       - name: Download frozen model bundle
@@ -66,7 +68,9 @@ jobs:
         if: always()
         with:
           name: inference-certificate-${{ matrix.runner }}
-          path: ${{ runner.temp }}/cfetch-inference-certificate.json
+          path: |
+            ${{ runner.temp }}/cfetch-inference-certificate.json
+            ${{ runner.temp }}/cfetch-hardware.txt
           if-no-files-found: warn
 
   apple-coreml-kat:
@@ -90,6 +94,8 @@ jobs:
             *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
           esac
       - uses: cachix/install-nix-action@v31
+      - name: Record non-identifying hardware evidence
+        run: bash scripts/certification-hardware.sh | tee "$RUNNER_TEMP/cfetch-hardware.txt"
       - name: Build the pinned CoreML test package
         run: nix build .#cfetch-test-coreml --out-link "$RUNNER_TEMP/cfetch-coreml"
       - name: Download frozen model bundle
@@ -118,4 +124,54 @@ jobs:
           path: |
             ${{ runner.temp }}/cfetch-inference-certificate.json
             ${{ runner.temp }}/cfetch-coreml-run.log
+            ${{ runner.temp }}/cfetch-hardware.txt
+          if-no-files-found: warn
+
+  intel-openvino-cpu-kat:
+    name: Intel OpenVINO CPU KAT
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate frozen bundle input
+        env:
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+        run: |
+          test "$BUNDLE_SHA256" = 12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+          case "$BUNDLE_URL" in
+            https://github.com/corbet-labs/cfetch/releases/download/*/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz) ;;
+            *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
+          esac
+      - uses: cachix/install-nix-action@v31
+      - name: Record non-identifying hardware evidence
+        run: bash scripts/certification-hardware.sh | tee "$RUNNER_TEMP/cfetch-hardware.txt"
+      - name: Build the pinned OpenVINO test package
+        run: nix build .#cfetch-test-openvino --out-link "$RUNNER_TEMP/cfetch-openvino"
+      - name: Download frozen model bundle
+        env:
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+        run: |
+          curl --proto '=https' --tlsv1.2 --location --fail --show-error \
+            --output "$RUNNER_TEMP/cfetch-embedding-v1.tar.gz" \
+            "$BUNDLE_URL"
+      - name: Run exact vector certification
+        env:
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+        run: |
+          set -o pipefail
+          bash scripts/certify-inference-bundle.sh \
+            "$RUNNER_TEMP/cfetch-embedding-v1.tar.gz" \
+            "$BUNDLE_SHA256" \
+            "$RUNNER_TEMP/cfetch-openvino/bin/cfetch" \
+            "$RUNNER_TEMP/cfetch-inference-certificate.json" \
+            openvino-cpu 2>&1 | tee "$RUNNER_TEMP/cfetch-openvino-run.log"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: inference-certificate-ubuntu-24.04-openvino-cpu
+          path: |
+            ${{ runner.temp }}/cfetch-inference-certificate.json
+            ${{ runner.temp }}/cfetch-openvino-run.log
+            ${{ runner.temp }}/cfetch-hardware.txt
           if-no-files-found: warn

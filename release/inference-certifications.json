@@ -17,8 +17,9 @@
     {
       "id": "linux-x86_64-cpu-microsoft-ort-1.28.0",
       "status": "passing-reference",
+      "scope": "exact package/runtime and passing physical host represented by run 32678932373; not an architecture-wide claim",
       "catalog_admitted": false,
-      "catalog_blocker": "the standalone local release variant and its reviewed release certificate have not been assembled",
+      "catalog_blocker": "a generic x86-64 release cannot be admitted because a later host using the same package/runtime failed 0/11; production remains host-KAT-gated",
       "os": "linux",
       "arch": "x86_64",
       "provider": "cpu",
@@ -33,14 +34,68 @@
       "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32678932373",
       "report_artifact_id": 9503739953,
       "report_sha256": "23866923e294a27fd8e8f239c2fc529c94273e03a43d9c1ae88bb1bd57ed4e32",
+      "additional_passing_runs": [
+        {
+          "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680584417",
+          "report_artifact_id": 9504237996,
+          "report_sha256": "f4cb5693343734631901e1465a896c71fb579f2ff1f933df0ab54120dcd19088",
+          "note": "11/11 exact on a later hosted x86-64 runner; this workflow predates hardware-model capture and therefore adds run-scoped evidence only"
+        }
+      ],
       "artifact_verified": true,
       "exact_known_answers_passed": 11,
       "exact_known_answers_failed": 0,
       "int8_evidence": "canonical QDQ graph audit: 171 learned nodes covered; no floating-point shadow learned weights",
-      "note": "The public model-v1 bundle and Nix package on main are usable directly; catalog admission stays false until they are assembled and reviewed as a standalone local release variant."
+      "note": "This is the canonical passing host, not proof that all x86-64 CPUs produce the same bytes. Ordinary local loading reruns the KAT on the actual host."
     }
   ],
   "rejected_attempts": [
+    {
+      "id": "macos-aarch64-coreml-gpu-run-32680584417",
+      "status": "rejected-accelerator-placement-and-graph-coverage",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680584417",
+      "evidence_artifact_id": 9504268649,
+      "evidence_artifact_sha256": "00bb15bace4c1fb31b7b12aa7a5d64c068001bfe119c9694502e2ca2006ee754",
+      "execution_log_sha256": "d03f3cf76b28a4e28c818d38f7e052a9171ed90e6fc01db74f89a82693740cbf",
+      "onnxruntime_archive_sha256": "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
+      "onnxruntime_library_sha256": "dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d",
+      "coreml_logged_operations": 2212,
+      "coreml_cpu_operations": 2212,
+      "coreml_gpu_operations": 0,
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "The CPUAndGPU CoreML probe compiled and emitted a compute plan, but every logged operation selected MLCPUComputeDevice and additional graph nodes remained on ORT's default CPU EP. With CPU fallback forbidden, cfetch rejected session initialization before the KAT. The runner workflow predates hardware-model capture, so this is run-scoped evidence only."
+    },
+    {
+      "id": "macos-aarch64-coreml-npu-run-32680584417",
+      "status": "rejected-accelerator-placement-and-graph-coverage",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680584417",
+      "evidence_artifact_id": 9504210671,
+      "evidence_artifact_sha256": "055872dc0c0df1c5c3173f3995150abd0becbe4b718e85f8dc139b97b001cedf",
+      "execution_log_sha256": "fe98aafcf1b73b6841c21b4645ead9cd4b19ae635da8f535acaa882e35dac1d0",
+      "onnxruntime_archive_sha256": "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
+      "onnxruntime_library_sha256": "dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d",
+      "coreml_logged_operations": 2212,
+      "coreml_cpu_operations": 2212,
+      "coreml_neural_engine_operations": 0,
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "The CPUAndNeuralEngine CoreML probe compiled and emitted a compute plan, but every logged operation selected MLCPUComputeDevice and additional graph nodes remained on ORT's default CPU EP. With CPU fallback forbidden, cfetch rejected session initialization before the KAT. The runner workflow predates hardware-model capture, so this is run-scoped evidence only."
+    },
+    {
+      "id": "linux-x86_64-cpu-microsoft-ort-1.28.0-run-32680098981",
+      "status": "rejected-vector-incompatibility",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32680098981",
+      "report_artifact_id": 9504034655,
+      "report_sha256": "18b53e3b076a44ba6f87d2b9341a526da634d66ce1c21bcabd493310939c9cbc",
+      "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+      "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 11,
+      "changed_components_per_vector": "412..739 of 768",
+      "cosine_to_x86_reference": "0.970912..0.982675",
+      "note": "A later public x86-64 runner loaded the exact passing package/runtime but produced a third vector family. The older workflow did not record its CPU model, so this rejection is scoped to the run rather than an inferred processor family."
+    },
     {
       "id": "linux-aarch64-cpu-microsoft-ort-1.28.0",
       "status": "rejected-vector-incompatibility",
@@ -71,10 +126,11 @@
     }
   ],
   "pending_physical_families": [
+    "linux-x86_64-cpu-additional-hosts",
     "linux-aarch64-cpu-alternative-runtime",
     "macos-aarch64-cpu-alternative-runtime",
-    "apple-metal",
-    "apple-ane",
+    "apple-metal-alternative-runtime-or-graph-path",
+    "apple-ane-alternative-runtime-or-graph-path",
     "intel-openvino-cpu",
     "intel-openvino-gpu",
     "intel-openvino-npu",

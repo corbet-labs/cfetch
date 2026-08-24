@@ -81,7 +81,7 @@ jq -e '
   .profile_id == "cfetch-embedding-v1" and
   .artifact_sha256 == "ed2c0cc371d55d8a6db53308bd923366a93dc5fc9cd8c32e03668ebbc12036e1" and
   .exact_vector_conformance == true and
-  (.device_class != "cpu" or .producer_eligible_without_external_review == true) and
+  (.provider != "cpu" or .producer_eligible_without_external_review == true) and
   (.known_answers | length == 11) and
   all(.known_answers[]; .passed == true)
 ' "$report" >/dev/null
