@@ -108,6 +108,12 @@ They are rejected producers, not “probably compatible” CPU packages. This is
 why shared vectors are derived once and distributed, and why an architecture
 name or matching runtime version cannot bypass the KAT.
 
+The same conclusion holds inside x86-64. A recorded AMD EPYC 7763 passed all
+11 answers, while a recorded Intel Xeon Platinum 8573C with AVX-512, VNNI and
+AMX-INT8 failed all 11 with identical model/runtime bytes. The v1 contract
+therefore names passing hosts, never an ISA marketing feature as a producer
+guarantee.
+
 A physical AMD Radeon RX 6800 produced the complementary accelerator result.
 ORT's MIGraphX provider could not own the whole graph with CPU fallback
 disabled. Standalone MIGraphX did compile and run the complete frozen W8A8

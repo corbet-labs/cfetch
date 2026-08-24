@@ -175,6 +175,12 @@ try {
     $stderr = $process.StandardError.ReadToEndAsync()
     $process.WaitForExit()
     [IO.File]::WriteAllText($reportPath, $stdout.Result, [Text.UTF8Encoding]::new($false))
+    if (-not [string]::IsNullOrWhiteSpace($stderr.Result)) {
+        # Emit through PowerShell's pipeline so the workflow Tee-Object writes
+        # the provider diagnostic into the uploaded run log. Writing directly
+        # to Console.Error is visible in the job log but bypasses Tee-Object.
+        Write-Output $stderr.Result.TrimEnd()
+    }
     $vitisReports = @()
     if ($manifest.provider -eq "vitis") {
         $placementPath = "$reportPath.vitis-placement"
@@ -188,7 +194,6 @@ try {
         }
     }
     if ($process.ExitCode -ne 0) {
-        [Console]::Error.Write($stderr.Result)
         throw "cfetch inference certification exited $($process.ExitCode)"
     }
 

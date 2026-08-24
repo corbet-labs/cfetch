@@ -283,10 +283,12 @@
             pluginDistribution ? null,
             pluginArchiveSha256 ? null,
             pluginLibrary ? null,
+            runTests ? true,
           }:
           pkgs.rustPlatform.buildRustPackage {
           inherit pname;
           inherit version;
+          doCheck = runTests;
           src = self;
           cargoLock = {
             lockFile = ./Cargo.lock;
@@ -376,6 +378,10 @@
           pname = "cfetch-test-webgpu";
           localInference = true;
           inferenceFeature = "inference-webgpu";
+          # This is a hardware probe package. The blocking platform suite
+          # already tests cfetch; rerunning unrelated iroh network tests here
+          # made Metal evidence depend on a flaky test-server destructor.
+          runTests = false;
           runtime = webgpuOrt;
           runtimeDistribution = "microsoft-github-release-v${ortVersion}+webgpu-plugin-${webgpuPluginVersion}";
           pluginDistribution = "nuget-Microsoft.ML.OnnxRuntime.EP.WebGpu-${webgpuPluginVersion}";
@@ -433,6 +439,9 @@
           pname = "cfetch-test-webgpu";
           localInference = true;
           inferenceFeature = "inference-webgpu";
+          # The package's next step is the exact device KAT. Application tests
+          # remain blocking checks, independently of this hardware probe.
+          runTests = false;
           runtime = webgpuOrt;
           runtimeDistribution = "microsoft-github-release-v${ortVersion}+webgpu-plugin-${webgpuPluginVersion}";
           pluginDistribution = "nuget-Microsoft.ML.OnnxRuntime.EP.WebGpu-${webgpuPluginVersion}";

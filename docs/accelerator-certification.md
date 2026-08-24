@@ -26,13 +26,13 @@ inference; they are never silently called producers.
 | x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified only on named hosts** with Microsoft's official ORT 1.28.0 release, 11/11 exact; a hosted run of the same bytes failed 0/11, so every host remains KAT-gated |
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: hardware-identified public runs loaded and executed but failed 0/11 exact vectors; alternative runtime pending |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
-| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official Linux Nix and Windows NuGet evidence packages integrated; Linux CPU probes rejected because OpenVINO did not own the complete frozen graph; Windows adverse execution and physical Intel CPU/GPU/NPU certificates pending |
+| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official Linux Nix and Windows NuGet evidence packages integrated; hosted Linux and Windows CPU probes rejected because OpenVINO did not own the complete frozen graph; physical Intel CPU/GPU/NPU certificates pending |
 | AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
 | AMD GPU | ORT MIGraphX EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT; ORT's older ROCm EP was removed in 1.23 and is not a second current path |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
-| Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Microsoft QNN 1.24.4 Windows ARM64 evidence package and public job integrated; physical Snapdragon HTP KAT/placement remains pending |
-| Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Microsoft DirectML 1.24.4 x64/ARM64 evidence package and public job integrated; each physical adapter still needs exact KAT and placement evidence |
-| WebGPU / Vulkan, D3D12, Metal fallback | ORT native WebGPU plugin EP | one official cross-vendor plugin targets Linux/Vulkan, Windows D3D12/Vulkan and macOS/Metal; quantized kernels exist but full W8A8 graph coverage and exact arithmetic are not assumed | Hash-pinned Linux/macOS Nix and Windows evidence packages integrated; local no-adapter rejection verified; hosted adverse and physical minimum/current adapter certificates pending |
+| Qualcomm HTP NPU | ORT QNN EP | QNN HTP has quantized INT8/UINT8 operators; its native signedness differs for some operators | Microsoft QNN 1.24.4 Windows ARM64 evidence package integrated; a hosted Cobalt ARM VM had no HTP and rejected backend initialization, so physical Snapdragon HTP KAT/placement remains pending |
+| Windows GPU / older mixed vendors | ORT DirectML EP | INT8 support and operator placement depend on driver and adapter | Microsoft DirectML 1.24.4 x64/ARM64 evidence package integrated; the hosted Hyper-V display exposed no matching DirectML device, so each physical adapter still needs exact KAT and placement evidence |
+| WebGPU / Vulkan, D3D12, Metal fallback | ORT native WebGPU plugin EP | one official cross-vendor plugin targets Linux/Vulkan, Windows D3D12/Vulkan and macOS/Metal; quantized kernels exist but full W8A8 graph coverage and exact arithmetic are not assumed | Hash-pinned Linux/macOS Nix and Windows evidence packages integrated; hosted Linux had no Vulkan adapter and hosted Windows left nodes on forbidden CPU fallback; physical minimum/current adapter certificates remain pending |
 
 There is no single native 8-bit container that every vendor accelerates.
 S8S8, U8U8, layout, fusion and kernel coverage differ. The common denominator
@@ -70,6 +70,14 @@ then passed 11/11 on a recorded AMD EPYC 7763 Azure VM while the same official
 runtime again failed 0/11 on recorded Arm Neoverse-N2 Linux and virtual Apple
 M1 macOS runners. Hardware capture makes each observation reproducible; it
 still does not turn a passing host into an architecture-wide package.
+Run
+[`32692516880`](https://github.com/corbet-labs/cfetch/actions/runs/32692516880)
+then failed 0/11 on a recorded Intel Xeon Platinum 8573C despite AVX2,
+AVX-512, VNNI and AMX-INT8; 412–739 bytes changed per answer. Run
+[`32693600516`](https://github.com/corbet-labs/cfetch/actions/runs/32693600516)
+reproduced 11/11 on the recorded EPYC 7763. The ISA's advertised integer
+instructions are therefore not sufficient admission metadata: the exact host
+executes the KAT and either produces or fails closed.
 
 The ort-sys bundled/static 1.28 build was deliberately rejected after failing
 all 11 records. ORT version strings are therefore informational; distribution
@@ -260,6 +268,16 @@ deliberately contains only OS/build, CPU name, GPU name/vendor/driver, and
 compute-accelerator friendly name/status—never PnP IDs, PCI addresses, UUIDs
 or serials.
 
+Public run
+[`32693600516`](https://github.com/corbet-labs/cfetch/actions/runs/32693600516)
+exercised all three packages. The Cobalt 100 ARM VM exposed no Qualcomm HTP;
+QNN returned `QNN_BACKEND_ERROR_CANNOT_INITIALIZE` and cfetch rejected the
+remaining CPU assignment. The x64 VM exposed only Microsoft Hyper-V Video, so
+DirectML found no matching device. Windows OpenVINO reached session
+construction on the hosted AMD CPU but did not own the complete graph. No KAT
+vector was emitted in any case, and none of these hosted results is relabeled
+as Qualcomm, DirectML-GPU or Intel-hardware evidence.
+
 ## Cross-vendor native WebGPU evidence package
 
 ONNX Runtime's native WebGPU EP is now an official plugin rather than an
@@ -290,6 +308,12 @@ and
 Both the core archive and plugin archive/library identities are recorded in
 the package manifest and certificate.
 
+This explicit hardware-probe package compiles the complete WebGPU feature but
+does not rerun cfetch's unrelated application integration tests. Those remain
+blocking platform checks. Two identical macOS attempts had otherwise stopped
+in an iroh test-server destructor before loading Metal; the probe's next step
+is the exact inference certificate, so no provider failure is being hidden.
+
 Plugin EPs use ORT's device API, so only this evidence package raises the Rust
 binding surface from C API 18 to API 22. The core runtime remains 1.28 and the
 frozen graph, FastEmbed pipeline, optimizer, static buckets, fallback rule,
@@ -299,6 +323,15 @@ devices originating from separate adapter factories even when they expose the
 same EP name. A local AMD host without an installed Vulkan
 ICD loaded the exact plugin and then failed with `No supported adapters`; that
 is a useful fail-closed package probe, not a GPU result.
+
+The corrected one-device public probe in run
+[`32693600516`](https://github.com/corbet-labs/cfetch/actions/runs/32693600516)
+reached the real provider boundary on Windows: the plugin registered a
+concrete device, but the frozen graph left nodes on forbidden ORT CPU fallback
+when the VM exposed only Microsoft Hyper-V Video. Linux loaded the same plugin
+and rejected `No supported adapters` because the runner had no Vulkan driver.
+These results prove package loading and fail-closed selection only; they do not
+certify a physical Vulkan or D3D12 adapter.
 
 ## Running a certificate
 
@@ -380,6 +413,10 @@ reproducible evidence tool, not a producer. Public run
 [`32681875052`](https://github.com/corbet-labs/cfetch/actions/runs/32681875052)
 reproduced that boundary on a recorded AMD EPYC 7763 hosted VM. That validates
 the package and rejection path, not Intel CPU/GPU/NPU support.
+Run
+[`32693600516`](https://github.com/corbet-labs/cfetch/actions/runs/32693600516)
+reproduced the same ownership rejection with both Linux and Windows evidence
+packages; its Windows host was also AMD, so Intel hardware remains untested.
 
 On physical Linux AMD systems, `nix build .#cfetch-test-migraphx` builds the
 locked ORT/MIGraphX/ROCm evidence package. Its first RX 6800 result is rejected

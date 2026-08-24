@@ -49,6 +49,16 @@
           "hardware_sha256": "b9480dac067c6571d3cdca9d672f61de2f6387d5ec0b20ad9ec7d1015a3db973",
           "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 7763; Microsoft hypervisor; runner image 20260816.277.1",
           "note": "11/11 exact with the hardware identity captured separately; the certificate remains scoped to this run and host environment"
+        },
+        {
+          "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
+          "report_artifact_id": 9508350456,
+          "report_artifact_digest": "sha256:fa5c1dc65386ad3ec93847b5e01c1113c43f848322967466b2594a34bbdc05c8",
+          "report_sha256": "5b89ccfcee22c9570b3e5c0fb9178214cf2b31c009c7b3aafe463302ebe59079",
+          "hardware_sha256": "b9480dac067c6571d3cdca9d672f61de2f6387d5ec0b20ad9ec7d1015a3db973",
+          "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 7763; Microsoft hypervisor; runner image 20260816.277.1",
+          "fastembed": "6.0.0 + cfetch session-controls 5dac3bca305617c4bb1b561cd83c97294a92ebec",
+          "note": "11/11 exact reproduction after the provider-device selector work; the passing scope remains this recorded host/runtime"
         }
       ],
       "artifact_verified": true,
@@ -126,6 +136,74 @@
       "note": "The public package reproduced the local session-construction rejection: OpenVINO could not own the complete frozen graph, so ORT attempted to assign nodes to its forbidden default CPU EP. This AMD CPU run validates the evidence package and failure boundary, not Intel device support."
     },
     {
+      "id": "windows-x86_64-openvino-cpu-run-32693600516",
+      "status": "rejected-accelerator-graph-coverage",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
+      "evidence_artifact_id": 9508298823,
+      "evidence_artifact_digest": "sha256:91dbcc669af471e42ed7c4ca10b29df3592a250337431bb6a208d33e8c74a0c2",
+      "hardware_sha256": "ae8aca6caf4348d3f8e5d2fb34b38fc4468e743b2dbff38debc7df4c5cd8572c",
+      "hardware": "GitHub standard windows-latest VM; AMD EPYC 9V74; Microsoft Hyper-V Video; runner build 26100",
+      "onnxruntime_distribution": "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1",
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "The pinned Windows package reached OpenVINO session initialization, but OpenVINO did not own the complete frozen graph and ORT rejected the forbidden CPU assignment. The hosted AMD CPU validates the Windows package/failure boundary, not an Intel device."
+    },
+    {
+      "id": "windows-arm64-qnn-htp-run-32693600516",
+      "status": "rejected-no-physical-htp-and-graph-coverage",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
+      "evidence_artifact_id": 9508236601,
+      "evidence_artifact_digest": "sha256:05246f15488f103651914c5c86333a0ab8bee53d06efd291460d5b1d522953c2",
+      "hardware_sha256": "f3edfb11417f64187f90c036808f75835f7dbdfea4f90f8280aa5f8ad92af68d",
+      "hardware": "GitHub standard windows-11-arm VM; Microsoft Cobalt 100 CPU; Microsoft Hyper-V Video; no compute accelerator reported",
+      "onnxruntime_distribution": "nuget-Microsoft.ML.OnnxRuntime.QNN-1.24.4",
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "The native ARM64 package loaded, but QNN HTP reported QNN_BACKEND_ERROR_CANNOT_INITIALIZE and remaining nodes would have used forbidden ORT CPU fallback. This is useful fail-closed hosted evidence, not Snapdragon/HTP hardware evidence."
+    },
+    {
+      "id": "windows-x86_64-directml-run-32693600516",
+      "status": "rejected-no-physical-adapter",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
+      "evidence_artifact_id": 9508311182,
+      "evidence_artifact_digest": "sha256:1635e908d1f746d7b63e4ea06a9a562f2b46edafa24e445bd254e7c14b9cc072",
+      "hardware_sha256": "4d8717cf7f1b886198a8a5722b784be2949431f8dc498b61df5634126ff526cf",
+      "hardware": "GitHub standard windows-latest VM; AMD EPYC 7763; Microsoft Hyper-V Video; runner build 26100",
+      "onnxruntime_distribution": "nuget-Microsoft.ML.OnnxRuntime.DirectML-1.24.4",
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "DirectML reported that no device matched the filter criteria. The hosted virtual display is not a physical DirectML adapter; package construction and the fail-closed boundary were exercised only."
+    },
+    {
+      "id": "windows-x86_64-webgpu-run-32693600516",
+      "status": "rejected-accelerator-graph-coverage-on-virtual-adapter",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
+      "evidence_artifact_id": 9508313943,
+      "evidence_artifact_digest": "sha256:0088cb37acfb280d59a5cb81344bc73018e5f1545eaec9e5882d976f818ead85",
+      "hardware_sha256": "4d8717cf7f1b886198a8a5722b784be2949431f8dc498b61df5634126ff526cf",
+      "hardware": "GitHub standard windows-latest VM; AMD EPYC 7763; Microsoft Hyper-V Video; runner build 26100",
+      "onnxruntime_distribution": "nuget-Microsoft.ML.OnnxRuntime-1.28.0-plus-EP.WebGpu-0.2.1",
+      "ort_c_api": 22,
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "The native WebGPU plugin registered one concrete device and reached session initialization, but it left graph nodes on forbidden ORT CPU fallback. The only exposed adapter was Microsoft Hyper-V Video, so this is adverse hosted evidence rather than a physical D3D12/Vulkan certificate."
+    },
+    {
+      "id": "linux-x86_64-webgpu-no-adapter-run-32693600516",
+      "status": "rejected-no-physical-adapter",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32693600516",
+      "evidence_artifact_id": 9508336499,
+      "evidence_artifact_digest": "sha256:40ffb72d931c49e5504daa3768aa6260cbf155c18ab066273874f1d4ff1c105f",
+      "execution_log_sha256": "d34d6d399eb6ec18ae2978689156090222fee1784a0eedbd1e05194493351409",
+      "hardware_sha256": "c5bf6c2873710e9ae5d86bc9e52a0b886e36cefb4d7f2476a02c4f877c6ebd04",
+      "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 9V74; Microsoft hypervisor; no Vulkan ICD/device exposed",
+      "onnxruntime_distribution": "microsoft-github-release-v1.28.0-plus-EP.WebGpu-0.2.1",
+      "ort_c_api": 22,
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 0,
+      "note": "The exact plugin loaded, Dawn found no Vulkan driver, and WebGPU failed with No supported adapters. No software renderer was substituted, so the package correctly failed closed without making a GPU claim."
+    },
+    {
       "id": "linux-x86_64-amd-rdna2-migraphx-rx6800",
       "status": "rejected-ort-graph-coverage-and-direct-vector-incompatibility",
       "evidence_scope": "physical local run recorded by public commit; no catalog admission",
@@ -173,6 +251,23 @@
       "note": "A later public x86-64 runner loaded the exact passing package/runtime but produced a third vector family. The older workflow did not record its CPU model, so this rejection is scoped to the run rather than an inferred processor family."
     },
     {
+      "id": "linux-x86_64-cpu-intel-xeon-8573c-run-32692516880",
+      "status": "rejected-vector-incompatibility",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32692516880",
+      "report_artifact_id": 9507958541,
+      "report_artifact_digest": "sha256:bda9eb4d052cdccf0fee85922c524da38bd01600d98c6cc560ceab0a6009aec9",
+      "report_sha256": "ee157f1efe7f1b6923ba63c17466818344ca41f7ce2f4eaaaca876b9f75d020f",
+      "hardware_sha256": "d6c98d2112212721b1f98529479a0eea856940f2646ee5718be1101018f160e2",
+      "hardware": "GitHub standard ubuntu-24.04 VM; Intel Xeon Platinum 8573C; AVX2/AVX-512/VNNI/AMX-INT8; Microsoft hypervisor; runner image 20260816.277.1",
+      "onnxruntime_archive_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407",
+      "onnxruntime_library_sha256": "1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab",
+      "exact_known_answers_passed": 0,
+      "exact_known_answers_failed": 11,
+      "changed_components_per_vector": "412..739 of 768",
+      "cosine_to_x86_reference": "0.970912..0.982675",
+      "note": "The exact official runtime and model executed on a recorded modern Intel host with extensive INT8 ISA support, but none of the 11 canonical records matched. AVX/VNNI/AMX availability is therefore not a producer certificate; the ordinary host KAT correctly rejects this environment."
+    },
+    {
       "id": "linux-aarch64-cpu-microsoft-ort-1.28.0",
       "status": "rejected-vector-incompatibility",
       "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32681875052",
@@ -218,11 +313,10 @@
     "intel-openvino-npu",
     "amd-xdna2",
     "amd-migraphx-rdna-current-generation-and-alternative-runtime",
-    "amd-rocm",
     "nvidia-cuda",
     "nvidia-tensorrt",
     "qualcomm-qnn-htp",
-    "windows-directml",
-    "webgpu-vulkan-class"
+    "windows-directml-physical-adapters",
+    "webgpu-vulkan-d3d12-metal-physical-adapters"
   ]
 }
