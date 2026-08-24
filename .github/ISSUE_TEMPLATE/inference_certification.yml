@@ -60,14 +60,14 @@ body:
     attributes:
       label: cfetch package identity
       description: Commit, package/variant name, and build source. Do not report an uncommitted binary.
-      placeholder: "commit d3aea70; cfetch-local-...; built from the public flake"
+      placeholder: "commit df2d676; cfetch-local-...; built from the public flake"
     validations:
       required: true
   - type: textarea
     id: certificate
     attributes:
-      label: Certificate JSON
-      description: Drag in the complete `cfetch-inference-certificate.json`, or paste it. The command is designed not to record private inputs or host identity.
+      label: Certificate JSON or failure output
+      description: Drag in the complete `cfetch-inference-certificate.json`, or paste it. If setup/execution failed before a report was written, paste the bounded error output instead. Remove private paths and host identity.
     validations:
       required: true
   - type: textarea
@@ -94,7 +94,7 @@ body:
           required: true
         - label: I reported the actual outcome without treating a load, approximate match, or failed run as producer support.
           required: true
-        - label: If this is an accelerator run, ORT CPU fallback was disabled and provider-internal placement is covered by the attached evidence.
+        - label: If accelerator inference executed, ORT CPU fallback was disabled and provider-internal placement is covered by the attached evidence; otherwise I described the blocker.
           required: true
         - label: I removed credentials, private inputs, usernames, hostnames, private paths, and unrelated machine data.
           required: true
