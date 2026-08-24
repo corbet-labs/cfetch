@@ -488,6 +488,11 @@ Linux x86-64 Intel testers use
 complete official ORT/OpenVINO wheel; exact bytes and per-device placement are
 still mandatory. The available local CPU probe was rejected because OpenVINO
 did not own the complete frozen graph, so this is an evidence package only.
+Windows x64 testers can create the equivalent hash-pinned NuGet evidence
+package with `scripts/build-windows-inference-package.ps1 -Provider
+openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
+replacing the provider suffix. The public hosted runner exercises CPU only and
+does not stand in for physical Intel GPU or NPU hardware.
 
 One tested x86-64 host is the current certified CPU reference; a later public
 x86-64 host using the exact same package/runtime failed all 11 vectors. Public

@@ -29,7 +29,9 @@ else {
 }
 $manifestPath = Join-Path $packagePath "runtime-manifest.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if ($manifest.schema_version -ne 1 -or $manifest.provider -notin @("directml", "qnn", "vitis")) {
+if ($manifest.schema_version -ne 1 -or $manifest.provider -notin @(
+        "directml", "qnn", "vitis", "openvino-cpu", "openvino-gpu", "openvino-npu"
+    )) {
     throw "unsupported Windows inference package manifest"
 }
 if ($manifest.os -ne "windows" -or $manifest.arch -notin @("x64", "arm64")) {
@@ -51,6 +53,18 @@ $publishedRuntimes = @{
     qnn = @{
         Distribution = "nuget-Microsoft.ML.OnnxRuntime.QNN-1.24.4"
         Sha256 = "e4d6eabb9e503d4f3c78494fc9400f02509b2ee315d9f707644a174ece8da17f"
+    }
+    "openvino-cpu" = @{
+        Distribution = "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1"
+        Sha256 = "f53ad5f90e3d616970a5c65e4880ebbe92c9774e9727020661db591cea74a110"
+    }
+    "openvino-gpu" = @{
+        Distribution = "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1"
+        Sha256 = "f53ad5f90e3d616970a5c65e4880ebbe92c9774e9727020661db591cea74a110"
+    }
+    "openvino-npu" = @{
+        Distribution = "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1"
+        Sha256 = "f53ad5f90e3d616970a5c65e4880ebbe92c9774e9727020661db591cea74a110"
     }
 }
 if ($publishedRuntimes.ContainsKey($manifest.provider)) {

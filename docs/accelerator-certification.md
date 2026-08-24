@@ -26,7 +26,7 @@ inference; they are never silently called producers.
 | x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified only on named hosts** with Microsoft's official ORT 1.28.0 release, 11/11 exact; a hosted run of the same bytes failed 0/11, so every host remains KAT-gated |
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: hardware-identified public runs loaded and executed but failed 0/11 exact vectors; alternative runtime pending |
 | Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | **Rejected on the hosted virtual Apple probe**: both GPU and NPU routes placed all 2,212 logged operations on Core ML's CPU and left other nodes on ORT CPU; a physical-device certificate and alternative runtime/graph route remain pending |
-| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official `cfetch-test-openvino` runtime package integrated for Linux x86-64; local CPU probe rejected because OpenVINO did not own the complete frozen graph; public reproduction and physical GPU/NPU certificates pending |
+| Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Official Linux Nix and Windows NuGet evidence packages integrated; Linux CPU probes rejected because OpenVINO did not own the complete frozen graph; Windows adverse execution and physical Intel CPU/GPU/NPU certificates pending |
 | AMD XDNA / XDNA2 NPU | ORT Vitis AI | Ryzen AI 1.8 exposes an A8W8 compiler and broad A8W8 operator coverage, but its compatibility table promises INT8 only for CNNs; the newer Windows ML route requires A16W8 for quantized Transformers | Rust session path and a local package builder for AMD's installed deployment runtime are integrated; physical X1/X2 KAT and operator-assignment reports remain pending, and no AMD NPU is yet a producer |
 | AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX compiled the complete frozen graph to 512 GPU code objects on a physical RDNA2 RX 6800, including 168 quantized dot and one quantized GEMM occurrence | Reproducible Nix/ORT/MIGraphX package integrated, but **rejected**: ORT left nodes on forbidden CPU fallback; standalone full-GPU MIGraphX executed but changed 729/768 bytes on the first KAT |
 | NVIDIA GPU | ORT CUDA or TensorRT EP | TensorRT explicit quantization uses signed INT8 Q/DQ; no cfetch recalibration is allowed | Official ORT CUDA 12 runtime and separate Nix-pinned CUDA/TensorRT evidence packages integrated; package tests pass, but oldest/current physical architecture KAT and placement certificates remain pending |
@@ -223,10 +223,11 @@ before session construction because `libcuda.so.1` was absent. That confirms
 the package did not fall back to CPU; it is not an NVIDIA hardware result and
 does not appear in the accepted or rejected device registry.
 
-## Windows DirectML and Qualcomm QNN evidence packages
+## Windows DirectML, Qualcomm QNN and Intel OpenVINO evidence packages
 
 `scripts/build-windows-inference-package.ps1` creates a self-checking local
-package for `directml` or `qnn`; the companion certification script verifies
+package for `directml`, `qnn`, `openvino-cpu`, `openvino-gpu`, or
+`openvino-npu`; the companion certification script verifies
 every packaged file and the frozen model bundle before running cfetch. DirectML
 uses Microsoft's
 `Microsoft.ML.OnnxRuntime.DirectML` 1.24.4 NuGet, archive SHA-256
@@ -239,13 +240,23 @@ package carries Microsoft's ORT QNN provider and Qualcomm's CPU/GPU/HTP
 runtime libraries and notices; cfetch selects `QnnHtp.dll` and still forbids
 ORT CPU fallback.
 
+The OpenVINO variants all pin Intel's
+`Intel.ML.OnnxRuntime.OpenVino` 1.24.1 NuGet, archive SHA-256
+`f53ad5f90e3d616970a5c65e4880ebbe92c9774e9727020661db591cea74a110`.
+Its Windows x64 native directory contains one ORT/OpenVINO build plus the
+OpenVINO 2025.4.1 CPU, GPU and NPU plugins. The provider name selects the
+device; it does not change the graph or package bytes. The package therefore
+refuses ARM64 rather than substituting a different runtime.
+
 The public workflow uses `windows-latest` for DirectML and
-`windows-11-arm` for QNN. These are packaging and adverse-execution probes on
-the hardware actually exposed to each hosted runner. A Windows ARM runner name
-is not proof of a Snapdragon HTP, and a virtual display adapter is not proof of
-a physical DirectML GPU. The uploaded hardware JSONL deliberately contains
-only OS/build, CPU name, GPU name/vendor/driver, and compute-accelerator
-friendly name/status—never PnP IDs, PCI addresses, UUIDs or serials.
+OpenVINO CPU and `windows-11-arm` for QNN. These are packaging and
+adverse-execution probes on the hardware actually exposed to each hosted
+runner. A Windows ARM runner name is not proof of a Snapdragon HTP, a virtual
+display adapter is not proof of a physical DirectML GPU, and hosted OpenVINO
+CPU execution is not Intel GPU/NPU evidence. The uploaded hardware JSONL
+deliberately contains only OS/build, CPU name, GPU name/vendor/driver, and
+compute-accelerator friendly name/status—never PnP IDs, PCI addresses, UUIDs
+or serials.
 
 ## Running a certificate
 
@@ -368,8 +379,10 @@ On Windows, build and run a provider package from PowerShell 7:
   -Report ./cfetch-inference-certificate.json
 ```
 
-Use `qnn` instead of `directml` only on native Windows ARM64. A physical QNN
-submission must also attach HTP placement/profiling evidence.
+Use `qnn` instead of `directml` only on native Windows ARM64. On Windows x64,
+use `openvino-cpu`, `openvino-gpu`, or `openvino-npu` to test Intel's pinned
+OpenVINO package. A physical accelerator submission must also attach the
+relevant HTP, DirectML or OpenVINO placement/profiling evidence.
 
 The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,
@@ -390,6 +403,7 @@ Primary implementation references:
 - [TensorRT explicit quantization](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/work-quantized-types.html)
 - [Core ML optimization overview](https://apple.github.io/coremltools/docs-guides/source/opt-overview.html)
 - [OpenVINO execution provider](https://onnxruntime.ai/docs/execution-providers/OpenVINO-ExecutionProvider.html)
+- [Intel ORT/OpenVINO NuGet](https://www.nuget.org/packages/Intel.ML.OnnxRuntime.OpenVino)
 - [Vitis AI execution provider](https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html)
 - [Ryzen AI 1.8 model deployment](https://ryzenai.docs.amd.com/en/latest/modelrun.html)
 - [Ryzen AI 1.8 application packaging](https://ryzenai.docs.amd.com/en/latest/app_development.html)

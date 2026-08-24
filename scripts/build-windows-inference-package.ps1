@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("directml", "qnn")]
+    [ValidateSet("directml", "qnn", "openvino-cpu", "openvino-gpu", "openvino-npu")]
     [string]$Provider,
 
     [Parameter(Mandatory = $true)]
@@ -42,10 +42,26 @@ $packages = @{
         Sha256 = "e4d6eabb9e503d4f3c78494fc9400f02509b2ee315d9f707644a174ece8da17f"
         Distribution = "nuget-Microsoft.ML.OnnxRuntime.QNN-1.24.4"
     }
+    openvino = @{
+        Feature = "inference-openvino"
+        Runtime = "win-x64"
+        Url = "https://api.nuget.org/v3-flatcontainer/intel.ml.onnxruntime.openvino/1.24.1/intel.ml.onnxruntime.openvino.1.24.1.nupkg"
+        Sha256 = "f53ad5f90e3d616970a5c65e4880ebbe92c9774e9727020661db591cea74a110"
+        Distribution = "nuget-Intel.ML.OnnxRuntime.OpenVino-1.24.1"
+    }
 }
-$package = $packages[$Provider]
+$packageKey = if ($Provider.StartsWith("openvino-", [StringComparison]::Ordinal)) {
+    "openvino"
+}
+else {
+    $Provider
+}
+$package = $packages[$packageKey]
 if ($Provider -eq "qnn" -and $architecture -ne "arm64") {
     throw "the QNN HTP evidence package requires native Windows ARM64"
+}
+if ($packageKey -eq "openvino" -and $architecture -ne "x64") {
+    throw "the Intel OpenVINO evidence package requires native Windows x64"
 }
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("cfetch-windows-package-" + [Guid]::NewGuid())

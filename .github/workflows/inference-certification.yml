@@ -186,6 +186,8 @@ jobs:
             provider: directml
           - runner: windows-11-arm
             provider: qnn
+          - runner: windows-latest
+            provider: openvino-cpu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
