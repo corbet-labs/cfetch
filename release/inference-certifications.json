@@ -24,7 +24,7 @@
       "status": "passing-reference",
       "scope": "Microsoft official ORT 1.28.0 with deterministic compute and precise QMM; exact admission still runs on every actual host",
       "catalog_admitted": false,
-      "catalog_blocker": "public hosted schema-2 recertification and final release-package publication are pending",
+      "catalog_blocker": "the published reference is not an architecture-wide producer: admission remains per actual host after its startup KAT, and the ordinary release catalog remains remote-only",
       "os": "linux",
       "arch": "x86_64",
       "provider": "cpu",
@@ -52,6 +52,17 @@
           "hardware_sha256": "c437e642a844f919f182869ab2e8d686dd87b57634b4998127d9c0d0e2944c49",
           "report_sha256": "af48bdb87317241155e5e8cba18a206ca80e19d59fd338af75a6063c5ddbe538",
           "result": "11/11 exact with the Ryzen raw outputs and INT8x768 bytes"
+        }
+      ],
+      "hosted_runs": [
+        {
+          "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32773351318",
+          "report_artifact_id": 9537501644,
+          "report_artifact_digest": "sha256:97261ce2160e2e2496a776d22f86cccc8a66ed3d7d5dab610ef606c5192f0de8",
+          "hardware": "GitHub standard ubuntu-24.04 VM; AMD EPYC 7763; AVX2; Microsoft hypervisor; runner image 20260816.277.1",
+          "hardware_sha256": "b9480dac067c6571d3cdca9d672f61de2f6387d5ec0b20ad9ec7d1015a3db973",
+          "report_sha256": "eed173f999519214e6c2f105df664e94ac0546e5d335a1c61d2db15e11778e95",
+          "result": "11/11 exact; this certifies the recorded host/runtime only"
         }
       ],
       "int8_evidence": "canonical QDQ graph audit: 171 learned nodes covered; no floating-point shadow learned weights",
@@ -342,6 +353,99 @@
       "exact_known_answers_failed": 11,
       "result": "Strict session rejected unsupported QuantizeLinear and other CPU nodes. Controlled hybrid output was byte-stable across three runs, but WebGPU dequantized learned tensors and executed f32 MatMul shaders instead of W8A8 kernels.",
       "note": "Temperature changed by several degrees without changing any raw-output or final-vector byte; this is deterministic provider lowering, not heat instability."
+    },
+    {
+      "id": "cpu-arm64-microsoft-ort-1.28.0-run-32773351318",
+      "status": "rejected-vector-incompatibility",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32773351318",
+      "head_sha": "d4a7ff43f6063fff2fcfdadc33266db53f8aab4f",
+      "diagnostic": "unchanged corrected-v1 profile; deterministic compute and precise QMM enabled",
+      "linux_arm64": {
+        "report_artifact_id": 9537351146,
+        "report_artifact_digest": "sha256:c943650aee862a4397d5ec127b173d6797b5505560c28181442aecde8aadcfed",
+        "hardware": "GitHub standard ubuntu-24.04-arm VM; Arm Neoverse-N2; runner image 20260817.96.1",
+        "hardware_sha256": "5fdfad8cd43342c7bd65a5e0f7e6f641dfff6c7718799223b9136b531c98197e",
+        "report_sha256": "b0df0f912843bd23079abb0485de1d7257bc66655a1ec5fb6c15c275903b96eb",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11
+      },
+      "macos_arm64": {
+        "report_artifact_id": 9537424048,
+        "report_artifact_digest": "sha256:1f3a0d87e96667f783f61b0744491a3bad4966be69141babc93fadfb2d4fba86",
+        "hardware": "GitHub standard macos-15 virtual runner; VirtualMac2,1; Apple M1 (Virtual); image 20260727.0256.1",
+        "hardware_sha256": "069fc6d45377d3204494d65f12b745198ca58d4c87bfea0d1740606e15fd82e0",
+        "report_sha256": "4020bc747eeed0743c0b40f1d81fd67603c8f2e5d614508f9b26bf14e71cd209",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11
+      },
+      "note": "Both routes were byte-stable on repeated execution but incompatible with corrected v1. The virtual Apple result is CPU evidence only, not physical Apple Silicon or ANE evidence."
+    },
+    {
+      "id": "cpu-arm64-disable-kleidiai-control-run-32775278824",
+      "status": "rejected-no-effect",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32775278824",
+      "head_sha": "737d2399eb769cfac7ada7b82ed42142a13d44e0",
+      "diagnostic_only": true,
+      "control": "session.disable_kleidiai=1 through the cfetch FastEmbed fork",
+      "linux_arm64": {
+        "report_artifact_id": 9538038763,
+        "report_artifact_digest": "sha256:71aafcd030ae649aff8efee584097d04684d1a429f8f13fc6fceeb1a276f9b0f",
+        "report_sha256": "70751b14bcb41d44c04023f11a293f7cb575b07048feb397d2fb6b214e221d24",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11
+      },
+      "macos_arm64": {
+        "report_artifact_id": 9538124219,
+        "report_artifact_digest": "sha256:ba120eea246ed9bb04ece2346c804aa24a9150a622550b067a79457f85b6878b",
+        "report_sha256": "6b88c55be34b63b908f985decaa986f39132267fba5c9ecbc49ac316a564a138",
+        "exact_known_answers_passed": 0,
+        "exact_known_answers_failed": 11
+      },
+      "note": "Disabling KleidiAI changed zero of 11 raw outputs and zero final vectors on both Arm hosts. KleidiAI was not the selected or causal route for this graph."
+    },
+    {
+      "id": "cpu-common-unsigned-qdq-control-run-32777227532",
+      "status": "rejected-vector-incompatibility",
+      "run_url": "https://github.com/corbet-labs/cfetch/actions/runs/32777227532",
+      "head_sha": "1368eb60e649d0393417a8910088fb8998d4d6ce",
+      "diagnostic_only": true,
+      "control": "session.qdqisint8allowed=0 on every architecture; no model or calibration change",
+      "physical_ryzen_x86_64": {
+        "hardware": "Physical Linux x86-64 host; AMD Ryzen 9 5950X; AVX2",
+        "report_sha256": "137a7cc3761a303c134b0d5f2988fbfee1bc26a806d0aa0f39b78c129a54b0d2",
+        "exact_known_answers_passed": 11,
+        "exact_known_answers_failed": 0
+      },
+      "hosted_x86_64": {
+        "report_artifact_id": 9538781594,
+        "report_artifact_digest": "sha256:e7e3a640c9dff0e29f2c933b1e0940f6502f8066141369e7a90639fef0969047",
+        "hardware": "GitHub standard ubuntu-24.04 VM; Intel Xeon Platinum 8573C; AVX-VNNI/AVX-512/VNNI/AMX-INT8; runner image 20260816.277.1",
+        "hardware_sha256": "d6c98d2112212721b1f98529479a0eea856940f2646ee5718be1101018f160e2",
+        "report_sha256": "cdc2ed4d6f1f5466216eae10552f0bfe1c2398051c177091b8faf983cdc02a12",
+        "exact_known_answers_passed": 6,
+        "exact_known_answers_failed": 5,
+        "result": "all sequence-32 and sequence-64 records passed; buckets 128 through 2048 failed"
+      },
+      "linux_arm64": {
+        "report_artifact_id": 9538750411,
+        "report_artifact_digest": "sha256:45d0465e673ab95e5af371061bc39ac98a0889c3626ef7209f578b173350ac2e",
+        "hardware": "GitHub standard ubuntu-24.04-arm VM; Arm Neoverse-N2; runner image 20260817.96.1",
+        "report_sha256": "829dec8a3862e2c0286443371865580b3ea27333cd2a8e615373e58a057ee317",
+        "exact_known_answers_passed": 1,
+        "exact_known_answers_failed": 10,
+        "passing_label": "source-code"
+      },
+      "macos_arm64": {
+        "report_artifact_id": 9538865788,
+        "report_artifact_digest": "sha256:03f8b491084665a630ea93edf1ee016e01d7cfd955bd5f71b38fac473b91e5ef",
+        "hardware": "GitHub standard macos-15 virtual runner; VirtualMac2,1; Apple M1 (Virtual); image 20260727.0256.1",
+        "report_sha256": "5a90651970e70455026a8d10353c2b33526fce9d2f35a14e182ee59ab02a4e25",
+        "exact_known_answers_passed": 1,
+        "exact_known_answers_failed": 10,
+        "passing_label": "source-code"
+      },
+      "accelerator_result": "CoreML, OpenVINO, QNN, DirectML and WebGPU jobs remained rejected at the same no-device or incomplete-graph-ownership boundaries; the control did not create a new accelerator producer route.",
+      "note": "ORT's architecture-dependent signed-QDQ policy is one source of divergence, but freezing it is insufficient. The remaining size- and ISA-specific quantized kernels still produce stable incompatible outputs; ORT deterministic compute does not promise cross-kernel byte identity."
     }
   ],
   "superseded_pre_release_kat_evidence": {

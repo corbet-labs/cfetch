@@ -522,11 +522,12 @@ the GPU warmed by several degrees, ruling out temperature instability.
 
 The corrected CPU reference freezes ORT deterministic compute and precise QMM.
 It produced identical raw outputs and final vectors on a physical Ryzen 9
-5950X AVX2 host and a physical Core Ultra 7 258V VNNI host: 11/11 on both. The
-former AVX2 KAT had accidentally canonized ORT's saturating U8S8 fast path and
-all earlier CPU reports are superseded until rerun against report schema 2.
-Ordinary local loading runs the same admission gate on the actual host and
-fails closed before writing incompatible vectors. See the
+5950X AVX2 host, a physical Core Ultra 7 258V VNNI host, and one hosted EPYC
+7763: 11/11 on each. Current hosted Arm routes failed 0/11, and a controlled
+Q/DQ-policy run on a Xeon 8573C passed only 6/11. Deterministic execution is
+repeatable on a selected kernel route; it is not a cross-hardware byte promise.
+Ordinary local loading therefore runs the same admission gate on every actual
+host and fails closed before writing incompatible vectors. See the
 [frozen profile](docs/embedding-profile-v1.md) and
 [certification matrix](docs/accelerator-certification.md).
 

@@ -27,6 +27,9 @@ archive. No training, fine-tuning, distillation or pruning was performed.
 The reference runner is the Nix x86-64 CPU package using Microsoft's exact
 official ONNX Runtime 1.28.0 shared release. With the frozen precise-QMM
 policy, the real Rust/FastEmbed/ORT path produces the same 11 raw outputs and
-known-answer vectors on physical AMD AVX2 and Intel VNNI CPUs. Other CPU, GPU
-and NPU paths remain consumer-only until their current physical certification
-reports pass.
+known-answer vectors on physical AMD AVX2 and Intel VNNI CPUs and on one
+recorded hosted AMD EPYC 7763. This is deliberately host-scoped: current
+hosted Arm routes failed exact conformance, and a hosted Intel Xeon 8573C
+control exposed a sequence-size-dependent mismatch despite extensive INT8 ISA
+support. Every actual producer host must pass the startup KAT. Other CPU, GPU
+and NPU paths remain consumer-only until their certification reports pass.
