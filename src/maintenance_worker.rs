@@ -79,10 +79,12 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
                                 debounce
                             }
                     });
+                    let _ = crate::runtime_status::refresh_static();
                 }
                 Err(error) => {
                     eprintln!("cfetch maintenance degraded: {error:#}");
                     due = Some(Instant::now() + FAILURE_RETRY);
+                    let _ = crate::runtime_status::refresh_static();
                 }
             }
         }
