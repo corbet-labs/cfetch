@@ -185,7 +185,7 @@ overwrite a shadow configuration owned by the other.
 ```console
 $ cfetch cards init
 $ cfetch cards list
-$ cfetch cards select cloud.certificates.databricks
+$ cfetch cards select cloud.bearingpoint.interview
 $ cfetch cards status
 $ cfetch cards tui
 ```
