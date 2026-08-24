@@ -5,6 +5,12 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Selective nixcards knowledge.** `cfetch cards` initializes and manages the
+  public nixcards catalogue as a blobless sparse checkout at
+  `knowledge/cards`, with dotted branch selectors, JSON status, explicit
+  fast-forward sync, and an optional handoff to the nixcards TUI. Git's native
+  sparse state is the sole local selection record shared by both tools;
+  materialized cards inherit trust only from their canonical knowledge path.
 - **Autonomous AI memory maintenance.** A configured daemon reacts to changed
   ring-5 evidence, runs bounded proposal and isolated review passes, rechecks
   deterministic authority, citation, path, secret, expiry, and exact-byte
