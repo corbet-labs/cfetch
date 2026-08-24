@@ -68,3 +68,54 @@ jobs:
           name: inference-certificate-${{ matrix.runner }}
           path: ${{ runner.temp }}/cfetch-inference-certificate.json
           if-no-files-found: warn
+
+  apple-coreml-kat:
+    name: Apple CoreML KAT (${{ matrix.provider }})
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [coreml-gpu, coreml-npu]
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate frozen bundle input
+        env:
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+        run: |
+          test "$BUNDLE_SHA256" = 12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+          case "$BUNDLE_URL" in
+            https://github.com/corbet-labs/cfetch/releases/download/*/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz) ;;
+            *) echo "bundle_url must name the frozen archive in a public cfetch GitHub release" >&2; exit 2 ;;
+          esac
+      - uses: cachix/install-nix-action@v31
+      - name: Build the pinned CoreML test package
+        run: nix build .#cfetch-test-coreml --out-link "$RUNNER_TEMP/cfetch-coreml"
+      - name: Download frozen model bundle
+        env:
+          BUNDLE_URL: ${{ inputs.bundle_url }}
+        run: |
+          curl --proto '=https' --tlsv1.2 --location --fail --show-error \
+            --output "$RUNNER_TEMP/cfetch-embedding-v1.tar.gz" \
+            "$BUNDLE_URL"
+      - name: Run exact vector certification with compute-plan logging
+        env:
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          PROVIDER: ${{ matrix.provider }}
+        run: |
+          set -o pipefail
+          bash scripts/certify-inference-bundle.sh \
+            "$RUNNER_TEMP/cfetch-embedding-v1.tar.gz" \
+            "$BUNDLE_SHA256" \
+            "$RUNNER_TEMP/cfetch-coreml/bin/cfetch" \
+            "$RUNNER_TEMP/cfetch-inference-certificate.json" \
+            "$PROVIDER" 2>&1 | tee "$RUNNER_TEMP/cfetch-coreml-run.log"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: inference-certificate-macos-15-${{ matrix.provider }}
+          path: |
+            ${{ runner.temp }}/cfetch-inference-certificate.json
+            ${{ runner.temp }}/cfetch-coreml-run.log
+          if-no-files-found: warn

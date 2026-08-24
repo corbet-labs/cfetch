@@ -25,7 +25,11 @@
             # flake would need NIXPKGS_ALLOW_UNFREE=1 just to install cfetch
             # from cfetch's own flake. Scoped to exactly this package.
             config.allowUnfreePredicate = pkg:
-              builtins.elem (nixpkgs.lib.getName pkg) [ "cfetch" "cfetch-local-cpu" ];
+              builtins.elem (nixpkgs.lib.getName pkg) [
+                "cfetch"
+                "cfetch-local-cpu"
+                "cfetch-test-coreml"
+              ];
           })
         );
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
@@ -75,6 +79,7 @@
           {
             pname,
             localInference ? false,
+            inferenceFeature ? "inference-ort",
           }:
           pkgs.rustPlatform.buildRustPackage {
           inherit pname;
@@ -90,7 +95,7 @@
                 "sha256-wM3644tWbej0NJX+k7utXNtAMlMe6vFpe0iYPu0fczE=";
             };
           };
-          buildFeatures = pkgs.lib.optionals localInference [ "inference-ort" ];
+          buildFeatures = pkgs.lib.optionals localInference [ inferenceFeature ];
           CFETCH_ORT_DISTRIBUTION =
             if localInference then "microsoft-github-release-v${ortVersion}" else null;
           CFETCH_ORT_ARCHIVE_SHA256 = if localInference then ortAsset.sha256 else null;
@@ -149,12 +154,29 @@
           localInference = true;
         };
         default = cfetch;
+      } // pkgs.lib.optionalAttrs (
+        pkgs.stdenv.hostPlatform.isDarwin
+        && pkgs.stdenv.hostPlatform.isAarch64
+      ) {
+        # Certification package, never a catalog claim. Microsoft's official
+        # macOS ORT archive contains CoreML; physical compute-plan evidence and
+        # exact bytes decide whether this host/provider may produce v1 vectors.
+        cfetch-test-coreml = mkCfetch {
+          pname = "cfetch-test-coreml";
+          localInference = true;
+          inferenceFeature = "inference-coreml";
+        };
       });
 
       checks = forAllSystems (pkgs: {
         # buildRustPackage already runs `cargo test` in checkPhase.
         cfetch = self.packages.${pkgs.stdenv.hostPlatform.system}.cfetch;
         cfetch-local-cpu = self.packages.${pkgs.stdenv.hostPlatform.system}.cfetch-local-cpu;
+      } // pkgs.lib.optionalAttrs (
+        pkgs.stdenv.hostPlatform.isDarwin
+        && pkgs.stdenv.hostPlatform.isAarch64
+      ) {
+        cfetch-test-coreml = self.packages.${pkgs.stdenv.hostPlatform.system}.cfetch-test-coreml;
       });
     };
 }

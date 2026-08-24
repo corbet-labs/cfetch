@@ -25,7 +25,7 @@ inference; they are never silently called producers.
 |---|---|---|---|
 | x86-64 CPU / AVX | FastEmbed + ORT CPU | canonical S8S8 Q/DQ graph; no float learned-weight copy | **Certified reference** on the tested x86-64 host with Microsoft's official ORT 1.28.0 release, 11/11 exact |
 | arm64 CPU | FastEmbed + ORT CPU | same graph; official Microsoft Linux arm64 and macOS arm64 runtime archives pinned | **Rejected** for production with those runtimes: public physical runs passed bundle/runtime loading but failed 0/11 exact vectors; alternative runtime pending |
-| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | Session path integrated; macOS EP runtime package and physical Metal/ANE certificates pending |
+| Apple Metal / ANE | ORT Core ML EP | Core ML supports 8-bit model optimization; actual device/compute-plan placement is hardware-generation dependent | Official-runtime `cfetch-test-coreml` package integrated with static MLProgram shapes and compute-plan logging; public Apple Silicon GPU/ANE probes and reviewed physical certificates pending |
 | Intel CPU / GPU / NPU | ORT OpenVINO EP | OpenVINO exposes INT8 execution across supported devices, but partitioning is graph/device specific | Session path integrated; Intel publishes EP runtimes; physical per-device certificates pending |
 | AMD XDNA2 NPU | ORT Vitis AI or a reviewed Ryzen AI adapter | XDNA2 exposes INT8, but Ryzen AI 1.8 documents INT8 for CNN and BF16 for NLP, an ORT 1.16 Vitis path, and automatic CPU partitioning | Rust session surface integrated, but no compatible cfetch runtime package yet; an AMD adapter/runtime update and physical KAT/placement proof are required |
 | AMD GPU | ORT MIGraphX or ROCm EP | MIGraphX accepts quantized ONNX paths on supported consumer/server GPUs; actual operator coverage varies | Session path integrated; AMD's current prebuilt MIGraphX runtime is within cfetch's API floor; RDNA/CDNA packaging and physical certificates pending |
@@ -135,6 +135,13 @@ reports only devices exposed to the hosted VM. Its first Apple run found CPU
 and an Apple paravirtual GPU but no Neural Engine; an arm64 runner label is not
 ANE evidence.
 
+On Apple Silicon, `nix build .#cfetch-test-coreml` builds the non-catalogue
+CoreML certification package against the same pinned official ORT archive.
+The workflow probes `coreml-gpu` and `coreml-npu` separately with MLProgram,
+the frozen static sequence buckets, low-precision GPU accumulation disabled,
+and Core ML compute-plan logging enabled. A hosted result can prove only the
+device actually exposed to that runner; it cannot stand in for an absent ANE.
+
 The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,
 runs the KAT, and uploads the JSON report. No secret or private runner is
@@ -143,7 +150,8 @@ physical testers use the same command and attach the report and profiler
 evidence through the public [inference hardware run form](https://github.com/corbet-labs/cfetch/issues/new?template=inference_certification.yml).
 The form accepts exact passes, byte mismatches, execution failures and setup
 blockers. Failed evidence is kept as a rejected attempt; it never becomes a
-producer claim.
+producer claim. The [public physical-certification tracker](https://github.com/corbet-labs/cfetch/issues/9)
+lists the remaining device families and current results.
 
 Primary implementation references:
 

@@ -753,7 +753,7 @@ fn cpu_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
 
 #[cfg(feature = "inference-coreml")]
 fn coreml_provider(name: &str) -> (&'static str, &'static str, ExecutionProviderDispatch) {
-    use ort::ep::coreml::ComputeUnits;
+    use ort::ep::coreml::{ComputeUnits, ModelFormat};
 
     let (name, units, class) = match name {
         "coreml-gpu" => ("coreml-gpu", ComputeUnits::CPUAndGPU, "gpu"),
@@ -766,6 +766,12 @@ fn coreml_provider(name: &str) -> (&'static str, &'static str, ExecutionProvider
         class,
         ort::ep::CoreML::default()
             .with_compute_units(units)
+            .with_model_format(ModelFormat::MLProgram)
+            .with_static_input_shapes(true)
+            // The log is part of the external placement-review evidence. It
+            // does not by itself grant producer admission.
+            .with_profile_compute_plan(true)
+            .with_low_precision_accumulation_on_gpu(false)
             .build()
             .error_on_failure(),
     )
