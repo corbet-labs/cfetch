@@ -410,7 +410,7 @@ line should not try to fit:
   configured embedding endpoint;
 - whether autonomous maintenance is configured and running, its local or
   remote route, proposal and review models, pending candidates, immutable
-  outcomes, exceptions, and last model attempt.
+  outcomes, tampered or unreadable history, exceptions, and last model attempt.
 
 ```console
 $ cfetch doctor               # one read-only diagnostic report with bounded peer probes

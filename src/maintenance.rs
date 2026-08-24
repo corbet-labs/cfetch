@@ -770,7 +770,24 @@ fn render_event(event: &MaintenanceEvent) -> String {
 
 fn load_event_at(path: &Path) -> anyhow::Result<MaintenanceEvent> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_value(fenced_json(&text)?).context("decode maintenance event")
+    let event: MaintenanceEvent =
+        serde_json::from_value(fenced_json(&text)?).context("decode maintenance event")?;
+    let expected = event_identity(&event)?;
+    anyhow::ensure!(
+        event.id == expected,
+        "maintenance event content address mismatch: expected {expected}"
+    );
+    anyhow::ensure!(
+        path.file_stem().and_then(|name| name.to_str()) == Some(event.id.as_str()),
+        "maintenance event filename does not match its content address"
+    );
+    Ok(event)
+}
+
+fn event_identity(event: &MaintenanceEvent) -> anyhow::Result<String> {
+    let mut identity = event.clone();
+    identity.id.clear();
+    Ok(format!("event-{}", &hash_bytes(serde_json::to_vec(&identity)?)[..16]))
 }
 
 fn write_event(cfg: &Config, mut event: MaintenanceEvent) -> anyhow::Result<MaintenanceEvent> {
@@ -778,9 +795,7 @@ fn write_event(cfg: &Config, mut event: MaintenanceEvent) -> anyhow::Result<Main
     for check in &mut event.checks {
         check.detail = journal_text(&check.detail);
     }
-    let mut identity = event.clone();
-    identity.id.clear();
-    event.id = format!("event-{}", &hash_bytes(serde_json::to_vec(&identity)?)[..16]);
+    event.id = event_identity(&event)?;
     let path = history_path(&cfg.brain_root, &event.id);
     if path.exists() {
         let existing = load_event_at(&path)?;
@@ -817,6 +832,33 @@ pub fn history(cfg: &Config) -> Vec<MaintenanceEvent> {
         .collect();
     events.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
     events
+}
+
+/// Corrupt or edited history is never accepted as an automatic outcome. The
+/// doctor uses these bounded, brain-relative diagnostics to make tampering or
+/// storage damage visible instead of silently lowering the event count.
+pub fn history_issues(cfg: &Config) -> Vec<String> {
+    let dir = state_dir(&cfg.brain_root, HISTORY);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => return vec![format!("history directory unreadable: {error}")],
+    };
+    let mut issues = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .filter_map(|path| {
+            load_event_at(&path).err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or("history record")
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    issues.sort();
+    issues
 }
 
 fn event_for(
@@ -2425,5 +2467,32 @@ mod tests {
         let bounded = journal_text(&large);
         assert!(bounded.len() <= MAX_JOURNAL_TEXT_BYTES + 64);
         assert!(bounded.ends_with("[journal detail truncated]"));
+    }
+
+    #[test]
+    fn edited_history_is_rejected_and_reported_for_doctor() {
+        let fixture = Fixture::new();
+        let event = write_event(
+            &fixture.cfg,
+            event_for(
+                None,
+                EventOutcome::Exception,
+                None,
+                Vec::new(),
+                "original exception",
+                vec![fixture.candidate.id.clone()],
+            ),
+        )
+        .unwrap();
+        let path = history_path(fixture.brain.path(), &event.id);
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("original exception", "edited exception");
+        std::fs::write(path, edited).unwrap();
+
+        assert!(history(&fixture.cfg).is_empty());
+        let issues = history_issues(&fixture.cfg);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("content address mismatch"), "{issues:?}");
     }
 }

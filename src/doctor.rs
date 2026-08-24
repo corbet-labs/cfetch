@@ -14,8 +14,8 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::{
-    daemon, embed, embedding_profile, grant, hardware, heartbeat, index, maintenance_model, net,
-    paths, rerank, runtime_status, variant, vectors,
+    daemon, embed, embedding_profile, grant, hardware, heartbeat, index, maintenance,
+    maintenance_model, net, paths, rerank, runtime_status, variant, vectors,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -149,6 +149,7 @@ pub struct MaintenanceModelDiagnostic {
     pub review_model: Option<String>,
     pub candidates: u64,
     pub history_events: u64,
+    pub unreadable_history: u64,
     pub exceptions: u64,
     pub last_outcome: Option<String>,
 }
@@ -642,6 +643,18 @@ fn inference_diagnostic(
     let profile = embedding_profile::manifest();
     let (embeddings, reranker, maintenance) = match cfg {
         Some(cfg) => {
+            let maintenance_history_issues = maintenance::history_issues(cfg);
+            if let Some(issue) = maintenance_history_issues.first() {
+                findings.push(Finding {
+                    code: "maintenance_history_unreadable".into(),
+                    severity: FindingSeverity::Critical,
+                    summary: short_error(issue),
+                    action: Some(
+                        "inspect todo/staging/maintenance/history and restore the immutable record from version control"
+                            .into(),
+                    ),
+                });
+            }
             if cfg.embeddings.enabled
                 && let Err(error) = cfg.embeddings.validate_profile()
             {
@@ -760,6 +773,7 @@ fn inference_diagnostic(
                 }),
                 candidates: runtime.maintenance.candidates,
                 history_events: runtime.maintenance.history_events,
+                unreadable_history: maintenance_history_issues.len() as u64,
                 exceptions: runtime.maintenance.exceptions,
                 last_outcome: runtime.maintenance.last_outcome.clone(),
             };
@@ -793,6 +807,7 @@ fn inference_diagnostic(
                 review_model: None,
                 candidates: runtime.maintenance.candidates,
                 history_events: runtime.maintenance.history_events,
+                unreadable_history: 0,
                 exceptions: runtime.maintenance.exceptions,
                 last_outcome: runtime.maintenance.last_outcome.clone(),
             },
@@ -1358,7 +1373,7 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
         },
         if report.inference.maintenance.configured {
             format!(
-                "  maintenance {} ({}) — propose {} · review {} · {} staged / {} event(s) / {} exception(s)",
+                "  maintenance {} ({}) — propose {} · review {} · {} staged / {} event(s) / {} unreadable / {} exception(s)",
                 report.inference.maintenance.state,
                 report
                     .inference
@@ -1380,6 +1395,7 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
                     .unwrap_or("model not configured"),
                 report.inference.maintenance.candidates,
                 report.inference.maintenance.history_events,
+                report.inference.maintenance.unreadable_history,
                 report.inference.maintenance.exceptions,
             )
         } else {
@@ -1704,6 +1720,7 @@ mod tests {
                     review_model: Some("review-model".into()),
                     candidates: 0,
                     history_events: 12,
+                    unreadable_history: 0,
                     exceptions: 1,
                     last_outcome: Some("applied".into()),
                 },
