@@ -1,11 +1,11 @@
-name: Inference hardware certificate
-description: Submit a physical CPU, GPU, or NPU run for cfetch embedding profile v1.
-title: "[Inference certificate]: "
+name: Inference hardware run
+description: Submit a passing, mismatching, or blocked physical CPU, GPU, or NPU run for cfetch embedding profile v1.
+title: "[Inference run]: "
 body:
   - type: markdown
     attributes:
       value: |
-        A device is not a v1 producer merely because the model loads or its vendor advertises INT8. Submit the exact cfetch certificate plus accelerator placement evidence described in [the certification guide](https://github.com/corbet-labs/cfetch/blob/main/docs/accelerator-certification.md). Do not include secrets, private model inputs, usernames, hostnames, or private paths.
+        A device is not a v1 producer merely because the model loads or its vendor advertises INT8. Passing and failing runs are both useful. Submit the exact cfetch report plus accelerator placement evidence described in [the certification guide](https://github.com/corbet-labs/cfetch/blob/main/docs/accelerator-certification.md). Only an exact pass with the required review can be admitted. Do not include secrets, private model inputs, usernames, hostnames, or private paths.
   - type: dropdown
     id: family
     attributes:
@@ -34,6 +34,17 @@ body:
       label: Exact physical device
       description: Vendor, model, architecture or generation, and relevant accelerator identifier.
       placeholder: "AMD Ryzen AI 9 HX 370; XDNA2 NPU"
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Run outcome
+      options:
+        - Exact 11/11 byte match
+        - Executed with one or more byte mismatches
+        - Provider or model could not execute
+        - Packaging or runtime setup blocked the run
     validations:
       required: true
   - type: input
@@ -81,7 +92,7 @@ body:
       options:
         - label: The run used the public model-v1 bundle without recalibration, conversion that changes semantics, fine-tuning, distillation, pruning, or another quantization.
           required: true
-        - label: All 11 known-answer vectors passed byte for byte.
+        - label: I reported the actual outcome without treating a load, approximate match, or failed run as producer support.
           required: true
         - label: If this is an accelerator run, ORT CPU fallback was disabled and provider-internal placement is covered by the attached evidence.
           required: true

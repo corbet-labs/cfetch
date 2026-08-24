@@ -139,8 +139,11 @@ The public certification workflow accepts only an HTTPS model-bundle URL plus
 its required SHA-256, builds the real package, verifies/extracts the archive,
 runs the KAT, and uploads the JSON report. No secret or private runner is
 required. Hosted runners can certify only hardware actually exposed to them;
-physical testers use the same command and attach the profiler evidence through
-the public [inference hardware certificate form](https://github.com/corbet-labs/cfetch/issues/new?template=inference_certification.yml).
+physical testers use the same command and attach the report and profiler
+evidence through the public [inference hardware run form](https://github.com/corbet-labs/cfetch/issues/new?template=inference_certification.yml).
+The form accepts exact passes, byte mismatches, execution failures and setup
+blockers. Failed evidence is kept as a rejected attempt; it never becomes a
+producer claim.
 
 Primary implementation references:
 
