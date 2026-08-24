@@ -30,6 +30,7 @@ macro_rules! eprintln {
 
 mod audit;
 mod bench;
+mod cards;
 mod code;
 mod condense;
 mod config;
@@ -303,6 +304,11 @@ enum Command {
         /// Where to create it. Defaults to the configured brain root
         path: Option<std::path::PathBuf>,
     },
+    /// Manage the nixcards catalogue stored under knowledge/cards
+    Cards {
+        #[command(subcommand)]
+        action: CardsAction,
+    },
     /// Open the terminal dashboard: health, system diagnostics, recall, and maintenance
     Dashboard,
     /// Explain hardware, inference, peers, artifacts, hooks, and daemon health
@@ -336,6 +342,38 @@ enum Command {
         #[arg(long, conflicts_with = "json")]
         line: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum CardsAction {
+    /// Create the blobless sparse catalogue checkout
+    Init {
+        #[arg(long, default_value = cards::OFFICIAL_REPOSITORY)]
+        repository: String,
+    },
+    /// Show every published set and whether it is local
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the local selection with dotted set IDs or category prefixes
+    Select {
+        selectors: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fast-forward the catalogue without changing its sparse selection
+    Sync {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain the local checkout, revision, filter, and selected sets
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open the nixcards TUI against this brain's catalogue checkout
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -2850,6 +2888,12 @@ fn main() {
         Command::Init { path } => {
             if let Err(e) = init_cmd(path) {
                 eprintln!("cfetch init: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Cards { action } => {
+            if let Err(e) = cards::run(action) {
+                eprintln!("cfetch cards: {e:#}");
                 std::process::exit(1);
             }
         }

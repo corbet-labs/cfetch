@@ -80,6 +80,7 @@ recall, code navigation, hooks, capture, and measurement need neither.
 | Area | Availability | What you experience | Main surfaces |
 |---|---|---|---|
 | Persistent agent memory | v0.9.9 | Decisions, rules, notes, and working state stay in plain Markdown and git | `cfetch init`, configurable knowledge tree |
+| Selective learning cards | **Main — next release** | A huge nixcards catalogue can contribute only the locally selected Markdown sets; the nixcards TUI and cfetch share Git's native sparse selection without a shadow config | `cards init`, `cards list`, `cards select`, `cards sync`, `cards tui` |
 | Cited retrieval | v0.9.9 | BM25, semantic, and hybrid search return statement-level citations that survive file reordering | `recall`, `recall --semantic`, `recall --hybrid`, `recall --id` |
 | Retrieval quality | v0.9.9 | Trust-aware ranking, optional cross-encoder reranking, lexical precision gates, duplicate suppression, and wikilink expansion | `recall --expand`, `rerank.*`, `recall.gate` |
 | Code intelligence | v0.9.9 | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
@@ -173,6 +174,32 @@ The knowledge tree is the only fact store. The local SQLite catalog, symbol
 index, fingerprints, and vector cache can be deleted and rebuilt without
 losing knowledge. This also means ordinary editors, git history, Obsidian,
 shell tools, and code review continue to work.
+
+### Selective nixcards knowledge
+
+`cfetch cards init` creates a `blob:none` partial clone of the public nixcards catalogue at
+`<brain_root>/knowledge/cards`. The checkout's Git sparse-checkout list is the only local selection
+record: cfetch and the nixcards Ratatui interface read and update the same state, so neither tool can
+overwrite a shadow configuration owned by the other.
+
+```console
+$ cfetch cards init
+$ cfetch cards list
+$ cfetch cards select cloud.certificates.databricks
+$ cfetch cards status
+$ cfetch cards tui
+```
+
+Dotted selectors may name one set or a whole hierarchy branch. The root `catalog.json` remains
+local so either interface can show the complete taxonomy; only the selected set directories and
+their Markdown blobs materialize. `cards sync` fast-forwards the catalogue without changing that
+selection. Store mutations share one bounded cross-platform lock, and the daemon watches selected
+files even when the outer brain repository ignores the nested checkout.
+
+The cards carry no cfetch trust setting. Their physical `knowledge/cards/...` paths pass through
+the brain's normal ordered `ring_rules`, exactly like manually written knowledge. The nixcards
+application remains independent: cfetch is not required for its TUI, web application, catalogue,
+or progress store.
 
 ### Trust is visible in every citation
 

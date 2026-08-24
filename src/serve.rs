@@ -714,29 +714,42 @@ pub struct ServeHandle {
 fn watchable_dirs(brain_root: &Path, rules: &crate::config::RingRules) -> WatchScope {
     let mut scope =
         WatchScope { dirs: vec![brain_root.to_path_buf()], census: index::DocCensus::default() };
-    let walker = crate::index::tree_walker(brain_root).build();
-    for entry in walker.flatten() {
-        let Some(kind) = entry.file_type() else { continue };
-        let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
-        // Same canonical `/`-separated form the indexer derives, so the watch
-        // set stays EXACTLY the index set on every platform — a
-        // backslash-separated `mind\secrets` would match no exclusion.
-        let rel = crate::index::rel_doc_path(rel);
-        if !kind.is_dir() {
-            // The census rides along on the walk the watcher has to do
-            // anyway. File entries carry their kind from the directory read,
-            // so counting them costs no stat — and a stat per file is the one
-            // thing that must not be added to a startup already slow enough
-            // to need this advice.
-            if kind.is_file() && crate::index::indexable_doc(&rel, rules) {
-                scope.census.record(&rel);
+    let mut seen_dirs = std::collections::HashSet::from([brain_root.to_path_buf()]);
+    let mut seen_files = std::collections::HashSet::new();
+    let mut walkers = vec![crate::index::tree_walker(brain_root).build()];
+    if let Some(mut builder) = crate::index::managed_cards_walker(brain_root) {
+        walkers.push(builder.build());
+    }
+    for walker in walkers {
+        for entry in walker.flatten() {
+            let Some(kind) = entry.file_type() else { continue };
+            let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
+            // Same canonical `/`-separated form the indexer derives, so the watch
+            // set stays EXACTLY the index set on every platform — a
+            // backslash-separated `mind\secrets` would match no exclusion.
+            let rel = crate::index::rel_doc_path(rel);
+            if !kind.is_dir() {
+                // The census rides along on the walk the watcher has to do
+                // anyway. File entries carry their kind from the directory read,
+                // so counting them costs no stat — and a stat per file is the one
+                // thing that must not be added to a startup already slow enough
+                // to need this advice.
+                if kind.is_file()
+                    && seen_files.insert(entry.path().to_path_buf())
+                    && crate::index::indexable_doc(&rel, rules)
+                {
+                    scope.census.record(&rel);
+                }
+                continue;
             }
-            continue;
+            if rel.is_empty()
+                || crate::index::excluded_dir(&rel, rules)
+                || !seen_dirs.insert(entry.path().to_path_buf())
+            {
+                continue;
+            }
+            scope.dirs.push(entry.path().to_path_buf());
         }
-        if rel.is_empty() || crate::index::excluded_dir(&rel, rules) {
-            continue;
-        }
-        scope.dirs.push(entry.path().to_path_buf());
     }
     scope
 }
@@ -902,6 +915,27 @@ mod watch_scope_tests {
         for d in watchable_dirs(brain.path(), &crate::config::RingRules::default()).dirs {
             assert!(d.is_dir(), "{d:?} is not a directory");
         }
+    }
+
+    #[test]
+    fn managed_cards_are_watched_even_when_the_outer_repo_ignores_them() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        let cards = root.join("knowledge/cards");
+        std::fs::create_dir_all(cards.join(".git")).unwrap();
+        std::fs::create_dir_all(cards.join("cloud/certificates/example")).unwrap();
+        std::fs::write(root.join(".gitignore"), "knowledge/cards/\n").unwrap();
+        std::fs::write(cards.join("catalog.json"), "{}").unwrap();
+        std::fs::write(
+            cards.join("cloud/certificates/example/question.md"),
+            "# Question?\n",
+        )
+        .unwrap();
+
+        let scope = watchable_dirs(root, &crate::config::RingRules::default());
+        assert!(scope.dirs.contains(&cards));
+        assert!(scope.dirs.contains(&cards.join("cloud/certificates/example")));
+        assert_eq!(scope.census.total(), 1);
     }
 
     #[test]

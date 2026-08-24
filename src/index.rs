@@ -623,6 +623,29 @@ pub fn tree_walker(root: &Path) -> ignore::WalkBuilder {
     builder
 }
 
+/// A managed nixcards checkout is knowledge even when the outer brain keeps
+/// the nested repository out of its own Git history. Walk it explicitly so
+/// `.gitignore` remains a version-control boundary rather than silently
+/// becoming a trust/index boundary. Configured cfetch exclusions still apply
+/// after the walk, and hidden `.git` internals never enter it.
+pub fn managed_cards_walker(root: &Path) -> Option<ignore::WalkBuilder> {
+    let cards = root.join("knowledge/cards");
+    if !cards.join(".git").exists() || !cards.join("catalog.json").is_file() {
+        return None;
+    }
+    let mut builder = ignore::WalkBuilder::new(cards);
+    builder
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(IGNORE_FILE)
+        .follow_links(false);
+    let _ = builder.add_ignore(root.join(IGNORE_FILE));
+    Some(builder)
+}
+
 /// Whether the indexer would actually READ this brain-relative path:
 /// markdown, past the exclusion boundary, not secret-shaped. The scan and
 /// the cost census below both come through here, so "what would be indexed"
@@ -726,25 +749,31 @@ fn collect_files(
     rules: &RingRules,
 ) -> Vec<SourceFile> {
     let mut out = Vec::new();
-    let walker = tree_walker(brain_root).build();
-    for entry in walker.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
+    let mut seen = std::collections::HashSet::new();
+    let mut walkers = vec![tree_walker(brain_root).build()];
+    if let Some(mut builder) = managed_cards_walker(brain_root) {
+        walkers.push(builder.build());
+    }
+    for walker in walkers {
+        for entry in walker.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() || !seen.insert(entry.path().to_path_buf()) {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
+            let rel = rel_doc_path(rel);
+            if !indexable_doc(&rel, rules) {
+                continue;
+            }
+            let (mtime, size) = stat_of(&meta);
+            out.push(SourceFile {
+                doc_path: rel.clone(),
+                abs: entry.path().to_path_buf(),
+                mtime,
+                size,
+                default_ring: default_ring(&rel, rules),
+            });
         }
-        let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
-        let rel = rel_doc_path(rel);
-        if !indexable_doc(&rel, rules) {
-            continue;
-        }
-        let (mtime, size) = stat_of(&meta);
-        out.push(SourceFile {
-            doc_path: rel.clone(),
-            abs: entry.path().to_path_buf(),
-            mtime,
-            size,
-            default_ring: default_ring(&rel, rules),
-        });
     }
     if let Some(projects) = native_root.and_then(|nr| std::fs::read_dir(nr).ok()) {
         for project in projects.flatten() {
@@ -2080,6 +2109,36 @@ mod scoping_tests {
             .map(|f| f.doc_path)
             .collect();
         assert_eq!(docs, vec!["knowledge/real.md".to_string()]);
+    }
+
+    #[test]
+    fn managed_cards_remain_knowledge_when_the_outer_repo_ignores_the_checkout() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        let cards = root.join("knowledge/cards");
+        std::fs::create_dir_all(cards.join(".git")).unwrap();
+        std::fs::create_dir_all(cards.join("cloud/certificates/example")).unwrap();
+        std::fs::write(root.join(".gitignore"), "knowledge/cards/\n").unwrap();
+        std::fs::write(cards.join("catalog.json"), "{\"schema_version\":1,\"sets\":[]}")
+            .unwrap();
+        std::fs::write(
+            cards.join("cloud/certificates/example/question.md"),
+            "# Question?\n\nAnswer.\n",
+        )
+        .unwrap();
+        std::fs::write(cards.join(".git/config.md"), "# must stay excluded\n").unwrap();
+
+        let docs: Vec<_> = collect_files(root, None, &RingRules::default())
+            .into_iter()
+            .map(|file| (file.doc_path, file.default_ring))
+            .collect();
+        assert_eq!(
+            docs,
+            vec![(
+                "knowledge/cards/cloud/certificates/example/question.md".to_string(),
+                crate::config::UNMATCHED_RING,
+            )]
+        );
     }
 
     #[test]
