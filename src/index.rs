@@ -751,7 +751,7 @@ fn collect_files(
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut walkers = vec![tree_walker(brain_root).build()];
-    if let Some(mut builder) = managed_cards_walker(brain_root) {
+    if let Some(builder) = managed_cards_walker(brain_root) {
         walkers.push(builder.build());
     }
     for walker in walkers {

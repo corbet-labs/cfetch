@@ -717,7 +717,7 @@ fn watchable_dirs(brain_root: &Path, rules: &crate::config::RingRules) -> WatchS
     let mut seen_dirs = std::collections::HashSet::from([brain_root.to_path_buf()]);
     let mut seen_files = std::collections::HashSet::new();
     let mut walkers = vec![crate::index::tree_walker(brain_root).build()];
-    if let Some(mut builder) = crate::index::managed_cards_walker(brain_root) {
+    if let Some(builder) = crate::index::managed_cards_walker(brain_root) {
         walkers.push(builder.build());
     }
     for walker in walkers {
