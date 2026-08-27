@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "profile_id": "cfetch-embedding-v1",
+  "profile_status": "candidate",
+  "reference_device_class": "npu",
+  "selection_order": [
+    "npu",
+    "gpu",
+    "cpu"
+  ],
+  "remote_policy": "explicit-only",
+  "admission": {
+    "same_runtime_artifact_device_repeatability": "byte-exact",
+    "cross_backend_byte_equality": "diagnostic-only",
+    "quality_gate": "mixed-query-document-retrieval",
+    "required_device_classes": [
+      "npu",
+      "gpu",
+      "cpu"
+    ]
+  },
+  "admitted_backends": [],
+  "targets": [
+    {
+      "device": "apple-neural-engine",
+      "device_class": "npu",
+      "runtime": "coreml",
+      "artifact_format": "mlpackage",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "intel-npu",
+      "device_class": "npu",
+      "runtime": "openvino",
+      "artifact_format": "openvino-ir-or-compiled-blob",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "amd-npu",
+      "device_class": "npu",
+      "runtime": "ryzen-ai-or-vitis-ai",
+      "artifact_format": "vendor-compiled-graph",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "qualcomm-npu",
+      "device_class": "npu",
+      "runtime": "litert-qualcomm-delegate-or-qnn",
+      "artifact_format": "tflite-or-qnn-context",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "nvidia-gpu",
+      "device_class": "gpu",
+      "runtime": "tensorrt",
+      "artifact_format": "tensorrt-engine",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "amd-gpu",
+      "device_class": "gpu",
+      "runtime": "migraphx-or-rocm",
+      "artifact_format": "compiled-onnx",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "intel-gpu",
+      "device_class": "gpu",
+      "runtime": "openvino",
+      "artifact_format": "openvino-ir-or-compiled-cache",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "apple-gpu",
+      "device_class": "gpu",
+      "runtime": "coreml-or-metal",
+      "artifact_format": "compiled-coreml",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "generic-windows-gpu",
+      "device_class": "gpu",
+      "runtime": "directml",
+      "artifact_format": "compiled-onnx",
+      "state": "needs-native-artifact-and-matrix"
+    },
+    {
+      "device": "cpu",
+      "device_class": "cpu",
+      "runtime": "xnnpack-onednn-or-equivalent",
+      "artifact_format": "runtime-native-int8",
+      "state": "needs-native-artifact-and-matrix"
+    }
+  ]
+}

@@ -63,10 +63,6 @@ mod maintenance_model;
 mod maintenance_worker;
 mod mcp;
 mod migrate;
-#[cfg(any(feature = "inference-ort", test))]
-mod model_artifact;
-#[cfg(feature = "inference-ort")]
-mod local_embed;
 mod net;
 #[cfg(not(test))]
 mod output;
@@ -237,18 +233,6 @@ enum Command {
     },
     /// Print the immutable embedding and network compatibility contract
     EmbeddingProfile {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Certify this package/provider against the exact v1 vector answers
-    InferenceCertify {
-        /// Extracted, separately licensed v1 model bundle directory
-        #[arg(long, value_name = "PATH")]
-        model_dir: std::path::PathBuf,
-        /// ORT execution provider packaged in this binary
-        #[arg(long, default_value = "auto")]
-        provider: String,
-        /// Print the complete portable certification report
         #[arg(long)]
         json: bool,
     },
@@ -2688,8 +2672,8 @@ fn main() {
         Command::Hardware { json } => {
             let found = hardware::detect();
             let release = variant::recommended_release();
-            let local_inference = cfg!(feature = "inference-ort");
-            let packaged_backend = if local_inference { "ort" } else { "endpoint" };
+            let local_inference = false;
+            let packaged_backend = "endpoint";
             if json {
                 println!(
                     "{}",
@@ -2719,7 +2703,7 @@ fn main() {
                         println!("    note: {note}");
                     }
                 }
-                println!("  discovery is not execution or producer certification");
+                println!("  discovery is not execution or backend admission");
                 println!("\nlocal inference:     {}", if local_inference { "included" } else { "not included" });
                 println!("embeddings backend:   {packaged_backend}");
                 println!("build variant:        {}", variant::build_id().unwrap_or("unidentified source build"));
@@ -2759,93 +2743,20 @@ fn main() {
                     profile.network_major,
                     profile.model,
                     profile.model_revision,
-                    profile.model_quantization,
+                    profile.model_numeric_format,
                     profile.dimensions,
                     profile.vector_bytes,
                 );
                 println!("query prefix: {:?}", profile.query_prefix);
                 println!("document prefix: {:?}", profile.document_prefix);
-                println!("pooling: {}; graph optimization: {}", profile.pooling, profile.graph_optimization);
+                println!("pooling: {}; artifact policy: {}", profile.pooling, profile.artifact_policy);
                 println!("normalization: {}", profile.normalization);
-            }
-        }
-        Command::InferenceCertify {
-            model_dir,
-            provider,
-            json,
-        } => {
-            #[cfg(feature = "inference-ort")]
-            let certification = {
-                #[cfg(windows)]
-                {
-                    // Windows' primary thread has a much smaller default stack
-                    // than the worker threads used by the Unix builds. ORT's
-                    // large quantized-graph initialization can exhaust it
-                    // before provider placement begins, which would turn a
-                    // harness limitation into a false hardware result.
-                    match std::thread::Builder::new()
-                        .name("cfetch-inference-certify".into())
-                        .stack_size(64 * 1024 * 1024)
-                        .spawn(move || local_embed::certify(&model_dir, &provider))
-                    {
-                        Ok(worker) => worker.join().unwrap_or_else(|_| {
-                            Err(anyhow::anyhow!("Windows certification worker panicked"))
-                        }),
-                        Err(error) => Err(anyhow::Error::new(error)
-                            .context("start Windows certification worker")),
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    local_embed::certify(&model_dir, &provider)
-                }
-            };
-            #[cfg(feature = "inference-ort")]
-            match certification {
-                Ok(report) => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&report)
-                                .expect("certification report serializes")
-                        );
-                    } else {
-                        println!(
-                            "{} / {}: {}/{} exact v1 known answers in {} ms",
-                            report.provider,
-                            report.device_class,
-                            report.known_answers.iter().filter(|answer| answer.passed).count(),
-                            report.known_answers.len(),
-                            report.elapsed_ms
-                        );
-                        if report.exact_vector_conformance
-                            && !report.producer_eligible_without_external_review
-                        {
-                            println!(
-                                "vector conformance passed; accelerator publication still requires reviewed INT8-kernel profiler evidence"
-                            );
-                        }
-                    }
-                    if !report.exact_vector_conformance {
-                        eprintln!(
-                            "cfetch inference-certify: provider output is incompatible with network major {}",
-                            embedding_profile::NETWORK_MAJOR
-                        );
-                        std::process::exit(1);
-                    }
-                }
-                Err(error) => {
-                    eprintln!("cfetch inference-certify: {error:#}");
-                    std::process::exit(1);
-                }
-            }
-            #[cfg(not(feature = "inference-ort"))]
-            {
-                let _ = (model_dir, provider, json);
-                eprintln!(
-                    "cfetch inference-certify: this package has no local ORT inference; use a local-inference provider package"
+                println!(
+                    "execution: {} (reference {}, exact cross-backend bytes: {})",
+                    profile.execution_policy,
+                    profile.reference_device_class,
+                    profile.cross_backend_exact_bytes,
                 );
-                std::process::exit(1);
             }
         }
         Command::Identity { json } => {

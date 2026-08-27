@@ -124,7 +124,7 @@ pub struct ModelDiagnostic {
     pub route: Option<String>,
     pub model: String,
     pub model_revision: String,
-    pub artifact_id: String,
+    pub artifact_policy: String,
     pub profile_id: String,
     pub dimensions: usize,
     pub vector_encoding: String,
@@ -499,40 +499,6 @@ fn compiled_backend() -> String {
     {
         return release.backend.clone();
     }
-    // Local and certification packages are intentionally absent from the
-    // public release catalog until their report is reviewed. They still need
-    // to describe what was actually compiled instead of masquerading as the
-    // endpoint-only archive.
-    if cfg!(feature = "inference-qnn") {
-        return "qnn".into();
-    }
-    if cfg!(feature = "inference-vitis") {
-        return "vitis".into();
-    }
-    if cfg!(feature = "inference-openvino") {
-        return "openvino".into();
-    }
-    if cfg!(feature = "inference-coreml") {
-        return "coreml".into();
-    }
-    if cfg!(feature = "inference-tensorrt") {
-        return "tensorrt".into();
-    }
-    if cfg!(feature = "inference-cuda") {
-        return "cuda".into();
-    }
-    if cfg!(feature = "inference-migraphx") {
-        return "migraphx".into();
-    }
-    if cfg!(feature = "inference-directml") {
-        return "directml".into();
-    }
-    if cfg!(feature = "inference-webgpu") {
-        return "webgpu".into();
-    }
-    if cfg!(feature = "inference-ort") {
-        return "cpu".into();
-    }
     "endpoint".into()
 }
 
@@ -698,12 +664,7 @@ fn inference_diagnostic(
                     ),
                 });
             }
-            // Constructing a local producer now runs the released byte KAT.
-            // Doctor is observation-only and must never invoke inference, so
-            // only validate the endpoint client here; local admission is
-            // reported from the last real selection/certification evidence.
             if cfg.embeddings.enabled
-                && cfg.embeddings.model_dir.trim().is_empty()
                 && let Err(error) = embed::EmbedClient::new(&cfg.embeddings)
             {
                 findings.push(Finding {
@@ -756,7 +717,7 @@ fn inference_diagnostic(
                     .then(|| route_name(runtime_status::endpoint_route(&cfg.embeddings.endpoint))),
                 model: cfg.embeddings.model.clone(),
                 model_revision: profile.model_revision.into(),
-                artifact_id: profile.model_artifact_id.into(),
+                artifact_policy: profile.artifact_policy.into(),
                 profile_id: profile.profile_id.into(),
                 dimensions: cfg.embeddings.dimensions,
                 vector_encoding: cfg.embeddings.spec().vector_encoding(),
@@ -822,7 +783,7 @@ fn inference_diagnostic(
                 route: None,
                 model: profile.model.into(),
                 model_revision: profile.model_revision.into(),
-                artifact_id: profile.model_artifact_id.into(),
+                artifact_policy: profile.artifact_policy.into(),
                 profile_id: profile.profile_id.into(),
                 dimensions: profile.dimensions,
                 vector_encoding: profile.vector_encoding.into(),
@@ -875,7 +836,7 @@ fn hardware_diagnostics(
             let class = format!("{:?}", found.device.class()).to_lowercase();
             let caveat = found.caveat().or_else(|| {
                 (found.device.class() != hardware::Class::Cpu).then(|| {
-                    "device discovery is not v1 producer certification; run the exact KAT and review provider placement"
+                    "device discovery is not backend admission; require accelerated placement and mixed query/document retrieval evidence"
                         .into()
                 })
             });
@@ -887,10 +848,9 @@ fn hardware_diagnostics(
                     selection.route == Some(runtime_status::InferenceRoute::Local)
                         && selection.device_class.as_deref() == Some(class.as_str())
                 });
-            // Discovery does not decide whether this exact graph/runtime is
-            // usable. Provider initialization and inference certification are
-            // the evidence boundary; do not blacklist or bless silicon from a
-            // PCI/device name alone.
+            // Discovery does not decide whether a native artifact is usable.
+            // Initialization, accelerated placement, repeatability, and the
+            // mixed-backend retrieval matrix are the evidence boundary.
             let supported = match build_backend {
                 "cpu" => found.device == hardware::Device::Cpu,
                 "qnn" => found.device == hardware::Device::QualcommNpu,
@@ -1378,7 +1338,7 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
             DisplayTone::Muted
         },
         format!(
-            "  embeddings {} — {} @ {} · artifact {} · {} · {} dimensions / {}",
+            "  embeddings {} — {} @ {} · {} · {} · {} dimensions / {}",
             if report.inference.embeddings.enabled {
                 format!(
                     "configured ({})",
@@ -1394,7 +1354,7 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
             },
             report.inference.embeddings.model,
             short_id(&report.inference.embeddings.model_revision),
-            report.inference.embeddings.artifact_id,
+            report.inference.embeddings.artifact_policy,
             report.inference.embeddings.profile_id,
             report.inference.embeddings.dimensions,
             report.inference.embeddings.vector_encoding,
@@ -1763,7 +1723,7 @@ mod tests {
                     route: Some("remote".into()),
                     model: "embedding-model".into(),
                     model_revision: "revision".into(),
-                    artifact_id: "artifact".into(),
+                    artifact_policy: "backend-native".into(),
                     profile_id: "profile".into(),
                     dimensions: 768,
                     vector_encoding: "signed-int8x768".into(),

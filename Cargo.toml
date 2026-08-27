@@ -16,45 +16,13 @@ include = [
   "/Cargo.toml",
   "/Cargo.lock",
   "/README.md",
-  "/docs/accelerator-certification.md",
+  "/docs/local-inference.md",
   "/docs/ai-maintenance.md",
   "/docs/embedding-profile-v1.md",
   "/LICENSE.md",
   "/THIRD-PARTY-LICENSES.txt",
   "/release/variants.json",
-  "/release/inference-certifications.json",
-]
-
-[features]
-default = []
-# FastEmbed owns tokenization and the common embedding API; ORT owns graph
-# execution. Accelerator packages enable exactly the provider they ship.
-inference-ort = [
-  "dep:fastembed",
-  "dep:ort",
-  "dep:tokenizers",
-  "ort/load-dynamic",
-]
-# There is intentionally no ORT download/bundled feature. The ort-sys 1.28
-# static archive failed the v1 byte KAT while Microsoft's official 1.28 shared
-# release passed it; local producer packages must pin an admitted runtime.
-inference-coreml = ["inference-ort", "ort/coreml"]
-inference-directml = ["inference-ort", "ort/directml"]
-inference-openvino = ["inference-ort", "ort/openvino"]
-inference-qnn = ["inference-ort", "ort/qnn"]
-inference-vitis = ["inference-ort", "ort/vitis"]
-inference-cuda = ["inference-ort", "ort/cuda"]
-inference-tensorrt = ["inference-ort", "ort/tensorrt"]
-# MIGraphX is the maintained ONNX Runtime path for AMD GPUs.  It receives the
-# already-quantized v1 Q/DQ graph; cfetch deliberately does not enable
-# MIGraphX's calibration-table quantizer, which would create incompatible
-# scales.
-inference-migraphx = ["inference-ort", "ort/migraphx"]
-# ORT removed its ROCm EP in 1.23; MIGraphX is the maintained AMD GPU path.
-inference-webgpu = [
-  "inference-ort",
-  "fastembed/ort-ep-device",
-  "ort/api-22",
+  "/release/inference-backends.json",
 ]
 
 [dependencies]
@@ -68,13 +36,6 @@ agent-session = "=0.5.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
-# No built-in model catalog or network fetch: cfetch supplies and verifies the
-# exact user-defined v1 artifact bytes.
-# Pinned to the public FastEmbed session-controls change proposed upstream in
-# https://github.com/Anush008/fastembed-rs/pull/280. This preserves FastEmbed's
-# pipeline while allowing cfetch to prohibit CPU fallback and specialize QNN
-# sessions to the profile's fixed shapes.
-fastembed = { version = "=6.0.0", git = "https://github.com/corbet-labs/fastembed-rs", rev = "1d9b6381354c23d7a17f61b0486fdabca1a724b0", default-features = false, optional = true }
 ignore = "0.4"
 iroh = "1.0.3"
 # BLAKE3-verified, resumable artifact transfer over the daemon's existing
@@ -82,12 +43,7 @@ iroh = "1.0.3"
 # protocol; cfetch's packed vector store remains the durable record.
 iroh-blobs = { version = "=0.103.0", default-features = false }
 notify = "8"
-# Kept exact with FastEmbed's own pin so provider features unify onto one ORT.
-# API 18 is the floor for normal provider packages. The WebGPU plugin feature
-# raises only its evidence package to API 22 for registered-device discovery.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["api-18", "ndarray", "std"], optional = true }
 ratatui = "0.30.2"
-tokenizers = { version = "=0.22.2", default-features = false, optional = true }
 # Exact-pinned official MCP SDK. cfetch owns its tools; rmcp owns JSON-RPC,
 # protocol negotiation, capability discovery, schemas, and stdio framing.
 rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }

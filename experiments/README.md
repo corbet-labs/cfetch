@@ -1,21 +1,12 @@
 # experiments
 
-Throwaway probes and spikes. Nothing in here is shipped code; anything worth
-keeping graduates into `src/` with tests.
+Probes and admission tools live here; none is shipped in the cfetch binary.
 
-`accelerators/openvino_direct_kat.py` tests the unchanged released v1 ONNX
-graph through native OpenVINO when ORT's OpenVINO provider cannot own it. It
-requires Python packages `openvino`, `numpy`, and `tokenizers` and verifies the
-frozen model, tokenizer tensors, execution device, runtime precision summary,
-and all 11 final vector hashes:
+- accelerators/apple_compute_probe.swift reports which Apple compute devices
+  a hosted runner exposes. Discovery is not backend admission.
+- embedding-profile/cross_backend_eval.py evaluates the complete NPU-, GPU-,
+  and CPU-query/document matrix for the candidate shared INT8 vector space.
 
-```console
-python experiments/accelerators/openvino_direct_kat.py \
-  --model-dir ./cfetch-embeddinggemma-300m-a8w8-v1 \
-  --device NPU \
-  --output ./openvino-npu.json
-```
-
-A mismatch is evidence, so the report is written before the command exits
-nonzero. `--inference-precision-hint` exists only for adverse controls; it does
-not authorize a vendor-specific v1 graph or codec.
+Backend-specific model runners belong beside the matrix evaluator as they are
+implemented. They must export the cache contract documented in
+embedding-profile/README.md and prove native accelerated placement separately.

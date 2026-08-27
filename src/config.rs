@@ -461,24 +461,14 @@ impl VectorSpec {
     }
 }
 
-/// Embeddings backend: the verified local FastEmbed/ORT artifact when
-/// `model_dir` is set, otherwise an OpenAI-compatible `/embeddings` endpoint.
-/// Disabled by default — semantic recall is opt-in, and the client is NEVER
-/// called from hook entrypoints (hooks must not spend inference time on that
-/// latency-critical path).
+/// Embeddings configuration. The current release transport is an admitted
+/// OpenAI-compatible endpoint. Native local backends will use their own
+/// runtime artifacts and the fixed NPU-first selection policy; neither is a
+/// user-selectable vector-space parameter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Directory containing the separately licensed, digest-pinned v1 ONNX
-    /// model and tokenizer files. When set, local inference is mandatory; a
-    /// missing compile-time provider is an error, never endpoint fallback.
-    #[serde(default)]
-    pub model_dir: String,
-    /// ORT execution provider compiled into this package. `auto` selects the
-    /// package's provider; explicit values are primarily for conformance runs.
-    #[serde(default = "default_execution_provider")]
-    pub execution_provider: String,
     /// Base URL; `/embeddings` is appended. Must be https or loopback —
     /// config is a file agents write, so the URL is SSRF-guarded at use.
     #[serde(default)]
@@ -593,8 +583,6 @@ impl Default for EmbeddingsConfig {
     fn default() -> Self {
         EmbeddingsConfig {
             enabled: false,
-            model_dir: String::new(),
-            execution_provider: default_execution_provider(),
             endpoint: String::new(),
             model: crate::embedding_profile::MODEL.to_string(),
             allow_hosts: Vec::new(),
@@ -686,10 +674,6 @@ fn default_maintenance_max_candidates() -> usize {
 
 fn default_embed_timeout_secs() -> u64 {
     10
-}
-
-fn default_execution_provider() -> String {
-    "auto".to_string()
 }
 
 fn default_embed_model() -> String {

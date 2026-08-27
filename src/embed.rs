@@ -154,8 +154,6 @@ enum EmbedBackend {
         /// construction (a missing variable fails fast, not mid-batch).
         auth: Option<String>,
     },
-    #[cfg(feature = "inference-ort")]
-    Local(Box<crate::local_embed::LocalEmbedder>),
 }
 
 pub struct EmbedClient {
@@ -178,11 +176,8 @@ impl std::fmt::Debug for EmbedClient {
     // Manual impl: ureq::Agent's Debug is not part of our contract, and the
     // interesting identity is (url, model) anyway.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let backend = match &self.backend {
-            EmbedBackend::Endpoint { url, .. } => url.as_str(),
-            #[cfg(feature = "inference-ort")]
-            EmbedBackend::Local(local) => local.provider(),
-        };
+        let EmbedBackend::Endpoint { url, .. } = &self.backend;
+        let backend = url.as_str();
         f.debug_struct("EmbedClient")
             .field("backend", &backend)
             .field("model", &self.model)
@@ -198,36 +193,22 @@ impl EmbedClient {
         anyhow::ensure!(cfg.enabled, "embeddings disabled (set embeddings.enabled=true in config)");
         anyhow::ensure!(!cfg.model.is_empty(), "embeddings.model is required");
         let base_timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
-        let backend = if cfg.model_dir.trim().is_empty() {
-            anyhow::ensure!(
-                !cfg.endpoint.is_empty(),
-                "embeddings not configured (embeddings.model_dir or embeddings.endpoint required)"
-            );
-            check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
-            let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
-            let agent: ureq::Agent = ureq::Agent::config_builder()
-                .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
-                .timeout_global(Some(base_timeout))
-                .http_status_as_error(false) // status checked explicitly below
-                .build()
-                .new_agent();
-            EmbedBackend::Endpoint {
-                agent,
-                url: format!("{}/embeddings", cfg.endpoint.trim_end_matches('/')),
-                auth,
-            }
-        } else {
-            #[cfg(feature = "inference-ort")]
-            {
-                EmbedBackend::Local(Box::new(crate::local_embed::LocalEmbedder::load_for_production(
-                    std::path::Path::new(&cfg.model_dir),
-                    &cfg.execution_provider,
-                )?))
-            }
-            #[cfg(not(feature = "inference-ort"))]
-            {
-                anyhow::bail!("embeddings.model_dir requires a cfetch package built with local ORT inference")
-            }
+        anyhow::ensure!(
+            !cfg.endpoint.is_empty(),
+            "embeddings endpoint is required by the current release; native local backends are being rebuilt around the NPU-first profile"
+        );
+        check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
+        let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
+            .timeout_global(Some(base_timeout))
+            .http_status_as_error(false) // status checked explicitly below
+            .build()
+            .new_agent();
+        let backend = EmbedBackend::Endpoint {
+            agent,
+            url: format!("{}/embeddings", cfg.endpoint.trim_end_matches('/')),
+            auth,
         };
         Ok(EmbedClient {
             backend,
@@ -316,33 +297,16 @@ impl EmbedClient {
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        match &self.backend {
-            EmbedBackend::Endpoint { url, .. } => {
-                let result = self.embed_request(texts, timeout);
-                crate::runtime_status::record_inference_attempt(
-                    crate::runtime_status::InferenceMode::Endpoint,
-                    crate::runtime_status::endpoint_route(url),
-                    "endpoint",
-                    None,
-                    result.is_ok(),
-                );
-                result
-            }
-            #[cfg(feature = "inference-ort")]
-            EmbedBackend::Local(local) => {
-                let result = local
-                    .embed(texts)
-                    .and_then(|vectors| vectors.into_iter().map(|v| self.fit(v)).collect());
-                crate::runtime_status::record_inference_attempt(
-                    crate::runtime_status::InferenceMode::Local,
-                    crate::runtime_status::InferenceRoute::Local,
-                    local.provider(),
-                    Some(local.device_class()),
-                    result.is_ok(),
-                );
-                result
-            }
-        }
+        let EmbedBackend::Endpoint { url, .. } = &self.backend;
+        let result = self.embed_request(texts, timeout);
+        crate::runtime_status::record_inference_attempt(
+            crate::runtime_status::InferenceMode::Endpoint,
+            crate::runtime_status::endpoint_route(url),
+            "endpoint",
+            None,
+            result.is_ok(),
+        );
+        result
     }
 
     fn embed_request(
@@ -350,13 +314,7 @@ impl EmbedClient {
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let (agent, url, auth) = match &self.backend {
-            EmbedBackend::Endpoint { agent, url, auth } => (agent, url, auth),
-            #[cfg(feature = "inference-ort")]
-            EmbedBackend::Local(_) => {
-                anyhow::bail!("internal error: endpoint request dispatched to local embeddings")
-            }
-        };
+        let EmbedBackend::Endpoint { agent, url, auth } = &self.backend;
         #[derive(serde::Deserialize)]
         struct Response {
             data: Vec<Row>,
@@ -368,10 +326,6 @@ impl EmbedClient {
             cfetch_profile_manifest_sha256: String,
             #[serde(default)]
             cfetch_model_revision: String,
-            #[serde(default)]
-            cfetch_model_quantization: String,
-            #[serde(default)]
-            cfetch_model_artifact: String,
         }
         #[derive(serde::Deserialize)]
         struct Row {
@@ -411,11 +365,8 @@ impl EmbedClient {
         anyhow::ensure!(
             parsed.cfetch_profile == crate::embedding_profile::PROFILE_ID
                 && parsed.cfetch_profile_manifest_sha256 == crate::embedding_profile::manifest_sha256()
-                && parsed.cfetch_model_revision == crate::embedding_profile::MODEL_REVISION
-                && parsed.cfetch_model_quantization
-                    == crate::embedding_profile::MODEL_QUANTIZATION
-                && parsed.cfetch_model_artifact == crate::embedding_profile::MODEL_ARTIFACT_ID,
-            "embeddings endpoint is not certified for {} (profile/revision/quantization/artifact attestation mismatch)",
+                && parsed.cfetch_model_revision == crate::embedding_profile::MODEL_REVISION,
+            "embeddings endpoint is not admitted for {} (vector-space profile/revision attestation mismatch)",
             crate::embedding_profile::PROFILE_ID
         );
         anyhow::ensure!(
@@ -789,13 +740,11 @@ mod tests {
         http_response(
             200,
             &format!(
-                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
+                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","data":[{}]}}"#,
                 v["model"],
                 crate::embedding_profile::PROFILE_ID,
                 crate::embedding_profile::manifest_sha256(),
                 crate::embedding_profile::MODEL_REVISION,
-                crate::embedding_profile::MODEL_QUANTIZATION,
-                crate::embedding_profile::MODEL_ARTIFACT_ID,
                 rows.join(",")
             ),
         )
@@ -816,12 +765,10 @@ mod tests {
         http_response(
             200,
             &format!(
-                r#"{{"object":"list","model":{model:?},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{rows}]}}"#,
+                r#"{{"object":"list","model":{model:?},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","data":[{rows}]}}"#,
                 crate::embedding_profile::PROFILE_ID,
                 crate::embedding_profile::manifest_sha256(),
                 crate::embedding_profile::MODEL_REVISION,
-                crate::embedding_profile::MODEL_QUANTIZATION,
-                crate::embedding_profile::MODEL_ARTIFACT_ID,
             ),
         )
     }
@@ -840,13 +787,11 @@ mod tests {
         http_response(
             200,
             &format!(
-                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","cfetch_model_quantization":"{}","cfetch_model_artifact":"{}","data":[{}]}}"#,
+                r#"{{"object":"list","model":{},"cfetch_profile":"{}","cfetch_profile_manifest_sha256":"{}","cfetch_model_revision":"{}","data":[{}]}}"#,
                 v["model"],
                 crate::embedding_profile::PROFILE_ID,
                 crate::embedding_profile::manifest_sha256(),
                 crate::embedding_profile::MODEL_REVISION,
-                crate::embedding_profile::MODEL_QUANTIZATION,
-                crate::embedding_profile::MODEL_ARTIFACT_ID,
                 rows.join(",")
             ),
         )
@@ -1100,7 +1045,7 @@ mod tests {
             )
         });
         let err = client_for(&url).embed_documents_batch(&["a"]).unwrap_err().to_string();
-        assert!(err.contains("not certified for cfetch-embedding-v1"), "{err}");
+        assert!(err.contains("not admitted for cfetch-embedding-v1"), "{err}");
     }
 
     // ---- auth header ----

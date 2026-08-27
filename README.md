@@ -72,9 +72,9 @@ for this screen or for routine approval.
 
 The latest tagged release is v0.9.9. Features added since that tag are clearly
 marked **Main — next release**; install from source to try them before the next
-release. Optional semantic search can use the frozen v1 local model package or
-a certified OpenAI-compatible producer; optional reranking still uses an
-OpenAI-compatible endpoint and is outside the shared-vector ABI. Lexical
+release. Optional semantic search currently uses an admitted OpenAI-compatible
+endpoint while NPU-first local packages are rebuilt; optional reranking uses
+an OpenAI-compatible endpoint and is outside the shared-vector ABI. Lexical
 recall, code navigation, hooks, capture, and measurement need neither.
 
 | Area | Availability | What you experience | Main surfaces |
@@ -95,7 +95,7 @@ recall, code navigation, hooks, capture, and measurement need neither.
 | Agent integrations | v0.9.9 | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
 | Multi-machine access | v0.9.9 | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
 | Selective sharing | v0.9.9 | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
-| Frozen shared-vector profile | **Main — next release** | Every producer uses one pinned model pipeline and exact 768-byte INT8 vector contract; incompatible network majors fail closed | `embedding-profile`, semantic and hybrid recall |
+| NPU-first shared-vector profile | **Main — candidate** | One pinned semantic pipeline uses backend-native INT8 artifacts; NPU, GPU, and CPU enter through mixed-backend retrieval tests | `embedding-profile`, semantic and hybrid recall |
 | Peer vector artifacts | **Main — next release** | A second storage group fetches matching canonical vectors from authorized origins before considering its own endpoint, avoiding duplicate embedding work | `embed-index`, iroh-blobs, `doctor` |
 | Continuous index and vector upkeep | **Main — next release** | Direct Obsidian edits and automatic maintenance advance the local catalog; generation changes hydrate shared/peer vectors and derive only missing content hashes | daemon watcher, vector worker, `status`, `doctor` |
 | Privacy and safety | v0.9.9 | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
@@ -488,79 +488,18 @@ Every archive includes the binary, cfetch license, generated third-party
 notices, and embedded variant metadata. `cfetch variants` prints the exact
 catalog used to build the release.
 
-### Evaluate the frozen v1 local CPU path
+### Local inference status
 
-The source flake exposes the local CPU package on x86-64 Linux, arm64 Linux,
-and Apple silicon. Each actual host must still pass the embedded byte gate.
-The separately licensed, immutable model bundle is published in the public
-[`model-v1` release](https://github.com/corbet-labs/cfetch/releases/tag/model-v1):
+The current public archives are endpoint builds. The former local ORT package
+and exact-byte certification route were a pre-activation experiment, not
+released NPU/GPU/CPU support, and have been retired.
 
-```console
-$ nix build github:corbet-labs/cfetch#cfetch-local-cpu
-$ curl --proto '=https' --tlsv1.2 --location --fail --output model-v1.tar.gz \
-    https://github.com/corbet-labs/cfetch/releases/download/model-v1/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz
-$ test "$(nix hash file --type sha256 --base16 model-v1.tar.gz)" = \
-    be377d9d3a4ff53e092898e30369dd64d368dc0ff803fbe62d7538c391d9d20f
-$ tar -xzf model-v1.tar.gz
-$ ./result/bin/cfetch inference-certify \
-    --model-dir ./cfetch-embeddinggemma-300m-a8w8-v1 --provider auto --json
-```
-
-Apple Silicon testers can build the non-catalogue CoreML evidence package with
-`nix build github:corbet-labs/cfetch#cfetch-test-coreml`, then certify
-`coreml-gpu` and `coreml-npu` separately. It enables Core ML compute-plan
-logging. The first hosted GPU and NPU probes were rejected: all logged Core ML
-operations ran on its CPU and ORT still required CPU fallback. A new route must
-pass exact bytes and placement review before it may produce vectors.
-
-Linux x86-64 Intel testers use
-`nix build github:corbet-labs/cfetch#cfetch-test-openvino` and certify
-`openvino-cpu`, `openvino-gpu`, or `openvino-npu`. The package pins Intel's
-complete official ORT/OpenVINO wheel; exact bytes and per-device placement are
-still mandatory. The available local CPU probe was rejected because OpenVINO
-did not own the complete frozen graph, so this is an evidence package only.
-For current Intel drivers, `cfetch-test-openvino-current` instead pins ORT
-1.27.1 and OpenVINO 2026.3 from the locked Nix input. A physical Core Ultra 7
-258V probe compiled the frozen graph on both Arc 140V and its NPU, but strict
-sessions still required forbidden CPU remainder. A native OpenVINO diagnostic
-subsequently owned the unchanged corrected-v1 graph completely on the Core
-Ultra CPU, Arc GPU, and Intel NPU across all seven buckets. Each passed 0/11
-exact vectors, including conservative `ACCURACY` controls and an FP32-hint GPU
-control. These are rejected routes, not producer support; production remains
-fail-closed.
-Windows x64 testers can create the equivalent hash-pinned NuGet evidence
-package with `scripts/build-windows-inference-package.ps1 -Provider
-openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
-replacing the provider suffix. The public hosted runner exercises CPU only and
-does not stand in for physical Intel GPU or NPU hardware.
-
-Mixed-vendor GPU testers use `nix build
-github:corbet-labs/cfetch#cfetch-test-webgpu` on Linux x86-64 or Apple Silicon,
-or the Windows package builder with `-Provider webgpu`. This pins Microsoft's
-native WebGPU plugin across Vulkan, D3D12, and Metal. It remains an evidence
-route: the actual adapter must pass exact bytes and placement review, and no
-Linux ARM64 plugin binary is currently published upstream. Public hosted
-probes failed closed: Linux exposed no Vulkan adapter and Windows exposed only
-Hyper-V Video, where WebGPU could not own the complete graph. The isolated
-macOS retry reached the pinned plugin on a virtual Apple M1 but likewise left
-nodes on forbidden CPU fallback. None is a physical GPU certificate.
-
-A physical Radeon RX 6800 added the missing Vulkan-class evidence. Strict
-WebGPU execution rejected unsupported `QuantizeLinear` and other CPU nodes. A
-controlled hybrid trace dequantized learned tensors and emitted `f32` MatMul
-shaders rather than W8A8 kernels. Three runs produced identical wrong bytes as
-the GPU warmed by several degrees, ruling out temperature instability.
-
-The corrected CPU reference freezes ORT deterministic compute and precise QMM.
-It produced identical raw outputs and final vectors on a physical Ryzen 9
-5950X AVX2 host, a physical Core Ultra 7 258V VNNI host, and one hosted EPYC
-7763: 11/11 on each. Current hosted Arm routes failed 0/11, and a controlled
-Q/DQ-policy run on a Xeon 8573C passed only 6/11. Deterministic execution is
-repeatable on a selected kernel route; it is not a cross-hardware byte promise.
-Ordinary local loading therefore runs the same admission gate on every actual
-host and fails closed before writing incompatible vectors. See the
-[frozen profile](docs/embedding-profile-v1.md) and
-[certification matrix](docs/accelerator-certification.md).
+Local packages will return as an NPU-first family: an admitted NPU is selected
+first, then an admitted GPU, then an accelerated CPU implementation. Each may
+carry a runtime-native INT8 artifact. Remote inference remains an explicit
+configuration choice, not a substitute for local capability or an automatic
+fallback. See the [candidate embedding profile](docs/embedding-profile-v1.md)
+and [local inference plan](docs/local-inference.md).
 
 ### Build the development branch
 
@@ -623,31 +562,25 @@ Ring rules are ordered; the first matching path prefix wins:
 }
 ```
 
-Semantic recall is off by default. Point it at an OpenAI-compatible embeddings
-endpoint, or use the local package and extracted v1 model bundle. Keep remote
-credentials in an environment variable, never in JSON.
+Semantic recall is off by default. The current release accepts an admitted
+OpenAI-compatible embeddings endpoint. Keep remote credentials in an
+environment variable, never in JSON.
 
-On `main` for the next release, the model pipeline is no longer configurable:
-network major 1 fixes EmbeddingGemma-300M,
-static signed-symmetric W8A8 INT8 execution, full 768 dimensions, the
-prompts/pooling/normalization,
-and one 768-byte signed-INT8 vector format. A producer endpoint must attest the
-exact cfetch profile, pinned model revision, quantizer, and artifact ID in its response;
-plain OpenAI wire shape alone is not permission to publish shared vectors:
+Network major 1 fixes the EmbeddingGemma source revision, tokenizer, full 768
+dimensions, query/document prompts, pooling, normalization, and the signed
+INT8x768 stored record. It does not freeze one vendor graph. Backend-native
+NPU, GPU, and CPU artifacts must attest the logical profile and pass the mixed
+query/document retrieval matrix before local packages ship.
 
 ```json
 {
   "embeddings": {
     "enabled": true,
-    "model_dir": "/absolute/path/to/cfetch-embeddinggemma-300m-a8w8-v1",
-    "execution_provider": "auto"
+    "endpoint": "https://embeddings.example/v1",
+    "api_key_env": "CFETCH_EMBEDDINGS_KEY"
   }
 }
 ```
-
-For a remote certified producer, replace `model_dir` and `execution_provider`
-with `endpoint` and `api_key_env`. A configured local model never silently
-falls back to that endpoint.
 
 Run `cfetch embed-index` for an explicit backfill or debugging pass. With the
 daemon running, catalog generation changes trigger the same shared-first
@@ -666,13 +599,12 @@ block can complete `embed-index` with embeddings disabled and zero endpoint
 calls.
 
 Run `cfetch embedding-profile --json` for the executable manifest. Changing
-any model-pipeline field is a new incompatible network major and requires every
-participant to upgrade plus a full re-embedding; different majors do not
-network with each other. Local packages use FastEmbed and ONNX Runtime, and
-`cfetch inference-certify` verifies the actual provider against all released
-vector bytes before it can be admitted as a producer. See
-[embedding profile v1](docs/embedding-profile-v1.md) and
-[accelerator certification](docs/accelerator-certification.md).
+a semantic pipeline field is a new incompatible network major and requires
+re-embedding. Runtime-native artifact hashes remain backend-scoped. The NPU is
+the reference direction; exact bytes across device families are not required,
+while repeatability on one runtime/artifact/device and the full mixed-backend
+retrieval matrix are mandatory. See [embedding profile v1](docs/embedding-profile-v1.md)
+and [local accelerated inference](docs/local-inference.md).
 
 Named slices limit recall and sharing by path:
 

@@ -450,7 +450,7 @@ impl VectorWriter<'_> {
                 .context("vector index named an existing record that could not be read")?;
             anyhow::ensure!(
                 existing == encoded,
-                "backend produced different canonical bytes for existing content {hash} under profile {} — refusing cross-runner drift",
+                "received different canonical bytes for existing content {hash} under profile {} — the derive-once store keeps its first admitted record",
                 self.store.spec.profile_id
             );
             return Ok(false);
@@ -642,7 +642,7 @@ mod tests {
             assert!(w.put("bb", &[0.0, 1.0, 0.0, 0.0]).unwrap());
             assert!(!w.put("aa", &[1.0, 0.0, 0.0, 0.0]).unwrap(), "same bytes: already stored");
             let drift = w.put("aa", &[9.0, 9.0, 9.0, 9.0]).unwrap_err().to_string();
-            assert!(drift.contains("cross-runner drift"), "{drift}");
+            assert!(drift.contains("derive-once store"), "{drift}");
             w.flush().unwrap();
         }
         assert_eq!(store.len(), 2);
