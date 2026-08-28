@@ -1,0 +1,1188 @@
+#!/usr/bin/env python3
+"""Focused tests for the backend-neutral adapter evidence exporter."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+import copy
+import hashlib
+import json
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import numpy as np
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from cross_backend_eval import load_cache
+from export_adapter_cache import (
+    ADMISSION_POLICY_SHA256,
+    DATASET,
+    DATASET_REVISION,
+    DIMENSIONS,
+    DOCUMENT_PREFIX,
+    MAX_ADAPTER_RESPONSE_BYTES,
+    MAX_TOKENS,
+    MODEL,
+    MODEL_REVISION,
+    PROFILE_ID,
+    PROFILE_MANIFEST_SHA256,
+    QUERY_PREFIX,
+    SEQUENCE_BUCKETS,
+    SEQUENCE_PROBE_ARRAY_NAMES,
+    SEQUENCE_SEMANTIC_FIXTURE_ID,
+    SEQUENCE_SEMANTIC_FIXTURE_SHA256,
+    SUPPORTED_MAX_BATCH_SIZE,
+    WIRE_BATCH_INPUT_SELECTION,
+    attestation_message,
+    build_cache_metadata,
+    build_parser,
+    canonical_i8,
+    collect_cache_arrays,
+    collect_sequence_probe_arrays,
+    embed_canonical,
+    ordered_input_json_sha256,
+    read_bounded_adapter_response,
+    read_verified_evidence,
+    request_embeddings,
+    sequence_semantic_probe_inputs,
+    utf8_sha256,
+    validate_evidence_reports,
+    validate_loopback_endpoint,
+    validate_response,
+    verify_response_signature,
+    verify_wire_batch_contract,
+    wire_batch_inputs,
+    write_cache,
+)
+
+
+def attested_response(rows: list[dict[str, object]]) -> dict[str, object]:
+    attested_rows = [
+        {
+            "cfetch_scope_id": "test-scope",
+            "token_count": 5,
+            "sequence_bucket": 32,
+            "truncated": False,
+            **row,
+        }
+        for row in rows
+    ]
+    return {
+        "model": MODEL,
+        "cfetch_profile": PROFILE_ID,
+        "cfetch_profile_manifest_sha256": PROFILE_MANIFEST_SHA256,
+        "cfetch_admission_policy_sha256": ADMISSION_POLICY_SHA256,
+        "cfetch_model_revision": MODEL_REVISION,
+        "cfetch_execution": {
+            "scope_id": "test-scope",
+            "backend": "test-adapter",
+            "runtime": "test-runtime",
+            "compiler": "test-compiler",
+            "package_target": "test-target",
+            "artifact_source": "test-source@revision/model",
+            "device_class": "cpu",
+            "device": "test-device",
+            "artifact_sha256": "1" * 64,
+            "internal_precision": "test-native",
+            "placement_evidence_sha256": "2" * 64,
+            "supported_max_tokens": MAX_TOKENS,
+            "supported_sequence_buckets": SEQUENCE_BUCKETS,
+            "supported_max_batch_size": SUPPORTED_MAX_BATCH_SIZE,
+            "sequence_capability_evidence_sha256": "3" * 64,
+            "performance_evidence_sha256": "4" * 64,
+            "accelerated_placement": True,
+        },
+        "data": attested_rows,
+    }
+
+
+def vector(seed: float) -> list[float]:
+    return [seed, -seed / 2.0] + [0.0] * (DIMENSIONS - 2)
+
+
+def semantic_probe_fixture(bucket: int) -> dict[str, object]:
+    query, relevant, irrelevant = sequence_semantic_probe_inputs(bucket)
+    return {
+        "fixture_id": SEQUENCE_SEMANTIC_FIXTURE_ID,
+        "fixture_sha256": SEQUENCE_SEMANTIC_FIXTURE_SHA256,
+        "query_input_utf8_sha256": utf8_sha256(query),
+        "relevant_document_input_utf8_sha256": utf8_sha256(relevant),
+        "irrelevant_document_input_utf8_sha256": utf8_sha256(irrelevant),
+        "query_token_count": bucket,
+        "relevant_document_token_count": bucket,
+        "irrelevant_document_token_count": bucket,
+        "query_canonical_output_bytes_sha256": "7" * 64,
+        "relevant_document_canonical_output_bytes_sha256": "8" * 64,
+        "irrelevant_document_canonical_output_bytes_sha256": "9" * 64,
+        "canonical_repeatability": True,
+        "self_relevant_before_irrelevant": True,
+    }
+
+
+def valid_evidence_fixture() -> tuple[
+    argparse.Namespace,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    args = argparse.Namespace(
+        scope_id="test-scope",
+        backend="test-adapter",
+        artifact_source="test-source@revision/model",
+        artifact_sha256="1" * 64,
+        internal_precision="test-native",
+        runtime="test-runtime",
+        compiler="test-compiler",
+        package_target="test-target",
+        device="test-device",
+        device_class="cpu",
+        supported_max_tokens=64,
+        supported_sequence_bucket=[32, 64],
+    )
+    identity = {
+        "scope_id": args.scope_id,
+        "backend": args.backend,
+        "artifact_source": args.artifact_source,
+        "artifact_sha256": args.artifact_sha256,
+        "internal_precision": args.internal_precision,
+        "runtime": args.runtime,
+        "compiler": args.compiler,
+        "package_target": args.package_target,
+        "device": args.device,
+        "device_class": args.device_class,
+    }
+    sequence = {
+        **identity,
+        "supported_max_tokens": 64,
+        "supported_sequence_buckets": [32, 64],
+        "supported_max_batch_size": SUPPORTED_MAX_BATCH_SIZE,
+        "wire_batch_results": [
+            {
+                "batch_size": batch_size,
+                "input_count": SUPPORTED_MAX_BATCH_SIZE,
+                "request_count": (
+                    SUPPORTED_MAX_BATCH_SIZE + batch_size - 1
+                )
+                // batch_size,
+                "response_row_count": SUPPORTED_MAX_BATCH_SIZE,
+                "ordered_input_json_sha256": "5" * 64,
+                "canonical_output_bytes_sha256": "5" * 64,
+            }
+            for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
+        ],
+        "grouping_invariance": {
+            "batch_sizes": list(range(1, SUPPORTED_MAX_BATCH_SIZE + 1)),
+            "input_selection": WIRE_BATCH_INPUT_SELECTION,
+            "same_inputs_in_same_order": True,
+            "canonical_output_bytes_equal": True,
+        },
+        "bucket_results": [
+            {
+                "bucket": bucket,
+                "requested_tokens": bucket,
+                "tokenized_tokens": bucket,
+                "executed_shape_tokens": bucket,
+                "output_dimensions": DIMENSIONS,
+                "finite_output": True,
+                "nonzero_output": True,
+                "truncated": False,
+                "semantic_probe": semantic_probe_fixture(bucket),
+            }
+            for bucket in (32, 64)
+        ],
+    }
+    placement = {
+        **identity,
+        "accelerated_placement": True,
+        "accelerator_execution_confirmed": True,
+        "fallback_disclosure_complete": True,
+        "unexpected_fallback_detected": False,
+        "bucket_results": [
+            {
+                "bucket": bucket,
+                "accelerator_execution_confirmed": True,
+                "fallback_disclosure_complete": True,
+                "unexpected_fallback_detected": False,
+                "fallback_summary": "none",
+                "profiler_output_sha256": "2" * 64,
+            }
+            for bucket in (32, 64)
+        ],
+    }
+    performance = {
+        **identity,
+        "bucket_results": [
+            {
+                "bucket": 32,
+                "sample_count": 10,
+                "benchmark_output_sha256": "6" * 64,
+                "latency_ms_p50": 1.0,
+                "latency_ms_p95": 2.0,
+                "peak_memory_bytes": 1024,
+                "energy_joules": 0.25,
+                "average_power_watts": 1.5,
+            },
+            {
+                "bucket": 64,
+                "sample_count": 10,
+                "benchmark_output_sha256": "6" * 64,
+                "latency_ms_p50": 1.0,
+                "latency_ms_p95": 2.0,
+                "peak_memory_bytes": 1024,
+                "energy_measurement": "not_measured",
+                "energy_not_measured_reason": "meter unavailable",
+            },
+        ],
+    }
+    return args, sequence, placement, performance
+
+
+class ExportAdapterCacheTests(unittest.TestCase):
+    def test_evidence_schema_binds_scope_buckets_placement_and_performance(self) -> None:
+        args, sequence, placement, performance = valid_evidence_fixture()
+        validate_evidence_reports(args, sequence, placement, performance)
+
+        cases = []
+        changed = copy.deepcopy(sequence)
+        changed["artifact_sha256"] = "9" * 64
+        cases.append(("scope identity", changed, placement, performance, "artifact_sha256"))
+        changed = copy.deepcopy(sequence)
+        changed["bucket_results"][0]["truncated"] = True
+        cases.append(("truncation", changed, placement, performance, "truncated"))
+        changed = copy.deepcopy(sequence)
+        changed["bucket_results"][0]["semantic_probe"][
+            "canonical_repeatability"
+        ] = False
+        cases.append(
+            ("bucket repeatability", changed, placement, performance, "repeatability")
+        )
+        changed = copy.deepcopy(sequence)
+        changed["bucket_results"][1]["semantic_probe"]["query_token_count"] = 32
+        cases.append(
+            ("probe bucket selection", changed, placement, performance, "select this bucket")
+        )
+        changed = copy.deepcopy(sequence)
+        changed["bucket_results"][0]["semantic_probe"][
+            "query_input_utf8_sha256"
+        ] = "0" * 64
+        cases.append(
+            ("probe input", changed, placement, performance, "pinned semantic probe")
+        )
+        changed = copy.deepcopy(sequence)
+        changed["bucket_results"].pop()
+        cases.append(("missing bucket", changed, placement, performance, "cover exactly"))
+        changed = copy.deepcopy(sequence)
+        changed["supported_max_batch_size"] = 32
+        cases.append(("max batch", changed, placement, performance, "max_batch_size"))
+        changed = copy.deepcopy(sequence)
+        changed["wire_batch_results"][1]["canonical_output_bytes_sha256"] = "6" * 64
+        cases.append(
+            ("batch grouping", changed, placement, performance, "canonical outputs differ")
+        )
+        changed = copy.deepcopy(sequence)
+        changed["wire_batch_results"][2]["request_count"] = 21
+        cases.append(("ceil request count", changed, placement, performance, "must be 22"))
+        changed = copy.deepcopy(sequence)
+        changed["wire_batch_results"].pop(17)
+        cases.append(("every batch size", changed, placement, performance, "cover exactly"))
+        changed = copy.deepcopy(sequence)
+        changed["wire_batch_results"][9]["ordered_input_json_sha256"] = "6" * 64
+        cases.append(
+            ("ordered batch inputs", changed, placement, performance, "different ordered inputs")
+        )
+        changed = copy.deepcopy(sequence)
+        changed["grouping_invariance"]["same_inputs_in_same_order"] = False
+        cases.append(
+            ("input grouping", changed, placement, performance, "same_inputs_in_same_order")
+        )
+        changed_placement = copy.deepcopy(placement)
+        changed_placement["bucket_results"][0]["unexpected_fallback_detected"] = True
+        cases.append(
+            ("unexpected fallback", sequence, changed_placement, performance, "unexpected fallback")
+        )
+        changed_placement = copy.deepcopy(placement)
+        changed_placement["bucket_results"][0]["profiler_output_sha256"] = "not-a-digest"
+        cases.append(("profiler digest", sequence, changed_placement, performance, "profiler"))
+        changed_performance = copy.deepcopy(performance)
+        changed_performance["bucket_results"][0]["latency_ms_p95"] = 0.5
+        cases.append(("latency order", sequence, placement, changed_performance, "below p50"))
+        changed_performance = copy.deepcopy(performance)
+        del changed_performance["bucket_results"][0]["energy_joules"]
+        cases.append(
+            ("partial energy", sequence, placement, changed_performance, "energy_joules")
+        )
+        changed_performance = copy.deepcopy(performance)
+        changed_performance["bucket_results"][1]["energy_not_measured_reason"] = " "
+        cases.append(
+            ("missing energy reason", sequence, placement, changed_performance, "nonempty")
+        )
+        for name, candidate_sequence, candidate_placement, candidate_performance, error in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                validate_evidence_reports(
+                    args,
+                    candidate_sequence,
+                    candidate_placement,
+                    candidate_performance,
+                )
+
+    def test_evidence_file_digest_is_checked_against_the_actual_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "evidence.json"
+            data = b'{"evidence":true}\n'
+            path.write_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            self.assertEqual(read_verified_evidence(path, digest), data)
+            with self.assertRaisesRegex(ValueError, "sha256"):
+                read_verified_evidence(path, "0" * 64)
+
+    def test_cache_metadata_never_persists_private_evidence_paths(self) -> None:
+        args = argparse.Namespace(
+            scope_id="test-scope",
+            backend="test-adapter",
+            runtime="test-runtime",
+            compiler="test-compiler",
+            package_target="test-target",
+            artifact_source="test-source@revision/model",
+            artifact_sha256="1" * 64,
+            attestation_public_key="5" * 64,
+            internal_precision="test-native",
+            supported_max_tokens=MAX_TOKENS,
+            supported_sequence_bucket=SEQUENCE_BUCKETS,
+            sequence_capability_evidence=Path(
+                "/home/private-user/results/sequence.json"
+            ),
+            sequence_capability_evidence_sha256="2" * 64,
+            device="test-device",
+            device_class="cpu",
+            placement_evidence=Path("/home/private-user/results/placement.json"),
+            placement_evidence_sha256="3" * 64,
+            performance_evidence=Path(
+                "/home/private-user/results/performance.json"
+            ),
+            performance_evidence_sha256="4" * 64,
+            accelerated_placement=True,
+        )
+
+        metadata = build_cache_metadata(args)
+        serialized = json.dumps(metadata, sort_keys=True)
+
+        self.assertNotIn("/home/", serialized)
+        self.assertEqual(
+            metadata["sequence_capability_evidence"],
+            "npz:sequence_capability_evidence_bytes",
+        )
+        self.assertEqual(
+            metadata["placement_evidence"], "npz:placement_evidence_bytes"
+        )
+        self.assertEqual(
+            metadata["performance_evidence"], "npz:performance_evidence_bytes"
+        )
+
+    def test_canonical_codec_is_signed_int8_and_rounds_ties_to_even(self) -> None:
+        values = np.zeros((1, DIMENSIONS), dtype=np.float32)
+        values[0, :5] = [
+            1.0,
+            0.5 / 127.0,
+            1.5 / 127.0,
+            -0.5 / 127.0,
+            -1.5 / 127.0,
+        ]
+
+        encoded = canonical_i8(values)
+
+        self.assertEqual(encoded.dtype, np.dtype(np.int8))
+        self.assertEqual(encoded[0, :5].tolist(), [127, 0, 2, 0, -2])
+
+    def test_export_batch_size_cannot_exceed_wire_contract(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not exceed 64"):
+            embed_canonical(
+                "http://127.0.0.1/embeddings",
+                [],
+                SUPPORTED_MAX_BATCH_SIZE + 1,
+                1.0,
+                None,
+            )
+
+    def test_admission_export_requires_a_lowercase_ed25519_public_key(self) -> None:
+        action = next(
+            item
+            for item in build_parser()._actions
+            if item.dest == "attestation_public_key"
+        )
+        self.assertTrue(action.required)
+        self.assertEqual(action.type("ab" * 32), "ab" * 32)
+        for invalid in ("AB" * 32, "ab" * 31, "z0" * 32):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                action.type(invalid)
+
+    def test_package_signature_binds_nonce_and_exact_request_response_bytes(self) -> None:
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        ).hex()
+        nonce = bytes(range(32))
+        request_body = b'{"input":["one"]}'
+        response_body = b'{"data":[{"index":0}]}'
+        signature = private_key.sign(
+            attestation_message(nonce, request_body, response_body)
+        ).hex()
+
+        verify_response_signature(
+            public_key, signature, nonce, request_body, response_body
+        )
+        for name, changed_nonce, changed_request, changed_response in (
+            ("nonce", bytes(reversed(nonce)), request_body, response_body),
+            ("request", nonce, request_body + b" ", response_body),
+            ("response", nonce, request_body, response_body + b" "),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "package-key signature"
+            ):
+                verify_response_signature(
+                    public_key,
+                    signature,
+                    changed_nonce,
+                    changed_request,
+                    changed_response,
+                )
+
+    def test_signed_http_requests_use_fresh_nonces(self) -> None:
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        ).hex()
+
+        class FakeResponse:
+            def __init__(self, body: bytes, signature: str) -> None:
+                self.body = body
+                self.headers = {"X-Cfetch-Attestation-Signature": signature}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def read(self, amount: int = -1) -> bytes:
+                return self.body[:amount] if amount >= 0 else self.body
+
+        class SigningOpener:
+            def __init__(self) -> None:
+                self.nonces: list[bytes] = []
+
+            def open(self, request, timeout: float):
+                del timeout
+                headers = {
+                    name.lower(): value for name, value in request.header_items()
+                }
+                nonce = bytes.fromhex(headers["x-cfetch-attestation-nonce"])
+                self.nonces.append(nonce)
+                request_payload = json.loads(request.data)
+                rows = [
+                    {"index": index, "embedding": vector(float(index + 1))}
+                    for index, _ in enumerate(request_payload["input"])
+                ]
+                response_body = json.dumps(
+                    attested_response(rows), separators=(",", ":")
+                ).encode("utf-8")
+                signature = private_key.sign(
+                    attestation_message(nonce, request.data, response_body)
+                ).hex()
+                return FakeResponse(response_body, signature)
+
+        opener = SigningOpener()
+        for _ in range(2):
+            result = request_embeddings(
+                "http://127.0.0.1:1234/embeddings",
+                [QUERY_PREFIX + "signed"],
+                7.0,
+                opener=opener,
+                attestation_public_key=public_key,
+            )
+            self.assertEqual(result.shape, (1, DIMENSIONS))
+        self.assertEqual(len(opener.nonces), 2)
+        self.assertEqual(len(opener.nonces[0]), 32)
+        self.assertNotEqual(opener.nonces[0], opener.nonces[1])
+
+    def test_adapter_response_rejects_oversized_content_length_before_read(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Length": str(MAX_ADAPTER_RESPONSE_BYTES + 1)}
+            read_called = False
+
+            def read(self, amount: int) -> bytes:
+                del amount
+                self.read_called = True
+                return b""
+
+        response = FakeResponse()
+        with self.assertRaisesRegex(ValueError, "Content-Length.*response limit"):
+            read_bounded_adapter_response(response)
+        self.assertFalse(response.read_called, "oversized declared bodies must not be read")
+
+    def test_chunked_adapter_response_reads_only_limit_plus_one(self) -> None:
+        class FakeResponse:
+            headers = {"Transfer-Encoding": "chunked"}
+            requested: int | None = None
+
+            def read(self, amount: int) -> bytes:
+                self.requested = amount
+                return b"x" * amount
+
+        response = FakeResponse()
+        with self.assertRaisesRegex(ValueError, "response exceeds.*byte limit"):
+            read_bounded_adapter_response(response)
+        self.assertEqual(response.requested, MAX_ADAPTER_RESPONSE_BYTES + 1)
+
+    def test_exporter_replays_same_64_inputs_at_every_wire_batch_size(self) -> None:
+        queries = [f"{QUERY_PREFIX}query-{index}" for index in range(32)]
+        documents = [f"{DOCUMENT_PREFIX}document-{index}" for index in range(32)]
+        inputs = wire_batch_inputs(queries, documents)
+        args, sequence, _, _ = valid_evidence_fixture()
+        del args
+
+        def floats_for(texts: Sequence[str]) -> np.ndarray:
+            values = np.zeros((len(texts), DIMENSIONS), dtype=np.float32)
+            for index, text in enumerate(texts):
+                values[index, 0] = 1.0
+                values[index, 1] = (sum(text.encode("utf-8")) % 97) / 100.0
+            return values
+
+        expected_digest = hashlib.sha256(
+            canonical_i8(floats_for(inputs)).tobytes()
+        ).hexdigest()
+        input_digest = ordered_input_json_sha256(inputs)
+        for row in sequence["wire_batch_results"]:
+            row["ordered_input_json_sha256"] = input_digest
+            row["canonical_output_bytes_sha256"] = expected_digest
+
+        calls: list[list[str]] = []
+
+        def fake_request(
+            endpoint: str,
+            texts: Sequence[str],
+            timeout: float,
+            token: str | None,
+        ) -> np.ndarray:
+            del endpoint, timeout, token
+            calls.append(list(texts))
+            return floats_for(texts)
+
+        outputs = verify_wire_batch_contract(
+            "http://127.0.0.1/embeddings",
+            inputs,
+            1.0,
+            None,
+            sequence,
+            fake_request,
+        )
+
+        self.assertEqual(outputs.shape, (64, 64, DIMENSIONS))
+        self.assertTrue(
+            all(np.array_equal(outputs[0], item) for item in outputs[1:])
+        )
+        self.assertEqual(
+            {
+                hashlib.sha256(np.ascontiguousarray(item).tobytes()).hexdigest()
+                for item in outputs
+            },
+            {expected_digest},
+        )
+        self.assertEqual(
+            len(calls),
+            sum((64 + batch_size - 1) // batch_size for batch_size in range(1, 65)),
+        )
+
+    def test_every_sequence_bucket_runs_twice_and_binds_semantic_outputs(self) -> None:
+        _, sequence, _, _ = valid_evidence_fixture()
+        floats = np.zeros((3, DIMENSIONS), dtype=np.float32)
+        floats[0, 0] = 1.0
+        floats[1, :2] = [1.0, 0.5]
+        floats[2, 0] = -1.0
+        canonical = canonical_i8(floats)
+        for row in sequence["bucket_results"]:
+            probe = row["semantic_probe"]
+            for index, label in enumerate(
+                ("query", "relevant_document", "irrelevant_document")
+            ):
+                probe[f"{label}_canonical_output_bytes_sha256"] = hashlib.sha256(
+                    canonical[index].tobytes()
+                ).hexdigest()
+
+        calls: list[tuple[list[str], list[dict[str, object]]]] = []
+
+        def fake_request(
+            texts: Sequence[str], metadata: Sequence[dict[str, object]]
+        ) -> np.ndarray:
+            calls.append((list(texts), list(metadata)))
+            return floats.copy()
+
+        arrays = collect_sequence_probe_arrays(sequence, fake_request)
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(arrays), len(SEQUENCE_PROBE_ARRAY_NAMES))
+        self.assertTrue(all(array.shape == (2, DIMENSIONS) for array in arrays))
+        self.assertTrue(np.array_equal(arrays[0], arrays[3]))
+        self.assertTrue(np.array_equal(arrays[1], arrays[4]))
+        self.assertTrue(np.array_equal(arrays[2], arrays[5]))
+        for offset, bucket in enumerate((32, 64)):
+            expected_inputs = list(sequence_semantic_probe_inputs(bucket))
+            first_call = calls[offset * 2]
+            repeat_call = calls[offset * 2 + 1]
+            self.assertEqual(first_call, repeat_call)
+            self.assertEqual(first_call[0], expected_inputs)
+            self.assertTrue(
+                all(row["sequence_bucket"] == bucket for row in first_call[1])
+            )
+
+        call_index = 0
+
+        def unstable_request(
+            texts: Sequence[str], metadata: Sequence[dict[str, object]]
+        ) -> np.ndarray:
+            nonlocal call_index
+            del texts, metadata
+            call_index += 1
+            changed = floats.copy()
+            if call_index == 2:
+                changed[0, :2] = [1.0, 0.25]
+            return changed
+
+        with self.assertRaisesRegex(ValueError, "not byte-repeatable"):
+            collect_sequence_probe_arrays(sequence, unstable_request)
+
+    def test_response_attestation_and_explicit_indices_are_enforced(self) -> None:
+        payload = attested_response(
+            [
+                {"index": 1, "embedding": vector(2.0)},
+                {"index": 0, "embedding": vector(1.0)},
+            ]
+        )
+
+        ordered = validate_response(payload, 2)
+
+        self.assertEqual(ordered[:, 0].tolist(), [1.0, 2.0])
+        with self.subTest("next smallest sequence bucket"):
+            boundary = attested_response(
+                [
+                    {
+                        "index": 0,
+                        "embedding": vector(1.0),
+                        "token_count": 33,
+                        "sequence_bucket": 64,
+                    }
+                ]
+            )
+            validate_response(boundary, 1)
+            with self.assertRaisesRegex(ValueError, "sequence evidence requires"):
+                validate_response(
+                    boundary,
+                    1,
+                    expected_row_metadata=[
+                        {"token_count": 34, "sequence_bucket": 64}
+                    ],
+                )
+        with self.subTest("wrong manifest"):
+            invalid = dict(payload)
+            invalid["cfetch_profile_manifest_sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "manifest"):
+                validate_response(invalid, 2)
+        with self.subTest("duplicate index"):
+            invalid = attested_response(
+                [
+                    {"index": 0, "embedding": vector(1.0)},
+                    {"index": 0, "embedding": vector(2.0)},
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                validate_response(invalid, 2)
+        with self.subTest("non-finite vector"):
+            invalid = attested_response([{"index": 0, "embedding": vector(float("nan"))}])
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                validate_response(invalid, 1)
+        with self.subTest("zero vector"):
+            invalid = attested_response(
+                [{"index": 0, "embedding": [0.0] * DIMENSIONS}]
+            )
+            with self.assertRaisesRegex(ValueError, "all zero"):
+                validate_response(invalid, 1)
+        for name, field, value, error in (
+            ("wrong row scope", "cfetch_scope_id", "other-scope", "cfetch_scope_id"),
+            ("zero token count", "token_count", 0, "token_count"),
+            ("boolean token count", "token_count", True, "token_count"),
+            ("overlength", "token_count", MAX_TOKENS + 1, "token_count"),
+            ("larger bucket", "sequence_bucket", 64, "smallest supported bucket"),
+            ("truncation", "truncated", True, "truncated=false"),
+        ):
+            with self.subTest(name=name):
+                invalid = copy.deepcopy(payload)
+                invalid["data"][0][field] = value
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_response(invalid, 2)
+        for name, field, error in (
+            ("missing row scope", "cfetch_scope_id", "cfetch_scope_id"),
+            ("missing token count", "token_count", "token_count"),
+            ("missing bucket", "sequence_bucket", "sequence_bucket"),
+            ("missing truncation", "truncated", "truncated=false"),
+        ):
+            with self.subTest(name=name):
+                invalid = copy.deepcopy(payload)
+                del invalid["data"][0][field]
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_response(invalid, 2)
+        with self.subTest("execution maximum batch"):
+            invalid = copy.deepcopy(payload)
+            invalid["cfetch_execution"]["supported_max_batch_size"] = 63
+            with self.assertRaisesRegex(ValueError, "max_batch_size"):
+                validate_response(invalid, 2)
+        with self.subTest("token count not covered by configured buckets"):
+            invalid = attested_response(
+                [
+                    {
+                        "index": 0,
+                        "embedding": vector(1.0),
+                        "token_count": 64,
+                        "sequence_bucket": 32,
+                    }
+                ]
+            )
+            invalid["cfetch_execution"]["supported_max_tokens"] = 64
+            invalid["cfetch_execution"]["supported_sequence_buckets"] = [32]
+            with self.assertRaisesRegex(ValueError, "does not fit"):
+                validate_response(invalid, 1)
+        with self.subTest("execution scope mismatch"):
+            with self.assertRaisesRegex(ValueError, "scope_id"):
+                validate_response(
+                    payload,
+                    2,
+                    {
+                        "scope_id": "another-scope",
+                        "backend": "test-adapter",
+                        "runtime": "test-runtime",
+                        "compiler": "test-compiler",
+                        "package_target": "test-target",
+                        "artifact_source": "test-source@revision/model",
+                        "device_class": "cpu",
+                        "device": "test-device",
+                        "artifact_sha256": "1" * 64,
+                        "internal_precision": "test-native",
+                        "placement_evidence_sha256": "2" * 64,
+                        "supported_max_tokens": MAX_TOKENS,
+                        "supported_sequence_buckets": SEQUENCE_BUCKETS,
+                        "supported_max_batch_size": SUPPORTED_MAX_BATCH_SIZE,
+                        "sequence_capability_evidence_sha256": "3" * 64,
+                        "performance_evidence_sha256": "4" * 64,
+                        "accelerated_placement": True,
+                    },
+                )
+
+    def test_only_loopback_embedding_urls_are_accepted(self) -> None:
+        self.assertEqual(
+            validate_loopback_endpoint("http://127.0.0.1:8080/v1/embeddings"),
+            "http://127.0.0.1:8080/v1/embeddings",
+        )
+        self.assertEqual(
+            validate_loopback_endpoint("http://[::1]:8080/embeddings"),
+            "http://[::1]:8080/embeddings",
+        )
+        for endpoint in (
+            "https://example.com/embeddings",
+            "file:///embeddings",
+            "http://localhost:8080/not-embeddings",
+            "http://localhost:8080/embeddings?redirect=1",
+        ):
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                validate_loopback_endpoint(endpoint)
+
+    def test_local_adapter_is_batched_run_twice_and_writes_gate_schema(self) -> None:
+        requests: list[dict[str, object]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                requests.append(payload)
+                rows = [
+                    {
+                        "index": index,
+                        "embedding": vector(float(len(text.encode("utf-8")) + 1)),
+                    }
+                    for index, text in reversed(list(enumerate(payload["input"])))
+                ]
+                response = json.dumps(attested_response(rows)).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}/embeddings"
+        query_inputs = [QUERY_PREFIX + "one", QUERY_PREFIX + "two"]
+        document_inputs = [
+            DOCUMENT_PREFIX + "alpha",
+            DOCUMENT_PREFIX + "beta",
+            DOCUMENT_PREFIX + "gamma",
+        ]
+        try:
+            arrays = collect_cache_arrays(
+                endpoint,
+                query_inputs,
+                document_inputs,
+                batch_size=2,
+                timeout_seconds=5.0,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5.0)
+
+        self.assertEqual(len(requests), 6)
+        self.assertEqual(
+            [len(request["input"]) for request in requests],
+            [2, 2, 1, 2, 2, 1],
+        )
+        self.assertTrue(
+            all(request["model"] == MODEL for request in requests)
+        )
+        self.assertTrue(
+            all(request["dimensions"] == DIMENSIONS for request in requests)
+        )
+        self.assertEqual(arrays[0].shape, (2, DIMENSIONS))
+        self.assertEqual(arrays[1].shape, (3, DIMENSIONS))
+        self.assertTrue(np.array_equal(arrays[0], arrays[2]))
+        self.assertTrue(np.array_equal(arrays[1], arrays[3]))
+
+        metadata = {
+            "schema_version": 1,
+            "profile_id": PROFILE_ID,
+            "profile_manifest_sha256": PROFILE_MANIFEST_SHA256,
+            "admission_policy_sha256": ADMISSION_POLICY_SHA256,
+            "model": MODEL,
+            "model_revision": MODEL_REVISION,
+            "vector_encoding": "signed-int8x768",
+            "supported_max_tokens": MAX_TOKENS,
+            "supported_sequence_buckets": SEQUENCE_BUCKETS,
+            "supported_max_batch_size": SUPPORTED_MAX_BATCH_SIZE,
+            "sequence_semantic_fixture_id": SEQUENCE_SEMANTIC_FIXTURE_ID,
+            "sequence_semantic_fixture_sha256": SEQUENCE_SEMANTIC_FIXTURE_SHA256,
+            "sequence_capability_evidence": "npz:sequence_capability_evidence_bytes",
+            "dataset": DATASET,
+            "dataset_revision": DATASET_REVISION,
+            "scope_id": "test-scope",
+            "backend": "test-adapter",
+            "runtime": "test-runtime",
+            "compiler": "test-compiler",
+            "package_target": "test-target",
+            "artifact_source": "test-source@revision/model",
+            "artifact_sha256": "1" * 64,
+            "attestation_public_key": "5" * 64,
+            "internal_precision": "test-native",
+            "device": "test-device",
+            "device_class": "cpu",
+            "placement_evidence": "npz:placement_evidence_bytes",
+            "performance_evidence": "npz:performance_evidence_bytes",
+            "accelerated_placement": True,
+        }
+        probe_queries = np.zeros((len(SEQUENCE_BUCKETS), DIMENSIONS), dtype=np.int8)
+        probe_relevant = np.zeros_like(probe_queries)
+        probe_irrelevant = np.zeros_like(probe_queries)
+        probe_queries[:, 0] = 127
+        probe_relevant[:, :2] = [127, 64]
+        probe_irrelevant[:, 0] = -127
+        sequence_probe_arrays = (
+            probe_queries,
+            probe_relevant,
+            probe_irrelevant,
+            probe_queries.copy(),
+            probe_relevant.copy(),
+            probe_irrelevant.copy(),
+        )
+        sequence_bucket_results = []
+        for index, bucket in enumerate(SEQUENCE_BUCKETS):
+            semantic_probe = semantic_probe_fixture(bucket)
+            for label, array in zip(
+                ("query", "relevant_document", "irrelevant_document"),
+                (probe_queries, probe_relevant, probe_irrelevant),
+                strict=True,
+            ):
+                semantic_probe[f"{label}_canonical_output_bytes_sha256"] = (
+                    hashlib.sha256(
+                        np.ascontiguousarray(array[index]).tobytes()
+                    ).hexdigest()
+                )
+            sequence_bucket_results.append(
+                {
+                    "bucket": bucket,
+                    "requested_tokens": bucket,
+                    "tokenized_tokens": bucket,
+                    "executed_shape_tokens": bucket,
+                    "output_dimensions": DIMENSIONS,
+                    "finite_output": True,
+                    "nonzero_output": True,
+                    "truncated": False,
+                    "semantic_probe": semantic_probe,
+                }
+            )
+        identity = {
+            field: metadata[field]
+            for field in (
+                "scope_id",
+                "backend",
+                "artifact_source",
+                "artifact_sha256",
+                "internal_precision",
+                "runtime",
+                "compiler",
+                "package_target",
+                "device",
+                "device_class",
+            )
+        }
+        sequence_evidence = (
+            json.dumps(
+                {
+                    **identity,
+                    "supported_max_tokens": MAX_TOKENS,
+                    "supported_sequence_buckets": SEQUENCE_BUCKETS,
+                    "supported_max_batch_size": SUPPORTED_MAX_BATCH_SIZE,
+                    "wire_batch_results": [
+                        {
+                            "batch_size": batch_size,
+                            "input_count": SUPPORTED_MAX_BATCH_SIZE,
+                            "request_count": (
+                                SUPPORTED_MAX_BATCH_SIZE + batch_size - 1
+                            )
+                            // batch_size,
+                            "response_row_count": SUPPORTED_MAX_BATCH_SIZE,
+                            "ordered_input_json_sha256": "6" * 64,
+                            "canonical_output_bytes_sha256": "7" * 64,
+                        }
+                        for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
+                    ],
+                    "grouping_invariance": {
+                        "batch_sizes": list(
+                            range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
+                        ),
+                        "input_selection": WIRE_BATCH_INPUT_SELECTION,
+                        "same_inputs_in_same_order": True,
+                        "canonical_output_bytes_equal": True,
+                    },
+                    "bucket_results": sequence_bucket_results,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        placement_evidence = {
+            **identity,
+            "accelerated_placement": True,
+            "accelerator_execution_confirmed": True,
+            "fallback_disclosure_complete": True,
+            "unexpected_fallback_detected": False,
+            "bucket_results": [
+                {
+                    "bucket": bucket,
+                    "accelerator_execution_confirmed": True,
+                    "fallback_disclosure_complete": True,
+                    "unexpected_fallback_detected": False,
+                    "fallback_summary": "none",
+                    "profiler_output_sha256": "8" * 64,
+                }
+                for bucket in SEQUENCE_BUCKETS
+            ],
+        }
+        performance_evidence = {
+            **identity,
+            "bucket_results": [
+                {
+                    "bucket": bucket,
+                    "sample_count": 10,
+                    "benchmark_output_sha256": "9" * 64,
+                    "latency_ms_p50": 1.0,
+                    "latency_ms_p95": 2.0,
+                    "peak_memory_bytes": 1024,
+                    "energy_measurement": "not_measured",
+                    "energy_not_measured_reason": "meter unavailable",
+                }
+                for bucket in SEQUENCE_BUCKETS
+            ],
+        }
+        evidence = {
+            "sequence_capability": sequence_evidence,
+            "placement": json.dumps(
+                placement_evidence, sort_keys=True, separators=(",", ":")
+            ).encode()
+            + b"\n",
+            "performance": json.dumps(
+                performance_evidence, sort_keys=True, separators=(",", ":")
+            ).encode()
+            + b"\n",
+        }
+        wire_batch_outputs = np.zeros(
+            (SUPPORTED_MAX_BATCH_SIZE, SUPPORTED_MAX_BATCH_SIZE, DIMENSIONS),
+            dtype=np.int8,
+        )
+        wire_batch_outputs[:, :, 0] = 127
+        metadata["sequence_capability_evidence_sha256"] = hashlib.sha256(
+            evidence["sequence_capability"]
+        ).hexdigest()
+        metadata["placement_evidence_sha256"] = hashlib.sha256(
+            evidence["placement"]
+        ).hexdigest()
+        metadata["performance_evidence_sha256"] = hashlib.sha256(
+            evidence["performance"]
+        ).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "adapter.npz"
+            write_cache(
+                output,
+                metadata,
+                arrays,
+                sequence_probe_arrays,
+                wire_batch_outputs,
+                evidence,
+            )
+            with np.load(output, allow_pickle=False) as cached:
+                self.assertEqual(json.loads(str(cached["metadata"].item())), metadata)
+                for name in (
+                    "queries",
+                    "documents",
+                    "queries_repeat",
+                    "documents_repeat",
+                ):
+                    self.assertEqual(cached[name].dtype, np.dtype(np.int8))
+                for name, expected in zip(
+                    SEQUENCE_PROBE_ARRAY_NAMES, sequence_probe_arrays, strict=True
+                ):
+                    self.assertTrue(np.array_equal(cached[name], expected))
+            loaded_metadata, loaded_queries, loaded_documents = load_cache(output)
+            self.assertEqual(loaded_metadata, metadata)
+            self.assertTrue(np.array_equal(loaded_queries, arrays[0]))
+            self.assertTrue(np.array_equal(loaded_documents, arrays[1]))
+
+            incomplete = dict(metadata)
+            incomplete["supported_max_tokens"] = 256
+            incomplete["supported_sequence_buckets"] = [32, 64, 128, 256]
+            incomplete_output = Path(directory) / "fixed-seq256.npz"
+            write_cache(
+                incomplete_output,
+                incomplete,
+                arrays,
+                sequence_probe_arrays,
+                wire_batch_outputs,
+                evidence,
+            )
+            with self.assertRaisesRegex(ValueError, "supported_max_tokens"):
+                load_cache(incomplete_output)
+
+    def test_http_request_honors_response_index_order(self) -> None:
+        class FakeResponse:
+            headers: dict[str, str] = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def read(self, amount: int = -1) -> bytes:
+                body = json.dumps(
+                    attested_response(
+                        [
+                            {"index": 1, "embedding": vector(4.0)},
+                            {"index": 0, "embedding": vector(3.0)},
+                        ]
+                    )
+                ).encode("utf-8")
+                return body[:amount] if amount >= 0 else body
+
+        class FakeOpener:
+            def open(self, request, timeout: float):
+                self.request = request
+                self.timeout = timeout
+                return FakeResponse()
+
+        opener = FakeOpener()
+        result = request_embeddings(
+            "http://127.0.0.1:1234/embeddings",
+            [QUERY_PREFIX + "first", QUERY_PREFIX + "second"],
+            7.0,
+            opener=opener,
+        )
+
+        self.assertEqual(result[:, 0].tolist(), [3.0, 4.0])
+        request_body = json.loads(opener.request.data)
+        self.assertEqual(request_body["dimensions"], DIMENSIONS)
+        self.assertEqual(opener.timeout, 7.0)
+
+    def test_signed_response_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        ).hex()
+        valid_body = json.dumps(
+            attested_response([{"index": 0, "embedding": vector(1.0)}]),
+            separators=(",", ":"),
+        ).encode()
+        hostile_bodies = {
+            "duplicate known field": b'{"model":"forged",' + valid_body[1:],
+            "nonfinite embedding": valid_body.replace(b"1.0", b"NaN", 1),
+        }
+
+        class FakeResponse:
+            def __init__(self, body: bytes, signature: str) -> None:
+                self.body = body
+                self.headers = {"X-Cfetch-Attestation-Signature": signature}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def read(self, amount: int = -1) -> bytes:
+                return self.body[:amount] if amount >= 0 else self.body
+
+        class SigningOpener:
+            def __init__(self, response_body: bytes) -> None:
+                self.response_body = response_body
+
+            def open(self, request, timeout: float):
+                del timeout
+                headers = {
+                    name.lower(): value for name, value in request.header_items()
+                }
+                nonce = bytes.fromhex(headers["x-cfetch-attestation-nonce"])
+                signature = private_key.sign(
+                    attestation_message(nonce, request.data, self.response_body)
+                ).hex()
+                return FakeResponse(self.response_body, signature)
+
+        for name, response_body in hostile_bodies.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "must be UTF-8 JSON"
+            ):
+                request_embeddings(
+                    "http://127.0.0.1:1234/embeddings",
+                    [QUERY_PREFIX + "hostile"],
+                    7.0,
+                    opener=SigningOpener(response_body),
+                    attestation_public_key=public_key,
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

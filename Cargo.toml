@@ -17,6 +17,7 @@ include = [
   "/Cargo.lock",
   "/README.md",
   "/docs/local-inference.md",
+  "/docs/local-embedding-adapter.md",
   "/docs/ai-maintenance.md",
   "/docs/embedding-profile-v1.md",
   "/LICENSE.md",
@@ -42,6 +43,9 @@ iroh = "1.0.3"
 # authenticated iroh endpoint. We use only the in-memory store and wire
 # protocol; cfetch's packed vector store remains the durable record.
 iroh-blobs = { version = "=0.103.0", default-features = false }
+# Drives iroh-blobs' progress stream so artifact downloads can be stopped at
+# the exact profile-derived byte boundary.
+n0-future = "0.3"
 notify = "8"
 ratatui = "0.30.2"
 # Exact-pinned official MCP SDK. cfetch owns its tools; rmcp owns JSON-RPC,

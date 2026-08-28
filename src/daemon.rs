@@ -813,6 +813,11 @@ fn artifact_nonce(ctx: &Ctx, peer: &str, slice: &str, content_hash: &str) -> [u8
 /// is disclosed only after the grant check above and is salted per peer and
 /// slice so public vector bytes do not make it guessable.
 fn offer_peer_vectors(req: &Request, peer: &str, slice: &str, ctx: &Ctx) -> Response {
+    if let Err(error) = crate::embedding_profile::production_availability() {
+        return Response::err(format!(
+            "canonical peer vector serving is unavailable: {error}"
+        ));
+    }
     let Some(wanted_spec) = req.vector_spec.as_ref() else {
         return Response::err("vector artifact request names no embedding profile");
     };
@@ -898,9 +903,77 @@ fn offer_peer_vectors(req: &Request, peer: &str, slice: &str, ctx: &Ctx) -> Resp
     })
 }
 
+fn ensure_exact_peer_artifact_len(actual: usize, expected: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        actual == expected,
+        "peer vector artifact has {actual} bytes; this VectorSpec requires exactly {expected}"
+    );
+    Ok(())
+}
+
+fn ensure_peer_fetch_progress(
+    existing: u64,
+    downloaded: u64,
+    expected: usize,
+) -> anyhow::Result<()> {
+    let expected = u64::try_from(expected).context("peer vector artifact length exceeds u64")?;
+    let total = existing
+        .checked_add(downloaded)
+        .context("peer vector artifact download byte count overflowed u64")?;
+    anyhow::ensure!(
+        total <= expected,
+        "peer vector artifact download reached {total} bytes and exceeded its {expected}-byte profile limit"
+    );
+    Ok(())
+}
+
+async fn fetch_peer_blob_bounded(
+    store: &iroh_blobs::api::Store,
+    conn: iroh::endpoint::Connection,
+    hash: iroh_blobs::Hash,
+    expected: usize,
+) -> anyhow::Result<()> {
+    use n0_future::StreamExt as _;
+
+    // `Progress` counts only bytes downloaded by this request. Include any
+    // verified partial blob retained from an earlier interrupted attempt so a
+    // retry cannot reset the profile-derived memory budget.
+    let existing = store
+        .remote()
+        .local(hash)
+        .await
+        .context("inspect partial peer vector artifact")?
+        .local_bytes();
+    ensure_peer_fetch_progress(existing, 0, expected)?;
+    let mut progress = store.remote().fetch(conn, hash).stream();
+    while let Some(item) = progress.next().await {
+        match item {
+            iroh_blobs::api::remote::GetProgressItem::Progress(downloaded) => {
+                // Dropping the stream on failure drops the in-flight fetch
+                // future. At most the current verified transfer chunk can
+                // reach the in-memory scratch store beyond this boundary.
+                ensure_peer_fetch_progress(existing, downloaded, expected)?;
+            }
+            iroh_blobs::api::remote::GetProgressItem::Done(_) => return Ok(()),
+            iroh_blobs::api::remote::GetProgressItem::Error(error) => {
+                anyhow::bail!("fetch peer vector artifact: {error:?}")
+            }
+        }
+    }
+    anyhow::bail!("peer vector artifact fetch ended without completion")
+}
+
 fn fetch_peer_vectors(req: &Request, ctx: &Ctx) -> anyhow::Result<usize> {
-    let target = req.target.clone().context("peer vector synchronization names no target")?;
-    let slice = req.slice.as_deref().context("peer vector synchronization names no slice")?;
+    crate::embedding_profile::production_availability()
+        .context("canonical peer vector synchronization is unavailable")?;
+    let target = req
+        .target
+        .clone()
+        .context("peer vector synchronization names no target")?;
+    let slice = req
+        .slice
+        .as_deref()
+        .context("peer vector synchronization names no slice")?;
     let hashes = req
         .vector_hashes
         .as_ref()
@@ -937,7 +1010,11 @@ fn fetch_peer_vectors(req: &Request, ctx: &Ctx) -> anyhow::Result<usize> {
         "peer answered with a different embedding profile"
     );
     let artifacts = offered.vector_artifacts.unwrap_or_default();
-    anyhow::ensure!(artifacts.len() <= hashes.len(), "peer offered more artifacts than requested");
+    anyhow::ensure!(
+        artifacts.len() <= hashes.len(),
+        "peer offered more artifacts than requested"
+    );
+    let expected_artifact_len = vectors::peer_artifact_len(spec)?;
     let mut offered_hashes = std::collections::HashSet::with_capacity(artifacts.len());
     for artifact in &artifacts {
         anyhow::ensure!(
@@ -950,6 +1027,10 @@ fn fetch_peer_vectors(req: &Request, ctx: &Ctx) -> anyhow::Result<usize> {
             "peer offered vector {} twice",
             artifact.content_hash
         );
+        // Validate the negotiated size before connecting to the blob
+        // transport. The content hash authenticates bytes, not whether those
+        // bytes have the profile's one legal shape.
+        ensure_exact_peer_artifact_len(artifact.bytes, expected_artifact_len)?;
     }
     if artifacts.is_empty() {
         return Ok(0);
@@ -969,14 +1050,16 @@ fn fetch_peer_vectors(req: &Request, ctx: &Ctx) -> anyhow::Result<usize> {
                     .blob_hash
                     .parse()
                     .context("peer returned an invalid artifact hash")?;
-                client
-                    .download_blobs
-                    .remote()
-                    .fetch(conn.clone(), blob_hash)
-                    .await
-                    .context("fetch peer vector artifact")?;
+                fetch_peer_blob_bounded(
+                    &client.download_blobs,
+                    conn.clone(),
+                    blob_hash,
+                    expected_artifact_len,
+                )
+                .await?;
                 let raw = client.download_blobs.get_bytes(blob_hash).await?;
-                anyhow::ensure!(raw.len() == artifact.bytes, "peer artifact size changed in transit");
+                ensure_exact_peer_artifact_len(raw.len(), expected_artifact_len)
+                    .context("peer artifact size changed in transit")?;
                 let record = vectors::decode_peer_artifact(&raw, spec, &artifact.content_hash)?;
                 records.push((artifact.content_hash.clone(), record));
             }
@@ -1915,6 +1998,29 @@ mod tests {
         stores.get_or_create("peer-a");
         assert!(stores.get("peer-a").is_some());
         assert!(stores.get("peer-b").is_none(), "another endpoint cannot see peer-a's blobs");
+    }
+
+    #[test]
+    fn peer_artifact_offer_and_fetch_progress_are_exactly_bounded() {
+        let expected = 872;
+        ensure_exact_peer_artifact_len(expected, expected).unwrap();
+        assert!(ensure_exact_peer_artifact_len(expected - 1, expected).is_err());
+        assert!(ensure_exact_peer_artifact_len(expected + 1, expected).is_err());
+
+        ensure_peer_fetch_progress(0, expected as u64, expected).unwrap();
+        ensure_peer_fetch_progress(320, 552, expected).unwrap();
+        let error = ensure_peer_fetch_progress(320, 553, expected)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exceeded") && error.contains("872"),
+            "{error}"
+        );
+        assert!(ensure_peer_fetch_progress(expected as u64 + 1, 0, expected).is_err());
+        let overflow = ensure_peer_fetch_progress(u64::MAX, 1, usize::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(overflow.contains("overflowed"), "{overflow}");
     }
 
     #[test]

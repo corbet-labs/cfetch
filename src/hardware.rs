@@ -10,10 +10,10 @@
 //! between a search that costs battery and one that does not.
 //!
 //! Detection reports evidence rather than a runtime or certification verdict:
-//! what was found and what proved it. Provider initialization, graph placement,
-//! INT8 kernel coverage, repeatability, and mixed-backend retrieval quality
-//! are separate gates. A device being present therefore never admits its
-//! runtime artifact by itself.
+//! what was found and what proved it. Provider initialization, confirmed
+//! accelerator execution with the declared placement and fallback behavior,
+//! repeatability, and mixed-backend retrieval quality are separate gates. A
+//! device being present therefore never admits its runtime artifact by itself.
 
 use std::path::Path;
 

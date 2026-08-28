@@ -1,0 +1,91 @@
+# Candidate-only SIMD CPU smoke. This does not run the global all-pairs gate
+# and cannot admit this artifact/runtime/device scope into the cfetch space.
+name: GGUF SIMD CPU candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gguf-cpu-candidate.yml
+      - experiments/embedding-profile/gguf/**
+      - release/inference-backends.json
+      - src/embedding_profile.rs
+  pull_request:
+    paths:
+      - .github/workflows/gguf-cpu-candidate.yml
+      - experiments/embedding-profile/gguf/**
+      - release/inference-backends.json
+      - src/embedding_profile.rs
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-gguf-smoke:
+    name: Pinned Q8 GGUF on SIMD CPU
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore the revision-pinned GGUF
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/cfetch-gguf-candidate/embeddinggemma-300M-Q8_0.gguf
+          key: embeddinggemma-q8-0f741b5-b5ce9d77
+
+      - name: Fetch and verify the exact GGUF
+        run: |
+          bash experiments/embedding-profile/gguf/download-pinned-artifact.sh \
+            "$RUNNER_TEMP/cfetch-gguf-candidate/embeddinggemma-300M-Q8_0.gguf"
+
+      - name: Build the exact SIMD CPU runtime
+        env:
+          CFETCH_GGUF_BUILD_JOBS: "2"
+        run: |
+          bash experiments/embedding-profile/gguf/build-pinned-llama.sh \
+            "$RUNNER_TEMP/cfetch-gguf-candidate/llama.cpp-b10516" \
+            "$RUNNER_TEMP/cfetch-gguf-candidate/llama.cpp-build"
+
+      - name: Run deterministic candidate smoke
+        run: |
+          python3 experiments/embedding-profile/gguf/probe.py \
+            --llama-embedding "$RUNNER_TEMP/cfetch-gguf-candidate/llama.cpp-build/bin/llama-embedding" \
+            --model "$RUNNER_TEMP/cfetch-gguf-candidate/embeddinggemma-300M-Q8_0.gguf" \
+            | tee "$RUNNER_TEMP/gguf-cpu-candidate.json"
+          python3 - "$RUNNER_TEMP/gguf-cpu-candidate.json" release/inference-backends.json <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              result = json.load(stream)
+          with open(sys.argv[2], encoding="utf-8") as stream:
+              registry = json.load(stream)
+          artifact = registry["artifact_candidates"]["standard-q8-gguf"]
+          assert result["profile_id"] == registry["profile_id"]
+          assert result["target_model"] == registry["model_candidate"]["source"]
+          assert result["target_model_revision"] == registry["model_candidate"]["revision"]
+          assert result["target_profile_manifest_sha256"] == registry["shared_identity"]["profile_manifest_sha256"]
+          assert result["artifact_repository"] == artifact["source"]
+          assert result["artifact_revision"] == artifact["revision"]
+          assert result["artifact_file"] == artifact["file"]
+          assert result["artifact_sha256"] == artifact["sha256"]
+          assert result["candidate_only"] is True
+          assert result["global_all_pairs_admitted"] is False
+          assert result["admission_state"] == "candidate-not-admitted"
+          assert result["same_scope_canonical_int8_repeatable"] is True
+          assert result["simd_placement_evidence"] is True
+          assert result["simd_features"]
+          assert len(result["vectors"]) == 2
+          assert all(vector["dimensions"] == 768 for vector in result["vectors"])
+          assert all(vector["finite"] is True for vector in result["vectors"])
+          assert all(vector["float_nonzero"] > 0 for vector in result["vectors"])
+          PY
+          {
+            echo 'Candidate only: pinned GGUF SIMD CPU smoke; not global all-pairs admission.'
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/gguf-cpu-candidate.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

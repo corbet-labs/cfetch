@@ -2734,28 +2734,52 @@ fn main() {
         }
         Command::EmbeddingProfile { json } => {
             let profile = embedding_profile::manifest();
+            let policy = embedding_profile::admission_policy();
             if json {
-                println!("{}", serde_json::to_string_pretty(&profile).expect("profile serializes"));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&embedding_profile::manifest_document())
+                        .expect("profile serializes")
+                );
             } else {
                 println!(
-                    "{}: network major {}, {} @ {}, {}, {} dims / {} bytes",
+                    "{}: network major {}, {} @ {}, {} dims / {} bytes",
                     profile.profile_id,
                     profile.network_major,
                     profile.model,
                     profile.model_revision,
-                    profile.model_numeric_format,
                     profile.dimensions,
                     profile.vector_bytes,
                 );
+                println!("profile status: {}", embedding_profile::PROFILE_STATUS);
+                match embedding_profile::production_availability() {
+                    Ok(()) => println!("production availability: active"),
+                    Err(error) => println!("production availability: unavailable ({error})"),
+                }
                 println!("query prefix: {:?}", profile.query_prefix);
                 println!("document prefix: {:?}", profile.document_prefix);
-                println!("pooling: {}; artifact policy: {}", profile.pooling, profile.artifact_policy);
+                println!(
+                    "pooling: {}; artifact policy: {}",
+                    profile.pooling, policy.artifact_policy
+                );
+                println!(
+                    "backend internal precision: {}",
+                    policy.backend_internal_precision
+                );
                 println!("normalization: {}", profile.normalization);
                 println!(
-                    "execution: {} (reference {}, exact cross-backend bytes: {})",
-                    profile.execution_policy,
-                    profile.reference_device_class,
-                    profile.cross_backend_exact_bytes,
+                    "profile manifest sha256: {}",
+                    embedding_profile::manifest_sha256()
+                );
+                println!(
+                    "admission policy sha256: {}",
+                    embedding_profile::admission_policy_sha256()
+                );
+                println!(
+                    "execution: {} (numerical anchor: {}, exact cross-backend bytes: {})",
+                    policy.execution_policy,
+                    policy.numerical_anchor.unwrap_or("none"),
+                    policy.cross_backend_exact_bytes,
                 );
             }
         }

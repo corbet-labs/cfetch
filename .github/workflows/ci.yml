@@ -67,6 +67,40 @@ jobs:
           bash scripts/generate-third-party-licenses.sh "$generated"
           diff -u THIRD-PARTY-LICENSES.txt "$generated"
 
+  embedding-profile-policy:
+    name: Embedding profile policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: experiments/embedding-profile/requirements-test.txt
+      - name: Install policy-test dependency
+        run: python -m pip install -r experiments/embedding-profile/requirements-test.txt
+      - name: Test canonical codec, adapter export, and all-pairs admission
+        working-directory: experiments/embedding-profile
+        run: python -m unittest -v test_cross_backend_eval.py test_export_adapter_cache.py
+      - name: Verify the pinned SciFact dataset contract
+        working-directory: experiments/embedding-profile
+        env:
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: python scifact_contract.py
+      - name: Verify the exact admission implementation bundle
+        working-directory: experiments/embedding-profile
+        run: python cross_backend_eval.py --verify-implementation-bundle
+      - name: Replay every admitted release scope
+        working-directory: experiments/embedding-profile
+        env:
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: python cross_backend_eval.py --verify-release-registry
+      - name: Keep command help dependency-light
+        run: |
+          python experiments/embedding-profile/export_adapter_cache.py --help >/dev/null
+          python experiments/embedding-profile/cross_backend_eval.py --help >/dev/null
+
   test:
     name: Test (${{ matrix.os }})
     strategy:

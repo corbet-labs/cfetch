@@ -1,0 +1,109 @@
+# Candidate-only fixed-seq256 smoke. This does not admit the backend into the
+# cfetch vector space and does not claim proof of Apple Neural Engine placement.
+name: Apple Core ML candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apple-coreml-candidate.yml
+      - experiments/embedding-profile/apple-coreml/**
+      - release/inference-backends.json
+      - src/embedding_profile.rs
+  pull_request:
+    paths:
+      - .github/workflows/apple-coreml-candidate.yml
+      - experiments/embedding-profile/apple-coreml/**
+      - release/inference-backends.json
+      - src/embedding_profile.rs
+
+permissions:
+  contents: read
+
+jobs:
+  fixed-seq256-smoke:
+    name: Fixed-seq256 INT8 output smoke (Apple Silicon)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Require the standard Apple Silicon runner
+        run: |
+          test "$(uname -m)" = arm64
+
+      - name: Restore the revision-pinned Core ML bundle
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/cfetch-embeddinggemma-coreml
+          key: embeddinggemma-coreml-d1dc305086782e958f91fa278de97e4af9caeaf0
+
+      - name: Fetch and verify the exact public artifact
+        run: |
+          bash experiments/embedding-profile/apple-coreml/download-pinned-artifact.sh \
+            "$RUNNER_TEMP/cfetch-embeddinggemma-coreml"
+
+      - name: Build the fully locked runtime adapter
+        run: |
+          swift build \
+            --package-path experiments/embedding-profile/apple-coreml \
+            --configuration release \
+            --disable-automatic-resolution
+
+      - name: Run deterministic candidate smoke
+        run: |
+          binary_directory="$(swift build \
+            --package-path experiments/embedding-profile/apple-coreml \
+            --configuration release \
+            --disable-automatic-resolution \
+            --show-bin-path)"
+          "$binary_directory/AppleCoreMLCandidate" \
+            --bundle "$RUNNER_TEMP/cfetch-embeddinggemma-coreml" \
+            | tee "$RUNNER_TEMP/apple-coreml-candidate.json"
+          jq -e \
+            --slurpfile registry release/inference-backends.json \
+            --slurpfile lock experiments/embedding-profile/apple-coreml/Package.resolved '
+            .candidate_only == true and
+            .global_all_pairs_admitted == false and
+            .accelerator_placement_proven == false and
+            .artifact_lineage_to_target_revision_proven == false and
+            .profile_max_sequence_length_covered == false and
+            .runtime_truncates_beyond_compiled_length == true and
+            .silent_truncation_is_admissible == false and
+            .architecture == "arm64" and
+            .codec == "signed-int8x768-maxabs-rne" and
+            .codec_self_test == true and
+            .model_max_sequence_length == 256 and
+            .full_profile_max_sequence_length == 2048 and
+            .profile_id == $registry[0].profile_id and
+            .target_model == $registry[0].model_candidate.source and
+            .target_model_revision == $registry[0].model_candidate.revision and
+            .target_profile_manifest_sha256 == $registry[0].shared_identity.profile_manifest_sha256 and
+            .coreml_llm_revision == ($lock[0].pins[] |
+              select(.identity == "coreml-llm").state.revision) and
+            .requested_compute_units == "cpuAndNeuralEngine" and
+            .artifact_repository == ($registry[0].targets[] |
+              select(.device == "apple-neural-engine").candidate_upstream) and
+            .artifact_revision == ($registry[0].targets[] |
+              select(.device == "apple-neural-engine").candidate_upstream_revision) and
+            .artifact_weight_sha256 == ($registry[0].targets[] |
+              select(.device == "apple-neural-engine").candidate_model_weight_sha256) and
+            (.vectors | length) == 2 and
+            ([.vectors[].role] | sort) == ["document", "query"] and
+            ([.vectors[].int8_sha256] | unique | length) == 2 and
+            all(.vectors[];
+              .dimensions == 768 and
+              .finite == true and
+              .int8_nonzero > 0 and
+              .l2_norm >= 0.98 and
+              .l2_norm <= 1.02 and
+              (.int8_sha256 | test("^[0-9a-f]{64}$")))
+          ' "$RUNNER_TEMP/apple-coreml-candidate.json" >/dev/null
+          {
+            echo 'Candidate only: fixed seq256 with unproven exact encoder lineage; not v1 admission or ANE placement proof.'
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/apple-coreml-candidate.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

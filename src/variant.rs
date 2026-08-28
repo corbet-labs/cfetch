@@ -136,16 +136,16 @@ mod tests {
     }
 
     #[test]
-    fn current_supported_target_has_exactly_one_release() {
-        if ["linux", "mac", "win"].contains(&os_token()) && ["x86_64", "aarch64"].contains(&arch_token()) {
-            let matches = catalog()
-                .variants
-                .iter()
-                .filter(|v| v.os == os_token() && v.arch == arch_token())
-                .count();
-            // linux-arm64 and windows-arm64 deliberately remain absent until
-            // their release legs exist.
-            assert!(matches <= 1);
+    fn every_supported_target_has_exactly_one_release() {
+        for os in ["linux", "mac", "win"] {
+            for arch in ["x86_64", "aarch64"] {
+                let matches = catalog()
+                    .variants
+                    .iter()
+                    .filter(|variant| variant.os == os && variant.arch == arch)
+                    .count();
+                assert_eq!(matches, 1, "supported target {os}/{arch}");
+            }
         }
     }
 }

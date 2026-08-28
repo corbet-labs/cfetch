@@ -551,12 +551,23 @@ fn memory_diagnostic(
             }
         };
 
+    let production_unavailable = embedding_profile::production_availability()
+        .err()
+        .map(|error| short_error(&error.to_string()));
+
     let vector_coverage = if !cfg.embeddings.enabled {
         CoverageDiagnostic {
             state: "disabled".into(),
             embedded: None,
             total: None,
             detail: Some("semantic retrieval is disabled".into()),
+        }
+    } else if let Some(error) = production_unavailable.as_ref() {
+        CoverageDiagnostic {
+            state: "profile_inactive".into(),
+            embedded: None,
+            total: None,
+            detail: Some(error.clone()),
         }
     } else if cfg.client.serving.is_some() {
         CoverageDiagnostic {
@@ -601,7 +612,9 @@ fn memory_diagnostic(
                 .count()
         })
         .unwrap_or(0);
-    let peer_artifact_state = if authorized_routes == 0 {
+    let peer_artifact_state = if production_unavailable.is_some() {
+        "profile_inactive"
+    } else if authorized_routes == 0 {
         "no_joined_routes"
     } else if daemon::call("ping", Duration::from_millis(300)).is_some() {
         "ready"
@@ -638,6 +651,7 @@ fn inference_diagnostic(
     findings: &mut Vec<Finding>,
 ) -> InferenceDiagnostic {
     let profile = embedding_profile::manifest();
+    let admission_policy = embedding_profile::admission_policy();
     let (embeddings, reranker, maintenance) = match cfg {
         Some(cfg) => {
             let maintenance_history_issues = maintenance::history_issues(cfg);
@@ -652,30 +666,38 @@ fn inference_diagnostic(
                     ),
                 });
             }
-            if cfg.embeddings.enabled
-                && let Err(error) = cfg.embeddings.validate_profile()
-            {
-                findings.push(Finding {
-                    code: "embedding_profile_mismatch".into(),
-                    severity: FindingSeverity::Critical,
-                    summary: short_error(&error.to_string()),
-                    action: Some(
-                        "restore the frozen embedding profile or migrate the network major".into(),
-                    ),
-                });
-            }
-            if cfg.embeddings.enabled
-                && let Err(error) = embed::EmbedClient::new(&cfg.embeddings)
-            {
-                findings.push(Finding {
-                    code: "embedding_endpoint_unusable".into(),
-                    severity: FindingSeverity::Critical,
-                    summary: short_error(&error.to_string()),
-                    action: Some(
-                        "repair the embedding endpoint, host policy, or credential environment"
-                            .into(),
-                    ),
-                });
+            if cfg.embeddings.enabled {
+                if let Err(error) = cfg.embeddings.validate_profile() {
+                    findings.push(Finding {
+                        code: "embedding_profile_mismatch".into(),
+                        severity: FindingSeverity::Critical,
+                        summary: short_error(&error.to_string()),
+                        action: Some(
+                            "restore the frozen embedding profile or migrate the network major"
+                                .into(),
+                        ),
+                    });
+                } else if let Err(error) = embedding_profile::production_availability() {
+                    findings.push(Finding {
+                        code: "embedding_profile_not_active".into(),
+                        severity: FindingSeverity::Critical,
+                        summary: short_error(&error.to_string()),
+                        action: Some(
+                            "install a release with an active profile and at least one admitted backend"
+                                .into(),
+                        ),
+                    });
+                } else if let Err(error) = embed::EmbedClient::new(&cfg.embeddings) {
+                    findings.push(Finding {
+                        code: "embedding_endpoint_unusable".into(),
+                        severity: FindingSeverity::Critical,
+                        summary: short_error(&error.to_string()),
+                        action: Some(
+                            "repair the embedding endpoint, host policy, or credential environment"
+                                .into(),
+                        ),
+                    });
+                }
             }
             if cfg.rerank.enabled
                 && let Err(error) = rerank::RerankClient::new(&cfg.rerank)
@@ -717,7 +739,7 @@ fn inference_diagnostic(
                     .then(|| route_name(runtime_status::endpoint_route(&cfg.embeddings.endpoint))),
                 model: cfg.embeddings.model.clone(),
                 model_revision: profile.model_revision.into(),
-                artifact_policy: profile.artifact_policy.into(),
+                artifact_policy: admission_policy.artifact_policy.into(),
                 profile_id: profile.profile_id.into(),
                 dimensions: cfg.embeddings.dimensions,
                 vector_encoding: cfg.embeddings.spec().vector_encoding(),
@@ -783,7 +805,7 @@ fn inference_diagnostic(
                 route: None,
                 model: profile.model.into(),
                 model_revision: profile.model_revision.into(),
-                artifact_policy: profile.artifact_policy.into(),
+                artifact_policy: admission_policy.artifact_policy.into(),
                 profile_id: profile.profile_id.into(),
                 dimensions: profile.dimensions,
                 vector_encoding: profile.vector_encoding.into(),
@@ -1817,6 +1839,40 @@ mod tests {
         assert!(
             !text.contains("secret"),
             "diagnostics must not expose invite material: {text}"
+        );
+    }
+
+    #[test]
+    fn enabled_embeddings_report_inactive_profile_before_endpoint_health() {
+        let brain = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            brain_root: brain.path().to_path_buf(),
+            ..Config::default()
+        };
+        cfg.embeddings.enabled = true;
+        cfg.embeddings.endpoint.clear();
+        let mut findings = Vec::new();
+        inference_diagnostic(
+            Some(&cfg),
+            &runtime_status::RuntimeStatusV1::default(),
+            "endpoint",
+            &mut findings,
+        );
+        let finding = findings
+            .iter()
+            .find(|finding| finding.code == "embedding_profile_not_active")
+            .expect("inactive canonical profile must be critical and explicit");
+        assert_eq!(finding.severity, FindingSeverity::Critical);
+        assert!(
+            finding.summary.contains("not active"),
+            "{}",
+            finding.summary
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.code != "embedding_endpoint_unusable"),
+            "profile lifecycle must be diagnosed before endpoint construction"
         );
     }
 }

@@ -37,7 +37,9 @@ pub(crate) fn sources_available(cfg: &Config, state_dir: &std::path::Path) -> bo
 }
 
 pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
-    if cfg.client.serving.is_some() {
+    if cfg.client.serving.is_some()
+        || crate::embedding_profile::production_availability().is_err()
+    {
         return;
     }
     let mut completed_generation = None;
@@ -101,6 +103,13 @@ mod tests {
             token_file: std::path::PathBuf::from("unused"),
         });
         run(cfg, || false);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn inactive_profile_worker_returns_without_retrying() {
+        let started = Instant::now();
+        run(Config::default(), || false);
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 

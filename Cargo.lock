@@ -453,6 +453,7 @@ dependencies = [
  "ignore",
  "iroh",
  "iroh-blobs",
+ "n0-future",
  "notify",
  "ratatui",
  "rmcp",

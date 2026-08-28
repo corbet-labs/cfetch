@@ -2,21 +2,138 @@
   "schema_version": 1,
   "profile_id": "cfetch-embedding-v1",
   "profile_status": "candidate",
-  "reference_device_class": "npu",
+  "decision_priority": [
+    "compatibility",
+    "quality",
+    "efficiency"
+  ],
+  "model_candidate": {
+    "source": "google/embeddinggemma-300m",
+    "revision": "57c266a740f537b4dc058e1b0cda161fd15afa75"
+  },
+  "shared_identity": {
+    "semantic_profile": "frozen",
+    "profile_manifest_sha256": "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7",
+    "dimensions": 768,
+    "output_index_codec": "signed-int8x768",
+    "vector_bytes": 768
+  },
+  "internal_execution": {
+    "precision_policy": "target-native",
+    "artifact_policy": "backend-native-pinned-artifact-global-gates-admitted",
+    "numerical_anchor": null
+  },
+  "artifact_candidates": {
+    "standard-q8-gguf": {
+      "source": "ggml-org/embeddinggemma-300M-GGUF",
+      "revision": "0f741b5a6585bd53aeb15cd1372c56f2a0f65e12",
+      "file": "embeddinggemma-300M-Q8_0.gguf",
+      "sha256": "b5ce9d77a3fc4b3b39ccb5643c36777911cc4eb46a66962eadfa3f5f60490d63",
+      "declared_base_model": "google/embeddinggemma-300m",
+      "maximum_tokens": 2048,
+      "state": "candidate-not-admitted"
+    }
+  },
   "selection_order": [
     "npu",
     "gpu",
     "cpu"
   ],
+  "cpu_requirement": "accelerated",
   "remote_policy": "explicit-only",
+  "adapter_boundary": "attested-openai-compatible-loopback",
+  "package_composition_schema": {
+    "package_id": "stable target package id",
+    "release_variant_id": "matching release/variants.json id",
+    "os": "target operating system",
+    "arch": "target architecture",
+    "device_families": ["exact supported device family"],
+    "ordered_scope_ids": [
+      "admitted NPU scope ids",
+      "admitted GPU scope ids",
+      "admitted accelerated CPU scope ids"
+    ],
+    "artifact_recipes": {
+      "scope-id": {
+        "artifact_sha256": "must equal the admitted backend entry",
+        "install_source": "pinned package-local artifact recipe"
+      }
+    },
+    "selection": "first available admitted scope in NPU, GPU, accelerated CPU order; each signed request and response is bound to the requested scope id",
+    "remote_fallback": "none"
+  },
+  "local_packages": [],
+  "admitted_backend_entry_schema": {
+    "profile_manifest_sha256": "must equal this registry's shared semantic identity",
+    "admission_policy_sha256": "must equal this registry's current admission policy",
+    "scope_id": "at most 128 lowercase slug characters with single separators",
+    "backend": "runtime backend label",
+    "runtime": "exact runtime and version",
+    "compiler": "exact compiler and settings identity",
+    "package_target": "exact package target triple or platform scope",
+    "artifact_source": "pinned artifact source and revision",
+    "device_class": "npu, gpu, or cpu",
+    "device": "exact admitted device family",
+    "artifact_sha256": "64 lowercase hexadecimal characters",
+    "internal_precision": "recorded target-native numeric path",
+    "placement_evidence_sha256": "64 lowercase hexadecimal characters",
+    "supported_max_tokens": 2048,
+    "supported_sequence_buckets": [32, 64, 128, 256, 512, 1024, 2048],
+    "supported_max_batch_size": 64,
+    "sequence_capability_evidence_sha256": "64 lowercase hexadecimal characters",
+    "performance_evidence_sha256": "64 lowercase hexadecimal characters",
+    "admission_cache_url": "https://github.com/corbet-labs/cfetch/releases/download/<tag>/<admission_cache_sha256>.npz",
+    "admission_cache_sha256": "64 lowercase hexadecimal characters",
+    "measurement_evidence_url": "https://github.com/corbet-labs/cfetch/releases/download/<tag>/<measurement_evidence_sha256>.zip",
+    "measurement_evidence_sha256": "64 lowercase hexadecimal characters",
+    "compatibility_report": "repository-relative release/admission/<compatibility_report_sha256>.json path",
+    "compatibility_report_sha256": "64 lowercase hexadecimal characters matching the report filename and exact bytes",
+    "attestation_public_key": "64 lowercase hexadecimal characters; Ed25519 package response-signing key",
+    "accelerated_placement": true
+  },
   "admission": {
-    "same_runtime_artifact_device_repeatability": "byte-exact",
-    "cross_backend_byte_equality": "diagnostic-only",
-    "quality_gate": "mixed-query-document-retrieval",
+    "policy_version": 1,
+    "policy_manifest_sha256": "1572cd91a489633bfe9168cf3fb6fd52b5318992bd415f1207042533eb0fb90d",
+    "implementation_bundle_sha256": "6716429c08922dc65b90d8835ad0f7ee646e03fc81b4cc4d3fc94df98d0b4783",
+    "dataset": "mteb/scifact",
+    "dataset_revision": "cf10ab6856b15b0e670ef8ae5dae4e266c12d035",
+    "sequence_semantic_fixture": {
+      "id": "cfetch-sequence-semantic-v1-cat-vs-music",
+      "sha256": "fccd9309f8e97f4f4750ea0d733670ded08e7cc6824da4f6aa66616cd402c417",
+      "buckets": [32, 64, 128, 256, 512, 1024, 2048]
+    },
+    "sequence_semantic_gate": "every-profile-sequence-bucket-global-ordered-query-document-scope-plus-adversarial-relevant-minimum-irrelevant-maximum-exact-int8-strict-ranking",
     "required_device_classes": [
       "npu",
       "gpu",
       "cpu"
+    ],
+    "same_runtime_artifact_device_repeatability": "byte-exact-after-canonical-output-encoding",
+    "cross_backend_byte_equality": "diagnostic-only",
+    "quality_gate": "global-ordered-all-pairs-plus-adversarial-mixed-document-plus-per-bucket-semantic-ranking",
+    "ranking": "exact-signed-int8-cosine-query-norm-cancels-sign-branches-squared-cross-multiplication",
+    "tie_break": "pinned-corpus-insertion-index-ascending-as-evaluation-block-id-order",
+    "ordered_pairs": "every-query-backend-x-every-document-backend-including-self",
+    "mixed_document_store": "per-query-relevant-minimum-irrelevant-maximum-exact-cosine-across-document-scopes",
+    "wire_batch_contract": "one-execution-scope-per-response-supports-1-through-64-items-canonical-output-invariant-for-same-64-ordered-inputs-under-every-grouping-size-1-through-64",
+    "scope_authentication": "fresh nonce plus exact request/response SHA-256 signed by the admitted package Ed25519 key",
+    "evidence_replay": "durable-content-addressed-cache-and-measurement-bundle-strict-schema-ci-full-gate-replay",
+    "absolute_minimums": {
+      "ndcg_at_10": 0.767907905520953,
+      "recall_at_100": 0.97,
+      "mrr_at_10": 0.7305529100529101
+    },
+    "required_evidence": [
+      "semantic-profile-attestation",
+      "native-artifact-and-runtime-provenance",
+      "accelerated-placement",
+      "repeatability",
+      "latency-and-peak-memory",
+      "energy-per-bucket-or-explicit-not-measured",
+      "wire-batch-1-through-64-grouping-invariance",
+      "per-bucket-global-ordered-and-adversarial-mixed-sequence-semantic-results",
+      "global-ordered-all-pairs-results",
+      "adversarial-mixed-document-results"
     ]
   },
   "admitted_backends": [],
@@ -25,71 +142,170 @@
       "device": "apple-neural-engine",
       "device_class": "npu",
       "runtime": "coreml",
-      "artifact_format": "mlpackage",
-      "state": "needs-native-artifact-and-matrix"
+      "artifact_format": "fixed-shape-mlpackage-or-compiled-model",
+      "internal_precision": "target-native",
+      "candidate_upstream": "valindotai/embeddinggemma-300m-coreml",
+      "candidate_upstream_revision": "d1dc305086782e958f91fa278de97e4af9caeaf0",
+      "candidate_model_weight_sha256": "62e84aaaa99bc7950668742301eaadb0b1a23204b5b9204dfaf20bfdd02bdf9d",
+      "candidate_note": "declares the pinned standard model family but is fixed to 256 tokens; rebuild remaining profile buckets without silent truncation",
+      "state": "candidate-not-admitted-needs-complete-buckets-profile-export-placement-and-global-retrieval-gates"
+    },
+    {
+      "device": "android-google-tensor-npu",
+      "device_class": "npu",
+      "runtime": "litert",
+      "artifact_format": "device-compiled-litert-model",
+      "internal_precision": "target-native",
+      "candidate_upstream": "litert-community/embeddinggemma-300m",
+      "candidate_upstream_revision": "870cbe05ef460385363c6b574c851ae5d8989ce3",
+      "candidate_sequence_buckets": [
+        256,
+        512,
+        1024,
+        2048
+      ],
+      "state": "candidate-not-admitted-needs-lineage-placement-and-global-retrieval-gates"
+    },
+    {
+      "device": "android-mediatek-npu",
+      "device_class": "npu",
+      "runtime": "litert-neuropilot",
+      "artifact_format": "device-compiled-litert-model",
+      "internal_precision": "target-native",
+      "candidate_upstream": "litert-community/embeddinggemma-300m",
+      "candidate_upstream_revision": "870cbe05ef460385363c6b574c851ae5d8989ce3",
+      "candidate_sequence_buckets": [
+        256,
+        512,
+        1024,
+        2048
+      ],
+      "state": "candidate-not-admitted-needs-lineage-placement-and-global-retrieval-gates"
+    },
+    {
+      "device": "android-qualcomm-npu",
+      "device_class": "npu",
+      "runtime": "litert-qualcomm-delegate-or-qnn",
+      "artifact_format": "device-compiled-litert-model-or-qnn-context",
+      "internal_precision": "target-native",
+      "candidate_upstream": "litert-community/embeddinggemma-300m",
+      "candidate_upstream_revision": "870cbe05ef460385363c6b574c851ae5d8989ce3",
+      "candidate_sequence_buckets": [
+        256,
+        512,
+        1024,
+        2048
+      ],
+      "state": "candidate-not-admitted-needs-lineage-placement-and-global-retrieval-gates"
     },
     {
       "device": "intel-npu",
       "device_class": "npu",
       "runtime": "openvino",
       "artifact_format": "openvino-ir-or-compiled-blob",
-      "state": "needs-native-artifact-and-matrix"
+      "internal_precision": "target-native",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     },
     {
       "device": "amd-npu",
       "device_class": "npu",
       "runtime": "ryzen-ai-or-vitis-ai",
       "artifact_format": "vendor-compiled-graph",
-      "state": "needs-native-artifact-and-matrix"
-    },
-    {
-      "device": "qualcomm-npu",
-      "device_class": "npu",
-      "runtime": "litert-qualcomm-delegate-or-qnn",
-      "artifact_format": "tflite-or-qnn-context",
-      "state": "needs-native-artifact-and-matrix"
+      "internal_precision": "target-native",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     },
     {
       "device": "nvidia-gpu",
       "device_class": "gpu",
       "runtime": "tensorrt",
       "artifact_format": "tensorrt-engine",
-      "state": "needs-native-artifact-and-matrix"
+      "internal_precision": "target-native",
+      "portable_fallback_runtime": "llama.cpp-cuda",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     },
     {
       "device": "amd-gpu",
       "device_class": "gpu",
       "runtime": "migraphx-or-rocm",
       "artifact_format": "compiled-onnx",
-      "state": "needs-native-artifact-and-matrix"
+      "internal_precision": "target-native",
+      "portable_fallback_runtime": "llama.cpp-rocm-or-vulkan",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     },
     {
       "device": "intel-gpu",
       "device_class": "gpu",
       "runtime": "openvino",
       "artifact_format": "openvino-ir-or-compiled-cache",
-      "state": "needs-native-artifact-and-matrix"
+      "internal_precision": "target-native",
+      "portable_fallback_runtime": "llama.cpp-sycl-or-vulkan",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     },
     {
       "device": "apple-gpu",
       "device_class": "gpu",
       "runtime": "coreml-or-metal",
       "artifact_format": "compiled-coreml",
-      "state": "needs-native-artifact-and-matrix"
+      "internal_precision": "target-native",
+      "portable_fallback_runtime": "llama.cpp-metal",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
+    },
+    {
+      "device": "android-gpu",
+      "device_class": "gpu",
+      "runtime": "litert-gpu-delegate-or-vulkan",
+      "artifact_format": "delegate-compatible-litert-model-or-gguf",
+      "internal_precision": "target-native",
+      "portable_fallback_runtime": "llama.cpp-vulkan",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
+    },
+    {
+      "device": "linux-arm64-gpu",
+      "device_class": "gpu",
+      "runtime": "vulkan-or-vendor-opencl",
+      "artifact_format": "gguf-or-runtime-native-graph",
+      "internal_precision": "target-native",
+      "device_families": [
+        "arm-mali",
+        "qualcomm-adreno",
+        "imagination-powervr"
+      ],
+      "portable_fallback_runtime": "llama.cpp-vulkan",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     },
     {
       "device": "generic-windows-gpu",
       "device_class": "gpu",
       "runtime": "directml",
       "artifact_format": "compiled-onnx",
-      "state": "needs-native-artifact-and-matrix"
+      "internal_precision": "target-native",
+      "portable_fallback_runtime": "llama.cpp-vulkan",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
+    },
+    {
+      "device": "windows-qualcomm-npu",
+      "device_class": "npu",
+      "runtime": "qnn-or-windows-ml",
+      "artifact_format": "qnn-context-or-runtime-native-graph",
+      "internal_precision": "target-native",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     },
     {
       "device": "cpu",
       "device_class": "cpu",
       "runtime": "xnnpack-onednn-or-equivalent",
-      "artifact_format": "runtime-native-int8",
-      "state": "needs-native-artifact-and-matrix"
+      "artifact_format": "runtime-native-graph",
+      "internal_precision": "target-native",
+      "portable_fallback_runtime": "llama.cpp-simd",
+      "portable_fallback_candidate": "standard-q8-gguf",
+      "state": "candidate-not-admitted-needs-native-adapter-artifact-placement-and-global-retrieval-gates"
     }
   ]
 }

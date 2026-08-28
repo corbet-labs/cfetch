@@ -1,0 +1,6 @@
+experiments/embedding-profile/cross_backend_eval.py text eol=lf
+experiments/embedding-profile/admission_evidence.py text eol=lf
+experiments/embedding-profile/export_adapter_cache.py text eol=lf
+experiments/embedding-profile/scifact_contract.py text eol=lf
+experiments/embedding-profile/requirements-test.txt text eol=lf
+experiments/embedding-profile/profile_identity.py text eol=lf

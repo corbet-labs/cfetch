@@ -35,19 +35,27 @@ listed here is a fix or an internal change with no effect on behavior.
   pane distinguish maintenance configuration, local or remote route, proposal
   and review models, last attempt, paused/degraded state, candidates, outcomes,
   and exceptions without exposing endpoint or credential details.
-- **One embedding/network ABI for v1.** The v1 profile freezes the pinned
-  EmbeddingGemma-300M Q8-QAT source, one static signed-symmetric W8A8 INT8
-  graph, official retrieval prompts, full 768 dimensions,
-  pooling/normalization, and an exact 768-byte signed-INT8 vector.
-  FastEmbed/ORT local execution now verifies the frozen model bundle and all
-  11 known-answer records; accelerator sessions disable CPU fallback and
-  remain catalog-gated until profiler evidence is reviewed. Model-pipeline
-  changes require a new network major and coordinated re-embedding;
-  configuration drift is refused.
-- **Byte-stable shared vectors.** INT8 records no longer carry an FP16 scale
-  trailer. Ranking uses integer-defined cosine order, repeated producers must
-  match an existing content hash byte-for-byte, and store/cache headers include
-  the network/profile identity.
+- **One semantic and output ABI for v1.** The candidate v1 profile freezes the
+  pinned EmbeddingGemma-300M source revision, tokenizer, retrieval prompts,
+  full 768 dimensions, pooling/normalization, and the canonical 768-byte signed
+  INT8 output/index codec. Core ML, LiteRT, OpenVINO, and other packages may
+  use target-native artifacts and internal precision. No NPU or runtime is a
+  numerical anchor; model-pipeline or codec changes require a new network
+  major and coordinated re-embedding.
+- **Absolute cross-device admission.** Every concrete artifact/runtime/device
+  scope must be repeatable and meet the same fixed retrieval floors in every
+  ordered query-backend x document-backend pairing, including self-pairs.
+  Each query backend must also pass a conservative adversarial mix of document
+  producers, covering the derive-once store's real per-content first-writer
+  behavior. Cross-backend exact bytes and cosine are diagnostics. Semantic
+  vector identity and versioned admission policy have separate digests, so a
+  policy change recertifies backends without re-embedding unchanged vectors.
+  The admitted registry remains empty until real placement and global evidence
+  exists.
+- **Local native-adapter boundary.** Target packages can expose Core ML,
+  LiteRT, OpenVINO, or another native runner through the attested loopback
+  embedding protocol that cfetch already consumes. The runner stays local and
+  cfetch owns canonical INT8x768 output encoding; this is not remote inference.
 - **Cross-major networking fails closed.** TCP, iroh ALPN, invites, grants, and
   remote memberships carry network major 1. Missing or different majors are
   rejected before slice data is served. `cfetch embedding-profile [--json]`
@@ -158,13 +166,14 @@ listed here is a fix or an internal change with no effect on behavior.
   zero-byte in-progress file. Lock retries honor their full deadline, and
   concurrent session updates have enough bounded time on macOS and Windows.
 
-- **Engine selection.** A variant is now a Cargo feature selection rather
+- **Engine selection (historical 0.9.2 behavior; superseded on main by the
+  candidate shared-output architecture above).** A variant is now a Cargo feature selection rather
   than a source fork: which engines are compiled in is a build-time fact,
   which device to use is a run-time one, and `cfetch hardware` reports both
   plus what it will actually do. A device no compiled-in engine can drive is
-  skipped rather than selected and then failed on, and everything falls back
-  to the remote endpoint — which is the right answer for a host that holds
-  nothing.
+  skipped rather than selected and then failed on. At that release, everything
+  fell back to the remote endpoint for a host that held nothing; main no longer
+  permits automatic remote fallback.
 - **Hardware detection.** `cfetch hardware` reports the accelerators it can
   see, what proved each one, and the variant this machine should run, under
   the `<os>-cfetch-<silicon>[-<level>]` scheme. The policy is NPU > GPU > CPU

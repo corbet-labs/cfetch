@@ -3,8 +3,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::Digest as _;
@@ -104,120 +102,66 @@ impl Host {
     }
 }
 
-struct EmbeddingServer {
-    endpoint: String,
-    calls: Arc<AtomicUsize>,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
+fn seed_profile_vector(host: &Host) {
+    let profile_output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
+        .args(["embedding-profile", "--json"])
+        .output()
+        .unwrap();
+    assert!(profile_output.status.success());
+    let profile: serde_json::Value = serde_json::from_slice(&profile_output.stdout).unwrap();
+    let conn = rusqlite::Connection::open(host.state.join("index.db")).unwrap();
+    let mut statement = conn.prepare("SELECT hash FROM blocks ORDER BY id").unwrap();
+    let hashes = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(statement);
+    drop(conn);
 
-impl EmbeddingServer {
-    fn start() -> Self {
-        let profile_output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
-            .args(["embedding-profile", "--json"])
-            .output()
-            .unwrap();
-        assert!(profile_output.status.success());
-        let profile: serde_json::Value = serde_json::from_slice(&profile_output.stdout).unwrap();
-        let profile_manifest_sha256 = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&profile).unwrap())
-        );
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_calls = calls.clone();
-        let thread_stop = stop.clone();
-        let thread = std::thread::spawn(move || {
-            while !thread_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        // macOS inherits O_NONBLOCK from the listening socket.
-                        // The accepted connection is handled synchronously, so
-                        // make that contract explicit before reading its body.
-                        stream.set_nonblocking(false).unwrap();
-                        use std::io::{Read as _, Write as _};
-                        let mut raw = Vec::new();
-                        let mut buf = [0u8; 4096];
-                        let header_end = loop {
-                            let n = stream.read(&mut buf).unwrap();
-                            if n == 0 {
-                                return;
-                            }
-                            raw.extend_from_slice(&buf[..n]);
-                            if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
-                                break pos + 4;
-                            }
-                        };
-                        let headers = String::from_utf8_lossy(&raw[..header_end]);
-                        let content_len: usize = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.split_once(':').and_then(|(name, value)| {
-                                    name.eq_ignore_ascii_case("content-length")
-                                        .then(|| value.trim().parse().unwrap())
-                                })
-                            })
-                            .unwrap_or(0);
-                        while raw.len() < header_end + content_len {
-                            let n = stream.read(&mut buf).unwrap();
-                            if n == 0 {
-                                break;
-                            }
-                            raw.extend_from_slice(&buf[..n]);
-                        }
-                        let request: serde_json::Value =
-                            serde_json::from_slice(&raw[header_end..header_end + content_len]).unwrap();
-                        let count = request["input"].as_array().unwrap().len();
-                        thread_calls.fetch_add(1, Ordering::SeqCst);
-                        let mut embedding = vec![0.0; 768];
-                        embedding[0] = 1.0;
-                        let data: Vec<serde_json::Value> = (0..count)
-                            .map(|index| serde_json::json!({"index": index, "embedding": embedding}))
-                            .collect();
-                        let body = serde_json::to_vec(&serde_json::json!({
-                            "model": profile["model"],
-                            "cfetch_profile": profile["profile_id"],
-                            "cfetch_profile_manifest_sha256": profile_manifest_sha256,
-                            "cfetch_model_revision": profile["model_revision"],
-                            "cfetch_model_quantization": profile["model_quantization"],
-                            "cfetch_model_artifact": profile["model_artifact_id"],
-                            "data": data,
-                        }))
-                        .unwrap();
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        )
-                        .unwrap();
-                        stream.write_all(&body).unwrap();
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
+    let document_prefix = profile["document_prefix"].as_str().unwrap();
+    let prefix_digest = sha2::Sha256::digest(document_prefix.as_bytes());
+    let prefix_tag = prefix_digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let model = profile["model"].as_str().unwrap();
+    let model_slug = model
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || ".-_".contains(character) {
+                character
+            } else {
+                '_'
             }
-        });
-        Self {
-            endpoint: format!("http://{addr}"),
-            calls,
-            stop,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for EmbeddingServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
-        }
-    }
+        })
+        .collect::<String>();
+    let stem = format!(
+        "network{}-{}-{model_slug}-{}-i8-{prefix_tag}",
+        profile["network_major"].as_u64().unwrap(),
+        profile["profile_id"].as_str().unwrap(),
+        profile["dimensions"].as_u64().unwrap(),
+    );
+    let directory = host.brain.join("state/cfetch/vectors");
+    std::fs::create_dir_all(&directory).unwrap();
+    let header = format!(
+        "cfetch-vectors v3\nnetwork_major {}\nprofile_id {}\nmodel {}\ndim {}\nprecision i8\nvector_encoding {}\ndoc_prefix {}\n{}\n",
+        profile["network_major"].as_u64().unwrap(),
+        profile["profile_id"].as_str().unwrap(),
+        model,
+        profile["dimensions"].as_u64().unwrap(),
+        profile["vector_encoding"].as_str().unwrap(),
+        document_prefix,
+        hashes.join("\n"),
+    );
+    std::fs::write(directory.join(format!("{stem}.idx")), header).unwrap();
+    let mut record = vec![0_u8; profile["vector_bytes"].as_u64().unwrap() as usize];
+    record[0] = 127;
+    std::fs::write(
+        directory.join(format!("{stem}.bin")),
+        record.repeat(hashes.len()),
+    )
+    .unwrap();
 }
 
 struct Daemon<'a> {
@@ -296,9 +240,8 @@ fn two_daemons_redeem_and_serve_a_slice_over_iroh() {
 }
 
 #[test]
-fn second_storage_group_fetches_vectors_without_an_embedding_call() {
-    let embeddings = EmbeddingServer::start();
-    let origin = Host::new_with_embeddings(true, true, Some(&embeddings.endpoint));
+fn inactive_profile_refuses_peer_vectors_even_when_bytes_already_exist() {
+    let origin = Host::new(true, true);
     let peer = Host::new(false, false);
     for host in [&origin, &peer] {
         let doc = host.brain.join(Path::new("knowledge/shared/fact.md"));
@@ -306,26 +249,22 @@ fn second_storage_group_fetches_vectors_without_an_embedding_call() {
         std::fs::write(&doc, "# Shared fact\n\n- artifactneedle is derived once\n").unwrap();
         host.run_ok(&["scan"]);
     }
-    origin.run_ok(&["embed-index", "--batch", "64"]);
-    let origin_calls = embeddings.calls.load(Ordering::SeqCst);
-    assert!(origin_calls > 0, "origin must derive the initial vectors");
+    seed_profile_vector(&origin);
 
     let _origin_daemon = origin.daemon();
     let _peer_daemon = peer.daemon();
     let ticket = text(&origin.run_ok(&["invite", "shared", "--mode", "ro"]));
     peer.run_ok(&["join", &ticket, "--json"]);
 
-    let synced = peer.run_ok(&["embed-index", "--batch", "64"]);
-    let synced = text(&synced);
+    let synced = peer.run(&["embed-index", "--batch", "64"]);
     assert!(
-        synced.contains("authorized peers over iroh-blobs (no embedding call)"),
-        "peer did not report its artifact route: {synced}"
+        !synced.status.success(),
+        "an inactive profile must fail closed"
     );
-    assert!(synced.contains("0 embedded this run"), "peer re-derived work: {synced}");
-    assert_eq!(
-        embeddings.calls.load(Ordering::SeqCst),
-        origin_calls,
-        "the receiving host must fetch every matching vector and make zero embedding calls"
+    let error = String::from_utf8_lossy(&synced.stderr);
+    assert!(
+        error.contains("not active") && error.contains("cannot produce canonical vectors"),
+        "unexpected peer-sync failure: {error}"
     );
 }
 

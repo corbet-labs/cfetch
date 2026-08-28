@@ -461,10 +461,11 @@ impl VectorSpec {
     }
 }
 
-/// Embeddings configuration. The current release transport is an admitted
-/// OpenAI-compatible endpoint. Native local backends will use their own
-/// runtime artifacts and the fixed NPU-first selection policy; neither is a
-/// user-selectable vector-space parameter.
+/// Embeddings configuration. The current release transport is an attested
+/// OpenAI-compatible endpoint: either a packaged target-native adapter on
+/// loopback or an explicitly configured remote deployment. Native artifacts
+/// and the NPU-first local selection order are package policy, never
+/// user-selectable vector-space parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
     #[serde(default)]
@@ -516,9 +517,22 @@ pub struct EmbeddingsConfig {
 impl EmbeddingsConfig {
     /// The artifact identity this configuration asks for.
     pub fn spec(&self) -> VectorSpec {
+        // Production configuration is validated against the canonical profile
+        // before use. Keeping deliberately non-canonical specs out of network
+        // major 1 also lets migration/unit callers exercise the generic store
+        // without accidentally claiming shareable v1 artifacts.
+        let canonical = self.model == crate::embedding_profile::MODEL;
         VectorSpec {
-            network_major: crate::embedding_profile::NETWORK_MAJOR,
-            profile_id: crate::embedding_profile::PROFILE_ID.to_string(),
+            network_major: if canonical {
+                crate::embedding_profile::NETWORK_MAJOR
+            } else {
+                0
+            },
+            profile_id: if canonical {
+                crate::embedding_profile::PROFILE_ID.to_string()
+            } else {
+                "unmanaged-embedding-profile".to_string()
+            },
             model: self.model.clone(),
             dim: self.dimensions,
             precision: self.precision,
@@ -1017,7 +1031,9 @@ impl Config {
                  an open listener is unconfigurable"
             );
         }
-        cfg.embeddings.validate_profile()?;
+        if cfg.embeddings.enabled {
+            cfg.embeddings.validate_profile()?;
+        }
         let maintenance_endpoint = cfg.maintenance.endpoint.trim();
         let maintenance_model = cfg.maintenance.model.trim();
         anyhow::ensure!(
@@ -1232,13 +1248,36 @@ mod tests {
         assert_eq!(EmbeddingsConfig::default().precision, Precision::I8);
 
         let p = dir.path().join("config.json");
-        std::fs::write(&p, r#"{"embeddings": {"dimensions": 512, "precision": "f32"}}"#).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"embeddings": {"enabled": true, "dimensions": 512, "precision": "f32"}}"#,
+        )
+        .unwrap();
         let err = Config::load_from(&p).unwrap_err().to_string();
         assert!(err.contains("network major") && err.contains("re-embedding"), "{err}");
 
         // An unknown width is a typo, not a policy: refused at load.
         std::fs::write(&p, r#"{"embeddings": {"precision": "bfloat16"}}"#).unwrap();
         assert!(Config::load_from(&p).is_err(), "unknown precision must be loud");
+    }
+
+    #[test]
+    fn disabled_stale_embedding_profile_does_not_block_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        let stale = r#"{"embeddings":{"enabled":false,"model":"retired/model","dimensions":512,"precision":"f32","document_prefix":"old document","query_prefix":"old query"}}"#;
+        std::fs::write(&p, stale).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(!cfg.embeddings.enabled);
+        assert_eq!(cfg.embeddings.model, "retired/model");
+
+        let enabled = stale.replacen("\"enabled\":false", "\"enabled\":true", 1);
+        std::fs::write(&p, enabled).unwrap();
+        let error = Config::load_from(&p).unwrap_err().to_string();
+        assert!(
+            error.contains("network major") && error.contains("re-embedding"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1251,6 +1290,8 @@ mod tests {
         }
         .spec();
         assert_eq!(spec.model, "nomic");
+        assert_eq!(spec.network_major, 0);
+        assert_eq!(spec.profile_id, "unmanaged-embedding-profile");
         assert_eq!(spec.dim, 256);
         assert_eq!(spec.precision, Precision::F32);
         assert_eq!(Precision::F16.width(), 2);

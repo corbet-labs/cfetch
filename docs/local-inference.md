@@ -1,83 +1,186 @@
 # Local accelerated inference
 
-cfetch's target is local accelerated inference on every supported install.
-The runtime order is fixed:
+cfetch's packaging goal is accelerated local embedding on every supported
+install. Runtime selection is fixed:
 
 1. NPU
 2. GPU
 3. accelerated CPU
 
-An NPU is preferred whenever an admitted NPU backend initializes and owns the
-required graph. If it cannot run, cfetch tries the best admitted GPU backend;
-if that cannot run, it uses the accelerated CPU floor. Remote inference is an
-explicit deployment choice, not the automatic fallback and not a substitute
-for a missing local implementation.
+This is an execution and energy preference, not a numerical hierarchy. No NPU
+defines the shared vector space. A target uses its NPU when an admitted native
+artifact initializes and proves the required placement; otherwise it tries an
+admitted GPU route and then its accelerated SIMD CPU route.
+
+Remote inference is an explicit deployment choice. It is not inserted into
+the local fallback chain and is not a substitute for a missing local package.
+
+## The local adapter boundary
+
+cfetch already accepts an attested OpenAI-compatible embedding endpoint and
+applies its canonical signed `INT8x768` output/index encoding. The shortest
+target-native integration is therefore a small local adapter:
+
+    cfetch -> authenticated loopback -> native Core ML/LiteRT/OpenVINO runner
+           -> 768-dimensional semantic output -> cfetch INT8x768 codec
+
+The adapter process and model execute on the same device as cfetch. Loopback
+is only the process boundary; this is local inference, not a remote provider.
+It lets each platform use its mature native runtime without coupling the Rust
+binary to every vendor SDK in the first package. See
+[Local embedding adapters](local-embedding-adapter.md) for the protocol and
+attestation contract.
 
 ## Backend plan
 
-Different hardware families need different native runtimes and artifacts.
-That is compatible with one vector space because the model semantics and
-mixed-backend quality gate are shared.
+Different hardware families require different native artifacts and may use
+different internal precision. FP16, mixed precision, weight-only integer, or
+fully integer internals are all permitted. They are implementation details;
+the frozen tokenizer, prompts, pooling, normalization, dimensions, and final
+signed `INT8x768` codec are shared.
 
-| Device | Primary runtime direction | Native artifact direction |
+| Device | Primary runtime direction | Candidate artifact direction |
 |---|---|---|
-| Apple Neural Engine | Core ML | mlpackage / compiled model |
+| Apple Neural Engine | Core ML | fixed-shape `mlpackage` / compiled model |
+| Android Google Tensor NPU | LiteRT | device-compiled LiteRT model |
+| Android MediaTek NPU | LiteRT / NeuroPilot | device-compiled LiteRT model |
+| Android Qualcomm NPU | LiteRT Qualcomm delegate or QNN | LiteRT model / QNN context binary |
 | Intel NPU | OpenVINO | OpenVINO IR / compiled blob |
 | AMD NPU | Ryzen AI / Vitis AI | vendor-compiled graph |
-| Qualcomm NPU | LiteRT with Qualcomm delegate or QNN | TFLite / QNN context binary |
-| NVIDIA GPU | TensorRT | serialized INT8 engine |
+| NVIDIA GPU | TensorRT | serialized native engine |
 | AMD GPU | MIGraphX / ROCm | compiled ONNX graph |
 | Intel GPU | OpenVINO | OpenVINO IR / compiled cache |
 | Apple GPU | Core ML / Metal | compiled Core ML graph |
+| Android GPU | LiteRT GPU delegate / Vulkan | delegate-compatible LiteRT model or GGUF |
+| Linux ARM GPU floor | Vulkan / vendor OpenCL | GGUF or runtime-native graph for Mali, Adreno, or PowerVR |
 | Windows GPU floor | DirectML | compiled ONNX graph |
-| CPU floor | XNNPACK, oneDNN, or equivalent SIMD runtime | runtime-native INT8 graph |
+| Windows Qualcomm NPU | QNN / Windows ML | QNN context or runtime-native graph |
+| CPU floor | XNNPACK, oneDNN, or equivalent SIMD runtime | runtime-native graph |
 
-The table is a build plan, not a support claim. Current admission state is
-recorded in release/inference-backends.json. A runtime is not shipped merely
-because it loads a model or detects a device.
+The table is a packaging direction, not a support claim. Current admission
+state is recorded in `release/inference-backends.json`; its admitted list is
+empty until hardware evidence and retrieval results exist.
+
+EmbeddingGemma is the current model candidate because usable packages already
+exist in the two highest-priority directions:
+
+- The available Apple Core ML community package is an ANE-targeted route and
+  declares the pinned standard EmbeddingGemma family, but its current
+  artifact is fixed to 256 tokens. It must be rebuilt for the remaining profile
+  buckets rather than silently truncating 2,048-token inputs.
+- The official LiteRT community package offers 256, 512, 1,024, and 2,048-token
+  artifacts, with device variants for Google Tensor, MediaTek, and Qualcomm.
+  Those upstream artifacts are candidates; they are not admitted cfetch
+  backends until their exact lineage, placement, and retrieval evidence pass.
+- The ggml-org Q8_0 GGUF declares the standard EmbeddingGemma base family and
+  is an immediate llama.cpp candidate for Metal, CUDA, ROCm/Vulkan, SYCL, and
+  accelerated SIMD CPU fallback packages. Exact conversion lineage to the
+  pinned source revision remains unproven. It covers GPU and CPU portability,
+  not NPU execution, and remains unadmitted until its exact packages pass the
+  same evidence, ordered-pair, and adversarial mixed-store gates.
 
 ## What admission proves
 
-Every local backend must provide:
+Every local backend scope must provide:
 
-- a pinned source revision and reproducible native artifact manifest;
-- verified placement on the claimed NPU, GPU, or accelerated CPU kernels;
-- finite, non-zero 768-dimensional outputs;
-- byte-repeatability on the same runtime/artifact/device;
-- the fixed NPU-anchor quality floor;
-- the complete NPU/GPU/CPU query-document retrieval matrix;
-- latency and peak-memory measurements for the supported sequence buckets.
+- the frozen semantic profile and output-codec attestation;
+- a pinned, reproducible native artifact and runtime manifest;
+- recorded internal precision rather than an assumed universal dtype;
+- profiler-backed accelerator execution on the claimed NPU, GPU, or
+  accelerated CPU for every supported sequence bucket, with complete fallback
+  disclosure and no unexpected or silent fallback;
+- finite, non-zero 768-dimensional output before canonical encoding;
+- byte repeatability after encoding on the same artifact/runtime/device;
+- the same fixed absolute SciFact floor for every ordered query/document
+  pairing with every admitted and candidate backend;
+- strict relevant-before-irrelevant ranking for the profile-pinned semantic
+  fixture at every compiled sequence bucket, both for every ordered scope pair
+  and for the relevant-minimum/irrelevant-maximum mixed-scope adversary;
+- latency distribution and peak-memory measurements for every supported
+  sequence bucket, plus energy measurements where the platform exposes them
+  or an explicit `not_measured` reason;
+- correct token counting, smallest-bucket selection, no truncation, and
+  canonical-output invariance for the same 64 ordered inputs under every wire
+  grouping size from 1 through 64.
 
-Backend admission is scoped to the artifact, runtime, device family, and
-compiler settings in its manifest. A different NPU family may emit slightly
-different records and must run the same matrix before release.
+There is no anchor backend. If there are `n` concrete backend scopes, release
+evaluation runs all `n x n` ordered query-backend x document-backend pairings,
+including every self-pair. Each pair must independently meet the absolute
+NDCG@10, Recall@100, and MRR@10 floors in the embedding profile. Exact bytes
+and corresponding-vector cosine across scopes remain diagnostics.
+
+The derive-once store can mix document producers per content hash. Therefore
+each query backend must also pass the adversarial mixed-document test: relevant
+documents use their minimum score and irrelevant documents their maximum score
+across all document backends. This is stricter than any real fixed first-writer
+mixture.
+
+The same derive-once construction is applied separately at every compiled
+sequence bucket to a profile-pinned semantic fixture. This closes the gap where
+short SciFact inputs pass but a deterministic long-shape graph is semantically
+wrong. Each bucket is executed twice for byte repeatability; the global gate
+then checks every ordered scope pair and requires the lowest relevant score
+across document scopes to remain strictly above the highest irrelevant score.
+
+Admission is scoped to the exact artifact, runtime, device family, compiler
+settings, and placement evidence in its manifest. A result from one Apple,
+Qualcomm, or other device family does not certify another family.
 
 ## Selection and failure
 
-Hardware discovery supplies candidates in NPU, GPU, CPU order. Runtime
-initialization proves whether a candidate is usable. Selection never promotes
-a detected device on name alone and never accepts silent CPU remainder while
-claiming NPU or GPU acceleration.
+A released local package will expose one supervised loopback dispatcher, not
+several manually chosen endpoints. Its embedded package plan supplies admitted
+scope IDs in NPU, GPU, accelerated CPU order. The dispatcher attempts that
+exact order, puts `cfetch_requested_scope_id` in each signed request body,
+requires `cfetch_execution.scope_id` to match it, and caches only a successful
+selection. Runtime initialization and signed response evidence—not a device
+name—prove which candidate was used. A valid CPU reply therefore cannot pass
+as completion of an NPU attempt.
 
-Failure is local and ordered:
+Failure remains local and ordered:
 
-    admitted NPU fails -> admitted GPU -> accelerated CPU
+    admitted NPU fails -> admitted GPU -> admitted accelerated CPU
 
-Remote use happens only when the operator explicitly configures the endpoint
-transport. It is not inserted into that local chain.
+Remote use happens only when the operator explicitly configures it.
+
+That dispatcher is deliberately not presented as implemented support today:
+`local_packages` and `admitted_backends` are both empty. The first real local
+package must land the typed package-plan validator and fallback dispatcher
+together with its admitted cohort. Until then, the existing single configured
+endpoint is explicit endpoint mode and cannot enter the candidate profile.
 
 ## Current state
 
-The public release catalog is still endpoint-only. The previous local ORT
-candidate and exact-byte certification command were removed because they
-encoded the rejected CPU-oracle architecture. Native local packages return to
-the catalog only after an NPU anchor plus GPU and CPU artifacts pass the new
-gate.
+The public release catalog is endpoint-only. Main admits no producer scope yet,
+so semantic production fails closed rather than allowing an untested endpoint
+to seed the shared derive-once store. The rejected local ORT/W8A8
+candidate and its CPU-byte certification route are not released support.
+Target-native local packages return only after their actual artifacts pass
+placement, repeatability, performance, global ordered-pair, and adversarial
+mixed-store retrieval gates. Their machine-readable OS/architecture/device to
+ordered-scope composition lives in `release/inference-backends.json`.
 
-The immediate implementation order is:
+The immediate implementation sequence is:
 
-1. build and measure the first native NPU artifact;
-2. export its pinned SciFact vectors and establish the NPU anchor;
-3. build accelerated GPU and CPU artifacts from the same source revision;
-4. run every mixed query/document pairing;
-5. integrate runtime selection and publish local variants.
+1. wrap NPU, GPU, and accelerated CPU candidates behind the same attested local
+   adapter protocol; Apple Core ML and Android LiteRT cover NPU directions,
+   while GGUF/native runners seed GPU and CPU candidates;
+2. verify each exact profile lineage and export canonical SciFact caches plus
+   byte-bound per-bucket placement, repeated semantic-probe, sequence, and
+   performance evidence;
+3. assemble an initial cohort containing at least one NPU, one GPU, and one
+   accelerated CPU scope—no NPU-only cohort can pass the policy;
+4. run every ordered cohort/self query-document pairing and every adversarial
+   mixed-document query backend against the fixed absolute floors, then repeat
+   the ordered and adversarial strict-ranking checks at every sequence bucket;
+5. admit and compose target packages only from the exact scopes that pass,
+   then repeat the same global process for further device families.
+
+For admission, maintainers rehost each exact cache as the cfetch release asset
+`<sha256>.npz` and every raw profiler/benchmark output in a separately hashed
+measurement ZIP. Registry entries bind both immutable HTTPS locators and
+digests. CI replays all vector-space gates from those cache bytes and verifies
+the measurement bundle against the embedded evidence summaries. This checks
+integrity and reproducibility; the reviewed physical runner and profiler
+provenance remain the trust boundary for claims about actual NPU/GPU/CPU
+placement.

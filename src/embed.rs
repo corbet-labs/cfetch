@@ -1,5 +1,8 @@
-//! Embeddings client for semantic recall — an OpenAI-compatible
-//! `POST {endpoint}/embeddings` with `{"model", "input": [texts]}`.
+//! Embeddings client for semantic recall — an attested OpenAI-compatible
+//! `POST {endpoint}/embeddings` with `{"model", "input": [texts]}`. The
+//! transport can be a packaged target-native adapter on loopback or an
+//! explicitly configured remote deployment; runtime status keeps those routes
+//! distinct.
 //!
 //! NEVER called from hook entrypoints. Hooks sit on the interactive path and
 //! must not spend network time; embedding happens only from the CLI
@@ -172,6 +175,499 @@ pub struct EmbedClient {
     doc_prefix: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct WireExecutionScope {
+    scope_id: String,
+    backend: String,
+    runtime: String,
+    compiler: String,
+    package_target: String,
+    artifact_source: String,
+    device_class: String,
+    device: String,
+    artifact_sha256: String,
+    internal_precision: String,
+    placement_evidence_sha256: String,
+    supported_max_tokens: usize,
+    supported_sequence_buckets: BoundedVec<usize, MAX_SEQUENCE_BUCKETS>,
+    supported_max_batch_size: usize,
+    sequence_capability_evidence_sha256: String,
+    performance_evidence_sha256: String,
+    compatibility_report_sha256: String,
+    accelerated_placement: bool,
+}
+
+#[derive(Debug)]
+struct ExecutionScope {
+    scope_id: String,
+    backend: String,
+    device_class: String,
+    attestation_public_key: String,
+}
+
+struct EmbeddedBatch {
+    vectors: Vec<Vec<f32>>,
+    execution: Option<ExecutionScope>,
+}
+
+/// A JSON array whose deserializer never reserves or materializes more than
+/// `MAX` elements. The response byte limit bounds raw input; this bound also
+/// prevents a compact nested array from amplifying into unbounded typed
+/// allocations before shape validation runs.
+#[derive(Debug)]
+struct BoundedVec<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedVec<T, MAX> {
+    fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<'de, T, const MAX: usize> serde::Deserialize<'de> for BoundedVec<T, MAX>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedVecVisitor<T, const MAX: usize>(std::marker::PhantomData<T>);
+
+        impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedVecVisitor<T, MAX>
+        where
+            T: serde::Deserialize<'de>,
+        {
+            type Value = BoundedVec<T, MAX>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "an array with at most {MAX} elements")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                if sequence.size_hint().is_some_and(|hint| hint > MAX) {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "array exceeds the hard limit of {MAX} elements"
+                    )));
+                }
+                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+                while values.len() < MAX {
+                    let Some(value) = sequence.next_element()? else {
+                        return Ok(BoundedVec(values));
+                    };
+                    values.push(value);
+                }
+                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "array exceeds the hard limit of {MAX} elements"
+                    )));
+                }
+                Ok(BoundedVec(values))
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(std::marker::PhantomData))
+    }
+}
+
+const MAX_EMBEDDING_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EMBEDDING_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NONCANONICAL_EMBEDDING_COMPONENTS: usize = 16 * 1024;
+const MAX_SEQUENCE_BUCKETS: usize = 16;
+
+#[derive(serde::Deserialize)]
+struct WireEmbeddingResponse<const MAX_COMPONENTS: usize> {
+    data: BoundedVec<
+        WireEmbeddingRow<MAX_COMPONENTS>,
+        { crate::embedding_profile::MAX_WIRE_BATCH_SIZE },
+    >,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    cfetch_profile: String,
+    #[serde(default)]
+    cfetch_profile_manifest_sha256: String,
+    #[serde(default)]
+    cfetch_admission_policy_sha256: String,
+    #[serde(default)]
+    cfetch_model_revision: String,
+    #[serde(default)]
+    cfetch_execution: Option<WireExecutionScope>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireEmbeddingRow<const MAX_COMPONENTS: usize> {
+    index: Option<usize>,
+    embedding: BoundedVec<f32, MAX_COMPONENTS>,
+    #[serde(default)]
+    token_count: Option<usize>,
+    #[serde(default)]
+    sequence_bucket: Option<usize>,
+    #[serde(default)]
+    truncated: Option<bool>,
+    #[serde(default)]
+    cfetch_scope_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ParsedEmbeddingResponse {
+    data: Vec<ParsedEmbeddingRow>,
+    model: String,
+    cfetch_profile: String,
+    cfetch_profile_manifest_sha256: String,
+    cfetch_admission_policy_sha256: String,
+    cfetch_model_revision: String,
+    cfetch_execution: Option<WireExecutionScope>,
+}
+
+#[derive(Debug)]
+struct ParsedEmbeddingRow {
+    index: Option<usize>,
+    embedding: Vec<f32>,
+    token_count: Option<usize>,
+    sequence_bucket: Option<usize>,
+    truncated: Option<bool>,
+    cfetch_scope_id: Option<String>,
+}
+
+impl<const MAX_COMPONENTS: usize> From<WireEmbeddingResponse<MAX_COMPONENTS>>
+    for ParsedEmbeddingResponse
+{
+    fn from(response: WireEmbeddingResponse<MAX_COMPONENTS>) -> Self {
+        Self {
+            data: response
+                .data
+                .into_vec()
+                .into_iter()
+                .map(|row| ParsedEmbeddingRow {
+                    index: row.index,
+                    embedding: row.embedding.into_vec(),
+                    token_count: row.token_count,
+                    sequence_bucket: row.sequence_bucket,
+                    truncated: row.truncated,
+                    cfetch_scope_id: row.cfetch_scope_id,
+                })
+                .collect(),
+            model: response.model,
+            cfetch_profile: response.cfetch_profile,
+            cfetch_profile_manifest_sha256: response.cfetch_profile_manifest_sha256,
+            cfetch_admission_policy_sha256: response.cfetch_admission_policy_sha256,
+            cfetch_model_revision: response.cfetch_model_revision,
+            cfetch_execution: response.cfetch_execution,
+        }
+    }
+}
+
+fn parse_embedding_response(
+    text: &str,
+    canonical_profile: bool,
+) -> serde_json::Result<ParsedEmbeddingResponse> {
+    if canonical_profile {
+        serde_json::from_str::<WireEmbeddingResponse<{ crate::embedding_profile::DIMENSIONS }>>(
+            text,
+        )
+        .map(Into::into)
+    } else {
+        serde_json::from_str::<WireEmbeddingResponse<MAX_NONCANONICAL_EMBEDDING_COMPONENTS>>(text)
+            .map(Into::into)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct WireEmbeddingRequest<'model, 'slice, 'text> {
+    model: &'model str,
+    input: &'slice [&'text str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
+}
+
+struct BoundedJsonBody {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+impl std::io::Write for BoundedJsonBody {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|length| length > MAX_EMBEDDING_REQUEST_BYTES)
+        {
+            self.overflowed = true;
+            return Err(std::io::Error::other(
+                "embedding request exceeds its byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_embedding_request(
+    model: &str,
+    texts: &[&str],
+    dimensions: usize,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        !texts.is_empty() && texts.len() <= crate::embedding_profile::MAX_WIRE_BATCH_SIZE,
+        "embedding requests must contain 1..={} items",
+        crate::embedding_profile::MAX_WIRE_BATCH_SIZE
+    );
+    let request = WireEmbeddingRequest {
+        model,
+        input: texts,
+        dimensions: (dimensions > 0).then_some(dimensions),
+    };
+    let mut writer = BoundedJsonBody {
+        bytes: Vec::with_capacity(16 * 1024),
+        overflowed: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, &request) {
+        if writer.overflowed {
+            anyhow::bail!(
+                "serialized embedding request exceeds the hard limit of {MAX_EMBEDDING_REQUEST_BYTES} bytes"
+            );
+        }
+        return Err(error).context("serialize embedding request");
+    }
+    Ok(writer.bytes)
+}
+
+fn validate_execution_scope(scope: Option<WireExecutionScope>) -> anyhow::Result<ExecutionScope> {
+    let scope =
+        scope.context("embedding producer omitted its exact cfetch_execution scope attestation")?;
+    anyhow::ensure!(
+        valid_scope_id(&scope.scope_id),
+        "embedding producer scope_id must be at most 128 lowercase slug characters"
+    );
+    anyhow::ensure!(
+        matches!(scope.device_class.as_str(), "npu" | "gpu" | "cpu"),
+        "embedding producer attested invalid device class {:?}",
+        scope.device_class
+    );
+    anyhow::ensure!(
+        scope.accelerated_placement,
+        "embedding producer did not attest accelerated placement"
+    );
+    anyhow::ensure!(
+        [
+            scope.scope_id.as_str(),
+            scope.backend.as_str(),
+            scope.runtime.as_str(),
+            scope.compiler.as_str(),
+            scope.package_target.as_str(),
+            scope.artifact_source.as_str(),
+            scope.internal_precision.as_str(),
+            scope.device.as_str(),
+        ]
+        .into_iter()
+        .all(|value| !value.trim().is_empty()),
+        "embedding producer execution provenance contains an empty field"
+    );
+    anyhow::ensure!(
+        scope.artifact_sha256.len() == 64
+            && scope
+                .artifact_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "embedding producer artifact_sha256 must be 64 lowercase hexadecimal characters"
+    );
+    for (field, digest) in [
+        (
+            "placement_evidence_sha256",
+            scope.placement_evidence_sha256.as_str(),
+        ),
+        (
+            "sequence_capability_evidence_sha256",
+            scope.sequence_capability_evidence_sha256.as_str(),
+        ),
+        (
+            "performance_evidence_sha256",
+            scope.performance_evidence_sha256.as_str(),
+        ),
+        (
+            "compatibility_report_sha256",
+            scope.compatibility_report_sha256.as_str(),
+        ),
+    ] {
+        anyhow::ensure!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "embedding producer {field} must be 64 lowercase hexadecimal characters"
+        );
+    }
+    anyhow::ensure!(
+        scope.supported_max_tokens == crate::embedding_profile::MAX_TOKENS
+            && scope.supported_sequence_buckets.as_slice()
+                == crate::embedding_profile::SEQUENCE_BUCKETS
+            && scope.supported_max_batch_size == crate::embedding_profile::MAX_WIRE_BATCH_SIZE,
+        "embedding producer does not cover the complete cfetch sequence and batch contract"
+    );
+    let attestation = crate::embedding_profile::BackendScopeAttestation {
+        scope_id: &scope.scope_id,
+        backend: &scope.backend,
+        runtime: &scope.runtime,
+        compiler: &scope.compiler,
+        package_target: &scope.package_target,
+        artifact_source: &scope.artifact_source,
+        artifact_sha256: &scope.artifact_sha256,
+        internal_precision: &scope.internal_precision,
+        device: &scope.device,
+        device_class: &scope.device_class,
+        placement_evidence_sha256: &scope.placement_evidence_sha256,
+        supported_max_tokens: scope.supported_max_tokens,
+        supported_sequence_buckets: scope.supported_sequence_buckets.as_slice(),
+        supported_max_batch_size: scope.supported_max_batch_size,
+        sequence_capability_evidence_sha256: &scope.sequence_capability_evidence_sha256,
+        performance_evidence_sha256: &scope.performance_evidence_sha256,
+        compatibility_report_sha256: &scope.compatibility_report_sha256,
+        accelerated_placement: scope.accelerated_placement,
+    };
+    let attestation_public_key =
+        crate::embedding_profile::admitted_backend_attestation_public_key(&attestation);
+    anyhow::ensure!(
+        attestation_public_key.is_some(),
+        "embedding producer scope {:?} is not an admitted backend in this cfetch release",
+        scope.scope_id
+    );
+    Ok(ExecutionScope {
+        scope_id: scope.scope_id,
+        backend: scope.backend,
+        device_class: scope.device_class,
+        attestation_public_key: attestation_public_key.expect("checked above"),
+    })
+}
+
+fn valid_scope_id(value: &str) -> bool {
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    let mut previous_was_separator = true;
+    for byte in value.bytes() {
+        let separator = matches!(byte, b'.' | b'_' | b'-');
+        if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || separator)
+            || (separator && previous_was_separator)
+        {
+            return false;
+        }
+        previous_was_separator = separator;
+    }
+    !previous_was_separator
+}
+
+const ATTESTATION_NONCE_HEADER: &str = "x-cfetch-attestation-nonce";
+const ATTESTATION_SIGNATURE_HEADER: &str = "x-cfetch-attestation-signature";
+const ATTESTATION_DOMAIN: &[u8] = b"cfetch-embedding-response-attestation-v1\0";
+fn lowercase_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn decode_lowercase_hex<const N: usize>(value: &str, field: &str) -> anyhow::Result<[u8; N]> {
+    anyhow::ensure!(
+        value.len() == N * 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{field} must be {} lowercase hexadecimal characters",
+        N * 2
+    );
+    let mut decoded = [0u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => unreachable!("validated lowercase hexadecimal input"),
+        };
+        decoded[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    Ok(decoded)
+}
+
+fn attestation_message(nonce: &[u8; 32], request_body: &[u8], response_body: &[u8]) -> Vec<u8> {
+    use sha2::Digest as _;
+
+    let request_sha256 = sha2::Sha256::digest(request_body);
+    let response_sha256 = sha2::Sha256::digest(response_body);
+    let mut message = Vec::with_capacity(ATTESTATION_DOMAIN.len() + 32 + 32 + 32);
+    message.extend_from_slice(ATTESTATION_DOMAIN);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(&request_sha256);
+    message.extend_from_slice(&response_sha256);
+    message
+}
+
+fn verify_execution_signature(
+    public_key_hex: &str,
+    signature_hex: &str,
+    nonce: &[u8; 32],
+    request_body: &[u8],
+    response_body: &[u8],
+) -> anyhow::Result<()> {
+    let public_key_bytes =
+        decode_lowercase_hex::<32>(public_key_hex, "admitted attestation public key")?;
+    let signature_bytes = decode_lowercase_hex::<64>(signature_hex, ATTESTATION_SIGNATURE_HEADER)?;
+    let public_key = iroh::PublicKey::from_bytes(&public_key_bytes)
+        .context("admitted attestation public key is not a valid Ed25519 key")?;
+    let signature = iroh::Signature::from_bytes(&signature_bytes);
+    public_key
+        .verify(
+            &attestation_message(nonce, request_body, response_body),
+            &signature,
+        )
+        .context("embedding response failed its admitted package-key signature")
+}
+
+fn validate_profile_row_metadata(
+    index: usize,
+    token_count: Option<usize>,
+    sequence_bucket: Option<usize>,
+    truncated: Option<bool>,
+    row_scope_id: Option<&str>,
+    execution_scope_id: &str,
+) -> anyhow::Result<()> {
+    let token_count = token_count
+        .with_context(|| format!("embeddings response index {index} omitted token_count"))?;
+    let expected_bucket = crate::embedding_profile::sequence_bucket_for_token_count(token_count)
+        .with_context(|| {
+            format!(
+                "embeddings response index {index} token_count {token_count} is outside the 1..={} profile limit",
+                crate::embedding_profile::MAX_TOKENS
+            )
+        })?;
+    anyhow::ensure!(
+        sequence_bucket == Some(expected_bucket),
+        "embeddings response index {index} used sequence bucket {sequence_bucket:?}, expected smallest fitting bucket {expected_bucket}"
+    );
+    anyhow::ensure!(
+        truncated == Some(false),
+        "embeddings response index {index} was truncated or omitted truncation metadata"
+    );
+    anyhow::ensure!(
+        row_scope_id == Some(execution_scope_id),
+        "embeddings response index {index} was not produced by the response's single admitted execution scope"
+    );
+    Ok(())
+}
+
 impl std::fmt::Debug for EmbedClient {
     // Manual impl: ureq::Agent's Debug is not part of our contract, and the
     // interesting identity is (url, model) anyway.
@@ -192,10 +688,19 @@ impl EmbedClient {
     pub fn new(cfg: &EmbeddingsConfig) -> anyhow::Result<EmbedClient> {
         anyhow::ensure!(cfg.enabled, "embeddings disabled (set embeddings.enabled=true in config)");
         anyhow::ensure!(!cfg.model.is_empty(), "embeddings.model is required");
+        if cfg.model == crate::embedding_profile::MODEL {
+            // Configuration can name an endpoint before a target scope has
+            // been admitted. Refuse that statically impossible route before
+            // constructing a client or sending private text. The daemon uses
+            // the same gate before starting its vector worker. Candidate
+            // probing lives in the standalone admission exporter, never in
+            // production inference.
+            crate::embedding_profile::production_availability()?;
+        }
         let base_timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
         anyhow::ensure!(
             !cfg.endpoint.is_empty(),
-            "embeddings endpoint is required by the current release; native local backends are being rebuilt around the NPU-first profile"
+            "embeddings endpoint is required by the current release; configure a packaged local adapter on loopback or an explicit remote endpoint"
         );
         check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
         let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
@@ -243,6 +748,12 @@ impl EmbedClient {
             crate::embedding_profile::NETWORK_MAJOR,
             self.dimensions
         );
+        if let Some(reason) = vectors::degenerate(&v) {
+            anyhow::bail!(
+                "model {} returned a degenerate embedding: {reason}",
+                self.model
+            );
+        }
         Ok(v)
     }
 
@@ -270,6 +781,11 @@ impl EmbedClient {
     /// Batch path (embed-index): the bound scales base + per-item, because a
     /// large batch on a slow backend is busy, not down.
     pub fn embed_documents_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(
+            !texts.is_empty() && texts.len() <= crate::embedding_profile::MAX_WIRE_BATCH_SIZE,
+            "embedding requests must contain 1..={} items; split larger batches without changing per-item semantics",
+            crate::embedding_profile::MAX_WIRE_BATCH_SIZE
+        );
         self.embed_prefixed(texts, batch_timeout(self.base_timeout, texts.len()))
     }
 
@@ -298,77 +814,120 @@ impl EmbedClient {
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let EmbedBackend::Endpoint { url, .. } = &self.backend;
+        let route = crate::runtime_status::endpoint_route(url);
         let result = self.embed_request(texts, timeout);
-        crate::runtime_status::record_inference_attempt(
-            crate::runtime_status::InferenceMode::Endpoint,
-            crate::runtime_status::endpoint_route(url),
-            "endpoint",
-            None,
-            result.is_ok(),
-        );
-        result
+        match &result {
+            Ok(batch) => {
+                let (backend, device_class) = match &batch.execution {
+                    Some(execution) => (
+                        execution.backend.as_str(),
+                        Some(execution.device_class.as_str()),
+                    ),
+                    None => ("endpoint", None),
+                };
+                crate::runtime_status::record_inference_attempt(
+                    // The packaged adapter is local execution, but its process
+                    // boundary is still the endpoint transport. `route` and
+                    // the attested device class expose locality and actual
+                    // NPU/GPU/CPU selection without fighting config refresh.
+                    crate::runtime_status::InferenceMode::Endpoint,
+                    route,
+                    backend,
+                    device_class,
+                    true,
+                );
+            }
+            Err(_) => crate::runtime_status::record_inference_attempt(
+                crate::runtime_status::InferenceMode::Endpoint,
+                route,
+                if self.model == crate::embedding_profile::MODEL {
+                    "profile-producer"
+                } else {
+                    "endpoint"
+                },
+                None,
+                false,
+            ),
+        }
+        result.map(|batch| batch.vectors)
     }
 
     fn embed_request(
         &self,
         texts: &[&str],
         timeout: std::time::Duration,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<EmbeddedBatch> {
         let EmbedBackend::Endpoint { agent, url, auth } = &self.backend;
-        #[derive(serde::Deserialize)]
-        struct Response {
-            data: Vec<Row>,
-            #[serde(default)]
-            model: String,
-            #[serde(default)]
-            cfetch_profile: String,
-            #[serde(default)]
-            cfetch_profile_manifest_sha256: String,
-            #[serde(default)]
-            cfetch_model_revision: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct Row {
-            index: Option<usize>,
-            embedding: Vec<f32>,
-        }
-        let mut request = serde_json::json!({ "model": self.model, "input": texts });
-        if self.dimensions > 0 {
-            // The profile width is both requested and checked exactly.
-            request["dimensions"] = serde_json::json!(self.dimensions);
-        }
-        let body = request.to_string();
+        // Serialize directly into a bounded writer: even a config or caller
+        // bug cannot materialize and send an arbitrarily large HTTP body.
+        let body = serialize_embedding_request(&self.model, texts, self.dimensions)?;
+        // A fresh challenge binds an admitted package key to these exact
+        // request and response bytes. Registry prose can be copied; the
+        // package-private key cannot be replayed under a new nonce.
+        let attestation_nonce = iroh::SecretKey::generate().to_bytes();
         let mut req = agent
             .post(url)
             .config()
             .timeout_global(Some(timeout)) // per-request override of the agent bound
             .build()
-            .header("content-type", "application/json");
+            .header("content-type", "application/json")
+            .header(ATTESTATION_NONCE_HEADER, lowercase_hex(&attestation_nonce));
         if let Some(auth) = auth {
             req = req.header("authorization", auth);
         }
         let mut resp = req
-            .send(body.as_bytes())
+            .send(body.as_slice())
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
+        let response_signature = resp
+            .headers()
+            .get(ATTESTATION_SIGNATURE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let text = resp
             .body_mut()
+            .with_config()
+            .limit(MAX_EMBEDDING_RESPONSE_BYTES as u64)
             .read_to_string()
             .with_context(|| format!("read response from {url}"))?;
+        anyhow::ensure!(
+            text.len() <= MAX_EMBEDDING_RESPONSE_BYTES,
+            "embeddings endpoint response exceeds {MAX_EMBEDDING_RESPONSE_BYTES} bytes"
+        );
         anyhow::ensure!(
             status.is_success(),
             "embeddings endpoint returned {status}: {}",
             snippet(&text)
         );
-        let parsed: Response = serde_json::from_str(&text)
+        let parsed = parse_embedding_response(&text, self.model == crate::embedding_profile::MODEL)
             .with_context(|| format!("unparseable embeddings response: {}", snippet(&text)))?;
         anyhow::ensure!(
             parsed.cfetch_profile == crate::embedding_profile::PROFILE_ID
                 && parsed.cfetch_profile_manifest_sha256 == crate::embedding_profile::manifest_sha256()
                 && parsed.cfetch_model_revision == crate::embedding_profile::MODEL_REVISION,
-            "embeddings endpoint is not admitted for {} (vector-space profile/revision attestation mismatch)",
+            "embeddings endpoint is not profile-attested for {} (vector-space profile/revision mismatch)",
             crate::embedding_profile::PROFILE_ID
         );
+        let execution = if self.model == crate::embedding_profile::MODEL {
+            anyhow::ensure!(
+                parsed.cfetch_admission_policy_sha256
+                    == crate::embedding_profile::admission_policy_sha256(),
+                "embeddings endpoint admission-policy digest does not match this cfetch release"
+            );
+            let execution = validate_execution_scope(parsed.cfetch_execution)?;
+            let signature = response_signature
+                .context("admitted embedding producer omitted its response-signature header")?;
+            verify_execution_signature(
+                &execution.attestation_public_key,
+                &signature,
+                &attestation_nonce,
+                &body,
+                text.as_bytes(),
+            )?;
+            Some(execution)
+        } else {
+            None
+        };
         anyhow::ensure!(
             parsed.model == self.model,
             "embeddings endpoint answered with model {:?}, requested {:?}",
@@ -392,14 +951,35 @@ impl EmbedClient {
                 "embeddings endpoint returned out-of-range index {index} for {} input(s)",
                 texts.len()
             );
-            anyhow::ensure!(ordered[index].is_none(), "embeddings endpoint returned duplicate index {index}");
+            anyhow::ensure!(
+                ordered[index].is_none(),
+                "embeddings endpoint returned duplicate index {index}"
+            );
+            if self.model == crate::embedding_profile::MODEL {
+                let execution_scope_id = execution
+                    .as_ref()
+                    .expect("canonical profile validated one execution scope")
+                    .scope_id
+                    .as_str();
+                validate_profile_row_metadata(
+                    index,
+                    row.token_count,
+                    row.sequence_bucket,
+                    row.truncated,
+                    row.cfetch_scope_id.as_deref(),
+                    execution_scope_id,
+                )?;
+            }
             ordered[index] = Some(self.fit(row.embedding)?);
         }
-        ordered
+        let vectors = ordered
             .into_iter()
             .enumerate()
-            .map(|(index, row)| row.with_context(|| format!("embeddings endpoint omitted index {index}")))
-            .collect()
+            .map(|(index, row)| {
+                row.with_context(|| format!("embeddings endpoint omitted index {index}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(EmbeddedBatch { vectors, execution })
     }
 }
 
@@ -430,7 +1010,11 @@ pub fn run(
     batch: usize,
     store: &mut vectors::VectorStore,
 ) -> anyhow::Result<EmbedIndexReport> {
-    let batch = batch.max(1);
+    anyhow::ensure!(
+        (1..=crate::embedding_profile::MAX_WIRE_BATCH_SIZE).contains(&batch),
+        "embed-index batch must be between 1 and {}",
+        crate::embedding_profile::MAX_WIRE_BATCH_SIZE
+    );
     let spec = store.spec().clone();
     anyhow::ensure!(
         spec.model == client.model() && spec.dim == client.dimensions(),
@@ -458,12 +1042,21 @@ pub fn run(
             let vectors = client.embed_documents_batch(&texts)?;
             // Record first, cache second: the shared artifact is what the
             // group keeps, the local row is a convenience.
+            let mut cache_vectors = Vec::with_capacity(vectors.len());
             for ((hash, _), vector) in pending.iter().zip(&vectors) {
-                writer.put(hash, vector)?;
+                if writer.put(hash, vector)? {
+                    cache_vectors.push(vector.clone());
+                } else {
+                    cache_vectors.push(writer.get_retained(hash)?.with_context(|| {
+                        format!(
+                            "derive-once store reported existing content {hash} but retained no record"
+                        )
+                    })?);
+                }
             }
             writer.flush()?;
             let tx = conn.transaction()?;
-            for ((hash, _), vector) in pending.iter().zip(&vectors) {
+            for ((hash, _), vector) in pending.iter().zip(&cache_vectors) {
                 index::insert_vector(&tx, hash, &spec, vector)?;
             }
             tx.commit()?;
@@ -555,6 +1148,10 @@ pub fn sync_configured(
         cfg.client.serving.is_none(),
         "this host delegates its index; vectors are maintained by the storage host"
     );
+    // Shared-store hydration and peer ingress are production vector paths too.
+    // While the profile is inactive, structurally valid candidate bytes must
+    // not enter the local index merely because no endpoint call is needed.
+    crate::embedding_profile::production_availability()?;
     let spec = cfg.embeddings.spec();
     let mut store = vectors::VectorStore::open(&cfg.brain_root, &spec)?;
     let native = crate::paths::native_projects_root();
@@ -662,6 +1259,12 @@ fn coverage_note(embedded: usize, total: usize) -> Option<String> {
     })
 }
 
+fn prepare_query_vector(vector: &mut [f32], precision: crate::config::Precision) {
+    if precision != crate::config::Precision::I8 {
+        index::l2_normalize(vector);
+    }
+}
+
 /// Semantic (`--semantic`) or hybrid (`--hybrid`) recall: embeds the query,
 /// then ranks by cosine alone or fuses with the BM25 list via RRF.
 pub fn semantic_hits(
@@ -708,7 +1311,11 @@ pub fn semantic_hits(
             });
         }
     };
-    index::l2_normalize(&mut qv);
+    // Canonical INT8 uses the same direct f32 -> maxabs/RNE codec for queries
+    // and documents. An extra f32 L2 pass is mathematically redundant but can
+    // move a component across an INT8 rounding boundary. Legacy floating-point
+    // specs retain their normalized query representation.
+    prepare_query_vector(&mut qv, spec.precision);
     let hits = if hybrid {
         index::hybrid_recall(conn, &spec, query, &qv, limit, cfg.recall.rrf_k, prefixes)?
     } else {
@@ -721,6 +1328,152 @@ pub fn semantic_hits(
 mod tests {
     use super::*;
     use crate::testhttp::{http_response, spawn_server};
+
+    #[test]
+    fn canonical_int8_query_skips_the_extra_float_normalization_pass() {
+        let original = vec![-1.0_f32, 0.765_432_1, 0.888_888_9];
+        let mut int8 = original.clone();
+        prepare_query_vector(&mut int8, crate::config::Precision::I8);
+        assert_eq!(int8, original);
+
+        let mut legacy = original.clone();
+        prepare_query_vector(&mut legacy, crate::config::Precision::F32);
+        assert_ne!(legacy, original);
+    }
+
+    #[test]
+    fn package_key_signature_binds_nonce_request_and_exact_response_bytes() {
+        let key = iroh::SecretKey::generate();
+        let nonce = [9; 32];
+        let request = br#"{"model":"m","input":["one"]}"#;
+        let response = br#"{"data":[{"index":0}]}"#;
+        let signature = key.sign(&attestation_message(&nonce, request, response));
+        let public_key = lowercase_hex(key.public().as_bytes());
+        let signature = lowercase_hex(&signature.to_bytes());
+
+        verify_execution_signature(&public_key, &signature, &nonce, request, response).unwrap();
+        assert!(
+            verify_execution_signature(
+                &public_key,
+                &signature,
+                &nonce,
+                request,
+                br#"{"data":[{"index":1}]}"#,
+            )
+            .is_err()
+        );
+        let mut another_nonce = nonce;
+        another_nonce[0] ^= 1;
+        assert!(
+            verify_execution_signature(&public_key, &signature, &another_nonce, request, response,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_rows_freeze_token_bucket_truncation_and_single_scope() {
+        validate_profile_row_metadata(
+            0,
+            Some(33),
+            Some(64),
+            Some(false),
+            Some("scope-a"),
+            "scope-a",
+        )
+        .unwrap();
+        for (token_count, bucket, truncated, scope, expected) in [
+            (Some(0), Some(32), Some(false), Some("scope-a"), "outside"),
+            (
+                Some(33),
+                Some(128),
+                Some(false),
+                Some("scope-a"),
+                "smallest fitting",
+            ),
+            (Some(33), Some(64), Some(true), Some("scope-a"), "truncated"),
+            (
+                Some(33),
+                Some(64),
+                Some(false),
+                Some("scope-b"),
+                "single admitted",
+            ),
+        ] {
+            let error =
+                validate_profile_row_metadata(0, token_count, bucket, truncated, scope, "scope-a")
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+        let error = validate_profile_row_metadata(
+            0,
+            Some(crate::embedding_profile::MAX_TOKENS + 1),
+            Some(crate::embedding_profile::MAX_TOKENS),
+            Some(false),
+            Some("scope-a"),
+            "scope-a",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outside"), "{error}");
+    }
+
+    #[test]
+    fn serialized_requests_are_bounded_before_send() {
+        let oversized = "x".repeat(MAX_EMBEDDING_REQUEST_BYTES);
+        let error = serialize_embedding_request("test-model", &[oversized.as_str()], 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hard limit"), "{error}");
+
+        let too_many = vec!["x"; crate::embedding_profile::MAX_WIRE_BATCH_SIZE + 1];
+        let error = serialize_embedding_request("test-model", &too_many, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1..=64"), "{error}");
+    }
+
+    #[test]
+    fn response_deserialization_refuses_more_than_64_rows() {
+        let rows = std::iter::repeat_n(
+            r#"{"index":0,"embedding":[]}"#,
+            crate::embedding_profile::MAX_WIRE_BATCH_SIZE + 1,
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+        let body = format!(r#"{{"data":[{rows}]}}"#);
+        let error = parse_embedding_response(&body, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hard limit of 64"), "{error}");
+    }
+
+    #[test]
+    fn response_deserialization_bounds_canonical_and_noncanonical_widths() {
+        let canonical_components = vec!["0"; crate::embedding_profile::DIMENSIONS + 1].join(",");
+        let canonical =
+            format!(r#"{{"data":[{{"index":0,"embedding":[{canonical_components}]}}]}}"#);
+        let error = parse_embedding_response(&canonical, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hard limit of 768"), "{error}");
+
+        let global_components = vec!["0"; MAX_NONCANONICAL_EMBEDDING_COMPONENTS + 1].join(",");
+        let noncanonical =
+            format!(r#"{{"data":[{{"index":0,"embedding":[{global_components}]}}]}}"#);
+        let error = parse_embedding_response(&noncanonical, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "hard limit of {MAX_NONCANONICAL_EMBEDDING_COMPONENTS}"
+            )),
+            "{error}"
+        );
+    }
 
     /// OpenAI-shaped response with one deterministic 2-d vector per input:
     /// input i (0-based, per request) -> [seed + i, 1.0]. Data rows are
@@ -874,6 +1627,18 @@ mod tests {
         })
         .unwrap_err();
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn inactive_canonical_profile_is_refused_before_any_endpoint_can_be_used() {
+        let error = EmbedClient::new(&EmbeddingsConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:1".into(),
+            ..EmbeddingsConfig::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not active"), "{error}");
     }
 
     #[test]
@@ -1044,8 +1809,79 @@ mod tests {
                 r#"{"object":"list","model":"test-model","data":[{"index":0,"embedding":[1.0,0.0]}]}"#,
             )
         });
-        let err = client_for(&url).embed_documents_batch(&["a"]).unwrap_err().to_string();
-        assert!(err.contains("not admitted for cfetch-embedding-v1"), "{err}");
+        let err = client_for(&url)
+            .embed_documents_batch(&["a"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not profile-attested for cfetch-embedding-v1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn profile_strings_cannot_self_admit_an_execution_scope() {
+        let error = validate_execution_scope(Some(WireExecutionScope {
+            scope_id: "unreviewed-scope".into(),
+            backend: "candidate-runtime".into(),
+            runtime: "runtime-version".into(),
+            compiler: "compiler-version".into(),
+            package_target: "test-target".into(),
+            artifact_source: "source@revision/file".into(),
+            device_class: "npu".into(),
+            device: "test-npu".into(),
+            artifact_sha256: "1".repeat(64),
+            internal_precision: "target-native".into(),
+            placement_evidence_sha256: "2".repeat(64),
+            supported_max_tokens: crate::embedding_profile::MAX_TOKENS,
+            supported_sequence_buckets: BoundedVec(
+                crate::embedding_profile::SEQUENCE_BUCKETS.to_vec(),
+            ),
+            supported_max_batch_size: crate::embedding_profile::MAX_WIRE_BATCH_SIZE,
+            sequence_capability_evidence_sha256: "3".repeat(64),
+            performance_evidence_sha256: "4".repeat(64),
+            compatibility_report_sha256: "5".repeat(64),
+            accelerated_placement: true,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not an admitted backend"), "{error}");
+
+        let error = validate_execution_scope(Some(WireExecutionScope {
+            scope_id: "unaccelerated".into(),
+            backend: "candidate-runtime".into(),
+            runtime: "runtime-version".into(),
+            compiler: "compiler-version".into(),
+            package_target: "test-target".into(),
+            artifact_source: "source@revision/file".into(),
+            device_class: "cpu".into(),
+            device: "test-cpu".into(),
+            artifact_sha256: "2".repeat(64),
+            internal_precision: "target-native".into(),
+            placement_evidence_sha256: "3".repeat(64),
+            supported_max_tokens: crate::embedding_profile::MAX_TOKENS,
+            supported_sequence_buckets: BoundedVec(
+                crate::embedding_profile::SEQUENCE_BUCKETS.to_vec(),
+            ),
+            supported_max_batch_size: crate::embedding_profile::MAX_WIRE_BATCH_SIZE,
+            sequence_capability_evidence_sha256: "4".repeat(64),
+            performance_evidence_sha256: "5".repeat(64),
+            compatibility_report_sha256: "6".repeat(64),
+            accelerated_placement: false,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("accelerated placement"), "{error}");
+    }
+
+    #[test]
+    fn a_degenerate_query_vector_is_refused_before_ranking() {
+        let (url, _, _) = spawn_server(|_, _| {
+            attested_rows("test-model", r#"{"index":0,"embedding":[0.0,0.0]}"#)
+        });
+        let err = client_for(&url).embed_query("x").unwrap_err().to_string();
+        assert!(err.contains("degenerate embedding"), "{err}");
+        assert!(err.contains("norm"), "{err}");
     }
 
     // ---- auth header ----
@@ -1203,6 +2039,24 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key='embed_dim'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(dim, "2");
+    }
+
+    #[test]
+    fn embed_index_rejects_batch_outside_the_wire_contract_before_work() {
+        let (brain, _state, mut conn) = five_block_index();
+        let client = client_for("http://127.0.0.1:1");
+        let mut store = store_for(brain.path());
+        for batch in [0, crate::embedding_profile::MAX_WIRE_BATCH_SIZE + 1] {
+            let error = match run(&mut conn, &client, batch, &mut store) {
+                Ok(_) => panic!("batch {batch} must be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("between 1 and 64"), "{error}");
+        }
+        assert!(
+            store.is_empty(),
+            "invalid batch must not touch the shared store"
+        );
     }
 
     #[test]

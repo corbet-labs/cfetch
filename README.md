@@ -72,9 +72,11 @@ for this screen or for routine approval.
 
 The latest tagged release is v0.9.9. Features added since that tag are clearly
 marked **Main — next release**; install from source to try them before the next
-release. Optional semantic search currently uses an admitted OpenAI-compatible
-endpoint while NPU-first local packages are rebuilt; optional reranking uses
-an OpenAI-compatible endpoint and is outside the shared-vector ABI. Lexical
+release. The semantic transport is implemented, but main currently admits no
+embedding execution scope: semantic production fails closed until an exact
+local or remote scope passes the compatibility and package-evidence gates.
+Optional reranking uses an
+OpenAI-compatible endpoint and is outside the shared-vector ABI. Lexical
 recall, code navigation, hooks, capture, and measurement need neither.
 
 | Area | Availability | What you experience | Main surfaces |
@@ -95,7 +97,7 @@ recall, code navigation, hooks, capture, and measurement need neither.
 | Agent integrations | v0.9.9 | Capability-detected native hooks, MCP registration, and recall-first instruction blocks across common coding agents | `install`, `install --agent`, `mcp` |
 | Multi-machine access | v0.9.9 | Storage hosts serve bounded, freshness-labeled queries; clients can hold no local index | serving daemon, drain barrier |
 | Selective sharing | v0.9.9 | Nested slices, authenticated host identities, one-time invites, and per-slice grants | `slices`, `identity`, `invite`, `join`, `grants` |
-| NPU-first shared-vector profile | **Main — candidate** | One pinned semantic pipeline uses backend-native INT8 artifacts; NPU, GPU, and CPU enter through mixed-backend retrieval tests | `embedding-profile`, semantic and hybrid recall |
+| NPU-first local shared-vector profile | **Main — candidate** | One frozen semantic pipeline and signed INT8x768 output/index codec permit target-native internal precision; concrete NPU, GPU, and accelerated CPU packages enter only through absolute all-pairs and adversarial mixed-store retrieval tests | `embedding-profile`, semantic and hybrid recall |
 | Peer vector artifacts | **Main — next release** | A second storage group fetches matching canonical vectors from authorized origins before considering its own endpoint, avoiding duplicate embedding work | `embed-index`, iroh-blobs, `doctor` |
 | Continuous index and vector upkeep | **Main — next release** | Direct Obsidian edits and automatic maintenance advance the local catalog; generation changes hydrate shared/peer vectors and derive only missing content hashes | daemon watcher, vector worker, `status`, `doctor` |
 | Privacy and safety | v0.9.9 | Secret-shaped files are excluded, `<private>` regions are blanked before indexing, and hooks never approve tools | built-in boundaries, local state |
@@ -495,11 +497,20 @@ and exact-byte certification route were a pre-activation experiment, not
 released NPU/GPU/CPU support, and have been retired.
 
 Local packages will return as an NPU-first family: an admitted NPU is selected
-first, then an admitted GPU, then an accelerated CPU implementation. Each may
-carry a runtime-native INT8 artifact. Remote inference remains an explicit
+first, then an admitted GPU, then an admitted accelerated CPU implementation. Each may
+use its runtime-native artifact and internal precision, then cfetch encodes its
+output into the shared signed INT8x768 index format. NPU-first is the execution
+order, not a numerical anchor. Remote inference remains an explicit
 configuration choice, not a substitute for local capability or an automatic
-fallback. See the [candidate embedding profile](docs/embedding-profile-v1.md)
-and [local inference plan](docs/local-inference.md).
+fallback.
+
+The immediate packaging boundary is an attested local adapter over loopback:
+Core ML, LiteRT, OpenVINO, or another native runner remains on the same device
+while cfetch owns the semantic-profile check and canonical output encoding.
+See the [candidate embedding profile](docs/embedding-profile-v1.md),
+[local inference plan](docs/local-inference.md), and
+[local adapter contract](docs/local-embedding-adapter.md). Existing Core ML
+and LiteRT artifacts are candidates to adapt and test, not certified support.
 
 ### Build the development branch
 
@@ -562,15 +573,23 @@ Ring rules are ordered; the first matching path prefix wins:
 }
 ```
 
-Semantic recall is off by default. The current release accepts an admitted
-OpenAI-compatible embeddings endpoint. Keep remote credentials in an
-environment variable, never in JSON.
+Semantic recall is off by default. The OpenAI-compatible transport supports
+both packaged loopback adapters and explicit remote deployments. A producer's
+profile strings are not sufficient: it must attest an exact execution scope,
+artifact digest, device class, and accelerated placement that this release's
+registry admits, then sign the nonce-bound request and exact response with that
+package scope's pinned Ed25519 key. Main currently admits none, so semantic
+production fails closed while the candidate matrix is built. Keep any
+credentials in an environment variable, never in JSON.
 
 Network major 1 fixes the EmbeddingGemma source revision, tokenizer, full 768
 dimensions, query/document prompts, pooling, normalization, and the signed
-INT8x768 stored record. It does not freeze one vendor graph. Backend-native
-NPU, GPU, and CPU artifacts must attest the logical profile and pass the mixed
-query/document retrieval matrix before local packages ship.
+INT8x768 output/index record. It does not freeze internal weight or activation
+precision, one vendor graph, or one backend's numerical output. Target-native
+NPU, GPU, and accelerated CPU packages must attest the semantic profile and
+pass the global ordered query-backend x document-backend retrieval matrix
+and the adversarial mixed-document-store test against the same absolute quality
+floors before they ship.
 
 ```json
 {
@@ -588,23 +607,26 @@ resolution automatically. Vectors are keyed by statement content hash, so
 editing one file processes only changed statements. Missing or partial vector
 coverage is always reported.
 
-With a running daemon and one or more joined origins, `embed-index` checks the
-shared tree first, then requests only its missing content hashes from each
-authorized slice. Matching canonical records stream over iroh-blobs with
-BLAKE3 verification; only the remainder reaches the configured embedding
-endpoint. Artifact capabilities are salted and isolated by authenticated peer,
-and the receiver verifies the exact profile, content hash, record width, and
-non-degenerate bytes before appending them. A host whose peers cover every
-block can complete `embed-index` with embeddings disabled and zero endpoint
-calls.
+After the profile and registry are active, `embed-index` checks the shared tree
+first, then requests only its missing content hashes from each authorized
+slice. Matching canonical records stream over iroh-blobs with BLAKE3
+verification; only the remainder reaches the configured embedding endpoint.
+Artifact capabilities are salted and isolated by authenticated peer, and the
+receiver verifies the exact profile, content hash, record width, and canonical
+codec before appending them. The compact record carries no per-vector producer
+receipt, so the authenticated authorized storage group is the peer trust
+boundary. A host whose peers cover every block can then complete `embed-index`
+with its local embedding endpoint disabled and zero endpoint calls. While the
+profile or registry is inactive, hydration and peer transfer fail closed.
 
 Run `cfetch embedding-profile --json` for the executable manifest. Changing
 a semantic pipeline field is a new incompatible network major and requires
-re-embedding. Runtime-native artifact hashes remain backend-scoped. The NPU is
-the reference direction; exact bytes across device families are not required,
-while repeatability on one runtime/artifact/device and the full mixed-backend
-retrieval matrix are mandatory. See [embedding profile v1](docs/embedding-profile-v1.md)
-and [local accelerated inference](docs/local-inference.md).
+re-embedding. Runtime-native artifact hashes and internal precision remain
+backend-scoped. There is no reference backend: exact bytes across device
+families are not required, while same-scope repeatability and the full ordered
+pair plus adversarial mixed-store absolute retrieval gates are mandatory. See
+[embedding profile v1](docs/embedding-profile-v1.md) and
+[local accelerated inference](docs/local-inference.md).
 
 Named slices limit recall and sharing by path:
 
@@ -636,8 +658,10 @@ duplicating resident injection.
 ### Does cfetch require a vector database or cloud service?
 
 No. Lexical recall and code search are local and work without embeddings.
-Semantic search can use a local or hosted OpenAI-compatible endpoint. The
-per-host catalog is disposable SQLite; Markdown remains the record.
+Semantic search can use a local or hosted cfetch-attested adapter with the
+OpenAI embeddings request shape; a generic OpenAI-compatible endpoint lacks
+the admitted scope metadata and package signature. The per-host catalog is
+disposable SQLite; Markdown remains the record.
 
 ### Is cfetch only for Claude Code?
 

@@ -1,19 +1,24 @@
 //! The SHARED vector artifact store.
 //!
-//! Vectors are a derived artifact of shared CONTENT, not of a host: the same
-//! block hashed on any machine embeds to the same vector under the same
-//! compatibility profile. So they are computed once per storage group and
-//! written into the tree — `<brain_root>/state/cfetch/vectors/` — where every
-//! host that can reach the tree READS them. Only a host with the embed
-//! capability writes. The per-host index.db keeps a cache of the same vectors
-//! for query speed; the cache is never the record, and losing it costs a
-//! re-read, never an embedding run.
+//! Vectors are profile-bound derived artifacts of shared CONTENT, not of a
+//! host. An admitted backend emits the frozen profile's canonical output
+//! codec, but another admitted backend is not required to emit identical
+//! bytes. The first derived record for a content hash is retained and shared;
+//! compatibility comes from global ordered-pair and adversarial mixed-store
+//! retrieval tests, never from treating that producer as a numerical
+//! reference. Records live in the tree at
+//! `<brain_root>/state/cfetch/vectors/`, where every host that can reach the
+//! tree reads them. Only a host with the embed capability writes. The per-host
+//! index.db keeps a cache of the same vectors for query speed; the cache is
+//! never the record, and losing it costs a re-read, never an embedding run.
 //!
 //! Layout, per network-major embedding profile:
 //!
-//! - `<slug>.bin` — records back to back, no per-record header. Every record
-//!   is exactly `dim * precision.width()` bytes, so record i lives at offset
-//!   `i * stride` and the offset table is implicit.
+//! - `<slug>.bin` — records back to back, no per-record header. Network-major
+//!   v1 records use the signed `INT8×768` output/storage codec and are exactly
+//!   768 bytes. The store machinery remains generic for non-network test and
+//!   migration profiles; every record is `dim * precision.width()` bytes, so
+//!   record i lives at offset `i * stride` and the offset table is implicit.
 //! - `<slug>.idx` — a text header (magic, exact model, dim, precision) then
 //!   one content hash per line, line i naming record i.
 //!
@@ -44,7 +49,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use rusqlite::Connection;
 
-use crate::config::VectorSpec;
+use crate::config::{Precision, VectorSpec};
 use crate::index;
 
 /// First line of every profile-bound `.idx`. Earlier formats were configurable
@@ -53,6 +58,7 @@ use crate::index;
 const MAGIC: &str = "cfetch-vectors v3";
 const HEADER_LINES: usize = 8;
 const PEER_ARTIFACT_MAGIC: &[u8] = b"cfetch-vector-artifact-v1\0";
+const PEER_ARTIFACT_HEADER_BYTES: usize = PEER_ARTIFACT_MAGIC.len() + 32 + 64;
 pub(crate) const MAX_PEER_ARTIFACTS: usize = 256;
 
 /// Short, stable, filename-safe digest of a document prefix.
@@ -66,6 +72,77 @@ fn prefix_tag(prefix: &str) -> String {
 /// Up to this many missing vectors, a hydrate seeks per record instead of
 /// streaming the whole artifact file.
 const SEEK_UNTIL: usize = 64;
+
+/// Enforce the canonical codec once a store identifies the frozen v1 model.
+/// Full semantic configuration is rejected by `embedding_profile::validate`
+/// before runtime selection; this boundary independently prevents an exact-v1
+/// producer from persisting a backend-native float format by mistake.
+fn is_canonical_v1_profile(spec: &VectorSpec) -> bool {
+    spec.network_major == crate::embedding_profile::NETWORK_MAJOR
+        && spec.profile_id == crate::embedding_profile::PROFILE_ID
+}
+
+fn validate_storage_spec(spec: &VectorSpec) -> anyhow::Result<()> {
+    if is_canonical_v1_profile(spec) {
+        anyhow::ensure!(
+            spec.model == crate::embedding_profile::MODEL,
+            "embedding profile {} requires model {:?}",
+            spec.profile_id,
+            crate::embedding_profile::MODEL
+        );
+        anyhow::ensure!(
+            spec.dim == crate::embedding_profile::DIMENSIONS,
+            "embedding profile {} requires signed INT8×{} output records",
+            spec.profile_id,
+            crate::embedding_profile::DIMENSIONS
+        );
+        anyhow::ensure!(
+            spec.precision == Precision::I8,
+            "embedding profile {} requires the canonical signed INT8×{} output/storage codec; backend-internal precision remains native",
+            spec.profile_id,
+            crate::embedding_profile::DIMENSIONS
+        );
+        anyhow::ensure!(
+            spec.doc_prefix == crate::embedding_profile::DOCUMENT_PREFIX,
+            "embedding profile {} requires document prefix {:?}",
+            spec.profile_id,
+            crate::embedding_profile::DOCUMENT_PREFIX
+        );
+    }
+    Ok(())
+}
+
+/// Validates bytes at every boundary that can introduce or consume a vector
+/// record. The v1 codec is not merely "some non-zero i8 values": `vec_to_blob`
+/// can emit neither -128 nor a non-zero record without at least one component
+/// saturated to +/-127. Accepting a wider byte language would give the same
+/// vector two encodings and undermine byte-exact repeatability within a scope.
+fn validate_record_bytes(spec: &VectorSpec, record: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        record.len() == spec.precision.record_bytes(spec.dim),
+        "canonical vector record has {} bytes, profile {} requires {}",
+        record.len(),
+        spec.profile_id,
+        spec.precision.record_bytes(spec.dim)
+    );
+    if is_canonical_v1_profile(spec) {
+        anyhow::ensure!(
+            !record.contains(&0x80),
+            "canonical signed INT8 vector contains forbidden -128"
+        );
+        anyhow::ensure!(
+            record
+                .iter()
+                .any(|byte| ((*byte as i8) as i16).unsigned_abs() == 127),
+            "canonical signed INT8 vector has no component saturated to +/-127"
+        );
+    }
+    degenerate(&index::blob_to_vec(record, spec.precision)).map_or(Ok(()), |why| {
+        Err(anyhow::anyhow!(
+            "canonical vector record is degenerate or invalid: {why}"
+        ))
+    })
+}
 
 /// Why a vector cannot be a real embedding, or `None` when it looks sane.
 ///
@@ -133,6 +210,7 @@ impl VectorStore {
     /// that does not exist yet reads as empty — a host with no artifacts is a
     /// host with zero coverage, not an error.
     pub fn open(brain_root: &Path, spec: &VectorSpec) -> anyhow::Result<VectorStore> {
+        validate_storage_spec(spec)?;
         anyhow::ensure!(
             !spec.model.contains(['\n', '\r']),
             "embeddings.model must not contain newlines"
@@ -278,7 +356,9 @@ impl VectorStore {
             .map(|blob| index::blob_to_vec(&blob, self.spec.precision)))
     }
 
-    /// One canonical record by content hash, without decoding or rewriting.
+    /// One canonical output/storage record by content hash, without decoding
+    /// or rewriting. Canonical describes its codec and retained identity, not
+    /// backend-internal arithmetic or cross-backend byte equality.
     pub(crate) fn get_blob(&self, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let Some(record) = self.hashes.iter().position(|h| h == hash) else {
             return Ok(None);
@@ -287,7 +367,10 @@ impl VectorStore {
         let mut file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
         file.seek(std::io::SeekFrom::Start((record * self.stride()) as u64))?;
         let mut buf = vec![0u8; self.stride()];
-        file.read_exact(&mut buf).with_context(|| format!("read record {record} of {}", path.display()))?;
+        file.read_exact(&mut buf)
+            .with_context(|| format!("read record {record} of {}", path.display()))?;
+        validate_record_bytes(&self.spec, &buf)
+            .with_context(|| format!("validate record {record} of {}", path.display()))?;
         Ok(Some(buf))
     }
 
@@ -308,6 +391,8 @@ impl VectorStore {
             reader
                 .read_exact(&mut buf)
                 .with_context(|| format!("read {} (short of its index)", path.display()))?;
+            validate_record_bytes(&self.spec, &buf)
+                .with_context(|| format!("validate vector for {hash} in {}", path.display()))?;
             f(hash, index::blob_to_vec(&buf, self.spec.precision))?;
         }
         Ok(())
@@ -389,6 +474,14 @@ pub struct VectorWriter<'a> {
 }
 
 impl VectorWriter<'_> {
+    /// Returns the record currently retained by the derive-once store. Callers
+    /// use this after losing a `put` race so their disposable local cache is
+    /// populated from the shared winner rather than from the vector they just
+    /// computed.
+    pub(crate) fn get_retained(&self, hash: &str) -> anyhow::Result<Option<Vec<f32>>> {
+        self.store.get(hash)
+    }
+
     /// Appends one vector. Returns false when the hash is already stored (the
     /// derive-once contract: an artifact that exists is never recomputed).
     pub fn put(&mut self, hash: &str, vector: &[f32]) -> anyhow::Result<bool> {
@@ -422,37 +515,36 @@ impl VectorWriter<'_> {
         self.put_encoded(hash, &encoded)
     }
 
-    /// Appends one already-canonical vector record received from a peer.
+    /// Appends one already-canonical output/storage record received from a peer.
     /// The byte representation is preserved exactly: decoding and re-
-    /// quantizing an INT8 artifact could otherwise manufacture drift.
+    /// quantizing an INT8 artifact could otherwise manufacture drift. A
+    /// different admitted backend may legitimately have produced different
+    /// bytes; it cannot replace the derive-once record already selected for
+    /// this content hash.
     pub(crate) fn put_encoded(&mut self, hash: &str, encoded: &[u8]) -> anyhow::Result<bool> {
         anyhow::ensure!(
             !hash.contains(['\n', '\r']) && !hash.is_empty(),
             "content hash {hash:?} is not a hash"
         );
-        anyhow::ensure!(
-            encoded.len() == self.store.stride(),
-            "canonical vector record has {} bytes, profile {} requires {}",
-            encoded.len(),
-            self.store.spec.profile_id,
-            self.store.stride()
-        );
-        let widened = index::blob_to_vec(encoded, self.store.spec.precision);
-        degenerate(&widened).map_or(Ok(()), |why| {
-            Err(anyhow::anyhow!(
-                "refusing peer vector for {hash}: {why}"
-            ))
-        })?;
+        validate_record_bytes(&self.store.spec, encoded)
+            .with_context(|| format!("refusing peer vector for {hash}"))?;
         if self.store.present.contains(hash) {
-            let existing = self
-                .store
-                .get_blob(hash)?
-                .context("vector index named an existing record that could not be read")?;
-            anyhow::ensure!(
-                existing == encoded,
-                "received different canonical bytes for existing content {hash} under profile {} — the derive-once store keeps its first admitted record",
-                self.store.spec.profile_id
-            );
+            if !is_canonical_v1_profile(&self.store.spec) {
+                let existing = self
+                    .store
+                    .get_blob(hash)?
+                    .context("vector index named an existing record that could not be read")?;
+                anyhow::ensure!(
+                    existing == encoded,
+                    "received different canonical bytes for existing content {hash} under profile {} — the derive-once store keeps its first record",
+                    self.store.spec.profile_id
+                );
+            }
+            // Under the admitted v1 profile, the first record is the
+            // derive-once winner. Another backend may legitimately emit
+            // different canonical bytes for the same text; retaining the
+            // existing record is not a conflict and must not turn
+            // cross-backend byte equality into an accidental runtime gate.
             return Ok(false);
         }
         // Record FIRST, index line second: a crash between them leaves an
@@ -500,6 +592,22 @@ pub(crate) fn encode_peer_artifact(
     Ok(out)
 }
 
+/// Exact byte length of one peer artifact for this vector-space profile.
+/// Negotiation checks this before opening the blob transport so a peer cannot
+/// use an honest content hash with a dishonest, much larger payload.
+pub(crate) fn peer_artifact_len(spec: &VectorSpec) -> anyhow::Result<usize> {
+    validate_storage_spec(spec)?;
+    anyhow::ensure!(spec.dim > 0, "peer vector artifact has zero dimensions");
+    let record = spec
+        .dim
+        .checked_mul(spec.precision.width())
+        .and_then(|bytes| bytes.checked_add(spec.precision.trailer()))
+        .context("peer vector artifact record length overflows usize")?;
+    PEER_ARTIFACT_HEADER_BYTES
+        .checked_add(record)
+        .context("peer vector artifact length overflows usize")
+}
+
 /// Decodes and structurally validates one peer artifact. The expected hash is
 /// supplied by the receiver, so a faulty peer cannot smuggle an unrelated
 /// record into the local artifact store.
@@ -508,21 +616,24 @@ pub(crate) fn decode_peer_artifact(
     spec: &VectorSpec,
     expected_hash: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    let stride = spec.precision.record_bytes(spec.dim);
-    let header = PEER_ARTIFACT_MAGIC.len() + 32 + 64;
-    anyhow::ensure!(raw.len() == header + stride, "peer vector artifact length is inconsistent");
+    let expected_len = peer_artifact_len(spec)?;
+    anyhow::ensure!(
+        raw.len() == expected_len,
+        "peer vector artifact length is inconsistent"
+    );
     anyhow::ensure!(
         raw.starts_with(PEER_ARTIFACT_MAGIC),
         "peer vector artifact has unknown format"
     );
     let hash_start = PEER_ARTIFACT_MAGIC.len() + 32;
     let hash = std::str::from_utf8(&raw[hash_start..hash_start + 64])?;
-    anyhow::ensure!(hash == expected_hash, "peer returned vector {hash} for requested {expected_hash}");
-    let record = raw[header..].to_vec();
     anyhow::ensure!(
-        degenerate(&index::blob_to_vec(&record, spec.precision)).is_none(),
-        "peer returned a degenerate vector for {hash}"
+        hash == expected_hash,
+        "peer returned vector {hash} for requested {expected_hash}"
     );
+    let record = raw[PEER_ARTIFACT_HEADER_BYTES..].to_vec();
+    validate_record_bytes(spec, &record)
+        .with_context(|| format!("peer returned an invalid vector for {hash}"))?;
     Ok(record)
 }
 
@@ -578,7 +689,6 @@ pub fn hydrate(conn: &Connection, store: &VectorStore) -> anyhow::Result<usize> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Precision;
 
     fn spec(dim: usize, precision: Precision) -> VectorSpec {
         VectorSpec {
@@ -589,6 +699,148 @@ mod tests {
             precision,
             doc_prefix: String::new(),
         }
+    }
+
+    fn canonical_spec() -> VectorSpec {
+        VectorSpec {
+            network_major: crate::embedding_profile::NETWORK_MAJOR,
+            profile_id: crate::embedding_profile::PROFILE_ID.into(),
+            model: crate::embedding_profile::MODEL.into(),
+            dim: crate::embedding_profile::DIMENSIONS,
+            precision: Precision::I8,
+            doc_prefix: crate::embedding_profile::DOCUMENT_PREFIX.into(),
+        }
+    }
+
+    #[test]
+    fn v1_model_store_accepts_only_the_signed_int8x768_codec() {
+        let brain = tempfile::tempdir().unwrap();
+        VectorStore::open(brain.path(), &canonical_spec()).unwrap();
+
+        let mut wrong = canonical_spec();
+        wrong.precision = Precision::F16;
+        let error = VectorStore::open(brain.path(), &wrong)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("output/storage codec"), "{error}");
+        assert!(
+            error.contains("backend-internal precision remains native"),
+            "{error}"
+        );
+
+        let mut wrong = canonical_spec();
+        wrong.model = "wrong/model".into();
+        assert!(VectorStore::open(brain.path(), &wrong).is_err());
+
+        let mut wrong = canonical_spec();
+        wrong.dim = 256;
+        assert!(VectorStore::open(brain.path(), &wrong).is_err());
+
+        let mut wrong = canonical_spec();
+        wrong.doc_prefix.clear();
+        assert!(VectorStore::open(brain.path(), &wrong).is_err());
+    }
+
+    #[test]
+    fn v1_codec_is_scale_free_signed_int8x768_with_ties_to_even() {
+        let brain = tempfile::tempdir().unwrap();
+        let s = canonical_spec();
+        let mut vector = vec![0.0; crate::embedding_profile::DIMENSIONS];
+        vector[..6].copy_from_slice(&[
+            1.0,
+            -1.0,
+            0.5 / 127.0,
+            1.5 / 127.0,
+            -0.5 / 127.0,
+            -1.5 / 127.0,
+        ]);
+        let scaled: Vec<f32> = vector.iter().map(|component| component * 0.25).collect();
+
+        let mut store = VectorStore::open(brain.path(), &s).unwrap();
+        {
+            let mut writer = store.begin_write().unwrap();
+            assert!(writer.put("native-output-a", &vector).unwrap());
+            assert!(writer.put("native-output-b", &scaled).unwrap());
+        }
+
+        let first = store.get_blob("native-output-a").unwrap().unwrap();
+        let second = store.get_blob("native-output-b").unwrap().unwrap();
+        assert_eq!(first.len(), 768);
+        assert_eq!(
+            first, second,
+            "the codec discards positive per-vector scale"
+        );
+        assert_eq!(first[0] as i8, 127);
+        assert_eq!(first[1] as i8, -127);
+        assert_eq!(first[2] as i8, 0, "0.5 rounds to the even integer 0");
+        assert_eq!(first[3] as i8, 2, "1.5 rounds to the even integer 2");
+        assert_eq!(first[4] as i8, 0, "-0.5 rounds to the even integer 0");
+        assert_eq!(first[5] as i8, -2, "-1.5 rounds to the even integer -2");
+    }
+
+    #[test]
+    fn v1_rejects_noncanonical_int8_bytes_at_write_peer_and_read_boundaries() {
+        let brain = tempfile::tempdir().unwrap();
+        let s = canonical_spec();
+        let hash = "ab".repeat(32);
+        let mut store = VectorStore::open(brain.path(), &s).unwrap();
+        {
+            let mut writer = store.begin_write().unwrap();
+            let unsaturated = vec![1; crate::embedding_profile::DIMENSIONS];
+            let error = format!("{:#}", writer.put_encoded(&hash, &unsaturated).unwrap_err());
+            assert!(error.contains("no component saturated"), "{error}");
+
+            let mut minus_128 = vec![0; crate::embedding_profile::DIMENSIONS];
+            minus_128[0] = 0x80;
+            minus_128[1] = 127;
+            let error = format!("{:#}", writer.put_encoded(&hash, &minus_128).unwrap_err());
+            assert!(error.contains("forbidden -128"), "{error}");
+        }
+
+        let mut peer_record = vec![0; crate::embedding_profile::DIMENSIONS];
+        peer_record[0] = 0x81; // canonical -127
+        peer_record[1] = 0x80; // forbidden -128
+        let raw = encode_peer_artifact(&hash, &peer_record, [7; 32]).unwrap();
+        let error = format!("{:#}", decode_peer_artifact(&raw, &s, &hash).unwrap_err());
+        assert!(error.contains("forbidden -128"), "{error}");
+
+        let mut valid = vec![0.0; crate::embedding_profile::DIMENSIONS];
+        valid[0] = 1.0;
+        {
+            let mut writer = store.begin_write().unwrap();
+            assert!(writer.put(&hash, &valid).unwrap());
+            writer.flush().unwrap();
+        }
+        let path = store.bin_path();
+        std::fs::write(&path, vec![1; crate::embedding_profile::DIMENSIONS]).unwrap();
+        let error = format!("{:#}", store.get_blob(&hash).unwrap_err());
+        assert!(error.contains("no component saturated"), "{error}");
+    }
+
+    #[test]
+    fn derive_once_retains_the_first_record_without_demanding_byte_identity() {
+        let brain = tempfile::tempdir().unwrap();
+        let s = canonical_spec();
+        let mut first = vec![0.0; crate::embedding_profile::DIMENSIONS];
+        first[0] = 1.0;
+        let mut another_admitted_output = first.clone();
+        another_admitted_output[1] = 0.01;
+
+        let mut store = VectorStore::open(brain.path(), &s).unwrap();
+        let mut writer = store.begin_write().unwrap();
+        assert!(writer.put("same-content", &first).unwrap());
+        assert!(
+            !writer
+                .put("same-content", &another_admitted_output)
+                .unwrap()
+        );
+        let retained = writer.get_retained("same-content").unwrap().unwrap();
+        let retained = crate::index::vec_to_blob(&retained, Precision::I8);
+        assert_eq!(retained, crate::index::vec_to_blob(&first, Precision::I8));
+        assert_ne!(
+            retained,
+            crate::index::vec_to_blob(&another_admitted_output, Precision::I8)
+        );
     }
 
     #[test]
@@ -617,6 +869,24 @@ mod tests {
     }
 
     #[test]
+    fn peer_artifact_length_is_exact_and_overflow_checked() {
+        for (precision, width) in [(Precision::I8, 1), (Precision::F16, 2), (Precision::F32, 4)] {
+            let s = spec(4, precision);
+            assert_eq!(
+                peer_artifact_len(&s).unwrap(),
+                PEER_ARTIFACT_HEADER_BYTES + 4 * width
+            );
+        }
+        let overflow = spec(usize::MAX, Precision::F32);
+        assert!(
+            peer_artifact_len(&overflow)
+                .unwrap_err()
+                .to_string()
+                .contains("overflows")
+        );
+    }
+
+    #[test]
     fn peer_artifact_rejects_wrong_width_and_degenerate_bytes() {
         let s = spec(4, Precision::I8);
         let hash = "ab".repeat(32);
@@ -624,9 +894,7 @@ mod tests {
         assert!(decode_peer_artifact(&short, &s, &hash).is_err());
         let zero = encode_peer_artifact(&hash, &[0, 0, 0, 0], [7; 32]).unwrap();
         assert!(
-            decode_peer_artifact(&zero, &s, &hash)
-                .unwrap_err()
-                .to_string()
+            format!("{:#}", decode_peer_artifact(&zero, &s, &hash).unwrap_err())
                 .contains("degenerate")
         );
     }
