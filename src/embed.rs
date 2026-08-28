@@ -591,7 +591,7 @@ fn decode_lowercase_hex<const N: usize>(value: &str, field: &str) -> anyhow::Res
         N * 2
     );
     let mut decoded = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let nibble = |byte: u8| match byte {
             b'0'..=b'9' => byte - b'0',
             b'a'..=b'f' => byte - b'a' + 10,
