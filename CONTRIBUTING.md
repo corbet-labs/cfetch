@@ -5,28 +5,27 @@ Contributions are welcome. Three things to know before your first pull request:
 ## 1. License and contributor agreement
 
 The project is licensed under [FSL-1.1-ALv2](LICENSE.md) (each release becomes
-Apache-2.0 after two years). To keep that promise coherent across the whole
-project, every contributor signs the
-[Contributor Copyright Assignment Agreement](CLA.md) once. Assignment happens
-only when a contribution is accepted. You keep attribution and receive a broad,
-permanent license back to your own contribution.
+Apache-2.0 after two years). External contributors retain copyright in their
+work and grant the rights described in Corbet Labs' organization-wide
+[Individual Contributor License Agreement](https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md).
 
-Signing is automated: on your first pull request, the CLA bot asks you to post
+Signing is automated: on your first pull request, the contributor-agreement bot
+asks you to post this exact comment:
 
-> I have read the Contributor Agreement and assign accepted Contributions as described in it
+> I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md.
 
-as a pull-request comment. One signature covers future contributions until you
-withdraw from the agreement for future work. Forking the repository to prepare a
-pull request is expected and welcome.
+The bot records the signature for future contributions to this repository.
+Forking the repository to prepare a pull request is expected and welcome.
 
 ## 2. Clean-room rule
 
 cfetch reimplements *mechanisms* studied in the AGPL projects
 `cytostack/openwolf` and `bassprofressor-lab/openwolf-enhanced`, without using
 their code. Do not copy, translate, or closely paraphrase source from either
-project (or any other incompatibly-licensed work) into a contribution — the CLA
-makes you warrant that you haven't. Behavior, ideas, and measurements are fair
-game; their expression is not.
+project (or any other incompatibly licensed work) into a contribution. The
+contributor agreement requires you to own the rights you grant and to follow
+these third-party-material instructions. Behavior, ideas, and measurements are
+fair game; their expression is not.
 
 ## 3. Third-party provenance
 
@@ -40,10 +39,9 @@ request must identify, for every copied part:
 - any required NOTICE text; and
 - what was modified after copying.
 
-This record is how the contribution satisfies section 6(3) of the contributor
-agreement. Copied
-material remains under its upstream license and is not treated as the
-contributor's original work. Missing provenance is a merge blocker.
+This record is how the contribution satisfies section 3(d) of the contributor
+agreement. Copied material remains under its upstream license and is not treated
+as the contributor's original work. Missing provenance is a merge blocker.
 
 ## 4. House rules
 

@@ -4,7 +4,6 @@
 /Cargo.toml @corbet-labs/maintainers
 /Cargo.lock @corbet-labs/maintainers
 /LICENSE.md @corbet-labs/maintainers
-/CLA.md @corbet-labs/maintainers
 /deny.toml @corbet-labs/maintainers
 /release/ @corbet-labs/maintainers
 /packaging/ @corbet-labs/maintainers

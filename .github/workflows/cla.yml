@@ -1,4 +1,4 @@
-name: CLA
+name: Individual contributor agreement
 
 on:
   issue_comment:
@@ -13,23 +13,23 @@ permissions:
   statuses: write
 
 jobs:
-  cla:
+  contributor-agreement:
     runs-on: ubuntu-latest
     steps:
       - name: Contributor agreement assistant
-        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the Contributor Agreement and assign accepted Contributions as described in it') || github.event_name == 'pull_request_target'
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md.') || github.event_name == 'pull_request_target'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: '.github/signatures/cla.json'
-          path-to-document: 'https://github.com/corbet-labs/cfetch/blob/main/CLA.md'
+          path-to-document: 'https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md'
           branch: 'cla-signatures'
           allowlist: 'julian-corbet,dependabot[bot],*[bot]'
           custom-notsigned-prcomment: >
             Thank you for the contribution. Before it can be merged, please sign the
-            [Contributor Copyright Assignment Agreement](https://github.com/corbet-labs/cfetch/blob/main/CLA.md)
+            [Individual Contributor License Agreement, version 1.0](https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md)
             by posting the sentence below as a comment on this pull request.
-          custom-pr-sign-comment: 'I have read the Contributor Agreement and assign accepted Contributions as described in it'
-          custom-allsigned-prcomment: 'All contributors have signed the Contributor Agreement.'
-          lock-pullrequest-aftermerge: false
+          custom-pr-sign-comment: 'I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md.'
+          custom-allsigned-prcomment: 'All contributors have agreed to the Individual Contributor License Agreement.'
+          lock-pullrequest-aftermerge: true

@@ -690,10 +690,10 @@ Report suspected vulnerabilities through the private process in
 purpose except offering a competing commercial product or service. Each
 release converts automatically to Apache-2.0 two years after publication.
 
-Contributions are welcome. Fork cfetch, send a focused pull request, and sign the
-[Contributor Agreement](CLA.md) once. Accepted contributions join the coherently
-licensed project through copyright assignment; contributors keep attribution and
-a broad license back to their own work. Read
+Contributions are welcome. Fork cfetch, send a focused pull request, and agree to
+the organization-wide [Individual Contributor License Agreement](https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md).
+Contributors retain copyright and grant the project the rights needed to license
+accepted contributions coherently. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) and follow the clean-room rule: do not copy or
 closely paraphrase code from OpenWolf, OpenWolf Enhanced, or other incompatibly
 licensed projects.

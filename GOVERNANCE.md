@@ -17,9 +17,11 @@ evidence for a load-bearing design change.
 
 ## Contributions and releases
 
-Contributors retain copyright and sign the project's CLA. Every merge must pass
-the required CI and license gates. Releases are tagged from verified commits and
-follow the process documented in the repository workflows and changelog.
+Contributors retain copyright and agree to Corbet Labs' organization-wide
+[Individual Contributor License Agreement](https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md).
+Every merge must pass the required CI and license gates. Releases are tagged
+from verified commits and follow the process documented in the repository
+workflows and changelog.
 
 cfetch remains on the 0.x release line. Version 1.0 and every later major are
 blocked until the project lead explicitly changes that policy.

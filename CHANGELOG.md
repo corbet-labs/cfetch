@@ -58,10 +58,10 @@ listed here is a fix or an internal change with no effect on behavior.
   cfetch with OpenWolf and OpenWolf Enhanced. A reproducible v0.9.9 study
   records 93.4% aggregate model-facing reduction across eight selected
   oversized command outputs, explicitly without claiming whole-session savings.
-- **Unified contributor stewardship.** Accepted contributions now assign
-  copyright to the project steward while preserving authorship attribution and
-  granting contributors a broad license back to their own work. This keeps the
-  whole project under one coherent FSL-to-Apache release promise.
+- **Organization-wide contributor terms.** External contributors retain
+  copyright and grant the project broad copyright and patent rights through
+  Corbet Labs' versioned Individual Contributor License Agreement. This keeps
+  the whole project under one coherent FSL-to-Apache release promise.
 
 ## 0.9.9
 
