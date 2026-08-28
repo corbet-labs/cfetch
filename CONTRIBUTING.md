@@ -9,13 +9,14 @@ Apache-2.0 after two years). External contributors retain copyright in their
 work and grant the rights described in Corbet Labs' organization-wide
 [Individual Contributor License Agreement](https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md).
 
-Signing is automated: on your first pull request, the contributor-agreement bot
-asks you to post this exact comment:
+Every external contribution must be submitted through a pull request whose
+description contains this exact affirmation:
 
 > I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md.
 
-The bot records the signature for future contributions to this repository.
-Forking the repository to prepare a pull request is expected and welcome.
+The checked affirmation and pull-request record form the electronic acceptance
+record. A maintainer must not merge an external contribution without it. Forking
+the repository to prepare a pull request is expected and welcome.
 
 ## 2. Clean-room rule
 
