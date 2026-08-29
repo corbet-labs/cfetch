@@ -154,6 +154,7 @@ class PackagingTests(unittest.TestCase):
             payload = base / "payload"
             (payload / "nested").mkdir(parents=True)
             (payload / "root.txt").write_bytes(b"root")
+            (payload / "nested/empty-metadata").write_bytes(b"")
             executable = payload / "nested/tool"
             executable.write_bytes(b"#!/bin/sh\nexit 0\n")
             executable.chmod(0o755)
@@ -168,9 +169,11 @@ class PackagingTests(unittest.TestCase):
             with tarfile.open(first, "r:gz") as bundle:
                 members = bundle.getmembers()
             self.assertEqual(
-                [member.name for member in members], ["nested/tool", "root.txt"]
+                [member.name for member in members],
+                ["nested/empty-metadata", "nested/tool", "root.txt"],
             )
             self.assertTrue(all(member.isreg() for member in members))
+            self.assertEqual(members[0].size, 0)
 
     def test_gemma_archive_refuses_missing_redistribution_payload(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -216,6 +219,7 @@ class PackagingTests(unittest.TestCase):
             native = root / "_internal/native.so"
             native.parent.mkdir()
             native.write_bytes(b"native-one")
+            (root / "_internal/empty-metadata").write_bytes(b"")
             inventory, digest = package_inventory.create(root)
             self.assertEqual(
                 hashlib.sha256(inventory.read_bytes()).hexdigest(), digest
