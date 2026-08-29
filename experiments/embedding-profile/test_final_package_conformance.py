@@ -87,6 +87,9 @@ def sequence_report(
                 "response_row_count": SUPPORTED_MAX_BATCH_SIZE,
                 "ordered_input_json_sha256": input_digest,
                 "canonical_output_bytes_sha256": output_digest,
+                "signed_transactions_sha256": hashlib.sha256(
+                    f"wire-transactions-{batch_size}".encode()
+                ).hexdigest(),
             }
             for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
         ],

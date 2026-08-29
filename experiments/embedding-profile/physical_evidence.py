@@ -1392,6 +1392,7 @@ def _wire_grouping_results(
     startup_timeout_seconds: float,
     request_timeout_seconds: float,
     inputs: Sequence[str],
+    raw_root: Path,
     nonce_registry: set[bytes],
 ) -> list[dict[str, Any]]:
     input_digest = ordered_input_json_sha256(inputs)
@@ -1408,12 +1409,14 @@ def _wire_grouping_results(
         )
         for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1):
             output = bytearray()
+            signed_transactions: list[dict[str, Any]] = []
             request_count = 0
             response_count = 0
             for start in range(0, len(inputs), batch_size):
                 transaction = client.request(
                     inputs[start : start + batch_size], measure_rss=False
                 )
+                signed_transactions.append(transaction.raw_document())
                 request_count += 1
                 response_count += len(transaction.rows)
                 for row in transaction.rows:
@@ -1425,6 +1428,17 @@ def _wire_grouping_results(
                 raise EvidenceError(
                     f"wire grouping size {batch_size} changed canonical output bytes"
                 )
+            signed_transactions_digest = _store_raw(
+                raw_root,
+                {
+                    "schema_version": 1,
+                    "kind": "wire-grouping-signed-transactions",
+                    "scope_id": package.scope.scope_id,
+                    "batch_size": batch_size,
+                    "ordered_input_json_sha256": input_digest,
+                    "transactions": signed_transactions,
+                },
+            )
             results.append(
                 {
                     "batch_size": batch_size,
@@ -1435,6 +1449,7 @@ def _wire_grouping_results(
                     "canonical_output_bytes_sha256": hashlib.sha256(
                         complete
                     ).hexdigest(),
+                    "signed_transactions_sha256": signed_transactions_digest,
                 }
             )
     return results
@@ -1510,6 +1525,7 @@ def collect_physical_evidence(
             startup_timeout_seconds,
             request_timeout_seconds,
             wire_inputs,
+            raw_root,
             nonce_registry,
         )
         identity = dict(package.scope.identity)

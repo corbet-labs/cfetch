@@ -20,9 +20,9 @@ pub const PROFILE_MANIFEST_SHA256: &str =
     "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7";
 pub const ADMISSION_POLICY_VERSION: u32 = 1;
 pub const ADMISSION_POLICY_SHA256: &str =
-    "f35d18b42c17e79fda60a8c731005871264e06fc3f5f138352d22e83399902fb";
+    "f21f6d0fcc1a48fb4e95dab9b47fe1e97d56036a44b4005b27eee0b8eb26cf44";
 pub const ADMISSION_IMPLEMENTATION_BUNDLE_SHA256: &str =
-    "3f84a6d3919a714ec71feab12fa0790882e5b443930dbf253dc0561166ff87d9";
+    "57130cfe69d5874257c0ae6988225eea142add77058fc0c0a360b46e21cad6f2";
 
 /// Immutable semantic source for the candidate profile. Every native package
 /// records its actual lineage and artifact digest; direct derivation is never

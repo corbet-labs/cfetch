@@ -227,6 +227,9 @@ def sequence_evidence_bytes(
                         "response_row_count": SUPPORTED_MAX_BATCH_SIZE,
                         "ordered_input_json_sha256": wire_input_digest,
                         "canonical_output_bytes_sha256": wire_output_digest,
+                        "signed_transactions_sha256": hashlib.sha256(
+                            f"wire-transactions-{batch_size}".encode()
+                        ).hexdigest(),
                     }
                     for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
                 ],
@@ -988,11 +991,26 @@ class AllPairsGateTests(unittest.TestCase):
             ):
                 validate_admission_cache_url("test-scope", url, digest)
 
-    def test_measurement_bundle_retains_every_raw_profiler_and_benchmark(self) -> None:
+    def test_measurement_bundle_retains_every_raw_signed_wire_profiler_and_benchmark(
+        self,
+    ) -> None:
         profiler_bytes = b"raw profiler output\n"
         benchmark_bytes = b"raw benchmark output\n"
         profiler_digest = hashlib.sha256(profiler_bytes).hexdigest()
         benchmark_digest = hashlib.sha256(benchmark_bytes).hexdigest()
+        probe_vectors = np.ones((len(SEQUENCE_BUCKETS), 768), dtype=np.int8)
+        sequence = json.loads(
+            sequence_evidence_bytes(probe_vectors, probe_vectors, probe_vectors)
+        )
+        wire_files = {
+            hashlib.sha256(
+                f"wire-transactions-{batch_size}".encode()
+            ).hexdigest(): f"wire-transactions-{batch_size}".encode()
+            for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
+        }
+        sequence_digest = hashlib.sha256(
+            json.dumps(sequence, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         placement = json.loads(placement_evidence_bytes())
         performance = json.loads(performance_evidence_bytes())
         for row in placement["bucket_results"]:
@@ -1006,12 +1024,14 @@ class AllPairsGateTests(unittest.TestCase):
             json.dumps(performance, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         entry = {
+            "sequence_capability_evidence_sha256": sequence_digest,
             "placement_evidence_sha256": placement_digest,
             "performance_evidence_sha256": performance_digest,
         }
         manifest = {
             "schema_version": 1,
             "scope_id": "test-scope",
+            "sequence_capability_evidence_sha256": sequence_digest,
             "placement_evidence_sha256": placement_digest,
             "performance_evidence_sha256": performance_digest,
             "files": [
@@ -1025,18 +1045,33 @@ class AllPairsGateTests(unittest.TestCase):
                     "sha256": profiler_digest,
                     "roles": ["placement-profiler"],
                 },
+                *[
+                    {
+                        "path": f"raw/{digest}.bin",
+                        "sha256": digest,
+                        "roles": ["wire-signed-transactions"],
+                    }
+                    for digest in sorted(wire_files)
+                ],
             ],
         }
 
         with tempfile.TemporaryDirectory() as directory:
             bundle = Path(directory) / "measurements.zip"
 
-            def write_bundle(manifest_bytes: bytes, include_profiler: bool = True) -> None:
+            def write_bundle(
+                manifest_bytes: bytes,
+                include_profiler: bool = True,
+                omitted_wire_digest: str | None = None,
+            ) -> None:
                 with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
                     archive.writestr("measurement-manifest.json", manifest_bytes)
                     archive.writestr(
                         f"raw/{benchmark_digest}.bin", benchmark_bytes
                     )
+                    for digest, raw in wire_files.items():
+                        if digest != omitted_wire_digest:
+                            archive.writestr(f"raw/{digest}.bin", raw)
                     if include_profiler:
                         archive.writestr(
                             f"raw/{profiler_digest}.bin", profiler_bytes
@@ -1050,7 +1085,11 @@ class AllPairsGateTests(unittest.TestCase):
                 bundle,
                 "test-scope",
                 entry,
-                {"placement": placement, "performance": performance},
+                {
+                    "sequence": sequence,
+                    "placement": placement,
+                    "performance": performance,
+                },
             )
 
             write_bundle(manifest_bytes, include_profiler=False)
@@ -1059,7 +1098,27 @@ class AllPairsGateTests(unittest.TestCase):
                     bundle,
                     "test-scope",
                     entry,
-                    {"placement": placement, "performance": performance},
+                    {
+                        "sequence": sequence,
+                        "placement": placement,
+                        "performance": performance,
+                    },
+                )
+
+            write_bundle(
+                manifest_bytes,
+                omitted_wire_digest=next(iter(wire_files)),
+            )
+            with self.assertRaisesRegex(ValueError, "retain every referenced raw output"):
+                validate_measurement_bundle(
+                    bundle,
+                    "test-scope",
+                    entry,
+                    {
+                        "sequence": sequence,
+                        "placement": placement,
+                        "performance": performance,
+                    },
                 )
 
             duplicate_manifest = manifest_bytes.replace(
@@ -1071,7 +1130,11 @@ class AllPairsGateTests(unittest.TestCase):
                     bundle,
                     "test-scope",
                     entry,
-                    {"placement": placement, "performance": performance},
+                    {
+                        "sequence": sequence,
+                        "placement": placement,
+                        "performance": performance,
+                    },
                 )
 
     def test_replay_tolerates_only_last_bit_quality_metric_drift(self) -> None:

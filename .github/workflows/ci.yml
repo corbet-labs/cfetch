@@ -90,6 +90,8 @@ jobs:
           test_export_adapter_cache.py
           test_measurement_bundle.py
           test_physical_evidence.py
+          test_openvino_scope_keys.py
+          test_scifact_contract.py
           test_final_package_conformance.py
           test_admission_transaction.py
       - name: Test dependency-light OpenVINO package contracts

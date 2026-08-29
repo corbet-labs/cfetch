@@ -4,11 +4,13 @@ import hashlib
 import http.client
 import io
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from packages.openvino import adapter
 from packages.openvino.manifest import (
@@ -377,18 +379,24 @@ class AdapterContractTests(unittest.TestCase):
                     return list(self.values)
                 return self.values[name]
 
-        matching = FakeCore(dict(self.scope.required_openvino_properties))
-        adapter.validate_openvino_properties(matching, self.scope)
+        indexed_scope = replace(
+            self.scope, required_execution_devices=("NPU.0",)
+        )
+        matching = FakeCore(dict(indexed_scope.required_openvino_properties))
+        adapter.validate_openvino_properties(matching, indexed_scope)
         self.assertEqual(
             matching.calls,
-            [("NPU", "SUPPORTED_PROPERTIES")]
-            + [("NPU", name) for name in self.scope.required_openvino_properties],
+            [("NPU.0", "SUPPORTED_PROPERTIES")]
+            + [
+                ("NPU.0", name)
+                for name in indexed_scope.required_openvino_properties
+            ],
         )
 
-        wrong = dict(self.scope.required_openvino_properties)
+        wrong = dict(indexed_scope.required_openvino_properties)
         wrong["NPU_DRIVER_VERSION"] = 99
         with self.assertRaisesRegex(RuntimeError, "did not match the admitted"):
-            adapter.validate_openvino_properties(FakeCore(wrong), self.scope)
+            adapter.validate_openvino_properties(FakeCore(wrong), indexed_scope)
 
     def test_host_binding_requires_exact_kernel_and_file_bytes(self) -> None:
         with unittest.mock.patch.object(
@@ -411,6 +419,322 @@ class AdapterContractTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "host identity did not match"):
                 adapter.validate_host_binding(self.scope)
+
+    def test_host_preflight_uses_typed_live_properties_and_all_static_compiles(
+        self,
+    ) -> None:
+        class BucketModel:
+            bucket = 0
+
+            def reshape(self, shapes):
+                self.bucket = next(iter(shapes.values()))[1]
+
+        class Model:
+            def clone(self):
+                return BucketModel()
+
+        class Compiled:
+            def __init__(self, execution_devices):
+                self.execution_devices = execution_devices
+
+            def get_property(self, name):
+                self.assert_property = name
+                return self.execution_devices
+
+        class Core:
+            available_devices = ["CPU", "GPU.0", "NPU.0"]
+
+            def __init__(self):
+                self.properties = dict(self_scope.required_openvino_properties)
+                self.compile_calls = []
+                self.property_calls = []
+
+            def get_property(self, device, name):
+                self.property_calls.append((device, name))
+                if name == "SUPPORTED_PROPERTIES":
+                    return list(self.properties)
+                return self.properties[name]
+
+            def read_model(self, *, model, weights):
+                self.graph_paths = (model, weights)
+                return Model()
+
+            def compile_model(self, model, device, config):
+                self.compile_calls.append((model.bucket, device, config))
+                return Compiled(["NPU.0"])
+
+        self_scope = self.scope
+        core = Core()
+        runtime = {
+            "runtime_manifest_sha256": "9" * 64,
+            "dependency_versions": {
+                "cryptography": "test",
+                "numpy": "test",
+                "openvino": "test",
+                "tokenizers": "test",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            host_file = Path(directory) / "libnpu-test.so"
+            host_file.write_bytes(b"driver bytes")
+            with patch.object(
+                adapter, "HOST_FILE_PREFIXES", (Path(directory),)
+            ), patch.object(
+                adapter.platform, "system", return_value="Linux"
+            ), patch.object(
+                adapter.platform, "machine", return_value="x86_64"
+            ), patch.object(
+                adapter.platform, "release", return_value="test-kernel"
+            ):
+                result = adapter.collect_host_preflight(
+                    self.package.artifact,
+                    runtime,
+                    "npu",
+                    "NPU",
+                    {"PERFORMANCE_HINT": "LATENCY"},
+                    [host_file],
+                    core=core,
+                )
+                wrong_type = Core()
+                wrong_type.properties["NPU_DRIVER_VERSION"] = "1"
+                with self.assertRaisesRegex(RuntimeError, "has type str"):
+                    adapter.collect_host_preflight(
+                        self.package.artifact,
+                        runtime,
+                        "npu",
+                        "NPU",
+                        {},
+                        [host_file],
+                        core=wrong_type,
+                    )
+                drifting = Core()
+
+                def compile_with_drift(model, device, config):
+                    drifting.compile_calls.append((model.bucket, device, config))
+                    selected = "NPU.1" if model.bucket == 2048 else "NPU.0"
+                    return Compiled([selected])
+
+                drifting.compile_model = compile_with_drift
+                with self.assertRaisesRegex(RuntimeError, "changed between"):
+                    adapter.collect_host_preflight(
+                        self.package.artifact,
+                        runtime,
+                        "npu",
+                        "NPU",
+                        {},
+                        [host_file],
+                        core=drifting,
+                    )
+                property_drifting = Core()
+                property_round = 0
+
+                def property_with_drift(device, name):
+                    nonlocal property_round
+                    property_drifting.property_calls.append((device, name))
+                    if name == "SUPPORTED_PROPERTIES":
+                        property_round += 1
+                        return list(property_drifting.properties)
+                    value = property_drifting.properties[name]
+                    if name == "NPU_DRIVER_VERSION" and property_round == 2:
+                        return value + 1
+                    return value
+
+                property_drifting.get_property = property_with_drift
+                with self.assertRaisesRegex(RuntimeError, "properties changed"):
+                    adapter.collect_host_preflight(
+                        self.package.artifact,
+                        runtime,
+                        "npu",
+                        "NPU",
+                        {},
+                        [host_file],
+                        core=property_drifting,
+                    )
+                host_before = {
+                    "system": "Linux",
+                    "machine": "x86_64",
+                    "kernel_release": "test-kernel",
+                    "files": [{"path": str(host_file), "sha256": "1" * 64}],
+                }
+                host_after = {
+                    **host_before,
+                    "files": [{"path": str(host_file), "sha256": "2" * 64}],
+                }
+                with patch.object(
+                    adapter,
+                    "_preflight_host_binding",
+                    side_effect=(host_before, host_after),
+                ), self.assertRaisesRegex(RuntimeError, "host binding changed"):
+                    adapter.collect_host_preflight(
+                        self.package.artifact,
+                        runtime,
+                        "npu",
+                        "NPU",
+                        {},
+                        [host_file],
+                        core=Core(),
+                    )
+
+        self.assertEqual(result["purpose"], adapter.PREFLIGHT_PURPOSE)
+        self.assertEqual(result["required_openvino_properties"], core.properties)
+        self.assertEqual(result["required_execution_devices"], ["NPU.0"])
+        self.assertEqual(result["openvino_property_device"], "NPU.0")
+        self.assertEqual(
+            result["host_binding_source"],
+            "operator-selected-paths-sha256-before-and-after-compilation",
+        )
+        self.assertEqual(
+            [device for device, _name in core.property_calls],
+            ["NPU.0"] * (2 * (len(core.properties) + 1)),
+        )
+        self.assertEqual(
+            [row["bucket"] for row in result["bucket_results"]],
+            list(adapter.SEQUENCE_BUCKETS),
+        )
+        self.assertEqual(
+            core.compile_calls,
+            [
+                (bucket, "NPU", {"PERFORMANCE_HINT": "LATENCY"})
+                for bucket in adapter.SEQUENCE_BUCKETS
+            ],
+        )
+        raw = adapter.canonical_preflight_output(result)
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(
+            raw,
+            (
+                json.dumps(
+                    json.loads(raw),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode(),
+        )
+
+    def test_host_preflight_rejects_noncanonical_config_and_device_drift(self) -> None:
+        self.assertEqual(
+            adapter.parse_preflight_compile_config('{"A":1,"B":true}'),
+            {"A": 1, "B": True},
+        )
+        for value in ('{ "A":1}', '{"B":1,"A":2}', '{"A":null}', "\ud800"):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                adapter.parse_preflight_compile_config(value)
+        with self.assertRaisesRegex(RuntimeError, "exactly match"):
+            adapter.collect_host_preflight(
+                self.package.artifact,
+                {
+                    "runtime_manifest_sha256": "9" * 64,
+                    "dependency_versions": {
+                        "cryptography": "test",
+                        "numpy": "test",
+                        "openvino": "test",
+                        "tokenizers": "test",
+                    },
+                },
+                "npu",
+                "GPU",
+                {},
+                [Path("/usr/lib/libtest.so")],
+                core=object(),
+            )
+
+    def test_host_preflight_main_uses_raw_runtime_without_package_inventory(self) -> None:
+        runtime = {
+            "schema_version": 1,
+            "runtime_manifest_sha256": "9" * 64,
+            "dependency_versions": {
+                "cryptography": "test",
+                "numpy": "test",
+                "openvino": "test",
+                "tokenizers": "test",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            host_file = root / "driver.so"
+            host_file.write_bytes(b"driver")
+            output_bytes = io.BytesIO()
+            output = io.TextIOWrapper(output_bytes, encoding="utf-8")
+            environment = dict(os.environ)
+            environment.pop("CFETCH_PACKAGE_INVENTORY_SHA256", None)
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                adapter, "runtime_self_check", return_value=runtime
+            ) as runtime_check, patch.object(
+                adapter, "load_artifact", return_value=self.package.artifact
+            ) as artifact_loader, patch.object(
+                adapter,
+                "collect_host_preflight",
+                return_value={"schema_version": 1, "purpose": adapter.PREFLIGHT_PURPOSE},
+            ), patch.object(
+                adapter, "verify_package_inventory"
+            ) as inventory_check, patch.object(
+                adapter.sys, "stdout", output
+            ):
+                result = adapter.main(
+                    [
+                        "host-preflight",
+                        "--runtime-manifest-sha256",
+                        "9" * 64,
+                        "--artifact-dir",
+                        str(root),
+                        "--artifact-manifest-sha256",
+                        "1" * 64,
+                        "--device-class",
+                        "npu",
+                        "--device",
+                        "NPU",
+                        "--compile-config-json",
+                        "{}",
+                        "--host-file",
+                        str(host_file),
+                    ]
+                )
+                output.flush()
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                output_bytes.getvalue(),
+                (
+                    '{"purpose":"physical-probe-scope-config-input-not-admission-evidence",'
+                    '"schema_version":1}\n'
+                ).encode(),
+            )
+            self.assertEqual(runtime_check.call_count, 2)
+            self.assertEqual(
+                runtime_check.call_args_list,
+                [unittest.mock.call("9" * 64), unittest.mock.call("9" * 64)],
+            )
+            self.assertEqual(artifact_loader.call_count, 2)
+            inventory_check.assert_not_called()
+
+    def test_runtime_check_uses_raw_runtime_without_package_inventory(self) -> None:
+        runtime = {
+            "schema_version": 1,
+            "runtime_manifest_sha256": "9" * 64,
+            "dependency_versions": {
+                "cryptography": "test",
+                "numpy": "test",
+                "openvino": "test",
+                "tokenizers": "test",
+            },
+        }
+        environment = dict(os.environ)
+        environment.pop("CFETCH_PACKAGE_INVENTORY_SHA256", None)
+        output = io.StringIO()
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            adapter, "runtime_self_check", return_value=runtime
+        ) as runtime_check, patch.object(
+            adapter, "verify_package_inventory"
+        ) as inventory_check, patch.object(
+            adapter.sys, "stdout", output
+        ):
+            result = adapter.main(["runtime-check"])
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue(), json.dumps(runtime, separators=(",", ":")) + "\n"
+        )
+        runtime_check.assert_called_once_with(None)
+        inventory_check.assert_not_called()
 
 
 if __name__ == "__main__":

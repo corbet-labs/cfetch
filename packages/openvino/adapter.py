@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import platform
 import re
 import sys
@@ -28,11 +29,15 @@ if __package__:
         MODEL_REVISION,
         PROFILE_ID,
         PROFILE_MANIFEST_SHA256,
+        DEVICE_FOR_CLASS,
+        HOST_FILE_PREFIXES,
+        REQUIRED_OPENVINO_PROPERTY_TYPES,
         SEQUENCE_BUCKETS,
         Artifact,
         ManifestError,
         PackageManifest,
         Scope,
+        load_artifact,
         load_package_manifest,
         read_bounded_file,
     )
@@ -57,11 +62,15 @@ else:  # Direct execution is the shipped sibling-executable form.
         MODEL_REVISION,
         PROFILE_ID,
         PROFILE_MANIFEST_SHA256,
+        DEVICE_FOR_CLASS,
+        HOST_FILE_PREFIXES,
+        REQUIRED_OPENVINO_PROPERTY_TYPES,
         SEQUENCE_BUCKETS,
         Artifact,
         ManifestError,
         PackageManifest,
         Scope,
+        load_artifact,
         load_package_manifest,
         read_bounded_file,
     )
@@ -86,6 +95,9 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 LOWER_HEX_32_RE = re.compile(r"[0-9a-f]{64}")
 RUNTIME_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+MAX_PREFLIGHT_CONFIG_BYTES = 64 * 1024
+MAX_PREFLIGHT_OUTPUT_BYTES = 1024 * 1024
+PREFLIGHT_PURPOSE = "physical-probe-scope-config-input-not-admission-evidence"
 
 
 class RequestError(ValueError):
@@ -485,30 +497,31 @@ class OpenVinoEngine:
 def validate_openvino_properties(core: Any, scope: Scope) -> dict[str, str | int]:
     """Bind a scope to the exact physical/runtime properties it admitted."""
 
+    property_device = scope.required_execution_devices[0]
     try:
         supported = {
             str(name)
             for name in core.get_property(
-                scope.openvino_device, "SUPPORTED_PROPERTIES"
+                property_device, "SUPPORTED_PROPERTIES"
             )
         }
     except Exception as error:
         raise RuntimeError(
-            f"OpenVINO device {scope.openvino_device} did not expose "
+            f"OpenVINO device {property_device} did not expose "
             "SUPPORTED_PROPERTIES"
         ) from error
     actual_properties: dict[str, str | int] = {}
     for property_name, expected in scope.required_openvino_properties.items():
         if property_name not in supported:
             raise RuntimeError(
-                f"OpenVINO device {scope.openvino_device} does not support required "
+                f"OpenVINO device {property_device} does not support required "
                 f"property {property_name}"
             )
         try:
-            actual = core.get_property(scope.openvino_device, property_name)
+            actual = core.get_property(property_device, property_name)
         except Exception as error:
             raise RuntimeError(
-                f"OpenVINO device {scope.openvino_device} did not expose required "
+                f"OpenVINO device {property_device} did not expose required "
                 f"property {property_name}"
             ) from error
         if type(actual) is not type(expected) or actual != expected:
@@ -518,6 +531,55 @@ def validate_openvino_properties(core: Any, scope: Scope) -> dict[str, str | int
             )
         actual_properties[property_name] = actual
     return actual_properties
+
+
+def parse_preflight_compile_config(raw: str) -> dict[str, str | int | float | bool]:
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise RuntimeError(
+            "host-preflight compile config is not valid UTF-8 text"
+        ) from error
+    if not encoded or len(encoded) > MAX_PREFLIGHT_CONFIG_BYTES:
+        raise RuntimeError(
+            "host-preflight compile config must contain 1..65536 UTF-8 bytes"
+        )
+    try:
+        value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, RequestError) as error:
+        raise RuntimeError(
+            f"host-preflight compile config is not strict JSON: {error}"
+        ) from error
+    if not isinstance(value, dict):
+        raise RuntimeError("host-preflight compile config must be a JSON object")
+    result: dict[str, str | int | float | bool] = {}
+    for key in sorted(value):
+        item = value[key]
+        if not isinstance(key, str) or not key or len(key) > 128:
+            raise RuntimeError(
+                "host-preflight compile config keys must be 1..128 character strings"
+            )
+        if type(item) not in {str, int, float, bool}:
+            raise RuntimeError(
+                f"host-preflight compile config {key} is not a JSON primitive"
+            )
+        if type(item) is float and not math.isfinite(item):
+            raise RuntimeError(
+                f"host-preflight compile config {key} is not finite"
+            )
+        result[key] = item
+    canonical = json.dumps(
+        result,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if raw != canonical:
+        raise RuntimeError(
+            "host-preflight compile config must be canonical compact sorted JSON"
+        )
+    return result
 
 
 def _host_file_sha256(path: Path) -> str:
@@ -542,6 +604,256 @@ def _host_file_sha256(path: Path) -> str:
     except OSError as error:
         raise RuntimeError(f"cannot read required host file {path}") from error
     return digest.hexdigest()
+
+
+def _preflight_host_binding(host_files: Sequence[Path]) -> dict[str, Any]:
+    if not 1 <= len(host_files) <= 16:
+        raise RuntimeError("host-preflight requires 1..16 explicit host files")
+    system = platform.system()
+    machine = platform.machine()
+    kernel_release = platform.release()
+    if system != "Linux" or machine != "x86_64":
+        raise RuntimeError("host-preflight requires exactly Linux x86_64")
+    if (
+        not kernel_release
+        or len(kernel_release) > 256
+        or any(character in kernel_release for character in ("\x00", "\r", "\n"))
+    ):
+        raise RuntimeError("host-preflight kernel release is invalid")
+    normalized: list[Path] = []
+    seen: set[str] = set()
+    for path in host_files:
+        text = str(path)
+        pure = PurePosixPath(text)
+        if (
+            not pure.is_absolute()
+            or str(pure) != text
+            or len(text) > 512
+            or any(part in ("", ".", "..") for part in pure.parts)
+            or not any(pure.is_relative_to(prefix) for prefix in HOST_FILE_PREFIXES)
+        ):
+            raise RuntimeError(
+                "host-preflight host files must be normalized absolute paths under "
+                "an allowlisted system library directory"
+            )
+        if text in seen:
+            raise RuntimeError("host-preflight host files must be distinct")
+        seen.add(text)
+        normalized.append(Path(text))
+    normalized.sort(key=str)
+    return {
+        "system": system,
+        "machine": machine,
+        "kernel_release": kernel_release,
+        "files": [
+            {"path": str(path), "sha256": _host_file_sha256(path)}
+            for path in normalized
+        ],
+    }
+
+
+def _preflight_openvino_properties(
+    core: Any, device_class: str, property_device: str
+) -> dict[str, str | int]:
+    try:
+        supported = {
+            str(name)
+            for name in core.get_property(property_device, "SUPPORTED_PROPERTIES")
+        }
+    except Exception as error:
+        raise RuntimeError(
+            f"host-preflight {property_device} did not expose SUPPORTED_PROPERTIES"
+        ) from error
+    properties: dict[str, str | int] = {}
+    for name, expected_type in REQUIRED_OPENVINO_PROPERTY_TYPES[device_class].items():
+        if name not in supported:
+            raise RuntimeError(
+                f"host-preflight {property_device} does not support required property {name}"
+            )
+        try:
+            actual = core.get_property(property_device, name)
+        except Exception as error:
+            raise RuntimeError(
+                f"host-preflight {property_device} did not expose required property {name}"
+            ) from error
+        if type(actual) is not expected_type:
+            raise RuntimeError(
+                f"host-preflight property {name} has type {type(actual).__name__}, "
+                f"expected {expected_type.__name__}"
+            )
+        if expected_type is str:
+            if (
+                not actual
+                or len(actual) > 4096
+                or any(character in actual for character in ("\x00", "\r", "\n"))
+            ):
+                raise RuntimeError(f"host-preflight property {name} is invalid")
+        elif not -(1 << 63) <= actual < (1 << 64):
+            raise RuntimeError(
+                f"host-preflight property {name} is outside the integer range"
+            )
+        properties[name] = actual
+    return properties
+
+
+def collect_host_preflight(
+    artifact: Artifact,
+    runtime: Mapping[str, Any],
+    device_class: str,
+    openvino_device: str,
+    compile_config: Mapping[str, str | int | float | bool],
+    host_files: Sequence[Path],
+    *,
+    core: Any | None = None,
+) -> dict[str, Any]:
+    """Compile every bucket with the frozen runtime and emit manifest inputs only."""
+
+    if device_class not in DEVICE_FOR_CLASS:
+        raise RuntimeError("host-preflight device class must be npu, gpu, or cpu")
+    if openvino_device != DEVICE_FOR_CLASS[device_class]:
+        raise RuntimeError(
+            "host-preflight device must exactly match its NPU/GPU/CPU class"
+        )
+    runtime_digest = runtime.get("runtime_manifest_sha256")
+    dependencies = runtime.get("dependency_versions")
+    if (
+        not isinstance(runtime_digest, str)
+        or LOWER_HEX_32_RE.fullmatch(runtime_digest) is None
+        or not isinstance(dependencies, dict)
+        or set(dependencies) != {"cryptography", "numpy", "openvino", "tokenizers"}
+        or any(not isinstance(value, str) or not value for value in dependencies.values())
+    ):
+        raise RuntimeError("host-preflight runtime identity is incomplete")
+    if artifact.conversion_versions.get("openvino") != dependencies["openvino"]:
+        raise RuntimeError(
+            "host-preflight artifact and frozen runtime use different OpenVINO versions"
+        )
+    selected_host_files = tuple(host_files)
+    host_before = _preflight_host_binding(selected_host_files)
+    if core is None:
+        import openvino as ov
+
+        core = ov.Core()
+    try:
+        available_devices = [str(device) for device in core.available_devices]
+    except Exception as error:
+        raise RuntimeError("host-preflight could not enumerate OpenVINO devices") from error
+    if not any(
+        re.fullmatch(rf"{re.escape(openvino_device)}(?:\.[0-9]+)?", device)
+        is not None
+        for device in available_devices
+    ):
+        raise RuntimeError(
+            f"host-preflight frozen OpenVINO does not expose a physical {openvino_device}"
+        )
+    try:
+        model = core.read_model(
+            model=str(artifact.graph_xml), weights=str(artifact.graph_bin)
+        )
+    except Exception as error:
+        raise RuntimeError("host-preflight could not read the verified OpenVINO graph") from error
+    required_execution_devices: tuple[str, ...] | None = None
+    properties_before: dict[str, str | int] | None = None
+    bucket_results: list[dict[str, Any]] = []
+    for bucket in SEQUENCE_BUCKETS:
+        try:
+            bucket_model = model.clone()
+            bucket_model.reshape(
+                {
+                    artifact.input_ids_name: [1, bucket],
+                    artifact.attention_mask_name: [1, bucket],
+                }
+            )
+            compiled = core.compile_model(
+                bucket_model,
+                openvino_device,
+                dict(compile_config),
+            )
+            raw_execution_devices = compiled.get_property("EXECUTION_DEVICES")
+            if isinstance(raw_execution_devices, (str, bytes)):
+                raise TypeError("EXECUTION_DEVICES was not an array")
+            execution_devices = tuple(str(value) for value in raw_execution_devices)
+        except Exception as error:
+            raise RuntimeError(
+                f"host-preflight could not compile bucket {bucket} or query EXECUTION_DEVICES"
+            ) from error
+        if (
+            len(execution_devices) != 1
+            or re.fullmatch(
+                rf"{re.escape(openvino_device)}(?:\.[0-9]+)?",
+                execution_devices[0],
+            )
+            is None
+        ):
+            raise RuntimeError(
+                f"host-preflight bucket {bucket} did not execute on one exact "
+                f"{openvino_device} device"
+            )
+        if required_execution_devices is None:
+            required_execution_devices = execution_devices
+            properties_before = _preflight_openvino_properties(
+                core, device_class, execution_devices[0]
+            )
+        elif execution_devices != required_execution_devices:
+            raise RuntimeError(
+                "host-preflight EXECUTION_DEVICES changed between static buckets"
+            )
+        bucket_results.append(
+            {"bucket": bucket, "execution_devices": list(execution_devices)}
+        )
+    if required_execution_devices is None:  # pragma: no cover - frozen tuple is nonempty
+        raise RuntimeError("host-preflight compiled no sequence buckets")
+    if properties_before is None:  # pragma: no cover - first bucket sets both values
+        raise RuntimeError("host-preflight queried no physical device properties")
+    properties_after = _preflight_openvino_properties(
+        core, device_class, required_execution_devices[0]
+    )
+    if properties_after != properties_before:
+        raise RuntimeError(
+            "host-preflight physical device properties changed during compilation"
+        )
+    host_after = _preflight_host_binding(selected_host_files)
+    if host_after != host_before:
+        raise RuntimeError("host-preflight host binding changed during compilation")
+    return {
+        "schema_version": 1,
+        "purpose": PREFLIGHT_PURPOSE,
+        "runtime_manifest_sha256": runtime_digest,
+        "dependency_versions": dict(sorted(dependencies.items())),
+        "artifact_manifest_sha256": artifact.manifest_sha256,
+        "device_class": device_class,
+        "openvino_device": openvino_device,
+        "openvino_property_device": required_execution_devices[0],
+        "openvino_compile_config": dict(sorted(compile_config.items())),
+        "required_openvino_properties": properties_before,
+        "required_execution_devices": list(required_execution_devices),
+        "required_host": host_before,
+        "host_binding_source": (
+            "operator-selected-paths-sha256-before-and-after-compilation"
+        ),
+        "device_properties_source": "core.get_property",
+        "execution_devices_source": "compiled_model.get_property(EXECUTION_DEVICES)",
+        "bucket_results": bucket_results,
+    }
+
+
+def canonical_preflight_output(document: Mapping[str, Any]) -> bytes:
+    try:
+        raw = (
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"host-preflight produced invalid JSON: {error}") from error
+    if not 1 <= len(raw) <= MAX_PREFLIGHT_OUTPUT_BYTES:
+        raise RuntimeError("host-preflight output exceeds its byte bound")
+    return raw
 
 
 def validate_host_binding(scope: Scope) -> dict[str, Any]:
@@ -909,29 +1221,91 @@ def parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "runtime-check", help="verify the frozen Python and OpenVINO runtime payload"
     )
+    preflight = subcommands.add_parser(
+        "host-preflight",
+        help="emit frozen-runtime inputs for one later physical-probe scope",
+    )
+    preflight.add_argument(
+        "--runtime-manifest-sha256",
+        required=True,
+        help="externally pinned SHA-256 of the raw frozen runtime manifest",
+    )
+    preflight.add_argument("--artifact-dir", required=True, type=Path)
+    preflight.add_argument("--artifact-manifest-sha256", required=True)
+    preflight.add_argument(
+        "--device-class", required=True, choices=tuple(DEVICE_FOR_CLASS)
+    )
+    preflight.add_argument(
+        "--device", required=True, choices=tuple(DEVICE_FOR_CLASS.values())
+    )
+    preflight.add_argument(
+        "--compile-config-json",
+        required=True,
+        help="canonical compact sorted JSON object, for example {}",
+    )
+    preflight.add_argument(
+        "--host-file",
+        action="append",
+        required=True,
+        type=Path,
+        help="repeat for 1..16 explicit driver/library files",
+    )
     return root
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    try:
-        inventory_sha256 = inventory_digest_from_environment()
-        verify_package_inventory(package_root(), inventory_sha256)
-    except (InventoryError, OSError) as error:
-        print(f"cfetch OpenVINO package integrity check failed: {error}", file=sys.stderr)
+    has_package_inventory = os.environ.get("CFETCH_PACKAGE_INVENTORY_SHA256") is not None
+    raw_runtime: dict[str, Any] | None = None
+    if has_package_inventory:
+        try:
+            inventory_sha256 = inventory_digest_from_environment()
+            verify_package_inventory(package_root(), inventory_sha256)
+        except (InventoryError, OSError) as error:
+            print(
+                f"cfetch OpenVINO package integrity check failed: {error}",
+                file=sys.stderr,
+            )
+            return 1
+    elif args.command in {"runtime-check", "host-preflight"}:
+        try:
+            expected_runtime_sha256 = (
+                args.runtime_manifest_sha256
+                if args.command == "host-preflight"
+                else None
+            )
+            raw_runtime = runtime_self_check(expected_runtime_sha256)
+        except (
+            ImportError,
+            ManifestError,
+            RuntimeBundleError,
+            RuntimeError,
+            OSError,
+        ) as error:
+            print(f"cfetch OpenVINO raw runtime check failed: {error}", file=sys.stderr)
+            return 1
+    else:
+        print(
+            "cfetch OpenVINO package integrity check failed: serve requires the "
+            "inventory-bound native launcher",
+            file=sys.stderr,
+        )
         return 1
     if args.command == "runtime-check":
         try:
-            manifest_path = package_root() / "package-manifest.json"
-            if manifest_path.exists():
-                package = load_package_manifest(manifest_path)
-                runtime = runtime_self_check(
-                    package.runtime_manifest_sha256, package_bound_files(package)
-                )
+            if raw_runtime is not None:
+                runtime = raw_runtime
             else:
-                runtime = runtime_self_check(
-                    allowed_package_files=(INVENTORY_NAME,)
-                )
+                manifest_path = package_root() / "package-manifest.json"
+                if manifest_path.exists():
+                    package = load_package_manifest(manifest_path)
+                    runtime = runtime_self_check(
+                        package.runtime_manifest_sha256, package_bound_files(package)
+                    )
+                else:
+                    runtime = runtime_self_check(
+                        allowed_package_files=(INVENTORY_NAME,)
+                    )
             print(json.dumps(runtime, separators=(",", ":")))
         except (
             ImportError,
@@ -941,6 +1315,62 @@ def main(argv: Sequence[str] | None = None) -> int:
             OSError,
         ) as error:
             print(f"cfetch OpenVINO runtime check failed: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "host-preflight":
+        if raw_runtime is None:
+            print(
+                "cfetch OpenVINO host-preflight requires the raw verified frozen "
+                "runtime dispatcher",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            if args.artifact_dir.is_symlink() or not args.artifact_dir.is_dir():
+                raise RuntimeError(
+                    "host-preflight artifact directory must be a real directory"
+                )
+            artifact = load_artifact(
+                args.artifact_dir,
+                "artifact-manifest.json",
+                args.artifact_manifest_sha256,
+            )
+            compile_config = parse_preflight_compile_config(
+                args.compile_config_json
+            )
+            result = collect_host_preflight(
+                artifact,
+                raw_runtime,
+                args.device_class,
+                args.device,
+                compile_config,
+                args.host_file,
+            )
+            verified_artifact = load_artifact(
+                args.artifact_dir,
+                "artifact-manifest.json",
+                args.artifact_manifest_sha256,
+            )
+            if verified_artifact.manifest_sha256 != artifact.manifest_sha256:
+                raise RuntimeError("host-preflight artifact changed during collection")
+            verified_runtime = runtime_self_check(args.runtime_manifest_sha256)
+            if (
+                verified_runtime["runtime_manifest_sha256"]
+                != raw_runtime["runtime_manifest_sha256"]
+                or verified_runtime["dependency_versions"]
+                != raw_runtime["dependency_versions"]
+            ):
+                raise RuntimeError("host-preflight runtime changed during collection")
+            sys.stdout.buffer.write(canonical_preflight_output(result))
+            sys.stdout.buffer.flush()
+        except (
+            ImportError,
+            ManifestError,
+            RuntimeBundleError,
+            RuntimeError,
+            OSError,
+        ) as error:
+            print(f"cfetch OpenVINO host-preflight failed: {error}", file=sys.stderr)
             return 1
         return 0
     if args.command != "serve":

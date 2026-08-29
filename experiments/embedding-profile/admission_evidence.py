@@ -180,6 +180,7 @@ def validate_wire_batch_evidence(report: dict[str, object]) -> None:
         )
     input_digests: set[str] = set()
     output_digests: set[str] = set()
+    transaction_digests: set[str] = set()
     for row, batch_size in zip(records, expected_batch_sizes, strict=True):
         expected_fields = {
             "batch_size",
@@ -188,6 +189,7 @@ def validate_wire_batch_evidence(report: dict[str, object]) -> None:
             "response_row_count",
             "ordered_input_json_sha256",
             "canonical_output_bytes_sha256",
+            "signed_transactions_sha256",
         }
         if set(row) != expected_fields:
             raise ValueError(
@@ -206,9 +208,11 @@ def validate_wire_batch_evidence(report: dict[str, object]) -> None:
                 )
         input_digest = row.get("ordered_input_json_sha256")
         output_digest = row.get("canonical_output_bytes_sha256")
+        transactions_digest = row.get("signed_transactions_sha256")
         for field, digest in (
             ("ordered_input_json_sha256", input_digest),
             ("canonical_output_bytes_sha256", output_digest),
+            ("signed_transactions_sha256", transactions_digest),
         ):
             if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise ValueError(
@@ -216,6 +220,7 @@ def validate_wire_batch_evidence(report: dict[str, object]) -> None:
                 )
         input_digests.add(input_digest)
         output_digests.add(output_digest)
+        transaction_digests.add(transactions_digest)
     grouping = report.get("grouping_invariance")
     if not isinstance(grouping, dict):
         raise ValueError("sequence evidence grouping_invariance must be an object")
@@ -247,6 +252,11 @@ def validate_wire_batch_evidence(report: dict[str, object]) -> None:
     if len(output_digests) != 1:
         raise ValueError(
             "sequence evidence batch sizes 1 through 64 canonical outputs differ"
+        )
+    if len(transaction_digests) != SUPPORTED_MAX_BATCH_SIZE:
+        raise ValueError(
+            "sequence evidence wire groupings must retain one distinct signed "
+            "transaction record per batch size"
         )
 
 

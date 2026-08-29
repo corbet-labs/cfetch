@@ -18,16 +18,25 @@ class MeasurementBundleTests(unittest.TestCase):
             output = Path(out_name)
             profiler = raw / "profiler.txt"
             benchmark = raw / "benchmark.txt"
+            wire = raw / "wire.txt"
             profiler.write_bytes(b"physical placement output\n")
             benchmark.write_bytes(b"physical benchmark output\n")
+            wire.write_bytes(b"signed wire transaction output\n")
             profiler_digest = file_sha256(profiler)
             benchmark_digest = file_sha256(benchmark)
+            wire_digest = file_sha256(wire)
             metadata = {
                 "scope_id": "test-cpu-scope",
+                "sequence_capability_evidence_sha256": "0" * 64,
                 "placement_evidence_sha256": "1" * 64,
                 "performance_evidence_sha256": "2" * 64,
             }
             reports = {
+                "sequence": {
+                    "wire_batch_results": [
+                        {"signed_transactions_sha256": wire_digest}
+                    ]
+                },
                 "placement": {
                     "bucket_results": [
                         {"profiler_output_sha256": profiler_digest}
@@ -61,10 +70,16 @@ class MeasurementBundleTests(unittest.TestCase):
             (raw / "unrelated.txt").write_text("not the required bytes")
             metadata = {
                 "scope_id": "test-cpu-scope",
+                "sequence_capability_evidence_sha256": "0" * 64,
                 "placement_evidence_sha256": "1" * 64,
                 "performance_evidence_sha256": "2" * 64,
             }
             reports = {
+                "sequence": {
+                    "wire_batch_results": [
+                        {"signed_transactions_sha256": "c" * 64}
+                    ]
+                },
                 "placement": {
                     "bucket_results": [{"profiler_output_sha256": "a" * 64}]
                 },
@@ -93,10 +108,16 @@ class MeasurementBundleTests(unittest.TestCase):
             digest = file_sha256(required)
             metadata = {
                 "scope_id": "test-cpu-scope",
+                "sequence_capability_evidence_sha256": "0" * 64,
                 "placement_evidence_sha256": "1" * 64,
                 "performance_evidence_sha256": "2" * 64,
             }
             reports = {
+                "sequence": {
+                    "wire_batch_results": [
+                        {"signed_transactions_sha256": digest}
+                    ]
+                },
                 "placement": {
                     "bucket_results": [{"profiler_output_sha256": digest}]
                 },

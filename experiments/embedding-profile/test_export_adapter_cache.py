@@ -216,6 +216,9 @@ def valid_evidence_fixture() -> tuple[
                 "response_row_count": SUPPORTED_MAX_BATCH_SIZE,
                 "ordered_input_json_sha256": "5" * 64,
                 "canonical_output_bytes_sha256": "5" * 64,
+                "signed_transactions_sha256": hashlib.sha256(
+                    f"wire-transactions-{batch_size}".encode()
+                ).hexdigest(),
             }
             for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
         ],
@@ -875,6 +878,38 @@ class ExportAdapterCacheTests(unittest.TestCase):
                         "accelerated_placement": True,
                     },
                 )
+        with self.subTest("supervised candidate lifecycle is explicit"):
+            candidate = copy.deepcopy(payload)
+            candidate["cfetch_execution"]["package_state"] = "candidate"
+            candidate["cfetch_execution"]["compatibility_report_sha256"] = None
+            lifecycle = {
+                "package_state": "candidate",
+                "compatibility_report_sha256": None,
+            }
+            validate_response(
+                candidate,
+                2,
+                "test-scope",
+                expected_execution=lifecycle,
+            )
+            missing = copy.deepcopy(candidate)
+            del missing["cfetch_execution"]["compatibility_report_sha256"]
+            with self.assertRaisesRegex(ValueError, "compatibility_report_sha256"):
+                validate_response(
+                    missing,
+                    2,
+                    "test-scope",
+                    expected_execution=lifecycle,
+                )
+            release = copy.deepcopy(candidate)
+            release["cfetch_execution"]["package_state"] = "release"
+            with self.assertRaisesRegex(ValueError, "package_state"):
+                validate_response(
+                    release,
+                    2,
+                    "test-scope",
+                    expected_execution=lifecycle,
+                )
         with self.subTest("requested scope mismatch"):
             with self.assertRaisesRegex(ValueError, "requested 'another-scope'"):
                 validate_response(payload, 2, "another-scope")
@@ -1090,6 +1125,9 @@ class ExportAdapterCacheTests(unittest.TestCase):
                             "response_row_count": SUPPORTED_MAX_BATCH_SIZE,
                             "ordered_input_json_sha256": "6" * 64,
                             "canonical_output_bytes_sha256": "7" * 64,
+                            "signed_transactions_sha256": hashlib.sha256(
+                                f"wire-transactions-{batch_size}".encode()
+                            ).hexdigest(),
                         }
                         for batch_size in range(1, SUPPORTED_MAX_BATCH_SIZE + 1)
                     ],

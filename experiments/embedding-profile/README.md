@@ -100,6 +100,9 @@ echoed, mismatched, aggregate, or fallback device claims fail collection.
 Run one scope at a time with a 64-input JSON manifest produced from the pinned
 SciFact revision and selection named in `WIRE_BATCH_INPUT_SELECTION`:
 
+    python experiments/embedding-profile/scifact_contract.py \
+      --wire-inputs-output results/wire-probe-inputs.json
+
     python experiments/embedding-profile/physical_evidence.py \
       --dispatcher results/openvino-probe/cfetch-openvino-adapter \
       --dispatcher-sha256 "$DISPATCHER_SHA256" \
@@ -111,8 +114,9 @@ SciFact revision and selection named in `WIRE_BATCH_INPUT_SELECTION`:
       --output-directory results/intel-lunar-lake-npu
 
 The output directory contains the exact sequence, placement, and performance
-JSON summaries plus only their referenced content-addressed raw profiler and
-benchmark records. Reassemble `package_state: candidate` with the three
+JSON summaries plus only their referenced content-addressed raw signed wire
+transactions, profiler records, and benchmark records. Reassemble
+`package_state: candidate` with the three
 generated summary digests before running `export_adapter_cache.py`. Admission
 reconstructs the canonical probe manifest from that candidate by resetting
 the state, three evidence bindings, and report binding; its SHA-256 must equal
@@ -228,7 +232,8 @@ two records may come from different document scopes.
 CLI evidence paths are host-local and are not published. The three validated
 JSON summaries are embedded byte-for-byte in the cache under stable `npz:...`
 logical locators. Raw profiler and benchmark outputs are retained separately
-in the measurement bundle described below.
+in the measurement bundle described below, together with every physical-probe
+wire grouping's signed request/response transactions.
 
 The exporter never invents sequence capability from the profile. The package
 must explicitly record its supported maximum and every supported bucket plus
@@ -285,17 +290,18 @@ generations are not a valid admitted cohort.
 An admitted scope has two immutable cfetch release assets:
 
 - `<admission_cache_sha256>.npz` is the exact exporter cache;
-- `<measurement_evidence_sha256>.zip` retains every raw profiler and benchmark
-  output referenced by the embedded summaries.
+- `<measurement_evidence_sha256>.zip` retains every raw signed wire transaction,
+  profiler output, and benchmark output referenced by the embedded summaries.
 
 Both registry URLs must be credential-free
 `https://github.com/corbet-labs/cfetch/releases/download/<tag>/...` locators.
 The measurement ZIP contains only `measurement-manifest.json` and
-`raw/<sha256>.bin` members. Its manifest has schema version 1, the scope ID,
-the placement and performance summary digests, and one `{path, sha256, roles}`
-entry per raw file. Roles are `placement-profiler` and/or
-`performance-benchmark`. Every referenced per-bucket digest must be present;
-unreferenced files and duplicate JSON keys are rejected.
+`raw/<sha256>.bin` members. Its manifest has schema version 1, the scope ID, the
+sequence, placement, and performance summary digests, and one
+`{path, sha256, roles}` entry per raw file. Roles are
+`wire-signed-transactions`, `placement-profiler`, and/or
+`performance-benchmark`. Every referenced wire-grouping and per-bucket digest
+must be present; unreferenced files and duplicate JSON keys are rejected.
 
 CI runs:
 
@@ -421,7 +427,7 @@ path and prints the raw public-key hex for the manifest:
       "packages": [
         {
           "package_id": "linux-openvino-lunar-lake-x86_64",
-          "release_variant_id": "linux-cfetch-local-openvino-x86_64",
+          "release_variant_id": "linux-cfetch-local-intel-lunar-lake-x86_64",
           "os": "linux",
           "arch": "x86_64",
           "device_families": [
@@ -434,7 +440,7 @@ path and prints the raw public-key hex for the manifest:
           "package_manifest": "package-manifest.json",
           "package_format": "zip",
           "dispatcher": {
-            "binary": "cfetch-inference",
+            "binary": "cfetch-openvino-adapter",
             "sha256": "<exact digest>"
           }
         }
@@ -477,7 +483,7 @@ the final conformance command for a content-addressed receipt:
       --package-id linux-openvino-lunar-lake-x86_64 \
       --package-asset "results/staged-admission/assets/$PACKAGE_SHA256.zip" \
       --package-sha256 "$PACKAGE_SHA256" \
-      --dispatcher cfetch-inference \
+      --dispatcher cfetch-openvino-adapter \
       --receipt-attestation-private-key results/receipt-attestation.key \
       --receipt-directory results/receipts
 
@@ -538,3 +544,7 @@ tests. They are machinery, not evidence. Before the first nonempty cohort:
 
 `admitted_backends` and `local_packages` remain empty. No target scope or local
 producer is admitted until both boundaries and a real complete cohort pass.
+
+The complete first-cohort operator sequence, including the frozen-runtime
+host-preflight boundary, is in `OPENVINO_OPERATIONS.md`. Do not substitute
+guessed host properties or a diagnostic run for physical input.

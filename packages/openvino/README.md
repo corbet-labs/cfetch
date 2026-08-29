@@ -209,8 +209,53 @@ this shape; angle-bracket values are intentionally not usable evidence:
 GPU requires exact `FULL_DEVICE_NAME`, `DEVICE_ARCHITECTURE`,
 `GPU_UARCH_VERSION`, and `GPU_DEVICE_ID`; CPU requires exact
 `FULL_DEVICE_NAME` and `DEVICE_ARCHITECTURE`. The host-file bindings cover
-driver identity that OpenVINO does not expose as a supported device property.
-All three classes and a distinct Ed25519 key per scope are mandatory.
+operator-selected libraries that OpenVINO does not expose as supported device
+properties; they do not prove that the selected files were driver-loaded. All
+three classes and a distinct Ed25519 key per scope are mandatory.
+
+Create correctly encoded, distinct package keys without using the unrelated
+raw-binary admission receipt key command:
+
+```console
+python experiments/embedding-profile/openvino_scope_keys.py \
+  --scope-id intel-lnl-npu \
+  --scope-id intel-lnl-gpu \
+  --scope-id intel-lnl-cpu \
+  --output-directory results/openvino-operator
+```
+
+The output manifest contains only the public keys and relative key filenames;
+the sibling `.key` files contain the required 64 lowercase hexadecimal private
+bytes and are mode `0600`. Keep the scope configuration in that directory (or
+adjust its relative key paths explicitly).
+
+Obtain required properties, host-file hashes, and exact compile-time
+`EXECUTION_DEVICES` from the verified raw frozen runtime before assembly:
+
+```console
+./cfetch-openvino-adapter-runtime host-preflight \
+  --runtime-manifest-sha256 "$RUNTIME_MANIFEST_SHA256" \
+  --artifact-dir "$ARTIFACT_DIR" \
+  --artifact-manifest-sha256 "$ARTIFACT_MANIFEST_SHA256" \
+  --device-class npu \
+  --device NPU \
+  --compile-config-json '{}' \
+  --host-file /usr/lib/<exact-regular-non-symlink-driver-library>
+```
+
+Repeat separately for GPU and CPU. The externally obtained runtime digest is
+required; the runtime cannot vouch for its own manifest identity. The command
+verifies that pinned raw runtime and the artifact before and after use, queries
+the exact typed allowlisted properties on the stable physical device returned
+by `EXECUTION_DEVICES`, hashes one through sixteen explicit operator-selected
+normalized host files before and after compilation, compiles all seven static
+buckets, and requires one stable physical `EXECUTION_DEVICES` value. It emits
+one bounded canonical JSON line containing the runtime/artifact digests,
+dependency versions, compile config, properties, host binding, and bucket
+results. Copy only the named scope-configuration fields into the matching
+physical-probe entry. This output is configuration provenance, not admission
+evidence; it does not discover relevant driver files. Do not substitute system
+OpenVINO, guessed paths, or marketing names.
 
 Assemble and self-check the final directory with:
 

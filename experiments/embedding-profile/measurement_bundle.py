@@ -13,6 +13,7 @@ from pathlib import Path
 
 from cross_backend_eval import (
     MAX_MEASUREMENT_BUNDLE_BYTES,
+    MAX_MEASUREMENT_BUNDLE_EXPANDED_BYTES,
     expected_measurement_roles,
     load_cache,
     load_embedded_evidence_reports,
@@ -44,7 +45,7 @@ def raw_files_by_digest(root: Path) -> dict[str, Path]:
         if size < 1:
             raise ValueError(f"raw measurement input is empty: {path}")
         total += size
-        if total > MAX_MEASUREMENT_BUNDLE_BYTES:
+        if total > MAX_MEASUREMENT_BUNDLE_EXPANDED_BYTES:
             raise ValueError("raw measurement inputs exceed the bundle byte bound")
         digest = file_sha256(path)
         previous = result.get(digest)
@@ -91,6 +92,9 @@ def build_measurement_bundle(
     manifest = {
         "schema_version": 1,
         "scope_id": scope_id,
+        "sequence_capability_evidence_sha256": metadata[
+            "sequence_capability_evidence_sha256"
+        ],
         "placement_evidence_sha256": metadata["placement_evidence_sha256"],
         "performance_evidence_sha256": metadata["performance_evidence_sha256"],
         "files": [
@@ -137,6 +141,9 @@ def build_measurement_bundle(
         else:
             os.replace(temporary_path, destination)
         entry = {
+            "sequence_capability_evidence_sha256": metadata[
+                "sequence_capability_evidence_sha256"
+            ],
             "placement_evidence_sha256": metadata["placement_evidence_sha256"],
             "performance_evidence_sha256": metadata["performance_evidence_sha256"],
         }

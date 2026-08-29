@@ -26,6 +26,7 @@ from admission_evidence import (
     SEQUENCE_BUCKETS,
     SEQUENCE_SEMANTIC_FIXTURE_ID,
     SEQUENCE_SEMANTIC_FIXTURE_SHA256,
+    SUPERVISED_LOCAL_TRANSPORT,
     SUPPORTED_MAX_BATCH_SIZE,
     TRANSPORTS,
     WIRE_BATCH_INPUT_SELECTION,
@@ -400,7 +401,7 @@ def validate_response(
         raise ValueError("cfetch_execution accelerated_placement must be true")
     if expected_execution is not None:
         for field, expected in expected_execution.items():
-            if execution.get(field) != expected:
+            if field not in execution or execution[field] != expected:
                 raise ValueError(
                     f"cfetch_execution {field}={execution.get(field)!r}, expected {expected!r}"
                 )
@@ -1121,6 +1122,13 @@ def main() -> None:
         "performance_evidence_sha256": args.performance_evidence_sha256,
         "accelerated_placement": args.accelerated_placement,
     }
+    if args.transport == SUPERVISED_LOCAL_TRANSPORT:
+        expected_execution.update(
+            {
+                "package_state": "candidate",
+                "compatibility_report_sha256": None,
+            }
+        )
     used_attestation_nonces: set[bytes] = set()
 
     def scoped_request(

@@ -1307,6 +1307,9 @@ def stage_transaction(manifest_path: Path, output: Path) -> Path:
                 measurement_path,
                 scope_id,
                 {
+                    "sequence_capability_evidence_sha256": loaded[scope_id][0][
+                        "sequence_capability_evidence_sha256"
+                    ],
                     "placement_evidence_sha256": loaded[scope_id][0][
                         "placement_evidence_sha256"
                     ],

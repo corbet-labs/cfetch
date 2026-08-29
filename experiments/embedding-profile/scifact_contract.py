@@ -3,8 +3,14 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
+import tempfile
+from typing import Sequence
 
 DATASET = "mteb/scifact"
 DATASET_REVISION = "cf10ab6856b15b0e670ef8ae5dae4e266c12d035"
@@ -20,6 +26,65 @@ class SciFactContract:
     qrels: dict[str, set[str]]
     query_texts: list[str]
     document_texts: list[str]
+
+
+def wire_probe_document(contract: SciFactContract) -> dict[str, object]:
+    """Build the one canonical offline input manifest used by the collector."""
+
+    # Import here so the dataset contract remains independently importable by
+    # admission_evidence.py users and cannot introduce an import cycle.
+    from admission_evidence import (
+        WIRE_BATCH_INPUT_SELECTION,
+        wire_batch_inputs,
+    )
+
+    return {
+        "schema_version": 1,
+        "dataset": DATASET,
+        "dataset_revision": DATASET_REVISION,
+        "selection": WIRE_BATCH_INPUT_SELECTION,
+        "inputs": wire_batch_inputs(contract.query_texts, contract.document_texts),
+    }
+
+
+def write_wire_probe_inputs(output: Path, contract: SciFactContract) -> tuple[Path, str]:
+    """Atomically create, but never replace, a canonical wire-input manifest."""
+
+    output = output.resolve()
+    parent = output.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise ValueError("wire-input output parent must be an existing real directory")
+    if output.exists() or output.is_symlink():
+        raise ValueError(f"refusing to overwrite wire-input manifest: {output}")
+    raw = (
+        json.dumps(
+            wire_probe_document(contract),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{output.name}-", suffix=".tmp", dir=parent, delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(raw)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chmod(temporary_path, 0o644)
+        # A same-directory hard link is an atomic no-replace publication.  A
+        # competing writer therefore fails instead of replacing trusted bytes.
+        os.link(temporary_path, output)
+        temporary_path.unlink()
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return output, hashlib.sha256(raw).hexdigest()
 
 
 def load_scifact_contract(
@@ -82,7 +147,44 @@ def load_scifact_contract(
     )
 
 
-def main() -> None:
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument(
+        "--wire-inputs-output",
+        type=Path,
+        help=(
+            "create the canonical prefixed 64-input physical-collector manifest "
+            "at a new path"
+        ),
+    )
+    return result
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parser().parse_args(argv)
+    if args.wire_inputs_output is not None:
+        from admission_evidence import DOCUMENT_PREFIX, QUERY_PREFIX
+
+        contract = load_scifact_contract(QUERY_PREFIX, DOCUMENT_PREFIX)
+        try:
+            output, digest = write_wire_probe_inputs(args.wire_inputs_output, contract)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"wire-input generation refused: {error}") from error
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "wire_inputs": str(output),
+                    "wire_inputs_sha256": digest,
+                    "inputs": 64,
+                    "dataset": DATASET,
+                    "dataset_revision": DATASET_REVISION,
+                },
+                sort_keys=True,
+            )
+        )
+        return
+
     contract = load_scifact_contract()
     print(
         json.dumps(

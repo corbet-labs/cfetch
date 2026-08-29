@@ -780,6 +780,10 @@ def load_embedded_evidence_reports(path: Path) -> dict[str, dict[str, object]]:
     validate_admission_cache_container(path)
     with np.load(path, allow_pickle=False) as cached:
         return {
+            "sequence": parse_evidence_json(
+                np.asarray(cached["sequence_capability_evidence_bytes"]).tobytes(),
+                f"{path}: sequence evidence",
+            ),
             "placement": parse_evidence_json(
                 np.asarray(cached["placement_evidence_bytes"]).tobytes(),
                 f"{path}: placement evidence",
@@ -2328,6 +2332,9 @@ def expected_measurement_roles(
     evidence_reports: dict[str, dict[str, object]],
 ) -> dict[str, list[str]]:
     roles: dict[str, set[str]] = {}
+    for row in evidence_reports["sequence"]["wire_batch_results"]:
+        digest = row["signed_transactions_sha256"]
+        roles.setdefault(digest, set()).add("wire-signed-transactions")
     for row in evidence_reports["placement"]["bucket_results"]:
         digest = row["profiler_output_sha256"]
         roles.setdefault(digest, set()).add("placement-profiler")
@@ -2387,6 +2394,7 @@ def validate_measurement_bundle(
             if set(manifest) != {
                 "schema_version",
                 "scope_id",
+                "sequence_capability_evidence_sha256",
                 "placement_evidence_sha256",
                 "performance_evidence_sha256",
                 "files",
@@ -2395,6 +2403,9 @@ def validate_measurement_bundle(
             expected_header = {
                 "schema_version": 1,
                 "scope_id": scope_id,
+                "sequence_capability_evidence_sha256": entry[
+                    "sequence_capability_evidence_sha256"
+                ],
                 "placement_evidence_sha256": entry["placement_evidence_sha256"],
                 "performance_evidence_sha256": entry["performance_evidence_sha256"],
             }
@@ -2421,7 +2432,12 @@ def validate_measurement_bundle(
                     or not isinstance(roles, list)
                     or roles != sorted(set(roles))
                     or any(
-                        role not in {"placement-profiler", "performance-benchmark"}
+                        role
+                        not in {
+                            "wire-signed-transactions",
+                            "placement-profiler",
+                            "performance-benchmark",
+                        }
                         for role in roles
                     )
                     or not roles

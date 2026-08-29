@@ -12,6 +12,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -31,7 +32,10 @@ from physical_evidence import (
     OpenVinoLiveEvidenceValidator,
     SignedAdapterClient,
     ScopeContract,
+    ResponseRow,
+    SignedTransaction,
     _store_raw,
+    _wire_grouping_results,
     canonical_i8_bytes,
     exact_i8_relevant_precedes,
     load_candidate_package,
@@ -99,7 +103,7 @@ def package_document() -> dict[str, object]:
             "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7"
         ),
         "admission_policy_sha256": (
-            "f35d18b42c17e79fda60a8c731005871264e06fc3f5f138352d22e83399902fb"
+            "f21f6d0fcc1a48fb4e95dab9b47fe1e97d56036a44b4005b27eee0b8eb26cf44"
         ),
         "model": "google/embeddinggemma-300m",
         "model_revision": "57c266a740f537b4dc058e1b0cda161fd15afa75",
@@ -181,6 +185,76 @@ def live_evidence() -> dict[str, object]:
 
 
 class PhysicalEvidenceTests(unittest.TestCase):
+    def test_wire_groupings_retain_one_content_addressed_signed_record_each(
+        self,
+    ) -> None:
+        inputs = [f"input-{index:02d}" for index in range(64)]
+
+        class Session:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                pass
+
+        class Client:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.counter = 0
+
+            def request(self, values, *, measure_rss):
+                self.counter += 1
+                request = json.dumps(list(values), separators=(",", ":")).encode()
+                rows = tuple(
+                    ResponseRow(
+                        token_count=1,
+                        sequence_bucket=32,
+                        canonical=bytes([inputs.index(value)]),
+                    )
+                    for value in values
+                )
+                return SignedTransaction(
+                    nonce_hex=f"{self.counter:064x}",
+                    signature_hex="ab" * 64,
+                    request_body=request,
+                    response_body=b"signed:" + request,
+                    elapsed_ns=1,
+                    peak_rss_bytes=None,
+                    rss_sample_count=0,
+                    rows=rows,
+                    runtime_evidence={},
+                )
+
+        package = SimpleNamespace(scope=SimpleNamespace(scope_id="test-cpu"))
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "physical_evidence.DispatcherSession", Session
+        ), patch("physical_evidence.SignedAdapterClient", Client):
+            raw_root = Path(directory)
+            results = _wire_grouping_results(
+                Path("cfetch-openvino-adapter"),
+                "0" * 64,
+                package,
+                1.0,
+                1.0,
+                inputs,
+                raw_root,
+                set(),
+            )
+            self.assertEqual(len(results), 64)
+            self.assertEqual(len({row["signed_transactions_sha256"] for row in results}), 64)
+            self.assertEqual(len(list(raw_root.glob("*.bin"))), 64)
+            for row in results:
+                raw = (
+                    raw_root / f"{row['signed_transactions_sha256']}.bin"
+                ).read_bytes()
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), row["signed_transactions_sha256"])
+                document = json.loads(raw)
+                self.assertEqual(document["batch_size"], row["batch_size"])
+                self.assertEqual(len(document["transactions"]), row["request_count"])
+                self.assertEqual(document["kind"], "wire-grouping-signed-transactions")
+
     def test_float32_codec_and_exact_integer_ranking_need_no_numpy(self) -> None:
         query = canonical_i8_bytes([1.0, 0.0] + [0.0] * 766)
         relevant = canonical_i8_bytes([1.0, 0.5] + [0.0] * 766)
@@ -269,7 +343,7 @@ class PhysicalEvidenceTests(unittest.TestCase):
                         "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7"
                     ),
                     "cfetch_admission_policy_sha256": (
-                        "f35d18b42c17e79fda60a8c731005871264e06fc3f5f138352d22e83399902fb"
+                        "f21f6d0fcc1a48fb4e95dab9b47fe1e97d56036a44b4005b27eee0b8eb26cf44"
                     ),
                     "cfetch_model_revision": (
                         "57c266a740f537b4dc058e1b0cda161fd15afa75"
