@@ -61,8 +61,8 @@ The table is a packaging direction, not a support claim. Current admission
 state is recorded in `release/inference-backends.json`; its admitted list is
 empty until hardware evidence and retrieval results exist.
 
-EmbeddingGemma is the current model candidate because usable packages already
-exist in the two highest-priority directions:
+EmbeddingGemma is the current model candidate. Community packages are useful
+conversion references, but none of them is a shared-space authority:
 
 - The available Apple Core ML community package is an ANE-targeted route and
   declares the pinned standard EmbeddingGemma family, but its current
@@ -72,12 +72,15 @@ exist in the two highest-priority directions:
   artifacts, with device variants for Google Tensor, MediaTek, and Qualcomm.
   Those upstream artifacts are candidates; they are not admitted cfetch
   backends until their exact lineage, placement, and retrieval evidence pass.
-- The ggml-org Q8_0 GGUF declares the standard EmbeddingGemma base family and
-  is an immediate llama.cpp candidate for Metal, CUDA, ROCm/Vulkan, SYCL, and
-  accelerated SIMD CPU fallback packages. Exact conversion lineage to the
-  pinned source revision remains unproven. It covers GPU and CPU portability,
-  not NPU execution, and remains unadmitted until its exact packages pass the
-  same evidence, ordered-pair, and adversarial mixed-store gates.
+- The ggml-org Q8_0 GGUF declares the standard EmbeddingGemma base family, but
+  its exact conversion lineage to the pinned source revision is unproven and
+  it cannot supply an NPU route. It remains a diagnostic candidate, not the
+  basis of the first cohort.
+- The first implementation package uses one exact-source OpenVINO IR on an
+  Intel Lunar Lake NPU, Arc GPU, and accelerated CPU. OpenVINO is only that
+  Intel package's native runtime; it is not cfetch's universal runtime or a
+  numerical anchor. Apple, Android, AMD, Qualcomm, and other packages join by
+  implementing the same adapter and admission contract.
 
 ## What admission proves
 
@@ -133,7 +136,9 @@ several manually chosen endpoints. Its embedded package plan supplies admitted
 scope IDs in NPU, GPU, accelerated CPU order. The dispatcher attempts that
 exact order, puts `cfetch_requested_scope_id` in each signed request body,
 requires `cfetch_execution.scope_id` to match it, and caches only a successful
-selection. Runtime initialization and signed response evidence—not a device
+selection. Each packaged scope and response also binds
+`transport: supervised-local`; explicitly configured endpoints bind
+`transport: remote-attested`. Runtime initialization and signed response evidence—not a device
 name—prove which candidate was used. A valid CPU reply therefore cannot pass
 as completion of an NPU attempt.
 
@@ -143,11 +148,11 @@ Failure remains local and ordered:
 
 Remote use happens only when the operator explicitly configures it.
 
-That dispatcher is deliberately not presented as implemented support today:
-`local_packages` and `admitted_backends` are both empty. The first real local
-package must land the typed package-plan validator and fallback dispatcher
-together with its admitted cohort. Until then, the existing single configured
-endpoint is explicit endpoint mode and cannot enter the candidate profile.
+The generic typed package-plan validator, supervised adapter process, exact
+requested-scope binding, ordered fallback, and successful-scope cache are
+implemented. They deliberately select nothing today because `local_packages`
+and `admitted_backends` are both empty. Actual support begins only when the
+first physical cohort and immutable package payload enter those arrays.
 
 ## Current state
 
@@ -160,12 +165,12 @@ placement, repeatability, performance, global ordered-pair, and adversarial
 mixed-store retrieval gates. Their machine-readable OS/architecture/device to
 ordered-scope composition lives in `release/inference-backends.json`.
 
-The immediate implementation sequence is:
+The immediate admission sequence is:
 
-1. wrap NPU, GPU, and accelerated CPU candidates behind the same attested local
-   adapter protocol; Apple Core ML and Android LiteRT cover NPU directions,
-   while GGUF/native runners seed GPU and CPU candidates;
-2. verify each exact profile lineage and export canonical SciFact caches plus
+1. build the pinned full EmbeddingGemma pipeline as seven static-shape
+   OpenVINO graphs and execute the exact package on the available Lunar Lake
+   NPU, Arc GPU, and accelerated CPU;
+2. verify exact profile lineage and export canonical SciFact caches plus
    byte-bound per-bucket placement, repeated semantic-probe, sequence, and
    performance evidence;
 3. assemble an initial cohort containing at least one NPU, one GPU, and one
@@ -173,8 +178,9 @@ The immediate implementation sequence is:
 4. run every ordered cohort/self query-document pairing and every adversarial
    mixed-document query backend against the fixed absolute floors, then repeat
    the ordered and adversarial strict-ranking checks at every sequence bucket;
-5. admit and compose target packages only from the exact scopes that pass,
-   then repeat the same global process for further device families.
+5. run final conformance against the immutable staged package bytes, then
+   atomically admit that package and cohort; repeat the global process for
+   further device families without changing the shared vector identity.
 
 For admission, maintainers rehost each exact cache as the cfetch release asset
 `<sha256>.npz` and every raw profiler/benchmark output in a separately hashed

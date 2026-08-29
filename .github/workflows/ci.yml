@@ -26,6 +26,8 @@ jobs:
         run: |
           bash scripts/check-packaging-variants.sh
           echo "matrix=$(bash scripts/variant-matrix.sh)" >> "$GITHUB_OUTPUT"
+      - name: Test exact local payload staging
+        run: python -m unittest -v scripts.test_stage_local_inference
 
   variant-build:
     name: Variant build (${{ matrix.id }})
@@ -77,12 +79,23 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: experiments/embedding-profile/requirements-test.txt
-      - name: Install policy-test dependency
-        run: python -m pip install -r experiments/embedding-profile/requirements-test.txt
+          cache-dependency-path: experiments/embedding-profile/requirements-lock.txt
+      - name: Install the fully hashed policy environment
+        run: python -m pip install --require-hashes -r experiments/embedding-profile/requirements-lock.txt
       - name: Test canonical codec, adapter export, and all-pairs admission
         working-directory: experiments/embedding-profile
-        run: python -m unittest -v test_cross_backend_eval.py test_export_adapter_cache.py
+        run: >-
+          python -m unittest -v
+          test_cross_backend_eval.py
+          test_export_adapter_cache.py
+          test_measurement_bundle.py
+          test_physical_evidence.py
+          test_final_package_conformance.py
+          test_admission_transaction.py
+      - name: Test dependency-light OpenVINO package contracts
+        run: python -m unittest discover -s packages/openvino/tests -v
+      - name: Test dependency-light activation promotion
+        run: python -m unittest scripts/test_apply_admission_activation.py -v
       - name: Verify the pinned SciFact dataset contract
         working-directory: experiments/embedding-profile
         env:
@@ -100,6 +113,10 @@ jobs:
         run: |
           python experiments/embedding-profile/export_adapter_cache.py --help >/dev/null
           python experiments/embedding-profile/cross_backend_eval.py --help >/dev/null
+          python experiments/embedding-profile/final_package_conformance.py --help >/dev/null
+          python experiments/embedding-profile/admission_transaction.py --help >/dev/null
+          python experiments/embedding-profile/physical_evidence.py --help >/dev/null
+          python scripts/apply_admission_activation.py --help >/dev/null
 
   test:
     name: Test (${{ matrix.os }})

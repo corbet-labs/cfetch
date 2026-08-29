@@ -47,7 +47,7 @@ impl Catalog {
         anyhow::ensure!(!self.variants.is_empty(), "variant catalog is empty");
 
         let mut ids = BTreeSet::new();
-        let mut targets = BTreeSet::new();
+        let mut endpoint_targets = BTreeSet::new();
         for variant in &self.variants {
             anyhow::ensure!(ids.insert(&variant.id), "duplicate variant id {}", variant.id);
             anyhow::ensure!(
@@ -60,16 +60,37 @@ impl Catalog {
             anyhow::ensure!(!variant.runner.is_empty(), "variant {} has no CI runner", variant.id);
             anyhow::ensure!(!variant.binary.is_empty(), "variant {} has no binary name", variant.id);
             anyhow::ensure!(["tar.gz", "zip"].contains(&variant.archive.as_str()), "variant {} has unknown archive format {}", variant.id, variant.archive);
-            anyhow::ensure!(variant.backend == "endpoint", "variant {} claims unimplemented backend {}", variant.id, variant.backend);
-            anyhow::ensure!(variant.cargo_features.is_empty(), "endpoint-only variant {} must not claim Cargo features", variant.id);
-            anyhow::ensure!(variant.id.contains("-cfetch-remote-"), "endpoint-only variant {} must be named remote", variant.id);
             anyhow::ensure!(
-                targets.insert((variant.os.clone(), variant.arch.clone(), variant.backend.clone())),
-                "multiple {} {} variants claim the same {} backend",
-                variant.os,
-                variant.arch,
+                matches!(variant.backend.as_str(), "endpoint" | "local"),
+                "variant {} claims unsupported backend {}",
+                variant.id,
                 variant.backend
             );
+            anyhow::ensure!(
+                variant.cargo_features.is_empty(),
+                "out-of-process inference variant {} must not claim Cargo engine features",
+                variant.id
+            );
+            let expected_name = if variant.backend == "local" {
+                "-cfetch-local-"
+            } else {
+                "-cfetch-remote-"
+            };
+            anyhow::ensure!(
+                variant.id.contains(expected_name),
+                "variant {} backend {} must contain {} in its id",
+                variant.id,
+                variant.backend,
+                expected_name
+            );
+            if variant.backend == "endpoint" {
+                anyhow::ensure!(
+                    endpoint_targets.insert((variant.os.clone(), variant.arch.clone())),
+                    "multiple {} {} variants claim the portable endpoint backend",
+                    variant.os,
+                    variant.arch
+                );
+            }
         }
         Ok(())
     }
@@ -102,7 +123,17 @@ pub fn arch_token() -> &'static str {
 
 /// The artifact an installer can truthfully offer for this target.
 pub fn recommended_release() -> Option<&'static ReleaseVariant> {
-    catalog().variants.iter().find(|v| v.os == os_token() && v.arch == arch_token())
+    build_id()
+        .and_then(|id| catalog().variants.iter().find(|variant| variant.id == id))
+        .or_else(|| {
+            // A source build has no package identity and therefore cannot
+            // assume that a device-specific local payload is installed.
+            catalog().variants.iter().find(|variant| {
+                variant.os == os_token()
+                    && variant.arch == arch_token()
+                    && variant.backend == "endpoint"
+            })
+        })
 }
 
 /// Identity injected by the release/package build. A developer build remains
@@ -121,28 +152,49 @@ mod tests {
     }
 
     #[test]
-    fn every_catalog_entry_is_a_real_remote_build() {
+    fn every_catalog_entry_uses_an_implemented_out_of_process_boundary() {
         for variant in &catalog().variants {
-            assert_eq!(variant.backend, "endpoint");
-            assert!(variant.id.contains("-remote-"));
+            assert!(matches!(variant.backend.as_str(), "endpoint" | "local"));
+            let marker = if variant.backend == "local" {
+                "-cfetch-local-"
+            } else {
+                "-cfetch-remote-"
+            };
+            assert!(variant.id.contains(marker));
             assert!(variant.cargo_features.is_empty());
         }
     }
 
     #[test]
-    fn catalog_refuses_a_backend_that_is_only_a_name() {
+    fn catalog_refuses_a_backend_that_has_no_package_contract() {
         let fake = CATALOG_JSON.replacen("\"backend\": \"endpoint\"", "\"backend\": \"coreml\"", 1);
-        assert!(Catalog::parse(&fake).unwrap_err().to_string().contains("unimplemented backend"));
+        assert!(Catalog::parse(&fake).unwrap_err().to_string().contains("unsupported backend"));
     }
 
     #[test]
-    fn every_supported_target_has_exactly_one_release() {
+    fn catalog_accepts_a_package_local_out_of_process_variant() {
+        let mut local = catalog().clone();
+        let mut variant = local.variants[0].clone();
+        variant.id = "linux-cfetch-local-intel-lunar-lake-x86_64".into();
+        variant.backend = "local".into();
+        local.variants.push(variant.clone());
+        variant.id = "linux-cfetch-local-amd-strix-point-x86_64".into();
+        local.variants.push(variant);
+        local.validate().unwrap();
+    }
+
+    #[test]
+    fn every_supported_target_has_exactly_one_portable_endpoint_release() {
         for os in ["linux", "mac", "win"] {
             for arch in ["x86_64", "aarch64"] {
                 let matches = catalog()
                     .variants
                     .iter()
-                    .filter(|variant| variant.os == os && variant.arch == arch)
+                    .filter(|variant| {
+                        variant.os == os
+                            && variant.arch == arch
+                            && variant.backend == "endpoint"
+                    })
                     .count();
                 assert_eq!(matches, 1, "supported target {os}/{arch}");
             }

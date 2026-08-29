@@ -47,6 +47,7 @@
     "release_variant_id": "matching release/variants.json id",
     "os": "target operating system",
     "arch": "target architecture",
+    "package_manifest_sha256": "64 lowercase hexadecimal characters for the exact root package-manifest.json bytes",
     "device_families": ["exact supported device family"],
     "ordered_scope_ids": [
       "admitted NPU scope ids",
@@ -67,6 +68,7 @@
     "profile_manifest_sha256": "must equal this registry's shared semantic identity",
     "admission_policy_sha256": "must equal this registry's current admission policy",
     "scope_id": "at most 128 lowercase slug characters with single separators",
+    "transport": "supervised-local for package scopes or remote-attested for explicit configured endpoints",
     "backend": "runtime backend label",
     "runtime": "exact runtime and version",
     "compiler": "exact compiler and settings identity",
@@ -93,8 +95,8 @@
   },
   "admission": {
     "policy_version": 1,
-    "policy_manifest_sha256": "1572cd91a489633bfe9168cf3fb6fd52b5318992bd415f1207042533eb0fb90d",
-    "implementation_bundle_sha256": "6716429c08922dc65b90d8835ad0f7ee646e03fc81b4cc4d3fc94df98d0b4783",
+    "policy_manifest_sha256": "f35d18b42c17e79fda60a8c731005871264e06fc3f5f138352d22e83399902fb",
+    "implementation_bundle_sha256": "3f84a6d3919a714ec71feab12fa0790882e5b443930dbf253dc0561166ff87d9",
     "dataset": "mteb/scifact",
     "dataset_revision": "cf10ab6856b15b0e670ef8ae5dae4e266c12d035",
     "sequence_semantic_fixture": {
@@ -116,7 +118,7 @@
     "ordered_pairs": "every-query-backend-x-every-document-backend-including-self",
     "mixed_document_store": "per-query-relevant-minimum-irrelevant-maximum-exact-cosine-across-document-scopes",
     "wire_batch_contract": "one-execution-scope-per-response-supports-1-through-64-items-canonical-output-invariant-for-same-64-ordered-inputs-under-every-grouping-size-1-through-64",
-    "scope_authentication": "fresh nonce plus exact request/response SHA-256 signed by the admitted package Ed25519 key",
+    "scope_authentication": "fresh nonce plus exact request/response SHA-256 signed by the admitted scope key; supervised-local and remote-attested assign different trust to that key",
     "evidence_replay": "durable-content-addressed-cache-and-measurement-bundle-strict-schema-ci-full-gate-replay",
     "absolute_minimums": {
       "ndcg_at_10": 0.767907905520953,

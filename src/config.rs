@@ -470,8 +470,10 @@ impl VectorSpec {
 pub struct EmbeddingsConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Base URL; `/embeddings` is appended. Must be https or loopback —
-    /// config is a file agents write, so the URL is SSRF-guarded at use.
+    /// Explicit remote/base URL; `/embeddings` is appended. Empty selects the
+    /// exact admitted package-local plan when this release contains one.
+    /// A configured URL always wins and is never a fallback after local CPU.
+    /// It must be https or loopback because config is a file agents write.
     #[serde(default)]
     pub endpoint: String,
     #[serde(default = "default_embed_model")]

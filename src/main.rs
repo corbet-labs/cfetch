@@ -56,6 +56,8 @@ mod jsonl;
 mod knowledge_graph;
 mod ledger;
 mod lockfile;
+mod local_adapter;
+mod local_inference;
 mod markers;
 mod maintenance;
 mod maintenance_inbox;
@@ -2672,8 +2674,15 @@ fn main() {
         Command::Hardware { json } => {
             let found = hardware::detect();
             let release = variant::recommended_release();
-            let local_inference = false;
-            let packaged_backend = "endpoint";
+            let local_plan = match local_inference::selected_local_package_plan() {
+                Ok(plan) => plan,
+                Err(error) => {
+                    eprintln!("cfetch hardware: invalid embedded local inference plan: {error:#}");
+                    std::process::exit(1);
+                }
+            };
+            let local_inference = local_plan.is_some();
+            let packaged_backend = if local_inference { "package-local" } else { "endpoint" };
             if json {
                 println!(
                     "{}",
@@ -2685,6 +2694,7 @@ fn main() {
                         "x86_64_level": hardware::x86_64_level(),
                         "local_inference": local_inference,
                         "backend": packaged_backend,
+                        "ordered_scope_ids": local_plan.as_ref().map(|plan| &plan.ordered_scope_ids),
                         "devices": found.iter().map(|f| serde_json::json!({
                             "device": f.device.describe(),
                             "token": f.device.token(),

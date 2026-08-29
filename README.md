@@ -658,10 +658,12 @@ duplicating resident injection.
 ### Does cfetch require a vector database or cloud service?
 
 No. Lexical recall and code search are local and work without embeddings.
-Semantic search can use a local or hosted cfetch-attested adapter with the
-OpenAI embeddings request shape; a generic OpenAI-compatible endpoint lacks
-the admitted scope metadata and package signature. The per-host catalog is
-disposable SQLite; Markdown remains the record.
+Semantic search can use a supervised local package or an explicitly configured
+remote-attested service with the OpenAI embeddings request shape. A generic
+OpenAI-compatible endpoint lacks the admitted transport and scope metadata.
+Local identity comes from cfetch's hash-pinned package and supervised-child
+boundary; remote identity additionally uses an operator-held response key.
+The per-host catalog is disposable SQLite; Markdown remains the record.
 
 ### Is cfetch only for Claude Code?
 

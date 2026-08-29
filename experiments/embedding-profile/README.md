@@ -63,6 +63,69 @@ exact INT8 comparator. For each query producer and bucket, the gate also takes
 the relevant minimum and irrelevant maximum across all document producers and
 requires that adversarial mixed-scope ordering to pass.
 
+## Collect physical package evidence
+
+`physical_evidence.py` owns and measures one exact package scope. It accepts
+only an OpenVINO package whose top-level `package_state` is `physical-probe`;
+all three physical-evidence digests and the compatibility-report digest must
+be explicit JSON `null`. This is the only non-circular bootstrap package. A
+probe package cannot be exported, admitted, selected by cfetch, or released.
+
+The collector verifies the dispatcher and probe-package manifest hashes before
+and after every child process. It launches the sibling dispatcher directly,
+sends a random bearer through stdin without persisting it, retains the stdin
+pipe as the parent-lifetime boundary, and accepts only the one bounded
+loopback readiness line. Every embedding request uses a globally unique
+32-byte nonce and the package-bound Ed25519 response signature.
+
+For each of the seven sequence buckets the collector starts a fresh dispatcher
+so RSS from previously compiled buckets cannot masquerade as this bucket's
+memory. It runs the pinned semantic triple twice, warmups, and at least 20
+measured signed loopback requests. It then starts a separate dispatcher and
+executes the same 64 pinned SciFact inputs under every grouping size from 1
+through 64. Latency is the end-to-end signed loopback request/response time.
+Peak memory is the highest observed Linux process-tree `VmRSS`, sampled every
+2 ms across initialization and measured requests. Energy is recorded only
+when a future physical meter implementation measures it; the current command
+requires a nonempty reason and writes `energy_measurement: not_measured`.
+
+Placement does not trust `cfetch_execution`. Every normal signed response must
+also carry live provider evidence. For OpenVINO this is the exact compiled
+model `EXECUTION_DEVICES`, exact `core.get_property` values, and exact
+platform/kernel/driver-file hashes. Expected and actual values, source APIs,
+compile configuration, dispatcher/runtime/probe-manifest identities, and the
+raw signed transaction digest remain in the placement summary. Missing,
+echoed, mismatched, aggregate, or fallback device claims fail collection.
+
+Run one scope at a time with a 64-input JSON manifest produced from the pinned
+SciFact revision and selection named in `WIRE_BATCH_INPUT_SELECTION`:
+
+    python experiments/embedding-profile/physical_evidence.py \
+      --dispatcher results/openvino-probe/cfetch-openvino-adapter \
+      --dispatcher-sha256 "$DISPATCHER_SHA256" \
+      --package-manifest results/openvino-probe/package-manifest.json \
+      --package-manifest-sha256 "$PROBE_PACKAGE_MANIFEST_SHA256" \
+      --scope-id intel-lunar-lake-npu \
+      --wire-inputs results/wire-probe-inputs.json \
+      --energy-not-measured-reason "No device-scoped physical meter was available" \
+      --output-directory results/intel-lunar-lake-npu
+
+The output directory contains the exact sequence, placement, and performance
+JSON summaries plus only their referenced content-addressed raw profiler and
+benchmark records. Reassemble `package_state: candidate` with the three
+generated summary digests before running `export_adapter_cache.py`. Admission
+reconstructs the canonical probe manifest from that candidate by resetting
+the state, three evidence bindings, and report binding; its SHA-256 must equal
+`placement.provider_binding.probe_package_manifest_sha256`. Therefore the
+measured probe and exported candidate may differ only in those bindings.
+Admission also verifies the candidate package inventory and native launcher,
+projects the reconstructed probe manifest into that verified tree, and requires
+the projected probe-launcher SHA-256 to equal the dispatcher measured by the
+collector. This binds every other package file across the lifecycle, not just
+the parsed manifest fields. The later `release` state adds only the global
+report binding, rebinds the inventory and launcher transactionally, and must
+pass final package conformance.
+
 ## Export one adapter scope
 
 `export_adapter_cache.py` is the backend-neutral bridge between a target-native
@@ -73,12 +136,18 @@ batches. The endpoint must return one explicitly indexed, finite, non-zero
 768-component float vector per input. The exporter applies the canonical
 max-absolute, round-ties-even signed INT8 codec, runs the complete query and
 document scope twice, and refuses non-repeatable output.
+Every request body carries `cfetch_requested_scope_id`; a response from any
+other execution scope is rejected even when its signature is otherwise valid.
+Transport is also scope identity: package-owned adapters use
+`supervised-local`, while an explicitly configured endpoint is admitted as
+`remote-attested`; one cannot impersonate the other by reusing provenance.
 
 For example:
 
     python experiments/embedding-profile/export_adapter_cache.py \
       --endpoint http://127.0.0.1:8080/embeddings \
       --scope-id apple-coreml-ane-example \
+      --transport supervised-local \
       --backend apple-coreml-ane \
       --runtime "Core ML 8.0" \
       --compiler "coremltools <version>" \
@@ -114,9 +183,11 @@ read its bearer token through `--bearer-token-env NAME`; the token is not
 written to the cache. The admission exporter requires the proposed package's
 64-character lowercase hexadecimal Ed25519 public key. It sends a fresh nonce,
 verifies the signature over the exact request and response bytes, and records
-the public key in cache metadata. Unsigned candidate smoke probes are not
-admission caches. The exporter refuses non-loopback hosts, redirects, implicit
-output paths, and overwriting an existing cache.
+the public key in cache metadata. One shared nonce register covers the entire
+export, so a repeated challenge fails before another request is sent. Unsigned
+candidate smoke probes are not admission caches. The exporter refuses
+non-loopback hosts, redirects, implicit output paths, and overwriting an
+existing cache.
 
 All three evidence files are UTF-8 JSON, are embedded byte-for-byte in the
 cache, and must identify the same scope ID, backend, artifact source/digest,
@@ -133,6 +204,12 @@ digest from those bytes, checks the pinned ordered-input digest, and proves all
 64 retained outputs are byte-identical. Placement evidence
 confirms accelerator execution for every bucket, records all fallback work
 explicitly, rejects unexpected fallback, and binds profiler output digests.
+Its provider binding retains normalized expected and live host bindings,
+compile configuration, dispatcher and runtime identities, and the probe
+package manifest digest. Every bucket retains expected and actual execution
+devices and device properties plus the exact live API source. The admission
+transaction can therefore compare the final manifest to measured facts instead
+of trusting only a placement-summary digest.
 Performance evidence records sample count, p50/p95 latency, peak memory, and
 measured energy—or an explicit reason it was not measurable—separately for
 every bucket. Each placement bucket includes `profiler_output_sha256`; each
@@ -257,16 +334,32 @@ that a past challenge can authenticate a future package.
 After admission, packaging injects the final report digest into the production
 adapter response/manifest without changing the evaluated artifact, runtime,
 compiler, package target, public key, or scope identity. The packaged adapter
-then reruns response-schema, nonce-signature, and scope-conformance tests before
-release. This repository does not pretend that post-admission package wiring
-already exists.
+then runs the bounded final conformance replay before release:
+
+    python experiments/embedding-profile/final_package_conformance.py \
+      --endpoint http://127.0.0.1:8080/embeddings \
+      --cache results/<scope>.npz \
+      --cache-sha256 "$CACHE_SHA256" \
+      --compatibility-report-sha256 "$COMPATIBILITY_REPORT_SHA256"
+
+The command validates the exact cache container and digest before allocation,
+requires the cached package key, exact requested scope, full execution
+identity, and injected compatibility-report digest on every response, and
+issues a distinct signed nonce challenge for every adapter call. It replays
+the same 64 inputs under grouping sizes 1 through 64 and each of the seven
+sequence-bucket fixtures twice, then byte-compares every canonical INT8 record
+with the retained cache arrays. The endpoint form above is candidate debugging
+only and cannot emit an activation receipt. Receipt mode, documented below,
+extracts and launches the exact staged package itself.
 
 The admission implementation is byte-bound separately from the semantic and
-policy identities. Its domain-separated digest covers the exact bytes and
-paths of `cross_backend_eval.py`, `admission_evidence.py`,
-`export_adapter_cache.py`, `scifact_contract.py`, and
-`requirements-test.txt`. That digest is pinned outside the bundle, recorded in
-the registry, and embedded in every report. Run:
+policy identities. Its domain-separated digest covers the exact paths and
+bytes of the evaluator, evidence validator, exporter, measurement builder,
+stage/activation transaction, final-package conformance launcher, dataset
+contract, explicit activation source promoter, direct requirements, and fully
+hashed transitive lock. That digest
+is pinned outside the bundle, recorded in the registry, and embedded in every
+report. Run:
 
     python experiments/embedding-profile/cross_backend_eval.py \
       --verify-implementation-bundle
@@ -282,7 +375,8 @@ The committed report contains only an allowlisted projection of public
 registry-bound metadata, never local evidence paths or unknown backend extras.
 Production adapters must attest the final compatibility-report digest.
 
-The evaluator uses the exact versions in `requirements-test.txt`. The shared
+Admission installs `requirements-lock.txt` with `--require-hashes`; its direct
+roots remain documented in `requirements-test.txt`. The shared
 dataset loader checks the revision-pinned `mteb/scifact` contract has 300 test
 queries, 339 positive qrels, and 5,183 ordered documents before export or
 evaluation.
@@ -294,27 +388,153 @@ target-native adapter using the artifacts listed in
 release/inference-backends.json; the exporter deliberately contains no vendor
 runtime code.
 
+## Hermetic stage and activation
+
+`admission_transaction.py` is the only supported bridge from candidate caches
+to a nonempty proposed registry. Its JSON manifest names the exact base
+registry digest, a fixed GitHub release tag, the complete retained-plus-new
+cohort, and every target-native package:
+
+Create the transaction-only receipt key once; the command refuses an existing
+path and prints the raw public-key hex for the manifest:
+
+    python experiments/embedding-profile/admission_transaction.py keygen \
+      --output results/receipt-attestation.key
+
+    {
+      "schema_version": 1,
+      "base_registry": "../../release/inference-backends.json",
+      "base_registry_sha256": "<exact digest>",
+      "base_variants": "../../release/variants.json",
+      "base_variants_sha256": "<exact digest>",
+      "release_tag": "admission-v0.9.10-intel-lnl-1",
+      "receipt_attestation_public_key": "<raw Ed25519 public key hex>",
+      "candidate_scopes": ["intel-lnl-npu", "intel-lnl-gpu", "intel-lnl-cpu"],
+      "scopes": [
+        {
+          "scope_id": "intel-lnl-npu",
+          "admission_cache": "results/intel-lnl-npu.npz",
+          "admission_cache_sha256": "<exact digest>",
+          "raw_measurements": "results/intel-lnl-npu-raw"
+        }
+      ],
+      "packages": [
+        {
+          "package_id": "linux-openvino-lunar-lake-x86_64",
+          "release_variant_id": "linux-cfetch-local-openvino-x86_64",
+          "os": "linux",
+          "arch": "x86_64",
+          "device_families": [
+            "intel-lunar-lake-npu",
+            "intel-arc-140v",
+            "x86-64-avx2"
+          ],
+          "ordered_scope_ids": ["intel-lnl-npu", "intel-lnl-gpu", "intel-lnl-cpu"],
+          "package_directory": "packages/linux-openvino-lunar-lake-x86_64",
+          "package_manifest": "package-manifest.json",
+          "package_format": "zip",
+          "dispatcher": {
+            "binary": "cfetch-inference",
+            "sha256": "<exact digest>"
+          }
+        }
+      ]
+    }
+
+The abbreviated arrays above must contain the full cohort in a real manifest.
+All paths are normalized relative paths below the manifest directory. Inputs
+and package trees containing symlinks, special files, missing digests, path
+escapes, unbounded containers, stale cache identities, missing hardware
+classes, or non-NPU/GPU/CPU package order are rejected. The dispatcher must be
+an executable regular non-symlink file at the package root, named by a plain
+basename, and its exact digest is rechecked inside the final package archive.
+Each package must also bind one unique `backend: local` entry from the exact
+hash-pinned release-variant catalog with matching OS, architecture, and a
+different cfetch binary basename.
+
+Run the offline stage into a new path:
+
+    python experiments/embedding-profile/admission_transaction.py stage \
+      --manifest results/admission-transaction.json \
+      --output results/staged-admission
+
+Staging replays the full gate, builds each deterministic raw-measurement ZIP,
+writes the digest-named report, injects that report digest into a copy of each
+package manifest, builds digest-named target-package ZIPs, and emits a proposed
+registry plus `stage-plan.json`. It does not edit the checked-out registry,
+upload an asset, create a tag, or publish a release. Reusing an output path is
+an error.
+
+Exercise every package/scope pair from the exact staged package bytes and ask
+the final conformance command for a content-addressed receipt:
+
+    python experiments/embedding-profile/final_package_conformance.py \
+      --cache "results/staged-admission/assets/$CACHE_SHA256.npz" \
+      --cache-sha256 "$CACHE_SHA256" \
+      --compatibility-report-sha256 "$REPORT_SHA256" \
+      --stage-id "$STAGE_ID" \
+      --stage-plan results/staged-admission/stage-plan.json \
+      --package-id linux-openvino-lunar-lake-x86_64 \
+      --package-asset "results/staged-admission/assets/$PACKAGE_SHA256.zip" \
+      --package-sha256 "$PACKAGE_SHA256" \
+      --dispatcher cfetch-inference \
+      --receipt-attestation-private-key results/receipt-attestation.key \
+      --receipt-directory results/receipts
+
+Receipt mode forbids a caller-supplied endpoint. It safely extracts the exact
+staged ZIP, re-hashes and launches its stage-pinned dispatcher, accepts only its
+strict loopback readiness record and scope order, and stops and re-hashes the
+package after the live replay. The receipt binds the stage, cache, newest
+report, package bytes, implementation bundle, all 64 wire groupings, all seven
+buckets, and all 351 fresh signed requests. It is signed by the separate raw
+Ed25519 transaction key whose public half is pinned in `stage-plan.json`; the
+private key is never placed in the target package or activation bundle.
+Activation requires exactly one valid signed receipt for every pair declared
+by the stage:
+
+    python experiments/embedding-profile/admission_transaction.py activate \
+      --stage-plan results/staged-admission/stage-plan.json \
+      --receipt results/receipts/<sha256>.json \
+      --output results/release-ready-admission
+
+The command still performs no external mutation. It verifies every staged byte
+again and creates a release-ready directory containing `assets/`, `release/`,
+the receipts, and a digest-named activation manifest. That manifest binds the
+current registry and variant-catalog digests plus the exact one-line
+`src/embedding_profile.rs` candidate-to-active transformation. A publisher can
+upload the assets to the already-selected fixed GitHub tag before applying the
+source promotion. This order removes the old tag/CI deadlock: the nonempty
+registry never points at release assets that do not exist yet.
+
+After those immutable assets exist at the bound tag, apply the complete local
+promotion explicitly from the repository root:
+
+    python scripts/apply_admission_activation.py \
+      --activation-manifest results/release-ready-admission/<sha256>.activation.json \
+      --repository .
+
+The dependency-light command verifies the activation filename and complete
+bundle inventory, every content hash, the checkout's still-current base
+registry and variant catalog, the nonempty active registry/report binding, and
+the exact candidate source digest before writing. It then copies the report and
+registry and changes only the hash-bound `PROFILE_STATUS` constant. Any schema,
+byte, or checkout drift is a hard error with a nonzero exit; success prints a
+machine-readable summary. It does not upload assets or publish a release.
+
 ## Activation blockers
 
-Two P1 release boundaries must be implemented and exercised before the first
-nonempty admitted cohort:
+The two-phase transaction, fully hashed dependency lock, and receipt-producing
+final conformance command are implemented and covered by synthetic fail-closed
+tests. They are machinery, not evidence. Before the first nonempty cohort:
 
-- Hermetic nonempty admission orchestration must construct a complete cohort
-  from pinned target inputs, produce its caches and raw measurement bundles,
-  write the digest-named report lineage, replay the nonempty registry, and
-  stage the registry/reports/packages as one reproducible transaction without
-  hidden manual state. It must also lock and verify the complete Python
-  dependency resolution, including transitives and artifact hashes; the
-  current requirements file pins only the direct policy-test dependencies.
-- Final package conformance must run the actual packaged implementation bytes
-  after the newest report digest is injected. The same release transaction
-  must verify the report-bound admission implementation-bundle digest,
-  requested scope and response schema, a fresh nonce signature,
-  artifact/runtime/device bindings, and the newest global report digest. It
-  must then replay every admitted sequence-bucket fixture and the same 64
-  ordered inputs under every wire grouping size from 1 through 64; all
-  canonical INT8 outputs must byte-match the fingerprints retained in that
-  scope's admission cache before publication.
+- Capture the complete physical NPU, GPU, and accelerated-CPU caches plus raw
+  placement/performance outputs, then run the stage command successfully under
+  the hash-locked environment.
+- Extract and start each exact staged target package, run final conformance for
+  every package/scope pair, and supply the complete receipt set to activation.
+- Publish the content-addressed activation assets at the fixed tag, run the
+  bound activation-application command, and pass the nonempty registry replay
+  in normal CI.
 
 `admitted_backends` and `local_packages` remain empty. No target scope or local
 producer is admitted until both boundaries and a real complete cohort pass.

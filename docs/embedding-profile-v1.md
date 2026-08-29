@@ -87,9 +87,13 @@ file.
 Each admitted registry entry also repeats the current semantic-profile and
 admission-policy digests and points to the byte-hashed, passing exact-cohort
 report. Updating a global header cannot make stale evidence current. Runtime
-acceptance additionally uses a fresh nonce and an Ed25519 response signature
-from the globally unique public key bound to that exact packaged scope; copying
-public registry fields into another endpoint is insufficient.
+acceptance additionally binds a fresh nonce and the exact request/response
+bytes with an Ed25519 signature from the scope key. For `supervised-local`,
+that key is distributed with the package and is therefore a consistency check
+inside cfetch's hash-pinned launcher, manifest, bearer, and child-process
+boundary—not independent producer identity. For `remote-attested`, the key is
+operator-held and copying public registry fields into another endpoint is
+insufficient.
 
 ## Numeric compatibility
 

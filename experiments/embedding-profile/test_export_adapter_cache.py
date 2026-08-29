@@ -13,6 +13,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from cryptography.hazmat.primitives import serialization
@@ -80,6 +81,7 @@ def attested_response(rows: list[dict[str, object]]) -> dict[str, object]:
         "cfetch_model_revision": MODEL_REVISION,
         "cfetch_execution": {
             "scope_id": "test-scope",
+            "transport": "supervised-local",
             "backend": "test-adapter",
             "runtime": "test-runtime",
             "compiler": "test-compiler",
@@ -124,6 +126,46 @@ def semantic_probe_fixture(bucket: int) -> dict[str, object]:
     }
 
 
+def openvino_provider_binding() -> dict[str, object]:
+    host = {
+        "system": "Linux",
+        "machine": "x86_64",
+        "kernel_release": "test-kernel",
+        "files": [{"path": "/usr/lib/libtest.so", "sha256": "a" * 64}],
+    }
+    return {
+        "schema_version": 1,
+        "provider": "openvino",
+        "dispatcher_sha256": "b" * 64,
+        "probe_package_manifest_sha256": "c" * 64,
+        "runtime_manifest_sha256": "d" * 64,
+        "openvino_compile_config": {},
+        "expected_host": host,
+        "actual_host": copy.deepcopy(host),
+        "host_source": "platform-and-sha256",
+    }
+
+
+def openvino_provider_evidence() -> dict[str, object]:
+    properties = {
+        "FULL_DEVICE_NAME": "Test accelerated CPU",
+        "DEVICE_ARCHITECTURE": "test-architecture",
+    }
+    return {
+        "schema_version": 1,
+        "provider": "openvino",
+        "requested_device": "CPU",
+        "expected_execution_devices": ["CPU"],
+        "actual_execution_devices": ["CPU"],
+        "execution_devices_source": (
+            "compiled_model.get_property(EXECUTION_DEVICES)"
+        ),
+        "expected_device_properties": properties,
+        "actual_device_properties": dict(properties),
+        "device_properties_source": "core.get_property",
+    }
+
+
 def valid_evidence_fixture() -> tuple[
     argparse.Namespace,
     dict[str, object],
@@ -132,6 +174,7 @@ def valid_evidence_fixture() -> tuple[
 ]:
     args = argparse.Namespace(
         scope_id="test-scope",
+        transport="supervised-local",
         backend="test-adapter",
         artifact_source="test-source@revision/model",
         artifact_sha256="1" * 64,
@@ -146,6 +189,7 @@ def valid_evidence_fixture() -> tuple[
     )
     identity = {
         "scope_id": args.scope_id,
+        "transport": args.transport,
         "backend": args.backend,
         "artifact_source": args.artifact_source,
         "artifact_sha256": args.artifact_sha256,
@@ -202,6 +246,7 @@ def valid_evidence_fixture() -> tuple[
         "accelerator_execution_confirmed": True,
         "fallback_disclosure_complete": True,
         "unexpected_fallback_detected": False,
+        "provider_binding": openvino_provider_binding(),
         "bucket_results": [
             {
                 "bucket": bucket,
@@ -210,6 +255,7 @@ def valid_evidence_fixture() -> tuple[
                 "unexpected_fallback_detected": False,
                 "fallback_summary": "none",
                 "profiler_output_sha256": "2" * 64,
+                "provider_evidence": openvino_provider_evidence(),
             }
             for bucket in (32, 64)
         ],
@@ -343,6 +389,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
     def test_cache_metadata_never_persists_private_evidence_paths(self) -> None:
         args = argparse.Namespace(
             scope_id="test-scope",
+            transport="supervised-local",
             backend="test-adapter",
             runtime="test-runtime",
             compiler="test-compiler",
@@ -402,6 +449,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not exceed 64"):
             embed_canonical(
                 "http://127.0.0.1/embeddings",
+                "test-scope",
                 [],
                 SUPPORTED_MAX_BATCH_SIZE + 1,
                 1.0,
@@ -421,6 +469,14 @@ class ExportAdapterCacheTests(unittest.TestCase):
                 argparse.ArgumentTypeError
             ):
                 action.type(invalid)
+
+        transport = next(
+            item for item in build_parser()._actions if item.dest == "transport"
+        )
+        self.assertTrue(transport.required)
+        self.assertEqual(
+            tuple(transport.choices), ("supervised-local", "remote-attested")
+        )
 
     def test_package_signature_binds_nonce_and_exact_request_response_bytes(self) -> None:
         private_key = Ed25519PrivateKey.generate()
@@ -443,7 +499,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
             ("response", nonce, request_body, response_body + b" "),
         ):
             with self.subTest(name=name), self.assertRaisesRegex(
-                ValueError, "package-key signature"
+                ValueError, "scope-key signature"
             ):
                 verify_response_signature(
                     public_key,
@@ -476,6 +532,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
         class SigningOpener:
             def __init__(self) -> None:
                 self.nonces: list[bytes] = []
+                self.requested_scopes: list[str] = []
 
             def open(self, request, timeout: float):
                 del timeout
@@ -485,12 +542,19 @@ class ExportAdapterCacheTests(unittest.TestCase):
                 nonce = bytes.fromhex(headers["x-cfetch-attestation-nonce"])
                 self.nonces.append(nonce)
                 request_payload = json.loads(request.data)
+                self.requested_scopes.append(
+                    request_payload["cfetch_requested_scope_id"]
+                )
                 rows = [
                     {"index": index, "embedding": vector(float(index + 1))}
                     for index, _ in enumerate(request_payload["input"])
                 ]
+                response_payload = attested_response(rows)
+                response_payload["cfetch_execution"][
+                    "compatibility_report_sha256"
+                ] = "a" * 64
                 response_body = json.dumps(
-                    attested_response(rows), separators=(",", ":")
+                    response_payload, separators=(",", ":")
                 ).encode("utf-8")
                 signature = private_key.sign(
                     attestation_message(nonce, request.data, response_body)
@@ -498,18 +562,37 @@ class ExportAdapterCacheTests(unittest.TestCase):
                 return FakeResponse(response_body, signature)
 
         opener = SigningOpener()
+        used_nonces: set[bytes] = set()
         for _ in range(2):
             result = request_embeddings(
                 "http://127.0.0.1:1234/embeddings",
+                "test-scope",
                 [QUERY_PREFIX + "signed"],
                 7.0,
                 opener=opener,
                 attestation_public_key=public_key,
+                expected_compatibility_report_sha256="a" * 64,
+                used_attestation_nonces=used_nonces,
             )
             self.assertEqual(result.shape, (1, DIMENSIONS))
         self.assertEqual(len(opener.nonces), 2)
         self.assertEqual(len(opener.nonces[0]), 32)
         self.assertNotEqual(opener.nonces[0], opener.nonces[1])
+        self.assertEqual(used_nonces, set(opener.nonces))
+        self.assertEqual(opener.requested_scopes, ["test-scope", "test-scope"])
+        with patch(
+            "export_adapter_cache.secrets.token_bytes", return_value=opener.nonces[0]
+        ), self.assertRaisesRegex(ValueError, "repeated a prior challenge"):
+            request_embeddings(
+                "http://127.0.0.1:1234/embeddings",
+                "test-scope",
+                [QUERY_PREFIX + "signed"],
+                7.0,
+                opener=opener,
+                attestation_public_key=public_key,
+                expected_compatibility_report_sha256="a" * 64,
+                used_attestation_nonces=used_nonces,
+            )
 
     def test_adapter_response_rejects_oversized_content_length_before_read(self) -> None:
         class FakeResponse:
@@ -566,16 +649,19 @@ class ExportAdapterCacheTests(unittest.TestCase):
 
         def fake_request(
             endpoint: str,
+            requested_scope_id: str,
             texts: Sequence[str],
             timeout: float,
             token: str | None,
         ) -> np.ndarray:
             del endpoint, timeout, token
+            self.assertEqual(requested_scope_id, "test-scope")
             calls.append(list(texts))
             return floats_for(texts)
 
         outputs = verify_wire_batch_contract(
             "http://127.0.0.1/embeddings",
+            "test-scope",
             inputs,
             1.0,
             None,
@@ -665,7 +751,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
             ]
         )
 
-        ordered = validate_response(payload, 2)
+        ordered = validate_response(payload, 2, "test-scope")
 
         self.assertEqual(ordered[:, 0].tolist(), [1.0, 2.0])
         with self.subTest("next smallest sequence bucket"):
@@ -679,11 +765,12 @@ class ExportAdapterCacheTests(unittest.TestCase):
                     }
                 ]
             )
-            validate_response(boundary, 1)
+            validate_response(boundary, 1, "test-scope")
             with self.assertRaisesRegex(ValueError, "sequence evidence requires"):
                 validate_response(
                     boundary,
                     1,
+                    "test-scope",
                     expected_row_metadata=[
                         {"token_count": 34, "sequence_bucket": 64}
                     ],
@@ -692,7 +779,12 @@ class ExportAdapterCacheTests(unittest.TestCase):
             invalid = dict(payload)
             invalid["cfetch_profile_manifest_sha256"] = "0" * 64
             with self.assertRaisesRegex(ValueError, "manifest"):
-                validate_response(invalid, 2)
+                validate_response(invalid, 2, "test-scope")
+        with self.subTest("invalid transport"):
+            invalid = copy.deepcopy(payload)
+            invalid["cfetch_execution"]["transport"] = "loopback"
+            with self.assertRaisesRegex(ValueError, "transport"):
+                validate_response(invalid, 2, "test-scope")
         with self.subTest("duplicate index"):
             invalid = attested_response(
                 [
@@ -701,17 +793,17 @@ class ExportAdapterCacheTests(unittest.TestCase):
                 ]
             )
             with self.assertRaisesRegex(ValueError, "duplicate"):
-                validate_response(invalid, 2)
+                validate_response(invalid, 2, "test-scope")
         with self.subTest("non-finite vector"):
             invalid = attested_response([{"index": 0, "embedding": vector(float("nan"))}])
             with self.assertRaisesRegex(ValueError, "non-finite"):
-                validate_response(invalid, 1)
+                validate_response(invalid, 1, "test-scope")
         with self.subTest("zero vector"):
             invalid = attested_response(
                 [{"index": 0, "embedding": [0.0] * DIMENSIONS}]
             )
             with self.assertRaisesRegex(ValueError, "all zero"):
-                validate_response(invalid, 1)
+                validate_response(invalid, 1, "test-scope")
         for name, field, value, error in (
             ("wrong row scope", "cfetch_scope_id", "other-scope", "cfetch_scope_id"),
             ("zero token count", "token_count", 0, "token_count"),
@@ -724,7 +816,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
                 invalid = copy.deepcopy(payload)
                 invalid["data"][0][field] = value
                 with self.assertRaisesRegex(ValueError, error):
-                    validate_response(invalid, 2)
+                    validate_response(invalid, 2, "test-scope")
         for name, field, error in (
             ("missing row scope", "cfetch_scope_id", "cfetch_scope_id"),
             ("missing token count", "token_count", "token_count"),
@@ -735,12 +827,12 @@ class ExportAdapterCacheTests(unittest.TestCase):
                 invalid = copy.deepcopy(payload)
                 del invalid["data"][0][field]
                 with self.assertRaisesRegex(ValueError, error):
-                    validate_response(invalid, 2)
+                    validate_response(invalid, 2, "test-scope")
         with self.subTest("execution maximum batch"):
             invalid = copy.deepcopy(payload)
             invalid["cfetch_execution"]["supported_max_batch_size"] = 63
             with self.assertRaisesRegex(ValueError, "max_batch_size"):
-                validate_response(invalid, 2)
+                validate_response(invalid, 2, "test-scope")
         with self.subTest("token count not covered by configured buckets"):
             invalid = attested_response(
                 [
@@ -755,14 +847,16 @@ class ExportAdapterCacheTests(unittest.TestCase):
             invalid["cfetch_execution"]["supported_max_tokens"] = 64
             invalid["cfetch_execution"]["supported_sequence_buckets"] = [32]
             with self.assertRaisesRegex(ValueError, "does not fit"):
-                validate_response(invalid, 1)
+                validate_response(invalid, 1, "test-scope")
         with self.subTest("execution scope mismatch"):
             with self.assertRaisesRegex(ValueError, "scope_id"):
                 validate_response(
                     payload,
                     2,
+                    "test-scope",
                     {
                         "scope_id": "another-scope",
+                        "transport": "supervised-local",
                         "backend": "test-adapter",
                         "runtime": "test-runtime",
                         "compiler": "test-compiler",
@@ -780,6 +874,25 @@ class ExportAdapterCacheTests(unittest.TestCase):
                         "performance_evidence_sha256": "4" * 64,
                         "accelerated_placement": True,
                     },
+                )
+        with self.subTest("requested scope mismatch"):
+            with self.assertRaisesRegex(ValueError, "requested 'another-scope'"):
+                validate_response(payload, 2, "another-scope")
+        with self.subTest("final compatibility report"):
+            final = copy.deepcopy(payload)
+            final["cfetch_execution"]["compatibility_report_sha256"] = "a" * 64
+            validate_response(
+                final,
+                2,
+                "test-scope",
+                expected_compatibility_report_sha256="a" * 64,
+            )
+            with self.assertRaisesRegex(ValueError, "compatibility_report_sha256"):
+                validate_response(
+                    final,
+                    2,
+                    "test-scope",
+                    expected_compatibility_report_sha256="b" * 64,
                 )
 
     def test_only_loopback_embedding_urls_are_accepted(self) -> None:
@@ -838,6 +951,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
         try:
             arrays = collect_cache_arrays(
                 endpoint,
+                "test-scope",
                 query_inputs,
                 document_inputs,
                 batch_size=2,
@@ -858,6 +972,12 @@ class ExportAdapterCacheTests(unittest.TestCase):
         )
         self.assertTrue(
             all(request["dimensions"] == DIMENSIONS for request in requests)
+        )
+        self.assertTrue(
+            all(
+                request["cfetch_requested_scope_id"] == "test-scope"
+                for request in requests
+            )
         )
         self.assertEqual(arrays[0].shape, (2, DIMENSIONS))
         self.assertEqual(arrays[1].shape, (3, DIMENSIONS))
@@ -881,6 +1001,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
             "dataset": DATASET,
             "dataset_revision": DATASET_REVISION,
             "scope_id": "test-scope",
+            "transport": "supervised-local",
             "backend": "test-adapter",
             "runtime": "test-runtime",
             "compiler": "test-compiler",
@@ -939,6 +1060,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
             field: metadata[field]
             for field in (
                 "scope_id",
+                "transport",
                 "backend",
                 "artifact_source",
                 "artifact_sha256",
@@ -992,6 +1114,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
             "accelerator_execution_confirmed": True,
             "fallback_disclosure_complete": True,
             "unexpected_fallback_detected": False,
+            "provider_binding": openvino_provider_binding(),
             "bucket_results": [
                 {
                     "bucket": bucket,
@@ -1000,6 +1123,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
                     "unexpected_fallback_detected": False,
                     "fallback_summary": "none",
                     "profiler_output_sha256": "8" * 64,
+                    "provider_evidence": openvino_provider_evidence(),
                 }
                 for bucket in SEQUENCE_BUCKETS
             ],
@@ -1118,6 +1242,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
         opener = FakeOpener()
         result = request_embeddings(
             "http://127.0.0.1:1234/embeddings",
+            "test-scope",
             [QUERY_PREFIX + "first", QUERY_PREFIX + "second"],
             7.0,
             opener=opener,
@@ -1126,6 +1251,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
         self.assertEqual(result[:, 0].tolist(), [3.0, 4.0])
         request_body = json.loads(opener.request.data)
         self.assertEqual(request_body["dimensions"], DIMENSIONS)
+        self.assertEqual(request_body["cfetch_requested_scope_id"], "test-scope")
         self.assertEqual(opener.timeout, 7.0)
 
     def test_signed_response_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
@@ -1177,6 +1303,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
             ):
                 request_embeddings(
                     "http://127.0.0.1:1234/embeddings",
+                    "test-scope",
                     [QUERY_PREFIX + "hostile"],
                     7.0,
                     opener=SigningOpener(response_body),

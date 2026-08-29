@@ -27,6 +27,7 @@ from admission_evidence import (
     SEQUENCE_SEMANTIC_FIXTURE_ID,
     SEQUENCE_SEMANTIC_FIXTURE_SHA256,
     SUPPORTED_MAX_BATCH_SIZE,
+    TRANSPORTS,
     WIRE_BATCH_INPUT_SELECTION,
     bucket_records,
     ordered_input_json_sha256,
@@ -176,6 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", required=True, type=Path, help="new .npz cache path")
     parser.add_argument("--scope-id", required=True, type=scope_id_value)
+    parser.add_argument("--transport", required=True, choices=TRANSPORTS)
     parser.add_argument("--backend", required=True, type=nonempty)
     parser.add_argument("--runtime", required=True, type=nonempty)
     parser.add_argument("--compiler", required=True, type=nonempty)
@@ -279,11 +281,17 @@ def canonical_i8(vectors: np.ndarray) -> np.ndarray:
 def validate_response(
     payload: object,
     expected_items: int,
+    requested_scope_id: str,
     expected_execution: dict[str, object] | None = None,
     expected_row_metadata: Sequence[dict[str, object]] | None = None,
+    expected_compatibility_report_sha256: str | None = None,
 ) -> np.ndarray:
     import numpy as np
 
+    try:
+        requested_scope_id = scope_id_value(requested_scope_id)
+    except argparse.ArgumentTypeError as error:
+        raise ValueError(str(error)) from error
     if not isinstance(payload, dict):
         raise ValueError("embeddings response must be a JSON object")
     attestation = {
@@ -303,6 +311,7 @@ def validate_response(
         raise ValueError("embeddings response must contain a cfetch_execution object")
     for field in (
         "scope_id",
+        "transport",
         "backend",
         "runtime",
         "compiler",
@@ -327,6 +336,15 @@ def validate_response(
         )
     if execution["device_class"] not in DEVICE_CLASSES:
         raise ValueError("cfetch_execution device_class must be npu, gpu, or cpu")
+    if execution["transport"] not in TRANSPORTS:
+        raise ValueError(
+            "cfetch_execution transport must be supervised-local or remote-attested"
+        )
+    if execution["scope_id"] != requested_scope_id:
+        raise ValueError(
+            "cfetch_execution scope_id="
+            f"{execution['scope_id']!r}, requested {requested_scope_id!r}"
+        )
     if re.fullmatch(r"[0-9a-f]{64}", execution["artifact_sha256"]) is None:
         raise ValueError(
             "cfetch_execution artifact_sha256 must be 64 lowercase hexadecimal characters"
@@ -339,6 +357,22 @@ def validate_response(
         if re.fullmatch(r"[0-9a-f]{64}", execution[field]) is None:
             raise ValueError(
                 f"cfetch_execution {field} must be 64 lowercase hexadecimal characters"
+            )
+    if expected_compatibility_report_sha256 is not None:
+        try:
+            expected_compatibility_report_sha256 = sha256_value(
+                expected_compatibility_report_sha256
+            )
+        except argparse.ArgumentTypeError as error:
+            raise ValueError(str(error)) from error
+        if (
+            execution.get("compatibility_report_sha256")
+            != expected_compatibility_report_sha256
+        ):
+            raise ValueError(
+                "cfetch_execution compatibility_report_sha256="
+                f"{execution.get('compatibility_report_sha256')!r}, expected "
+                f"{expected_compatibility_report_sha256!r}"
             )
     supported_max_tokens = execution.get("supported_max_tokens")
     if type(supported_max_tokens) is not int or supported_max_tokens < 1:
@@ -524,7 +558,7 @@ def verify_response_signature(
         )
     except InvalidSignature as error:
         raise ValueError(
-            "embedding response failed its proposed package-key signature"
+            "embedding response failed its proposed scope-key signature"
         ) from error
     except ValueError as error:
         raise ValueError("proposed Ed25519 public key is invalid") from error
@@ -558,6 +592,7 @@ def read_bounded_adapter_response(
 
 def request_embeddings(
     endpoint: str,
+    requested_scope_id: str,
     texts: Sequence[str],
     timeout_seconds: float,
     bearer_token: str | None = None,
@@ -565,10 +600,21 @@ def request_embeddings(
     expected_execution: dict[str, object] | None = None,
     attestation_public_key: str | None = None,
     expected_row_metadata: Sequence[dict[str, object]] | None = None,
+    expected_compatibility_report_sha256: str | None = None,
+    used_attestation_nonces: set[bytes] | None = None,
 ) -> np.ndarray:
     validate_loopback_endpoint(endpoint)
+    try:
+        requested_scope_id = scope_id_value(requested_scope_id)
+    except argparse.ArgumentTypeError as error:
+        raise ValueError(str(error)) from error
     body = json.dumps(
-        {"model": MODEL, "dimensions": DIMENSIONS, "input": list(texts)},
+        {
+            "model": MODEL,
+            "dimensions": DIMENSIONS,
+            "input": list(texts),
+            "cfetch_requested_scope_id": requested_scope_id,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -580,6 +626,12 @@ def request_embeddings(
         except argparse.ArgumentTypeError as error:
             raise ValueError(str(error)) from error
         attestation_nonce = secrets.token_bytes(32)
+        if len(attestation_nonce) != 32:
+            raise ValueError("attestation nonce source did not return exactly 32 bytes")
+        if used_attestation_nonces is not None:
+            if attestation_nonce in used_attestation_nonces:
+                raise ValueError("attestation nonce source repeated a prior challenge")
+            used_attestation_nonces.add(attestation_nonce)
         headers[ATTESTATION_NONCE_HEADER] = attestation_nonce.hex()
     if bearer_token is not None:
         headers["Authorization"] = f"Bearer {bearer_token}"
@@ -612,11 +664,16 @@ def request_embeddings(
         response_body, "embeddings endpoint response"
     )
     return validate_response(
-        payload, len(texts), expected_execution, expected_row_metadata
+        payload,
+        len(texts),
+        requested_scope_id,
+        expected_execution,
+        expected_row_metadata,
+        expected_compatibility_report_sha256,
     )
 
 
-RequestFunction = Callable[[str, Sequence[str], float, str | None], object]
+RequestFunction = Callable[[str, str, Sequence[str], float, str | None], object]
 SequenceProbeRequestFunction = Callable[
     [Sequence[str], Sequence[dict[str, object]]], object
 ]
@@ -624,6 +681,7 @@ SequenceProbeRequestFunction = Callable[
 
 def embed_canonical(
     endpoint: str,
+    requested_scope_id: str,
     texts: Sequence[str],
     batch_size: int,
     timeout_seconds: float,
@@ -644,6 +702,7 @@ def embed_canonical(
     for start in range(0, len(texts), batch_size):
         floats = request_function(
             endpoint,
+            requested_scope_id,
             texts[start : start + batch_size],
             timeout_seconds,
             bearer_token,
@@ -656,6 +715,7 @@ def embed_canonical(
 
 def collect_cache_arrays(
     endpoint: str,
+    requested_scope_id: str,
     query_inputs: Sequence[str],
     document_inputs: Sequence[str],
     batch_size: int,
@@ -674,6 +734,7 @@ def collect_cache_arrays(
 
     queries = embed_canonical(
         endpoint,
+        requested_scope_id,
         query_inputs,
         batch_size,
         timeout_seconds,
@@ -682,6 +743,7 @@ def collect_cache_arrays(
     )
     documents = embed_canonical(
         endpoint,
+        requested_scope_id,
         document_inputs,
         batch_size,
         timeout_seconds,
@@ -690,6 +752,7 @@ def collect_cache_arrays(
     )
     queries_repeat = embed_canonical(
         endpoint,
+        requested_scope_id,
         query_inputs,
         batch_size,
         timeout_seconds,
@@ -698,6 +761,7 @@ def collect_cache_arrays(
     )
     documents_repeat = embed_canonical(
         endpoint,
+        requested_scope_id,
         document_inputs,
         batch_size,
         timeout_seconds,
@@ -713,6 +777,7 @@ def collect_cache_arrays(
 
 def verify_wire_batch_contract(
     endpoint: str,
+    requested_scope_id: str,
     texts: Sequence[str],
     timeout_seconds: float,
     bearer_token: str | None,
@@ -741,6 +806,7 @@ def verify_wire_batch_contract(
 
         def counted_request(
             request_endpoint: str,
+            request_scope_id: str,
             request_texts: Sequence[str],
             request_timeout: float,
             request_token: str | None,
@@ -749,6 +815,7 @@ def verify_wire_batch_contract(
             request_count += 1
             response = request_function(
                 request_endpoint,
+                request_scope_id,
                 request_texts,
                 request_timeout,
                 request_token,
@@ -758,6 +825,7 @@ def verify_wire_batch_contract(
 
         outputs = embed_canonical(
             endpoint,
+            requested_scope_id,
             texts,
             batch_size,
             timeout_seconds,
@@ -909,6 +977,7 @@ def build_cache_metadata(args: argparse.Namespace) -> dict[str, object]:
         "dataset": DATASET,
         "dataset_revision": DATASET_REVISION,
         "scope_id": args.scope_id,
+        "transport": args.transport,
         "backend": args.backend,
         "runtime": args.runtime,
         "compiler": args.compiler,
@@ -1034,6 +1103,7 @@ def main() -> None:
     query_inputs, document_inputs = load_scifact_inputs()
     expected_execution = {
         "scope_id": args.scope_id,
+        "transport": args.transport,
         "backend": args.backend,
         "runtime": args.runtime,
         "compiler": args.compiler,
@@ -1051,24 +1121,29 @@ def main() -> None:
         "performance_evidence_sha256": args.performance_evidence_sha256,
         "accelerated_placement": args.accelerated_placement,
     }
+    used_attestation_nonces: set[bytes] = set()
 
     def scoped_request(
         request_endpoint: str,
+        requested_scope_id: str,
         texts: Sequence[str],
         request_timeout: float,
         request_token: str | None,
     ) -> object:
         return request_embeddings(
             request_endpoint,
+            requested_scope_id,
             texts,
             request_timeout,
             request_token,
             expected_execution=expected_execution,
             attestation_public_key=args.attestation_public_key,
+            used_attestation_nonces=used_attestation_nonces,
         )
 
     wire_batch_outputs = verify_wire_batch_contract(
         endpoint,
+        args.scope_id,
         wire_batch_inputs(query_inputs, document_inputs),
         args.timeout_seconds,
         bearer_token,
@@ -1082,12 +1157,14 @@ def main() -> None:
     ) -> object:
         return request_embeddings(
             endpoint,
+            args.scope_id,
             texts,
             args.timeout_seconds,
             bearer_token,
             expected_execution=expected_execution,
             attestation_public_key=args.attestation_public_key,
             expected_row_metadata=expected_row_metadata,
+            used_attestation_nonces=used_attestation_nonces,
         )
 
     sequence_probe_arrays = collect_sequence_probe_arrays(
@@ -1095,6 +1172,7 @@ def main() -> None:
     )
     arrays = collect_cache_arrays(
         endpoint,
+        args.scope_id,
         query_inputs,
         document_inputs,
         args.batch_size,

@@ -10,15 +10,17 @@ jq -e '
   .schema_version == 1 and
   (.variants | length > 0) and
   ([.variants[].id] | length == (unique | length)) and
+  ([.variants[] | select(.backend == "endpoint") | [.os, .arch]] |
+    length == (unique | length)) and
   all(.variants[];
     (.id | test("^[a-z0-9_-]+$")) and
-    (.id | contains("-cfetch-remote-")) and
     (.os == "linux" or .os == "mac" or .os == "win") and
     (.arch == "x86_64" or .arch == "aarch64") and
     (.runner | length > 0) and
     (.binary | length > 0) and
     (.archive == "tar.gz" or .archive == "zip") and
-    .backend == "endpoint" and
+    ((.backend == "endpoint" and (.id | contains("-cfetch-remote-"))) or
+     (.backend == "local" and (.id | contains("-cfetch-local-")))) and
     .cargo_features == "")
 ' "$catalog" >/dev/null
 

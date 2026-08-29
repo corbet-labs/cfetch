@@ -45,9 +45,15 @@ cfetch sends an OpenAI-shaped request to `POST /embeddings`:
 {
   "model": "<profile model id>",
   "dimensions": 768,
-  "input": ["already-prefixed text"]
+  "input": ["already-prefixed text"],
+  "cfetch_requested_scope_id": "<exact package-plan scope>"
 }
 ```
+
+`cfetch_requested_scope_id` is mandatory on the package-local boundary and is
+part of the exact signed request bytes. An explicitly configured remote
+endpoint omits it because that deployment owns its admitted scope selection;
+remote execution is never inserted after local CPU fallback.
 
 For the production profile the request also carries a fresh 32-byte challenge
 as 64 lowercase hexadecimal characters in
@@ -128,12 +134,17 @@ summaries from arbitrary profiler output; it validates their strict schema,
 bindings, raw-output retention, and hashes. Runner identity, profiler meaning,
 and honest capture remain reviewed evidence.
 
-This signature is package identity and fail-closed wiring, not remote
-attestation of the silicon. It prevents a stale or different loopback worker
-from impersonating an admitted package, but it cannot defeat an operator who
-controls and replaces the installed package or prove accelerator placement by
-itself. Placement remains bound to the release's profiler evidence and exact
-artifact/runtime/device scope.
+For a `supervised-local` scope the signing key is distributed in the package,
+so its signature is a request/response consistency check, not an independent
+package or silicon identity. A stale or different loopback worker is excluded
+by the combined boundary: cfetch re-hashes the exact launcher and root package
+manifest, starts that sibling itself, supplies a fresh bearer over stdin, and
+owns the child's lifetime. The signature then binds the fresh nonce and exact
+wire bytes within that boundary. It cannot defeat an operator who controls and
+replaces the installed package or prove accelerator placement by itself.
+Placement remains bound to the release's live provider evidence and exact
+artifact/runtime/device scope. A `remote-attested` service instead uses an
+operator-held, non-distributed key and is a separate transport identity.
 
 cfetch applies the frozen retrieval prompt before sending the request. The
 adapter must not add a second task prefix. It returns rows with explicit,
@@ -148,6 +159,7 @@ unique input indices and the profile attestation:
   "cfetch_model_revision": "<profile source revision>",
   "cfetch_execution": {
     "scope_id": "<exact admitted scope id>",
+    "transport": "supervised-local",
     "backend": "<runtime backend label>",
     "runtime": "<exact runtime and version>",
     "compiler": "<exact compiler/settings identity>",
@@ -256,7 +268,9 @@ For each local attempt the dispatcher adds
 the response only when `cfetch_execution.scope_id` equals that requested
 scope. Thus a valid CPU package response cannot masquerade as completion of an
 NPU attempt. An explicitly configured remote endpoint is not part of this
-fallback chain and receives no local requested-scope selection.
+fallback chain and receives no local requested-scope selection. Its admitted
+scope must instead bind `transport: remote-attested`; transport identity is
+never inferred from a copied scope ID or provenance string.
 
 `release/inference-backends.json` is the machine-readable composition
 boundary: every future local package maps its OS, architecture, and device
@@ -264,25 +278,19 @@ families to ordered admitted scope IDs and exact artifact recipes. That list is
 empty while no scope is admitted; endpoint-only release variants remain
 truthfully remote rather than borrowing candidate accelerator names.
 
-The current Rust release does not yet dispatch that empty plan. The typed plan
-validator, expected-scope request binding, ordered fallback, and cached
-selection must ship atomically with the first nonempty `local_packages` entry;
-an admitted CPU endpoint alone is not a valid local package implementation.
+The Rust core now validates and dispatches that plan, including supervised
+process lifetime, expected-scope request binding, NPU-to-GPU-to-accelerated-CPU
+fallback, one crash restart, and cached successful selection. With the current
+empty `local_packages` array it selects nothing and preserves explicit endpoint
+behavior. An admitted CPU endpoint alone is still not a valid local package.
 
-Two P1 boundaries also precede that first nonempty cohort. A hermetic nonempty
-admission orchestrator must reproducibly produce the complete cache,
-measurement, digest-named report lineage, registry, and package transaction
-without hidden manual state. That transaction must lock the complete Python
-dependency resolution, including transitive artifacts and hashes; the current
-requirements file pins only direct dependencies. Final package conformance
-must then execute the published target package and, in the same release
-transaction, verify the report-bound admission implementation-bundle digest,
-requested scope, response schema, fresh nonce signature,
-artifact/runtime/device bindings, and newest global report digest. It must also
-re-execute every admitted sequence-bucket fixture and every wire grouping from
-1 through 64, byte-matching the canonical INT8 output fingerprints retained in
-that scope's admission cache. Neither boundary is implemented merely by the
-candidate exporter or generic empty-registry CI path.
+The admission tooling uses a complete hash-locked transitive Python
+environment. Final package conformance challenges the immutable target payload
+with fresh nonces and re-executes every sequence bucket and wire grouping from
+1 through 64 against retained canonical INT8 fingerprints. The two-phase
+transaction stages content-addressed evidence and package bytes first; only a
+complete set of conformance receipts may produce activation files. Empty
+registry CI remains a no-op, not evidence.
 
 The registry currently has no admitted backend and no local package. Nothing
 in this candidate protocol certifies a target until those boundaries and a

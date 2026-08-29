@@ -26,6 +26,7 @@ from cross_backend_eval import (
     EXACT_RANKING_TIE_BREAK,
     EVIDENCE_REPLAY_POLICY,
     ExactI8Scores,
+    IMPLEMENTATION_BUNDLE_FILES,
     MAX_TOKENS,
     MODEL,
     MODEL_REVISION,
@@ -44,6 +45,7 @@ from cross_backend_eval import (
     evaluate_admission_gate,
     evaluate_compatibility_gate,
     evaluate_sequence_semantic_gate,
+    implementation_bundle_sha256,
     load_cache,
     load_sequence_probe_cache,
     metrics,
@@ -64,6 +66,7 @@ from cross_backend_eval import (
     validate_single_cohort_report_binding,
     validate_stored_admission_report,
     validate_wire_batch_output_cache,
+    verify_requirements_lock,
     verify_release_registry,
     write_new_report,
 )
@@ -76,6 +79,7 @@ CLASSES = {"npu", "gpu", "cpu"}
 def cache_evidence_identity() -> dict[str, object]:
     return {
         "scope_id": "test-scope",
+        "transport": "supervised-local",
         "backend": "test-backend",
         "runtime": "test-runtime",
         "compiler": "test-compiler",
@@ -85,6 +89,46 @@ def cache_evidence_identity() -> dict[str, object]:
         "internal_precision": "test-native",
         "device": "test-device",
         "device_class": "cpu",
+    }
+
+
+def openvino_provider_binding() -> dict[str, object]:
+    host = {
+        "system": "Linux",
+        "machine": "x86_64",
+        "kernel_release": "test-kernel",
+        "files": [{"path": "/usr/lib/libtest.so", "sha256": "a" * 64}],
+    }
+    return {
+        "schema_version": 1,
+        "provider": "openvino",
+        "dispatcher_sha256": "b" * 64,
+        "probe_package_manifest_sha256": "c" * 64,
+        "runtime_manifest_sha256": "d" * 64,
+        "openvino_compile_config": {},
+        "expected_host": host,
+        "actual_host": copy.deepcopy(host),
+        "host_source": "platform-and-sha256",
+    }
+
+
+def openvino_provider_evidence() -> dict[str, object]:
+    properties = {
+        "FULL_DEVICE_NAME": "Test accelerated CPU",
+        "DEVICE_ARCHITECTURE": "test-architecture",
+    }
+    return {
+        "schema_version": 1,
+        "provider": "openvino",
+        "requested_device": "CPU",
+        "expected_execution_devices": ["CPU"],
+        "actual_execution_devices": ["CPU"],
+        "execution_devices_source": (
+            "compiled_model.get_property(EXECUTION_DEVICES)"
+        ),
+        "expected_device_properties": properties,
+        "actual_device_properties": dict(properties),
+        "device_properties_source": "core.get_property",
     }
 
 
@@ -211,6 +255,7 @@ def placement_evidence_bytes() -> bytes:
         "accelerator_execution_confirmed": True,
         "fallback_disclosure_complete": True,
         "unexpected_fallback_detected": False,
+        "provider_binding": openvino_provider_binding(),
         "bucket_results": [
             {
                 "bucket": bucket,
@@ -219,6 +264,7 @@ def placement_evidence_bytes() -> bytes:
                 "unexpected_fallback_detected": False,
                 "fallback_summary": "none",
                 "profiler_output_sha256": "7" * 64,
+                "provider_evidence": openvino_provider_evidence(),
             }
             for bucket in SEQUENCE_BUCKETS
         ],
@@ -260,6 +306,7 @@ def complete_admission_report() -> tuple[
             "profile_manifest_sha256": PROFILE_MANIFEST_SHA256,
             "admission_policy_sha256": ADMISSION_POLICY_SHA256,
             "scope_id": scope_id,
+            "transport": "supervised-local",
             "backend": f"backend-{scope_id}",
             "runtime": f"runtime-{scope_id}",
             "compiler": f"compiler-{scope_id}",
@@ -454,6 +501,7 @@ class AllPairsGateTests(unittest.TestCase):
             "dataset": DATASET,
             "dataset_revision": DATASET_REVISION,
             "scope_id": "test-scope",
+            "transport": "supervised-local",
             "backend": "test-backend",
             "runtime": "test-runtime",
             "compiler": "test-compiler",
@@ -674,6 +722,12 @@ class AllPairsGateTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, error):
                         load_cache(path)
 
+            invalid_transport = dict(metadata)
+            invalid_transport["transport"] = "loopback"
+            write_cache(invalid_transport, valid)
+            with self.assertRaisesRegex(ValueError, "transport"):
+                load_cache(path)
+
     def test_python_tools_and_release_registry_share_one_profile_identity(self) -> None:
         from export_adapter_cache import (
             ADMISSION_POLICY_SHA256 as EXPORT_ADMISSION_POLICY_SHA256,
@@ -772,26 +826,16 @@ class AllPairsGateTests(unittest.TestCase):
 
     def test_exact_admission_implementation_bundle_matches_registry(self) -> None:
         repository = Path(__file__).resolve().parents[2]
-        relative_paths = sorted(
-            (
-                "experiments/embedding-profile/cross_backend_eval.py",
-                "experiments/embedding-profile/admission_evidence.py",
-                "experiments/embedding-profile/export_adapter_cache.py",
-                "experiments/embedding-profile/scifact_contract.py",
-                "experiments/embedding-profile/requirements-test.txt",
-            )
+        self.assertEqual(
+            IMPLEMENTATION_BUNDLE_FILES,
+            tuple(sorted(IMPLEMENTATION_BUNDLE_FILES)),
         )
-        digest = hashlib.sha256(
-            b"cfetch-admission-implementation-bundle-v1\0"
+        self.assertEqual(len(IMPLEMENTATION_BUNDLE_FILES), 12)
+        self.assertIn(
+            "packages/openvino/package_inventory.py", IMPLEMENTATION_BUNDLE_FILES
         )
-        for relative_path in relative_paths:
-            path_bytes = relative_path.encode("utf-8")
-            data = (repository / relative_path).read_bytes()
-            digest.update(len(path_bytes).to_bytes(4, "big"))
-            digest.update(path_bytes)
-            digest.update(len(data).to_bytes(8, "big"))
-            digest.update(data)
-        computed = digest.hexdigest()
+        self.assertIn("scripts/apply_admission_activation.py", IMPLEMENTATION_BUNDLE_FILES)
+        computed = implementation_bundle_sha256(repository)
         registry = json.loads(
             (repository / "release/inference-backends.json").read_text()
         )
@@ -800,6 +844,11 @@ class AllPairsGateTests(unittest.TestCase):
         self.assertEqual(
             registry["admission"]["implementation_bundle_sha256"], computed
         )
+
+    def test_admission_environment_is_fully_hashed_and_covers_direct_pins(self) -> None:
+        result = verify_requirements_lock()
+        self.assertEqual(result["direct_packages"], 3)
+        self.assertGreater(result["locked_packages"], result["direct_packages"])
 
     def test_registry_replay_is_a_clean_no_op_for_an_empty_registry(self) -> None:
         with patch("cross_backend_eval.admitted_scopes", return_value={}):

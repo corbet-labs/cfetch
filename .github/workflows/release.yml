@@ -85,6 +85,11 @@ jobs:
           fi
           cp LICENSE.md THIRD-PARTY-LICENSES.txt release/variants.json \
             release/inference-backends.json "dist/$package/"
+          python scripts/stage_local_inference.py \
+            --registry release/inference-backends.json \
+            --catalog release/variants.json \
+            --variant '${{ matrix.id }}' \
+            --destination "dist/$package"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             (cd dist && 7z a "$package.zip" "$package" >/dev/null)
           else

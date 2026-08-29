@@ -736,7 +736,13 @@ fn inference_diagnostic(
                 route: cfg
                     .embeddings
                     .enabled
-                    .then(|| route_name(runtime_status::endpoint_route(&cfg.embeddings.endpoint))),
+                    .then(|| {
+                        if cfg.embeddings.endpoint.is_empty() && build_backend == "local" {
+                            "local".into()
+                        } else {
+                            route_name(runtime_status::endpoint_route(&cfg.embeddings.endpoint))
+                        }
+                    }),
                 model: cfg.embeddings.model.clone(),
                 model_revision: profile.model_revision.into(),
                 artifact_policy: admission_policy.artifact_policy.into(),

@@ -157,7 +157,51 @@ enum EmbedBackend {
         /// construction (a missing variable fails fast, not mid-batch).
         auth: Option<String>,
     },
+    Local {
+        agent: ureq::Agent,
+        state: Box<std::sync::Mutex<LocalBackendState>>,
+    },
 }
+
+struct LocalBackendState {
+    supervisor: crate::local_adapter::AdapterSupervisor,
+    ordered_scope_ids: Vec<String>,
+    selected_scope: Option<usize>,
+}
+
+#[derive(Debug)]
+struct AdapterTransportError(String);
+
+impl std::fmt::Display for AdapterTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AdapterTransportError {}
+
+fn response_body_error(
+    error: ureq::Error,
+    url: &str,
+    requested_scope_id: Option<&str>,
+) -> anyhow::Error {
+    if requested_scope_id.is_some() {
+        AdapterTransportError(format!("read response from {url}: {error}")).into()
+    } else {
+        anyhow::Error::new(error).context(format!("read response from {url}"))
+    }
+}
+
+#[derive(Debug)]
+struct ScopeUnavailableError(String);
+
+impl std::fmt::Display for ScopeUnavailableError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScopeUnavailableError {}
 
 pub struct EmbedClient {
     backend: EmbedBackend,
@@ -178,6 +222,7 @@ pub struct EmbedClient {
 #[derive(Debug, serde::Deserialize)]
 struct WireExecutionScope {
     scope_id: String,
+    transport: crate::embedding_profile::ExecutionTransport,
     backend: String,
     runtime: String,
     compiler: String,
@@ -302,6 +347,20 @@ struct WireEmbeddingResponse<const MAX_COMPONENTS: usize> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireLocalErrorEnvelope {
+    error: WireLocalError,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireLocalError {
+    code: String,
+    scope_id: String,
+    message: String,
+}
+
+#[derive(serde::Deserialize)]
 struct WireEmbeddingRow<const MAX_COMPONENTS: usize> {
     index: Option<usize>,
     embedding: BoundedVec<f32, MAX_COMPONENTS>,
@@ -385,6 +444,11 @@ struct WireEmbeddingRequest<'model, 'slice, 'text> {
     input: &'slice [&'text str],
     #[serde(skip_serializing_if = "Option::is_none")]
     dimensions: Option<usize>,
+    /// Present only for a packaged local plan. An explicit remote endpoint
+    /// chooses its own admitted execution scope, while local fallback must
+    /// prove that an NPU attempt did not silently answer on a GPU or CPU.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cfetch_requested_scope_id: Option<&'model str>,
 }
 
 struct BoundedJsonBody {
@@ -418,6 +482,7 @@ fn serialize_embedding_request(
     model: &str,
     texts: &[&str],
     dimensions: usize,
+    requested_scope_id: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
         !texts.is_empty() && texts.len() <= crate::embedding_profile::MAX_WIRE_BATCH_SIZE,
@@ -428,6 +493,7 @@ fn serialize_embedding_request(
         model,
         input: texts,
         dimensions: (dimensions > 0).then_some(dimensions),
+        cfetch_requested_scope_id: requested_scope_id,
     };
     let mut writer = BoundedJsonBody {
         bytes: Vec::with_capacity(16 * 1024),
@@ -444,12 +510,34 @@ fn serialize_embedding_request(
     Ok(writer.bytes)
 }
 
-fn validate_execution_scope(scope: Option<WireExecutionScope>) -> anyhow::Result<ExecutionScope> {
+fn validate_execution_scope(
+    scope: Option<WireExecutionScope>,
+    requested_scope_id: Option<&str>,
+) -> anyhow::Result<ExecutionScope> {
     let scope =
         scope.context("embedding producer omitted its exact cfetch_execution scope attestation")?;
     anyhow::ensure!(
         valid_scope_id(&scope.scope_id),
         "embedding producer scope_id must be at most 128 lowercase slug characters"
+    );
+    if let Some(requested_scope_id) = requested_scope_id {
+        anyhow::ensure!(
+            scope.scope_id == requested_scope_id,
+            "embedding producer answered with scope {:?}, but the local package plan requested {:?}",
+            scope.scope_id,
+            requested_scope_id
+        );
+    }
+    let expected_transport = if requested_scope_id.is_some() {
+        crate::embedding_profile::ExecutionTransport::SupervisedLocal
+    } else {
+        crate::embedding_profile::ExecutionTransport::RemoteAttested
+    };
+    anyhow::ensure!(
+        scope.transport == expected_transport,
+        "embedding producer transport {:?} does not match the required {:?} route",
+        scope.transport.as_str(),
+        expected_transport.as_str()
     );
     anyhow::ensure!(
         matches!(scope.device_class.as_str(), "npu" | "gpu" | "cpu"),
@@ -518,6 +606,7 @@ fn validate_execution_scope(scope: Option<WireExecutionScope>) -> anyhow::Result
     );
     let attestation = crate::embedding_profile::BackendScopeAttestation {
         scope_id: &scope.scope_id,
+        transport: scope.transport,
         backend: &scope.backend,
         runtime: &scope.runtime,
         compiler: &scope.compiler,
@@ -633,7 +722,7 @@ fn verify_execution_signature(
             &attestation_message(nonce, request_body, response_body),
             &signature,
         )
-        .context("embedding response failed its admitted package-key signature")
+        .context("embedding response failed its admitted scope-key signature")
 }
 
 fn validate_profile_row_metadata(
@@ -672,8 +761,10 @@ impl std::fmt::Debug for EmbedClient {
     // Manual impl: ureq::Agent's Debug is not part of our contract, and the
     // interesting identity is (url, model) anyway.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let EmbedBackend::Endpoint { url, .. } = &self.backend;
-        let backend = url.as_str();
+        let backend = match &self.backend {
+            EmbedBackend::Endpoint { url, .. } => url.as_str(),
+            EmbedBackend::Local { .. } => "package-local",
+        };
         f.debug_struct("EmbedClient")
             .field("backend", &backend)
             .field("model", &self.model)
@@ -698,22 +789,56 @@ impl EmbedClient {
             crate::embedding_profile::production_availability()?;
         }
         let base_timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
-        anyhow::ensure!(
-            !cfg.endpoint.is_empty(),
-            "embeddings endpoint is required by the current release; configure a packaged local adapter on loopback or an explicit remote endpoint"
-        );
-        check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
-        let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .max_redirects(0) // with max_redirects_will_error (default true): any 3xx is an Err
             .timeout_global(Some(base_timeout))
             .http_status_as_error(false) // status checked explicitly below
             .build()
             .new_agent();
-        let backend = EmbedBackend::Endpoint {
-            agent,
-            url: format!("{}/embeddings", cfg.endpoint.trim_end_matches('/')),
-            auth,
+        let backend = if cfg.endpoint.is_empty() {
+            anyhow::ensure!(
+                cfg.model == crate::embedding_profile::MODEL,
+                "an unmanaged embedding model requires an explicit endpoint"
+            );
+            anyhow::ensure!(
+                cfg.api_key_env.is_empty() && cfg.allow_hosts.is_empty(),
+                "embeddings endpoint credentials/host exemptions cannot configure a package-local adapter"
+            );
+            let plan = crate::local_inference::selected_local_package_plan()?.context(
+                "this exact cfetch build contains no admitted local inference package; install a compatible local variant or configure an explicit endpoint",
+            )?;
+            let executable = std::env::current_exe().context("resolve the running cfetch binary")?;
+            let package_directory = executable
+                .parent()
+                .context("the running cfetch binary has no package directory")?;
+            let sibling = package_directory.join(&plan.dispatcher.binary);
+            let supervisor = crate::local_adapter::AdapterSupervisor::new(
+                crate::local_adapter::AdapterLaunch {
+                    binary: sibling,
+                    sha256: plan.dispatcher.sha256,
+                    package_manifest: package_directory.join("package-manifest.json"),
+                    package_manifest_sha256: plan.package_manifest_sha256,
+                    ordered_scope_ids: plan.ordered_scope_ids.clone(),
+                },
+            )?;
+            EmbedBackend::Local {
+                agent,
+                state: Box::new(std::sync::Mutex::new(LocalBackendState {
+                    supervisor,
+                    ordered_scope_ids: plan.ordered_scope_ids,
+                    selected_scope: None,
+                })),
+            }
+        } else {
+            // A configured endpoint is an explicit route and never a hidden
+            // fourth step after package-local NPU/GPU/CPU fallback.
+            check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
+            let auth = resolve_auth(&cfg.api_key_env, "embeddings")?;
+            EmbedBackend::Endpoint {
+                agent,
+                url: format!("{}/embeddings", cfg.endpoint.trim_end_matches('/')),
+                auth,
+            }
         };
         Ok(EmbedClient {
             backend,
@@ -813,9 +938,25 @@ impl EmbedClient {
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let EmbedBackend::Endpoint { url, .. } = &self.backend;
-        let route = crate::runtime_status::endpoint_route(url);
-        let result = self.embed_request(texts, timeout);
+        let (mode, route, result) = match &self.backend {
+            EmbedBackend::Endpoint { agent, url, auth } => (
+                crate::runtime_status::InferenceMode::Endpoint,
+                crate::runtime_status::endpoint_route(url),
+                self.embed_request(
+                    agent,
+                    url,
+                    auth.as_deref(),
+                    texts,
+                    timeout,
+                    None,
+                ),
+            ),
+            EmbedBackend::Local { agent, state } => (
+                crate::runtime_status::InferenceMode::Local,
+                crate::runtime_status::InferenceRoute::Local,
+                self.embed_local(agent, state, texts, timeout),
+            ),
+        };
         match &result {
             Ok(batch) => {
                 let (backend, device_class) = match &batch.execution {
@@ -826,11 +967,7 @@ impl EmbedClient {
                     None => ("endpoint", None),
                 };
                 crate::runtime_status::record_inference_attempt(
-                    // The packaged adapter is local execution, but its process
-                    // boundary is still the endpoint transport. `route` and
-                    // the attested device class expose locality and actual
-                    // NPU/GPU/CPU selection without fighting config refresh.
-                    crate::runtime_status::InferenceMode::Endpoint,
+                    mode,
                     route,
                     backend,
                     device_class,
@@ -838,7 +975,7 @@ impl EmbedClient {
                 );
             }
             Err(_) => crate::runtime_status::record_inference_attempt(
-                crate::runtime_status::InferenceMode::Endpoint,
+                mode,
                 route,
                 if self.model == crate::embedding_profile::MODEL {
                     "profile-producer"
@@ -852,18 +989,93 @@ impl EmbedClient {
         result.map(|batch| batch.vectors)
     }
 
-    fn embed_request(
+    fn embed_local(
         &self,
+        agent: &ureq::Agent,
+        state: &std::sync::Mutex<LocalBackendState>,
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<EmbeddedBatch> {
-        let EmbedBackend::Endpoint { agent, url, auth } = &self.backend;
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("package-local adapter supervisor lock was poisoned"))?;
+        let selected = state.selected_scope;
+        let mut attempts = Vec::new();
+        if let Some(index) = selected {
+            attempts.push(index);
+        }
+        attempts.extend(
+            (0..state.ordered_scope_ids.len()).filter(|index| Some(*index) != selected),
+        );
+
+        let mut unavailable = Vec::new();
+        for index in attempts {
+            let scope_id = state.ordered_scope_ids[index].clone();
+            let endpoint = state.supervisor.endpoint()?;
+            let url = format!("{}/embeddings", endpoint.base_url.trim_end_matches('/'));
+            let mut result = self.embed_request(
+                agent,
+                &url,
+                Some(&endpoint.authorization),
+                texts,
+                timeout,
+                Some(&scope_id),
+            );
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.downcast_ref::<AdapterTransportError>().is_some())
+            {
+                let restarted = state.supervisor.restart_after_transport_failure()?;
+                let retry_url = format!("{}/embeddings", restarted.base_url.trim_end_matches('/'));
+                result = self.embed_request(
+                    agent,
+                    &retry_url,
+                    Some(&restarted.authorization),
+                    texts,
+                    timeout,
+                    Some(&scope_id),
+                );
+            }
+            match result {
+                Ok(batch) => {
+                    state.selected_scope = Some(index);
+                    return Ok(batch);
+                }
+                Err(error) if error.downcast_ref::<ScopeUnavailableError>().is_some() => {
+                    state.selected_scope = None;
+                    unavailable.push(scope_id);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        anyhow::bail!(
+            "every admitted package-local execution scope was unavailable in NPU, GPU, accelerated CPU order: {}",
+            unavailable.join(", ")
+        )
+    }
+
+    fn embed_request(
+        &self,
+        agent: &ureq::Agent,
+        url: &str,
+        auth: Option<&str>,
+        texts: &[&str],
+        timeout: std::time::Duration,
+        requested_scope_id: Option<&str>,
+    ) -> anyhow::Result<EmbeddedBatch> {
         // Serialize directly into a bounded writer: even a config or caller
         // bug cannot materialize and send an arbitrarily large HTTP body.
-        let body = serialize_embedding_request(&self.model, texts, self.dimensions)?;
-        // A fresh challenge binds an admitted package key to these exact
-        // request and response bytes. Registry prose can be copied; the
-        // package-private key cannot be replayed under a new nonce.
+        let body = serialize_embedding_request(
+            &self.model,
+            texts,
+            self.dimensions,
+            requested_scope_id,
+        )?;
+        // A fresh challenge binds these exact request and response bytes to
+        // the admitted scope key. On supervised-local it checks response
+        // consistency inside the separately hashed and supervised package
+        // boundary; on remote-attested it authenticates the admitted producer.
         let attestation_nonce = iroh::SecretKey::generate().to_bytes();
         let mut req = agent
             .post(url)
@@ -875,9 +1087,9 @@ impl EmbedClient {
         if let Some(auth) = auth {
             req = req.header("authorization", auth);
         }
-        let mut resp = req
-            .send(body.as_slice())
-            .with_context(|| format!("POST {url}"))?;
+        let mut resp = req.send(body.as_slice()).map_err(|error| {
+            AdapterTransportError(format!("POST {url}: {error}"))
+        })?;
         let status = resp.status();
         let response_signature = resp
             .headers()
@@ -889,11 +1101,26 @@ impl EmbedClient {
             .with_config()
             .limit(MAX_EMBEDDING_RESPONSE_BYTES as u64)
             .read_to_string()
-            .with_context(|| format!("read response from {url}"))?;
+            .map_err(|error| response_body_error(error, url, requested_scope_id))?;
         anyhow::ensure!(
             text.len() <= MAX_EMBEDDING_RESPONSE_BYTES,
             "embeddings endpoint response exceeds {MAX_EMBEDDING_RESPONSE_BYTES} bytes"
         );
+        if !status.is_success()
+            && requested_scope_id.is_some()
+            && status.as_u16() == 503
+            && let Ok(unavailable) = serde_json::from_str::<WireLocalErrorEnvelope>(&text)
+            && unavailable.error.code == "scope_unavailable"
+            && Some(unavailable.error.scope_id.as_str()) == requested_scope_id
+            && unavailable.error.message
+                == "requested admitted scope could not initialize or execute"
+        {
+            return Err(ScopeUnavailableError(format!(
+                "package-local scope {} is unavailable",
+                unavailable.error.scope_id
+            ))
+            .into());
+        }
         anyhow::ensure!(
             status.is_success(),
             "embeddings endpoint returned {status}: {}",
@@ -914,7 +1141,8 @@ impl EmbedClient {
                     == crate::embedding_profile::admission_policy_sha256(),
                 "embeddings endpoint admission-policy digest does not match this cfetch release"
             );
-            let execution = validate_execution_scope(parsed.cfetch_execution)?;
+            let execution =
+                validate_execution_scope(parsed.cfetch_execution, requested_scope_id)?;
             let signature = response_signature
                 .context("admitted embedding producer omitted its response-signature header")?;
             verify_execution_signature(
@@ -1424,16 +1652,63 @@ mod tests {
     #[test]
     fn serialized_requests_are_bounded_before_send() {
         let oversized = "x".repeat(MAX_EMBEDDING_REQUEST_BYTES);
-        let error = serialize_embedding_request("test-model", &[oversized.as_str()], 2)
+        let error = serialize_embedding_request("test-model", &[oversized.as_str()], 2, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("hard limit"), "{error}");
 
         let too_many = vec!["x"; crate::embedding_profile::MAX_WIRE_BATCH_SIZE + 1];
-        let error = serialize_embedding_request("test-model", &too_many, 2)
+        let error = serialize_embedding_request("test-model", &too_many, 2, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("1..=64"), "{error}");
+    }
+
+    #[test]
+    fn only_supervised_response_body_failures_trigger_adapter_restart() {
+        let local = response_body_error(
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated",
+            )),
+            "http://127.0.0.1:1/v1/embeddings",
+            Some("local-scope"),
+        );
+        assert!(local.downcast_ref::<AdapterTransportError>().is_some());
+
+        let configured_endpoint = response_body_error(
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated",
+            )),
+            "https://example.invalid/embeddings",
+            None,
+        );
+        assert!(
+            configured_endpoint
+                .downcast_ref::<AdapterTransportError>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_request_binds_the_exact_scope_inside_the_signed_body() {
+        let body = serialize_embedding_request(
+            crate::embedding_profile::MODEL,
+            &["already prefixed"],
+            crate::embedding_profile::DIMENSIONS,
+            Some("intel-lunar-lake-npu-openvino-v1"),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["cfetch_requested_scope_id"],
+            "intel-lunar-lake-npu-openvino-v1"
+        );
+
+        let remote = serialize_embedding_request("test-model", &["text"], 2, None).unwrap();
+        let remote: serde_json::Value = serde_json::from_slice(&remote).unwrap();
+        assert!(remote.get("cfetch_requested_scope_id").is_none());
     }
 
     #[test]
@@ -1524,6 +1799,96 @@ mod tests {
                 crate::embedding_profile::MODEL_REVISION,
             ),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_local_selection_falls_back_npu_gpu_cpu_then_caches_success() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requested.clone();
+        let (server_url, _, _) = spawn_server(move |_, body| {
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            let scope = request["cfetch_requested_scope_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            observed.lock().unwrap().push(scope.clone());
+            if scope != "cpu-scope" {
+                return http_response(
+                    503,
+                    &format!(
+                        r#"{{"error":{{"code":"scope_unavailable","scope_id":{scope:?},"message":"requested admitted scope could not initialize or execute"}}}}"#
+                    ),
+                );
+            }
+            canned_embeddings(body, 1.0)
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let adapter = directory.path().join("fake-local-adapter");
+        let package_manifest = directory.path().join("package-manifest.json");
+        let ready_url = format!("{server_url}/v1");
+        std::fs::write(
+            &adapter,
+            format!(
+                "#!/bin/sh\nIFS= read -r secret\nprintf '%s\\n' '{{\"schema_version\":1,\"url\":\"{ready_url}\",\"scope_ids\":[\"npu-scope\",\"gpu-scope\",\"cpu-scope\"]}}'\ncat >/dev/null\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&package_manifest, "{\"schema_version\":1}\n").unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(std::fs::read(&adapter).unwrap()));
+        let package_manifest_sha256 = format!(
+            "{:x}",
+            sha2::Sha256::digest(std::fs::read(&package_manifest).unwrap())
+        );
+        let supervisor = crate::local_adapter::AdapterSupervisor::new(
+            crate::local_adapter::AdapterLaunch {
+                binary: adapter,
+                sha256: digest,
+                package_manifest,
+                package_manifest_sha256,
+                ordered_scope_ids: vec![
+                    "npu-scope".into(),
+                    "gpu-scope".into(),
+                    "cpu-scope".into(),
+                ],
+            },
+        )
+        .unwrap();
+        let agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        let client = EmbedClient {
+            backend: EmbedBackend::Local {
+                agent,
+                state: Box::new(std::sync::Mutex::new(LocalBackendState {
+                    supervisor,
+                    ordered_scope_ids: vec![
+                        "npu-scope".into(),
+                        "gpu-scope".into(),
+                        "cpu-scope".into(),
+                    ],
+                    selected_scope: None,
+                })),
+            },
+            model: "test-model".into(),
+            base_timeout: std::time::Duration::from_secs(2),
+            dimensions: 2,
+            query_prefix: String::new(),
+            doc_prefix: String::new(),
+        };
+        client.embed_documents_batch(&["first"]).unwrap();
+        client.embed_documents_batch(&["second"]).unwrap();
+        assert_eq!(
+            *requested.lock().unwrap(),
+            ["npu-scope", "gpu-scope", "cpu-scope", "cpu-scope"]
+        );
     }
 
     /// Response whose vectors are `width` long regardless of the requested
@@ -1823,6 +2188,7 @@ mod tests {
     fn profile_strings_cannot_self_admit_an_execution_scope() {
         let error = validate_execution_scope(Some(WireExecutionScope {
             scope_id: "unreviewed-scope".into(),
+            transport: crate::embedding_profile::ExecutionTransport::RemoteAttested,
             backend: "candidate-runtime".into(),
             runtime: "runtime-version".into(),
             compiler: "compiler-version".into(),
@@ -1842,13 +2208,44 @@ mod tests {
             performance_evidence_sha256: "4".repeat(64),
             compatibility_report_sha256: "5".repeat(64),
             accelerated_placement: true,
-        }))
+        }), None)
         .unwrap_err()
         .to_string();
         assert!(error.contains("not an admitted backend"), "{error}");
 
+        let error = validate_execution_scope(
+            Some(WireExecutionScope {
+                scope_id: "intel-lunar-lake-cpu-openvino-v1".into(),
+                transport: crate::embedding_profile::ExecutionTransport::SupervisedLocal,
+                backend: "openvino".into(),
+                runtime: "openvino-2026.3.1".into(),
+                compiler: "openvino-ir".into(),
+                package_target: "x86_64-unknown-linux-gnu".into(),
+                artifact_source: "pinned-source@revision".into(),
+                device_class: "cpu".into(),
+                device: "intel-lunar-lake".into(),
+                artifact_sha256: "1".repeat(64),
+                internal_precision: "target-native".into(),
+                placement_evidence_sha256: "2".repeat(64),
+                supported_max_tokens: crate::embedding_profile::MAX_TOKENS,
+                supported_sequence_buckets: BoundedVec(
+                    crate::embedding_profile::SEQUENCE_BUCKETS.to_vec(),
+                ),
+                supported_max_batch_size: crate::embedding_profile::MAX_WIRE_BATCH_SIZE,
+                sequence_capability_evidence_sha256: "3".repeat(64),
+                performance_evidence_sha256: "4".repeat(64),
+                compatibility_report_sha256: "5".repeat(64),
+                accelerated_placement: true,
+            }),
+            Some("intel-lunar-lake-npu-openvino-v1"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("local package plan requested"), "{error}");
+
         let error = validate_execution_scope(Some(WireExecutionScope {
             scope_id: "unaccelerated".into(),
+            transport: crate::embedding_profile::ExecutionTransport::RemoteAttested,
             backend: "candidate-runtime".into(),
             runtime: "runtime-version".into(),
             compiler: "compiler-version".into(),
@@ -1868,7 +2265,7 @@ mod tests {
             performance_evidence_sha256: "5".repeat(64),
             compatibility_report_sha256: "6".repeat(64),
             accelerated_placement: false,
-        }))
+        }), None)
         .unwrap_err()
         .to_string();
         assert!(error.contains("accelerated placement"), "{error}");

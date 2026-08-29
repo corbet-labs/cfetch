@@ -25,9 +25,13 @@ SEQUENCE_SEMANTIC_FIXTURE_ID = "cfetch-sequence-semantic-v1-cat-vs-music"
 SEQUENCE_SEMANTIC_FIXTURE_SHA256 = (
     "fccd9309f8e97f4f4750ea0d733670ded08e7cc6824da4f6aa66616cd402c417"
 )
+SUPERVISED_LOCAL_TRANSPORT = "supervised-local"
+REMOTE_ATTESTED_TRANSPORT = "remote-attested"
+TRANSPORTS = (SUPERVISED_LOCAL_TRANSPORT, REMOTE_ATTESTED_TRANSPORT)
 
 EVIDENCE_IDENTITY_FIELDS = (
     "scope_id",
+    "transport",
     "backend",
     "artifact_source",
     "artifact_sha256",
@@ -252,6 +256,23 @@ def _source_value(source: object, name: str) -> object:
     return getattr(source, name, None)
 
 
+def _exact_json_equal(actual: object, expected: object) -> bool:
+    """Compare JSON values without treating booleans as integers."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, dict):
+        return set(actual) == set(expected) and all(
+            _exact_json_equal(actual[key], expected[key]) for key in actual
+        )
+    if isinstance(actual, list):
+        return len(actual) == len(expected) and all(
+            _exact_json_equal(left, right)
+            for left, right in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
 def _supported_buckets(source: object) -> list[int]:
     value = _source_value(source, "supported_sequence_buckets")
     if value is None:
@@ -271,6 +292,10 @@ def validate_evidence_reports(
     evidence_scope = {field: _source_value(scope, field) for field in EVIDENCE_IDENTITY_FIELDS}
     if any(value is None for value in evidence_scope.values()):
         raise ValueError("admission evidence scope identity is incomplete")
+    if evidence_scope["transport"] not in TRANSPORTS:
+        raise ValueError(
+            "admission evidence transport must be supervised-local or remote-attested"
+        )
     for kind, report in (
         ("sequence", sequence_report),
         ("placement", placement_report),
@@ -297,6 +322,7 @@ def validate_evidence_reports(
         "accelerator_execution_confirmed",
         "fallback_disclosure_complete",
         "unexpected_fallback_detected",
+        "provider_binding",
         "bucket_results",
     }
     performance_fields = {*EVIDENCE_IDENTITY_FIELDS, "bucket_results"}
@@ -434,6 +460,96 @@ def validate_evidence_reports(
                 f"placement evidence {field}={placement_report.get(field)!r}, "
                 f"expected {expected!r}"
             )
+
+    provider_binding = placement_report.get("provider_binding")
+    if not isinstance(provider_binding, dict):
+        raise ValueError("placement evidence provider_binding must be an object")
+    if provider_binding.get("provider") != "openvino":
+        raise ValueError("placement evidence currently supports provider=openvino")
+    provider_binding_fields = {
+        "schema_version",
+        "provider",
+        "dispatcher_sha256",
+        "probe_package_manifest_sha256",
+        "runtime_manifest_sha256",
+        "openvino_compile_config",
+        "expected_host",
+        "actual_host",
+        "host_source",
+    }
+    if set(provider_binding) != provider_binding_fields:
+        raise ValueError(
+            "OpenVINO placement provider_binding must contain exactly "
+            f"{sorted(provider_binding_fields)}"
+        )
+    if provider_binding["schema_version"] != 1:
+        raise ValueError("OpenVINO placement provider_binding schema_version must be 1")
+    for field in (
+        "dispatcher_sha256",
+        "probe_package_manifest_sha256",
+        "runtime_manifest_sha256",
+    ):
+        value = provider_binding.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"OpenVINO placement provider_binding {field} must be a digest")
+    compile_config = provider_binding.get("openvino_compile_config")
+    if not isinstance(compile_config, dict) or any(
+        not isinstance(key, str)
+        or not key
+        or type(value) not in {str, int, float, bool}
+        or (type(value) is float and not math.isfinite(value))
+        for key, value in compile_config.items()
+    ):
+        raise ValueError(
+            "OpenVINO placement provider_binding openvino_compile_config must "
+            "contain finite JSON primitives"
+        )
+    if provider_binding.get("host_source") != "platform-and-sha256":
+        raise ValueError(
+            "OpenVINO placement provider_binding host_source must be "
+            "platform-and-sha256"
+        )
+
+    def validate_host(value: object, label: str) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != {
+            "system",
+            "machine",
+            "kernel_release",
+            "files",
+        }:
+            raise ValueError(f"{label} must contain exact host binding fields")
+        for field in ("system", "machine", "kernel_release"):
+            if not isinstance(value[field], str) or not value[field]:
+                raise ValueError(f"{label} {field} must be a nonempty string")
+        files = value["files"]
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"{label} files must be a nonempty array")
+        paths: set[str] = set()
+        for index, row in enumerate(files):
+            if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
+                raise ValueError(f"{label} files[{index}] has an unexpected schema")
+            path = row["path"]
+            digest = row["sha256"]
+            if not isinstance(path, str) or not path or path in paths:
+                raise ValueError(f"{label} files[{index}] path is invalid or duplicated")
+            paths.add(path)
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError(f"{label} files[{index}] sha256 must be a digest")
+        return value
+
+    expected_host = validate_host(
+        provider_binding.get("expected_host"),
+        "OpenVINO placement provider_binding expected_host",
+    )
+    actual_host = validate_host(
+        provider_binding.get("actual_host"),
+        "OpenVINO placement provider_binding actual_host",
+    )
+    if not _exact_json_equal(actual_host, expected_host):
+        raise ValueError(
+            "OpenVINO placement actual host binding differs from the expected binding"
+        )
+
     for row in bucket_records(placement_report, supported_buckets, "placement"):
         bucket = row["bucket"]
         placement_bucket_fields = {
@@ -443,6 +559,7 @@ def validate_evidence_reports(
             "unexpected_fallback_detected",
             "fallback_summary",
             "profiler_output_sha256",
+            "provider_evidence",
         }
         if set(row) != placement_bucket_fields:
             raise ValueError(
@@ -472,6 +589,80 @@ def validate_evidence_reports(
         ) is None:
             raise ValueError(
                 f"placement evidence bucket {bucket} needs profiler_output_sha256"
+            )
+        provider_evidence = row.get("provider_evidence")
+        provider_evidence_fields = {
+            "schema_version",
+            "provider",
+            "requested_device",
+            "expected_execution_devices",
+            "actual_execution_devices",
+            "execution_devices_source",
+            "expected_device_properties",
+            "actual_device_properties",
+            "device_properties_source",
+        }
+        if (
+            not isinstance(provider_evidence, dict)
+            or set(provider_evidence) != provider_evidence_fields
+        ):
+            raise ValueError(
+                f"placement evidence bucket {bucket} provider_evidence must contain "
+                f"exactly {sorted(provider_evidence_fields)}"
+            )
+        if (
+            provider_evidence["schema_version"] != 1
+            or provider_evidence["provider"] != "openvino"
+        ):
+            raise ValueError(
+                f"placement evidence bucket {bucket} provider_evidence is not OpenVINO v1"
+            )
+        expected_device = {"npu": "NPU", "gpu": "GPU", "cpu": "CPU"}.get(
+            evidence_scope["device_class"]
+        )
+        if provider_evidence["requested_device"] != expected_device:
+            raise ValueError(
+                f"placement evidence bucket {bucket} requested_device does not "
+                "match device_class"
+            )
+        expected_devices = provider_evidence["expected_execution_devices"]
+        actual_devices = provider_evidence["actual_execution_devices"]
+        if (
+            not isinstance(expected_devices, list)
+            or len(expected_devices) != 1
+            or any(not isinstance(value, str) or not value for value in expected_devices)
+            or not _exact_json_equal(actual_devices, expected_devices)
+        ):
+            raise ValueError(
+                f"placement evidence bucket {bucket} actual execution devices differ "
+                "from the one expected device"
+            )
+        if provider_evidence["execution_devices_source"] != (
+            "compiled_model.get_property(EXECUTION_DEVICES)"
+        ):
+            raise ValueError(
+                f"placement evidence bucket {bucket} lacks live EXECUTION_DEVICES provenance"
+            )
+        expected_properties = provider_evidence["expected_device_properties"]
+        actual_properties = provider_evidence["actual_device_properties"]
+        if (
+            not isinstance(expected_properties, dict)
+            or not expected_properties
+            or any(
+                not isinstance(key, str)
+                or not key
+                or type(value) not in {str, int}
+                for key, value in expected_properties.items()
+            )
+            or not _exact_json_equal(actual_properties, expected_properties)
+        ):
+            raise ValueError(
+                f"placement evidence bucket {bucket} actual device properties differ "
+                "from expected properties"
+            )
+        if provider_evidence["device_properties_source"] != "core.get_property":
+            raise ValueError(
+                f"placement evidence bucket {bucket} lacks live device-property provenance"
             )
 
     for row in bucket_records(performance_report, supported_buckets, "performance"):

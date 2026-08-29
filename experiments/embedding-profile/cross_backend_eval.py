@@ -26,6 +26,7 @@ from admission_evidence import (
     SEQUENCE_SEMANTIC_FIXTURE_ID,
     SEQUENCE_SEMANTIC_FIXTURE_SHA256,
     SUPPORTED_MAX_BATCH_SIZE,
+    TRANSPORTS,
     ordered_input_json_sha256,
     parse_evidence_json,
     sequence_semantic_fixture_sha256,
@@ -92,9 +93,16 @@ IMPLEMENTATION_BUNDLE_FILES = tuple(
         (
             "experiments/embedding-profile/cross_backend_eval.py",
             "experiments/embedding-profile/admission_evidence.py",
+            "experiments/embedding-profile/admission_transaction.py",
             "experiments/embedding-profile/export_adapter_cache.py",
+            "experiments/embedding-profile/final_package_conformance.py",
+            "experiments/embedding-profile/measurement_bundle.py",
+            "experiments/embedding-profile/physical_evidence.py",
             "experiments/embedding-profile/scifact_contract.py",
+            "experiments/embedding-profile/requirements-lock.txt",
             "experiments/embedding-profile/requirements-test.txt",
+            "packages/openvino/package_inventory.py",
+            "scripts/apply_admission_activation.py",
         )
     )
 )
@@ -203,7 +211,49 @@ def implementation_bundle_sha256(repository: Path | None = None) -> str:
     return digest.hexdigest()
 
 
+def verify_requirements_lock(repository: Path | None = None) -> dict[str, object]:
+    """Require an exact, hash-complete transitive environment for admission."""
+    root = repository or Path(__file__).resolve().parents[2]
+    direct_path = root / "experiments/embedding-profile/requirements-test.txt"
+    lock_path = root / "experiments/embedding-profile/requirements-lock.txt"
+    direct: dict[str, str] = {}
+    for line in direct_path.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^\s\\]+)", value)
+        if match is None:
+            raise ValueError(
+                f"{direct_path}: direct admission requirements must be exact pins"
+            )
+        direct[match.group(1).lower().replace("_", "-")] = match.group(2)
+
+    raw_lock = lock_path.read_text(encoding="utf-8")
+    starts = list(
+        re.finditer(r"(?m)^([A-Za-z0-9_.-]+)==([^\s\\]+)(?:\s*\\)?$", raw_lock)
+    )
+    if not starts:
+        raise ValueError(f"{lock_path}: transitive requirements lock is empty")
+    locked: dict[str, str] = {}
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(raw_lock)
+        entry = raw_lock[match.start() : end]
+        name = match.group(1).lower().replace("_", "-")
+        if name in locked:
+            raise ValueError(f"{lock_path}: duplicate locked package {name}")
+        if re.search(r"--hash=sha256:[0-9a-f]{64}(?:\s|\\|$)", entry) is None:
+            raise ValueError(f"{lock_path}: locked package {name} has no SHA-256")
+        locked[name] = match.group(2)
+    for name, version in direct.items():
+        if locked.get(name) != version:
+            raise ValueError(
+                f"{lock_path}: direct pin {name}=={version} is absent or changed"
+            )
+    return {"direct_packages": len(direct), "locked_packages": len(locked)}
+
+
 def verify_implementation_bundle() -> dict[str, object]:
+    lock = verify_requirements_lock()
     actual = implementation_bundle_sha256()
     if actual != ADMISSION_IMPLEMENTATION_BUNDLE_SHA256:
         raise ValueError(
@@ -222,7 +272,11 @@ def verify_implementation_bundle() -> dict[str, object]:
         raise ValueError(
             "release registry admission implementation bundle digest is stale"
         )
-    return {"implementation_bundle_sha256": actual, "status": "passed"}
+    return {
+        "implementation_bundle_sha256": actual,
+        **lock,
+        "status": "passed",
+    }
 
 
 def read_bounded_local_file(path: Path, maximum_bytes: int, context: str) -> bytes:
@@ -636,6 +690,7 @@ def load_cache(path: Path) -> tuple[dict[str, object], np.ndarray, np.ndarray]:
             raise ValueError(f"{path}: metadata {key}={metadata.get(key)!r}, expected {value!r}")
     for key in (
         "scope_id",
+        "transport",
         "backend",
         "runtime",
         "compiler",
@@ -654,6 +709,10 @@ def load_cache(path: Path) -> tuple[dict[str, object], np.ndarray, np.ndarray]:
     ):
         if not isinstance(metadata.get(key), str) or not metadata[key]:
             raise ValueError(f"{path}: metadata {key} must be a non-empty string")
+    if metadata["transport"] not in TRANSPORTS:
+        raise ValueError(
+            f"{path}: metadata transport must be supervised-local or remote-attested"
+        )
     if re.fullmatch(r"[0-9a-f]{64}", metadata["artifact_sha256"]) is None:
         raise ValueError(f"{path}: metadata artifact_sha256 must be 64 lowercase hexadecimal characters")
     if re.fullmatch(r"[0-9a-f]{64}", metadata["attestation_public_key"]) is None:
@@ -1222,6 +1281,7 @@ REPORT_BACKEND_BINDING_FIELDS = (
     "profile_manifest_sha256",
     "admission_policy_sha256",
     "scope_id",
+    "transport",
     "backend",
     "runtime",
     "compiler",
@@ -1829,6 +1889,7 @@ def admitted_scopes() -> dict[str, dict[str, object]]:
             raise ValueError("admitted backend scope_ids must be non-empty and unique")
         for field in (
             "backend",
+            "transport",
             "runtime",
             "compiler",
             "package_target",
@@ -1850,6 +1911,11 @@ def admitted_scopes() -> dict[str, dict[str, object]]:
         ):
             if not isinstance(entry.get(field), str) or not entry[field]:
                 raise ValueError(f"admitted backend {entry['scope_id']} needs {field}")
+        if entry["transport"] not in TRANSPORTS:
+            raise ValueError(
+                f"admitted backend {entry['scope_id']} transport must be "
+                "supervised-local or remote-attested"
+            )
         for field in (
             "artifact_sha256",
             "placement_evidence_sha256",
@@ -1916,6 +1982,7 @@ def admitted_scopes() -> dict[str, dict[str, object]]:
 
 
 REGISTRY_CACHE_BINDING_FIELDS = (
+    "transport",
     "backend",
     "runtime",
     "compiler",

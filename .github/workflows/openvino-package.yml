@@ -1,0 +1,161 @@
+# Manual, gated build for the first exact Intel OpenVINO artifact and frozen
+# Linux x86_64 runtime.  This produces build inputs, not admitted hardware
+# scopes: physical NPU/GPU/CPU evidence is collected on the target host later.
+name: OpenVINO pinned package inputs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Pinned Gemma IR and frozen OpenVINO runtime
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      PYTHONHASHSEED: "0"
+      SOURCE_DATE_EPOCH: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packages/openvino/requirements-build.lock
+
+      - name: Require the frozen Linux build floor
+        run: |
+          test "$(uname -m)" = x86_64
+          python - <<'PY'
+          import platform
+          import sys
+          assert sys.version_info[:2] == (3, 12)
+          assert platform.libc_ver() == ("glibc", "2.35")
+          PY
+
+      - name: Install the fully hashed conversion and runtime builder
+        env:
+          PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --require-hashes
+          --only-binary=:all:
+          -r packages/openvino/requirements-build.lock
+
+      - name: Test dependency-light package contracts
+        run: python -m unittest discover -s packages/openvino/tests -v
+
+      - name: Materialize and verify required Gemma distribution terms
+        run: |
+          python packages/openvino/legal.py fetch \
+            --output-dir "$RUNNER_TEMP/gemma-legal" \
+            > "$RUNNER_TEMP/legal-result.json"
+
+      - name: Fetch and verify only the exact gated model commit
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          test -n "$HF_TOKEN"
+          python packages/openvino/fetch_source.py \
+            --output-dir "$RUNNER_TEMP/embeddinggemma-source" \
+            --cache-dir "$RUNNER_TEMP/huggingface-cache" \
+            > "$RUNNER_TEMP/source-result.json"
+
+      - name: Convert the exact mean-dense-dense-L2 pipeline
+        run: |
+          python packages/openvino/convert.py \
+            --source-dir "$RUNNER_TEMP/embeddinggemma-source" \
+            --legal-dir "$RUNNER_TEMP/gemma-legal" \
+            --output-dir "$RUNNER_TEMP/openvino-artifact" \
+            --weight-storage f16 \
+            > "$RUNNER_TEMP/conversion-result.json"
+
+      - name: Compare PyTorch and OpenVINO CPU at short and maximum buckets
+        run: |
+          python packages/openvino/smoke_parity.py \
+            --source-dir "$RUNNER_TEMP/embeddinggemma-source" \
+            --artifact-dir "$RUNNER_TEMP/openvino-artifact" \
+            --output "$RUNNER_TEMP/openvino-parity-smoke.json" \
+            > "$RUNNER_TEMP/parity-result.json"
+
+      - name: Build and execute the frozen integrity-checking runtime
+        run: |
+          python packages/openvino/build_runtime.py \
+            --output-dir "$RUNNER_TEMP/openvino-runtime" \
+            --minimum-glibc 2.35 \
+            --cc /usr/bin/cc \
+            > "$RUNNER_TEMP/runtime-result.json"
+
+      - name: Create regular-file-only content-addressed archives
+        run: |
+          mkdir -p "$RUNNER_TEMP/openvino-archives"
+          python packages/openvino/archive.py \
+            --directory "$RUNNER_TEMP/openvino-artifact" \
+            --output-dir "$RUNNER_TEMP/openvino-archives" \
+            --prefix cfetch-openvino-embeddinggemma-artifact \
+            --require-gemma-legal \
+            > "$RUNNER_TEMP/artifact-archive-result.json"
+          python packages/openvino/archive.py \
+            --directory "$RUNNER_TEMP/openvino-runtime" \
+            --output-dir "$RUNNER_TEMP/openvino-archives" \
+            --prefix cfetch-openvino-linux-x86-64-runtime \
+            > "$RUNNER_TEMP/runtime-archive-result.json"
+
+      - name: Bind build reports and archive identities
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          names = (
+              "source-result.json",
+              "legal-result.json",
+              "conversion-result.json",
+              "parity-result.json",
+              "openvino-parity-smoke.json",
+              "runtime-result.json",
+              "artifact-archive-result.json",
+              "runtime-archive-result.json",
+          )
+          files = {}
+          for name in names:
+              raw = (root / name).read_bytes()
+              files[name] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+          document = {
+              "schema_version": 1,
+              "purpose": "conversion-and-runtime-build-not-hardware-admission",
+              "repository_commit": os.environ["GITHUB_SHA"],
+              "runner_image": "ubuntu-22.04",
+              "files": files,
+          }
+          raw = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          (root / "openvino-build-metadata.json").write_bytes(raw)
+          PY
+          cp "$RUNNER_TEMP/openvino-parity-smoke.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/openvino-build-metadata.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/source-result.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/legal-result.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/conversion-result.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/parity-result.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/runtime-result.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/artifact-archive-result.json" "$RUNNER_TEMP/openvino-archives/"
+          cp "$RUNNER_TEMP/runtime-archive-result.json" "$RUNNER_TEMP/openvino-archives/"
+          sha256sum "$RUNNER_TEMP"/openvino-archives/* \
+            > "$RUNNER_TEMP/openvino-archives/SHA256SUMS"
+
+      - name: Upload content-addressed build inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: openvino-pinned-inputs-${{ github.run_id }}
+          path: ${{ runner.temp }}/openvino-archives/*
+          if-no-files-found: error
+          retention-days: 7

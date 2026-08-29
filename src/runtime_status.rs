@@ -298,13 +298,26 @@ fn apply_config(status: &mut RuntimeStatusV1, cfg: &Config) {
             ServiceState::Ready
         };
     }
-    let configured = if cfg.embeddings.enabled || cfg.rerank.enabled {
+    let local_plan = crate::local_inference::selected_local_package_plan();
+    let local_plan_invalid = cfg.embeddings.enabled
+        && cfg.embeddings.endpoint.is_empty()
+        && local_plan.is_err();
+    let packaged_local_embedding = cfg.embeddings.enabled
+        && cfg.embeddings.endpoint.is_empty()
+        && local_plan.as_ref().is_ok_and(|plan| plan.is_some());
+    let configured = if packaged_local_embedding && !cfg.rerank.enabled {
+        InferenceMode::Local
+    } else if cfg.embeddings.enabled || cfg.rerank.enabled {
         InferenceMode::Endpoint
     } else {
         InferenceMode::Disabled
     };
-    let embedding_route = (cfg.embeddings.enabled && !cfg.embeddings.endpoint.is_empty())
-        .then(|| endpoint_route(&cfg.embeddings.endpoint));
+    let embedding_route = if packaged_local_embedding {
+        Some(InferenceRoute::Local)
+    } else {
+        (cfg.embeddings.enabled && !cfg.embeddings.endpoint.is_empty())
+            .then(|| endpoint_route(&cfg.embeddings.endpoint))
+    };
     let rerank_route = (cfg.rerank.enabled && !cfg.rerank.endpoint.is_empty())
         .then(|| endpoint_route(&cfg.rerank.endpoint));
     let configured_route = match (embedding_route, rerank_route) {
@@ -333,8 +346,19 @@ fn apply_config(status: &mut RuntimeStatusV1, cfg: &Config) {
         remove_failure(status, "inference_initialization_failed");
     }
     remove_failure(status, "inference_misconfigured");
+    if local_plan_invalid {
+        upsert_failure(
+            status,
+            "inference_initialization_failed",
+            FailureSeverity::Warning,
+            "install an intact target-local inference package or configure an explicit endpoint",
+        );
+    }
     if (cfg.embeddings.enabled
-        && (cfg.embeddings.endpoint.is_empty() || cfg.embeddings.model.is_empty()))
+        && ((!packaged_local_embedding
+            && !local_plan_invalid
+            && cfg.embeddings.endpoint.is_empty())
+            || cfg.embeddings.model.is_empty()))
         || (cfg.rerank.enabled && (cfg.rerank.endpoint.is_empty() || cfg.rerank.model.is_empty()))
     {
         upsert_failure(
