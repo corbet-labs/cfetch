@@ -85,7 +85,7 @@ recall, code navigation, hooks, capture, and measurement need neither.
 | Selective learning cards | **Main — next release** | A huge nixcards catalogue can contribute only the locally selected Markdown sets; the nixcards TUI and cfetch share Git's native sparse selection without a shadow config | `cards init`, `cards list`, `cards select`, `cards sync`, `cards tui` |
 | Cited retrieval | v0.9.9 | BM25, semantic, and hybrid search return statement-level citations that survive file reordering | `recall`, `recall --semantic`, `recall --hybrid`, `recall --id` |
 | Retrieval quality | v0.9.9 | Trust-aware ranking, optional cross-encoder reranking, lexical precision gates, duplicate suppression, and wikilink expansion | `recall --expand`, `rerank.*`, `recall.gate` |
-| Code intelligence | v0.9.9 | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
+| Code intelligence | **Main — next release** | Tree-sitter symbols, exact line ranges, import-graph importance, token-budgeted repository maps, explainable dependency paths, and reverse-impact analysis | `find`, `map`, `code-graph path`, `code-graph impact`, `.cfetchignore` |
 | Session continuity | v0.9.9 | Scoped startup memory, periodic rule refresh, modified-file recovery after compaction, and known-failure lookup | hooks, `failures` |
 | Context control | v0.9.9 | Repeat-read guidance, large-file slice hints, token-capped answers, and structural command-output condensation | native tool hooks, `--budget-tokens` |
 | Learning capture | v0.9.9 | Redacted session activity is captured and deterministic signals flag evidence worth maintaining | hooks, ring-6 exhaust, ring-5 staging |
@@ -290,6 +290,19 @@ $ cfetch recall --expand "database migration"
 
 ### Graphs and vectors remain derived from readable files
 
+Source imports form a separate, disposable code graph. `code-graph path`
+explains one deterministic shortest chain of project-internal imports;
+`code-graph impact` walks the same edges backwards to expose a bounded blast
+radius. Each step names its typed relation and extraction evidence class,
+ambiguous file suffixes fail instead of guessing, and paths stay relative when
+served by another machine.
+
+```console
+$ cfetch code-graph path src/main.rs src/runtime/worker.rs
+$ cfetch code-graph impact src/config.rs --depth 4 --limit 50
+$ cfetch code-graph impact src/config.rs --json
+```
+
 `[[Obsidian wikilinks]]` are the knowledge graph. cfetch resolves them only
 when a target is unambiguous, exposes incoming and outgoing relationships, and
 can center a bounded neighborhood on one note. It does not require a separate
@@ -312,8 +325,9 @@ export step.
 ### Freshness is part of the answer
 
 A machine holding the Markdown can serve recall, citation expansion, knowledge
-graphs, code search, and repository maps to other machines. Every response
-carries an origin, catalog generation, and `fresh` flag. Queries pass a bounded drain
+graphs, code search, repository maps, and dependency explanations to other
+machines. Every response carries an origin, catalog generation, and `fresh`
+flag. Queries pass a bounded drain
 barrier: cfetch either proves that visible writes have reached the catalog or
 labels the answer stale and explains why.
 
@@ -415,8 +429,8 @@ For any MCP client, the manual registration is the standard stdio shape:
 
 The v0.9.9 server exposes read-only `cfetch_recall`, `cfetch_expand`, and
 `cfetch_find`. On `main` for the next release, it also exposes read-only
-`cfetch_runtime_status`, `cfetch_maintenance_packet`, and
-`cfetch_maintenance_show` tools.
+`cfetch_code_path`, `cfetch_code_impact`, `cfetch_runtime_status`,
+`cfetch_maintenance_packet`, and `cfetch_maintenance_show` tools.
 `cfetch_maintenance_propose` and `cfetch_maintenance_review` can write only
 idempotent ring-5 records for debugging and intervention. Apply, revert, reject,
 and finalize remain CLI-only; MCP cannot promote or overwrite trusted memory.

@@ -156,6 +156,11 @@ enum Command {
         #[arg(long, default_value_t = graph::DEFAULT_MAP_BUDGET_TOKENS)]
         budget_tokens: u64,
     },
+    /// Explain paths and blast radius in the indexed source import graph
+    CodeGraph {
+        #[command(subcommand)]
+        action: CodeGraphAction,
+    },
     /// Inspect the Obsidian knowledge graph derived from curated Markdown links
     Graph {
         /// Center the view on a Markdown path or note name
@@ -327,6 +332,32 @@ enum Command {
         /// Print one cached, terminal-width-aware line (no network or inference)
         #[arg(long, conflicts_with = "json")]
         line: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodeGraphAction {
+    /// Find one deterministic shortest import path between two files
+    Path {
+        from: String,
+        to: String,
+        /// Maximum import hops to traverse (1-32)
+        #[arg(long, default_value_t = graph::DEFAULT_PATH_DEPTH)]
+        depth: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show files that directly or transitively import the target
+    Impact {
+        target: String,
+        /// Maximum reverse-import hops to traverse (1-32)
+        #[arg(long, default_value_t = graph::DEFAULT_IMPACT_DEPTH)]
+        depth: usize,
+        /// Maximum affected files to return (1-200)
+        #[arg(long, default_value_t = graph::DEFAULT_IMPACT_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1109,6 +1140,105 @@ fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     let conn = index::open(&paths::state_dir())?;
     let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
     print_map(&m.into(), focus, None);
+    Ok(())
+}
+
+fn code_graph_cmd(action: CodeGraphAction) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    match action {
+        CodeGraphAction::Path { from, to, depth, json } => {
+            if let Some(cs) = &cfg.client.serving {
+                let response = serve::client_call(
+                    cs,
+                    serde_json::json!({
+                        "op": "code-path",
+                        "from_path": from,
+                        "to_path": to,
+                        "depth": depth,
+                    }),
+                    serve::QUERY_TIMEOUT,
+                )?;
+                let path = response.dependency_path.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("serving host {} returned no dependency path", cs.addr)
+                })?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": path,
+                            "origin": response.origin,
+                            "generation": response.generation,
+                            "fresh": response.fresh,
+                            "stale_note": response.stale_note,
+                        }))?
+                    );
+                } else {
+                    println!("{}", graph::render_dependency_path(path));
+                    print_served_by(&response);
+                }
+                return Ok(());
+            }
+            let conn = index::open(&paths::state_dir())?;
+            let path = graph::dependency_path(
+                &conn,
+                &cfg.effective_code_roots(),
+                &from,
+                &to,
+                depth,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&path)?);
+            } else {
+                println!("{}", graph::render_dependency_path(&path));
+            }
+        }
+        CodeGraphAction::Impact { target, depth, limit, json } => {
+            if let Some(cs) = &cfg.client.serving {
+                let response = serve::client_call(
+                    cs,
+                    serde_json::json!({
+                        "op": "code-impact",
+                        "path": target,
+                        "depth": depth,
+                        "limit": limit,
+                    }),
+                    serve::QUERY_TIMEOUT,
+                )?;
+                let impact = response.dependency_impact.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("serving host {} returned no dependency impact", cs.addr)
+                })?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "impact": impact,
+                            "origin": response.origin,
+                            "generation": response.generation,
+                            "fresh": response.fresh,
+                            "stale_note": response.stale_note,
+                        }))?
+                    );
+                } else {
+                    println!("{}", graph::render_dependency_impact(impact));
+                    print_served_by(&response);
+                }
+                return Ok(());
+            }
+            let conn = index::open(&paths::state_dir())?;
+            let impact = graph::dependency_impact(
+                &conn,
+                &cfg.effective_code_roots(),
+                &target,
+                depth,
+                limit,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&impact)?);
+            } else {
+                println!("{}", graph::render_dependency_impact(&impact));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2893,6 +3023,12 @@ fn main() {
         Command::Map { focus, budget_tokens } => {
             if let Err(e) = map_cmd(focus.as_deref(), budget_tokens) {
                 eprintln!("cfetch map: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::CodeGraph { action } => {
+            if let Err(e) = code_graph_cmd(action) {
+                eprintln!("cfetch code-graph: {e}");
                 std::process::exit(1);
             }
         }

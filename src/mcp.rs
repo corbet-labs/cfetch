@@ -6,6 +6,7 @@
 //! official Rust MCP SDK owns JSON-RPC framing, lifecycle, version
 //! negotiation, capability discovery, schema validation, and stdio concurrency.
 
+use anyhow::Context as _;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
@@ -17,7 +18,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use crate::{answer, code, config::Config, index, maintenance, paths, serve};
+use crate::{answer, code, config::Config, graph, index, maintenance, paths, serve};
 
 /// The tools we serve; a tools/call naming anything else is the caller's
 /// protocol error (-32602), not a tool-execution failure.
@@ -25,6 +26,8 @@ const TOOL_NAMES: &[&str] = &[
     "cfetch_recall",
     "cfetch_expand",
     "cfetch_find",
+    "cfetch_code_path",
+    "cfetch_code_impact",
     "cfetch_runtime_status",
     "cfetch_maintenance_packet",
     "cfetch_maintenance_show",
@@ -88,6 +91,34 @@ fn tool_defs() -> Vec<Tool> {
                     "limit": {"type": "integer", "default": 10}
                 },
                 "required": ["query"]
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_code_path",
+            "Explain one deterministic shortest path through the indexed source import graph. Every hop names the source file, typed `imports` relation, target file, and extraction evidence class. The traversal is read-only and bounded by depth.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "from": {"type": "string", "description": "importing file path or unambiguous suffix"},
+                    "to": {"type": "string", "description": "imported file path or unambiguous suffix"},
+                    "depth": {"type": "integer", "default": graph::DEFAULT_PATH_DEPTH, "minimum": 1, "maximum": graph::MAX_DEPENDENCY_DEPTH}
+                },
+                "required": ["from", "to"]
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_code_impact",
+            "Show the bounded blast radius of one indexed source file by walking import edges backwards. Every affected file names its depth and next explanatory hop toward the target; ambiguous suffixes fail instead of guessing.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "file path or unambiguous suffix"},
+                    "depth": {"type": "integer", "default": graph::DEFAULT_IMPACT_DEPTH, "minimum": 1, "maximum": graph::MAX_DEPENDENCY_DEPTH},
+                    "limit": {"type": "integer", "default": graph::DEFAULT_IMPACT_LIMIT, "minimum": 1, "maximum": graph::MAX_IMPACT_LIMIT}
+                },
+                "required": ["target"]
             })),
         )
         .with_annotations(read_only()),
@@ -241,6 +272,20 @@ fn run_tool_remote(
             "query": args.get("query").and_then(Value::as_str).unwrap_or(""),
             "limit": if limit == 0 { 10 } else { limit },
         }),
+        "cfetch_code_path" => json!({
+            "op": "code-path",
+            "from_path": args.get("from").and_then(Value::as_str).unwrap_or(""),
+            "to_path": args.get("to").and_then(Value::as_str).unwrap_or(""),
+            "depth": args.get("depth").and_then(Value::as_u64)
+                .unwrap_or(graph::DEFAULT_PATH_DEPTH as u64),
+        }),
+        "cfetch_code_impact" => json!({
+            "op": "code-impact",
+            "path": args.get("target").and_then(Value::as_str).unwrap_or(""),
+            "depth": args.get("depth").and_then(Value::as_u64)
+                .unwrap_or(graph::DEFAULT_IMPACT_DEPTH as u64),
+            "limit": if limit == 0 { graph::DEFAULT_IMPACT_LIMIT } else { limit },
+        }),
         other => anyhow::bail!("unknown tool: {other}"),
     };
     let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
@@ -268,7 +313,7 @@ fn run_tool_remote(
                 )
             }
         }
-        _ => {
+        "cfetch_find" => {
             let hits = resp.code_hits.clone().unwrap_or_default();
             if hits.is_empty() {
                 "no hits".to_string()
@@ -291,6 +336,21 @@ fn run_tool_remote(
                 )
             }
         }
+        "cfetch_code_path" => {
+            let path = resp
+                .dependency_path
+                .as_ref()
+                .context("serving host returned no dependency path")?;
+            graph::render_dependency_path(path)
+        }
+        "cfetch_code_impact" => {
+            let impact = resp
+                .dependency_impact
+                .as_ref()
+                .context("serving host returned no dependency impact")?;
+            graph::render_dependency_impact(impact)
+        }
+        other => anyhow::bail!("unknown tool: {other}"),
     };
     Ok(format!("{text}{}", served_footer(&resp)))
 }
@@ -414,6 +474,40 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                 answer::FIND_BUDGET_TOKENS,
                 answer::MCP_RECOVERY,
             ))
+        }
+        "cfetch_code_path" => {
+            let from = args.get("from").and_then(Value::as_str).unwrap_or("");
+            let to = args.get("to").and_then(Value::as_str).unwrap_or("");
+            let depth = args
+                .get("depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(graph::DEFAULT_PATH_DEPTH as u64) as usize;
+            let conn = index::open(&paths::state_dir())?;
+            let path = graph::dependency_path(
+                &conn,
+                &cfg.effective_code_roots(),
+                from,
+                to,
+                depth,
+            )?;
+            Ok(graph::render_dependency_path(&path))
+        }
+        "cfetch_code_impact" => {
+            let target = args.get("target").and_then(Value::as_str).unwrap_or("");
+            let depth = args
+                .get("depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(graph::DEFAULT_IMPACT_DEPTH as u64) as usize;
+            let limit = if limit == 0 { graph::DEFAULT_IMPACT_LIMIT } else { limit };
+            let conn = index::open(&paths::state_dir())?;
+            let impact = graph::dependency_impact(
+                &conn,
+                &cfg.effective_code_roots(),
+                target,
+                depth,
+                limit,
+            )?;
+            Ok(graph::render_dependency_impact(&impact))
         }
         other => anyhow::bail!("unknown tool: {other}"),
     }

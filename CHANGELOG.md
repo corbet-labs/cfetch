@@ -5,6 +5,12 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Explainable source dependency graph.** `cfetch code-graph path` returns one
+  deterministic shortest import chain, while `cfetch code-graph impact` walks
+  reverse imports for a bounded blast radius. Typed steps name their extraction
+  evidence, ambiguous suffixes fail closed, relative paths are stable across
+  serving hosts, and equivalent read-only MCP tools use the same graph query
+  pipeline.
 - **Selective nixcards knowledge.** `cfetch cards` initializes and manages the
   public nixcards catalogue as a blobless sparse checkout at
   `knowledge/cards`, with dotted branch selectors, JSON status, explicit

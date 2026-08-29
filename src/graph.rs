@@ -16,10 +16,11 @@
 //! personalized PageRank (restart vector seeded by `--focus` matches),
 //! fitted to a token budget by binary search over the entry count.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 pub const DAMPING: f64 = 0.85;
 pub const ITERATIONS: usize = 30;
@@ -602,6 +603,381 @@ pub fn prune_edges(conn: &Connection) -> anyhow::Result<()> {
         [],
     )?;
     Ok(())
+}
+
+// --------------------------------------------- explainable dependency graph
+
+pub const DEFAULT_PATH_DEPTH: usize = 12;
+pub const DEFAULT_IMPACT_DEPTH: usize = 4;
+pub const DEFAULT_IMPACT_LIMIT: usize = 50;
+pub const MAX_DEPENDENCY_DEPTH: usize = 32;
+pub const MAX_IMPACT_LIMIT: usize = 200;
+
+/// One stable, typed explanation step from the rebuildable source graph.
+///
+/// Import extraction deliberately accepts only resolvable project-internal
+/// imports in the source-file head. Until the index records exact import line
+/// spans, that extraction class is the honest evidence granularity: callers
+/// can inspect `source`, while cfetch never invents a more precise citation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyEdge {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyPath {
+    pub from: String,
+    pub to: String,
+    pub max_depth: usize,
+    pub found: bool,
+    pub edges: Vec<DependencyEdge>,
+}
+
+/// One reverse dependency and the next file on its deterministic shortest
+/// explanation toward the requested target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactNode {
+    pub path: String,
+    pub depth: usize,
+    pub via: String,
+    pub relation: String,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyImpact {
+    pub target: String,
+    pub max_depth: usize,
+    pub total: usize,
+    pub omitted: usize,
+    pub nodes: Vec<ImpactNode>,
+}
+
+struct DependencyIndex {
+    absolute: Vec<String>,
+    display: Vec<String>,
+    outgoing: Vec<Vec<usize>>,
+    incoming: Vec<Vec<usize>>,
+}
+
+fn portable_path(path: &Path) -> String {
+    crate::index::rel_doc_path(path)
+}
+
+/// All served paths are root-relative and forward-slashed. When explicitly
+/// configured roots contain the same relative path, `@N/` identifies the
+/// root by its stable configuration order without leaking a host path.
+fn dependency_index(conn: &Connection, roots: &[PathBuf]) -> anyhow::Result<DependencyIndex> {
+    crate::code::ensure_schema(conn)?;
+    anyhow::ensure!(!roots.is_empty(), "no code roots configured");
+
+    let mut stmt = conn.prepare("SELECT path FROM code_files ORDER BY path")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut files: Vec<(String, usize, String)> = rows
+        .filter_map(Result::ok)
+        .filter_map(|absolute| {
+            roots.iter().enumerate().find_map(|(root_index, root)| {
+                Path::new(&absolute)
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|relative| (absolute.clone(), root_index, portable_path(relative)))
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.dedup_by(|a, b| a.0 == b.0);
+    anyhow::ensure!(!files.is_empty(), "code index is empty for the configured roots — run `cfetch scan`");
+
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, _, relative) in &files {
+        *counts.entry(relative).or_default() += 1;
+    }
+    let absolute: Vec<String> = files.iter().map(|(path, _, _)| path.clone()).collect();
+    let display: Vec<String> = files
+        .iter()
+        .map(|(_, root_index, relative)| {
+            if counts.get(relative.as_str()).copied().unwrap_or(0) > 1 {
+                format!("@{}/{relative}", root_index + 1)
+            } else {
+                relative.clone()
+            }
+        })
+        .collect();
+    let by_absolute: BTreeMap<&str, usize> =
+        absolute.iter().enumerate().map(|(index, path)| (path.as_str(), index)).collect();
+    let mut outgoing = vec![Vec::new(); absolute.len()];
+    let mut incoming = vec![Vec::new(); absolute.len()];
+    let mut edges = conn.prepare("SELECT src, dst FROM import_edges ORDER BY src, dst")?;
+    let rows = edges.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for (source, target) in rows.filter_map(Result::ok) {
+        let (Some(&source), Some(&target)) =
+            (by_absolute.get(source.as_str()), by_absolute.get(target.as_str()))
+        else {
+            continue;
+        };
+        outgoing[source].push(target);
+        incoming[target].push(source);
+    }
+    for neighbors in outgoing.iter_mut().chain(incoming.iter_mut()) {
+        neighbors.sort_by(|left, right| display[*left].cmp(&display[*right]));
+        neighbors.dedup();
+    }
+    Ok(DependencyIndex { absolute, display, outgoing, incoming })
+}
+
+fn normalized_query(query: &str) -> String {
+    query
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn suffix_match(candidate: &str, query: &str) -> bool {
+    candidate == query
+        || candidate
+            .strip_suffix(query)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+fn resolve_file(index: &DependencyIndex, query: &str) -> anyhow::Result<usize> {
+    let query = normalized_query(query);
+    anyhow::ensure!(!query.is_empty(), "dependency target must name a file path");
+
+    let portable_absolute: Vec<String> = index
+        .absolute
+        .iter()
+        .map(|path| path.replace('\\', "/"))
+        .collect();
+    let mut matches: Vec<usize> = index
+        .display
+        .iter()
+        .zip(&portable_absolute)
+        .enumerate()
+        .filter_map(|(i, (display, absolute))| {
+            (display == &query || absolute == &query).then_some(i)
+        })
+        .collect();
+    if matches.is_empty() {
+        matches = index
+            .display
+            .iter()
+            .zip(&portable_absolute)
+            .enumerate()
+            .filter_map(|(i, (display, absolute))| {
+                (suffix_match(display, &query) || suffix_match(absolute, &query)).then_some(i)
+            })
+            .collect();
+    }
+    if matches.is_empty() {
+        let folded = query.to_ascii_lowercase();
+        matches = index
+            .display
+            .iter()
+            .zip(&portable_absolute)
+            .enumerate()
+            .filter_map(|(i, (display, absolute))| {
+                let display = display.to_ascii_lowercase();
+                let absolute = absolute.to_ascii_lowercase();
+                (suffix_match(&display, &folded) || suffix_match(&absolute, &folded)).then_some(i)
+            })
+            .collect();
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => anyhow::bail!("no indexed code file matches {query:?}"),
+        _ => {
+            let mut candidates: Vec<&str> =
+                matches.iter().map(|&i| index.display[i].as_str()).collect();
+            candidates.sort_unstable();
+            anyhow::bail!(
+                "dependency target {query:?} is ambiguous; use one of: {}",
+                candidates.join(", ")
+            )
+        }
+    }
+}
+
+fn dependency_edge(index: &DependencyIndex, source: usize, target: usize) -> DependencyEdge {
+    DependencyEdge {
+        source: index.display[source].clone(),
+        relation: "imports".to_string(),
+        target: index.display[target].clone(),
+        evidence: "source-file-head".to_string(),
+    }
+}
+
+/// Finds one deterministic shortest directed import path. Equal-length paths
+/// are settled in lexical display-path order, so every host serving the same
+/// catalog returns the same explanation.
+pub fn dependency_path(
+    conn: &Connection,
+    roots: &[PathBuf],
+    from: &str,
+    to: &str,
+    max_depth: usize,
+) -> anyhow::Result<DependencyPath> {
+    anyhow::ensure!(
+        (1..=MAX_DEPENDENCY_DEPTH).contains(&max_depth),
+        "max depth must be between 1 and {MAX_DEPENDENCY_DEPTH}"
+    );
+    let index = dependency_index(conn, roots)?;
+    let from = resolve_file(&index, from)?;
+    let to = resolve_file(&index, to)?;
+    let mut previous = vec![None; index.display.len()];
+    let mut depth = vec![usize::MAX; index.display.len()];
+    let mut queue = VecDeque::from([from]);
+    depth[from] = 0;
+    while let Some(node) = queue.pop_front() {
+        if node == to || depth[node] >= max_depth {
+            continue;
+        }
+        for &next in &index.outgoing[node] {
+            if depth[next] != usize::MAX {
+                continue;
+            }
+            depth[next] = depth[node] + 1;
+            previous[next] = Some(node);
+            queue.push_back(next);
+        }
+    }
+    let mut edges = Vec::new();
+    if depth[to] != usize::MAX {
+        let mut nodes = vec![to];
+        let mut cursor = to;
+        while cursor != from {
+            cursor = previous[cursor].expect("a reached dependency node has a predecessor");
+            nodes.push(cursor);
+        }
+        nodes.reverse();
+        edges = nodes
+            .windows(2)
+            .map(|pair| dependency_edge(&index, pair[0], pair[1]))
+            .collect();
+    }
+    Ok(DependencyPath {
+        from: index.display[from].clone(),
+        to: index.display[to].clone(),
+        max_depth,
+        found: depth[to] != usize::MAX,
+        edges,
+    })
+}
+
+/// Walks import edges backwards to show which indexed files can be affected
+/// by a target. Every result carries the next hop toward the target, making
+/// the blast radius inspectable rather than a bag of graph scores.
+pub fn dependency_impact(
+    conn: &Connection,
+    roots: &[PathBuf],
+    target: &str,
+    max_depth: usize,
+    limit: usize,
+) -> anyhow::Result<DependencyImpact> {
+    anyhow::ensure!(
+        (1..=MAX_DEPENDENCY_DEPTH).contains(&max_depth),
+        "max depth must be between 1 and {MAX_DEPENDENCY_DEPTH}"
+    );
+    anyhow::ensure!(
+        (1..=MAX_IMPACT_LIMIT).contains(&limit),
+        "limit must be between 1 and {MAX_IMPACT_LIMIT}"
+    );
+    let index = dependency_index(conn, roots)?;
+    let target = resolve_file(&index, target)?;
+    let mut via = vec![None; index.display.len()];
+    let mut depth = vec![usize::MAX; index.display.len()];
+    let mut queue = VecDeque::from([target]);
+    depth[target] = 0;
+    while let Some(node) = queue.pop_front() {
+        if depth[node] >= max_depth {
+            continue;
+        }
+        for &importer in &index.incoming[node] {
+            if depth[importer] != usize::MAX {
+                continue;
+            }
+            depth[importer] = depth[node] + 1;
+            via[importer] = Some(node);
+            queue.push_back(importer);
+        }
+    }
+    let mut reached: Vec<usize> = (0..index.display.len())
+        .filter(|&node| node != target && depth[node] != usize::MAX)
+        .collect();
+    reached.sort_by(|&left, &right| {
+        depth[left]
+            .cmp(&depth[right])
+            .then(index.display[left].cmp(&index.display[right]))
+    });
+    let total = reached.len();
+    reached.truncate(limit);
+    let nodes = reached
+        .into_iter()
+        .map(|node| ImpactNode {
+            path: index.display[node].clone(),
+            depth: depth[node],
+            via: index.display[via[node].expect("a reverse-reached node has a next hop")].clone(),
+            relation: "imports".to_string(),
+            evidence: "source-file-head".to_string(),
+        })
+        .collect();
+    Ok(DependencyImpact {
+        target: index.display[target].clone(),
+        max_depth,
+        total,
+        omitted: total.saturating_sub(limit),
+        nodes,
+    })
+}
+
+pub fn render_dependency_path(path: &DependencyPath) -> String {
+    if !path.found {
+        return format!(
+            "no import path from {} to {} within {} hop(s)",
+            path.from, path.to, path.max_depth
+        );
+    }
+    if path.edges.is_empty() {
+        return format!("dependency path: {} is the requested target (0 hops)", path.from);
+    }
+    let mut lines = vec![format!(
+        "dependency path: {} -> {} ({} hop(s))",
+        path.from,
+        path.to,
+        path.edges.len()
+    )];
+    lines.extend(path.edges.iter().map(|edge| {
+        format!(
+            "{} --{}--> {} [{}]",
+            edge.source, edge.relation, edge.target, edge.evidence
+        )
+    }));
+    lines.join("\n")
+}
+
+pub fn render_dependency_impact(impact: &DependencyImpact) -> String {
+    let mut lines = vec![format!(
+        "dependency impact: {} <- {} file(s), depth <= {}",
+        impact.target, impact.total, impact.max_depth
+    )];
+    lines.extend(impact.nodes.iter().map(|node| {
+        format!(
+            "d{} {} --{}--> {} [{}]",
+            node.depth, node.path, node.relation, node.via, node.evidence
+        )
+    }));
+    if impact.omitted > 0 {
+        lines.push(format!("... {} more file(s) omitted by the limit", impact.omitted));
+    }
+    lines.join("\n")
 }
 
 // -------------------------------------------------------------- pagerank
@@ -1213,5 +1589,116 @@ mod tests {
         let miss = map(&conn, &roots, Some("zzz_nothing"), 100_000).unwrap();
         assert!(!miss.focus_matched, "an unmatched focus degrades to the plain map");
         assert!(miss.lines[0].starts_with("b.rs"));
+    }
+
+    // ---- explainable dependency queries
+
+    fn branching_rust_project(root: &Path) {
+        write(root, "main.rs", "mod a;\nmod z;\nfn main() {}\n");
+        write(root, "a.rs", "use crate::b::value;\npub fn a() {}\n");
+        write(root, "z.rs", "use crate::b::value;\npub fn z() {}\n");
+        write(root, "b.rs", "pub fn value() {}\n");
+    }
+
+    #[test]
+    fn dependency_path_is_shortest_typed_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        branching_rust_project(dir.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let path = dependency_path(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "main.rs",
+            "b.rs",
+            8,
+        )
+        .unwrap();
+        assert!(path.found);
+        assert_eq!(path.from, "main.rs");
+        assert_eq!(path.to, "b.rs");
+        assert_eq!(path.edges.len(), 2);
+        assert_eq!(path.edges[0].source, "main.rs");
+        assert_eq!(path.edges[0].target, "a.rs", "equal shortest paths use lexical order");
+        assert_eq!(path.edges[0].relation, "imports");
+        assert_eq!(path.edges[0].evidence, "source-file-head");
+        assert_eq!(path.edges[1].source, "a.rs");
+        assert_eq!(path.edges[1].target, "b.rs");
+
+        let bounded = dependency_path(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "main.rs",
+            "b.rs",
+            1,
+        )
+        .unwrap();
+        assert!(!bounded.found, "the bound must be real, not advisory");
+        assert!(bounded.edges.is_empty());
+    }
+
+    #[test]
+    fn dependency_impact_walks_reverse_edges_with_explainable_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        branching_rust_project(dir.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let impact = dependency_impact(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "b.rs",
+            4,
+            10,
+        )
+        .unwrap();
+        assert_eq!(impact.target, "b.rs");
+        assert_eq!(impact.total, 3);
+        assert_eq!(impact.omitted, 0);
+        assert_eq!(
+            impact.nodes.iter().map(|node| (&*node.path, node.depth)).collect::<Vec<_>>(),
+            vec![("a.rs", 1), ("z.rs", 1), ("main.rs", 2)]
+        );
+        let main = impact.nodes.iter().find(|node| node.path == "main.rs").unwrap();
+        assert_eq!(main.via, "a.rs", "the lexical shortest explanation is stable");
+        assert_eq!(main.relation, "imports");
+        assert_eq!(main.evidence, "source-file-head");
+
+        let clipped = dependency_impact(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "b.rs",
+            4,
+            2,
+        )
+        .unwrap();
+        assert_eq!(clipped.nodes.len(), 2);
+        assert_eq!(clipped.omitted, 1, "bounded answers must name what they omit");
+    }
+
+    #[test]
+    fn dependency_targets_never_guess_across_ambiguous_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "one/lib.rs", "pub fn one() {}\n");
+        write(dir.path(), "two/lib.rs", "pub fn two() {}\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let error = dependency_impact(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "lib.rs",
+            2,
+            10,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("one/lib.rs"), "{error}");
+        assert!(error.contains("two/lib.rs"), "{error}");
     }
 }
