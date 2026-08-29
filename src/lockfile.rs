@@ -1,5 +1,5 @@
 //! Advisory lockfile with the SAME contract on every platform: a PERMANENT
-//! lock file, a non-blocking exclusive claim in a bounded 50ms-step retry, the
+//! lock file, a non-blocking exclusive claim in a bounded short-step retry, the
 //! open file handle as the guard. The kernel releases the claim when the
 //! holder's last handle closes — including on crash — so there is no
 //! staleness concept and no steal path. The file is never unlinked:
@@ -24,6 +24,13 @@
 use std::path::Path;
 use std::time::Duration;
 
+// Keep a release visible promptly under a thundering herd. With 50ms sleeps,
+// 32 contenders can consume almost the entire 2s identity-lock budget even
+// when every critical section is tiny: losers go back to sleep before the
+// current winner drops its handle. Five milliseconds keeps the retry bounded
+// without turning contention into a busy loop.
+const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 /// Held lock. The open file handle IS the lock: dropping it closes the
 /// handle, which releases the claim. The lock file itself stays on disk
 /// forever.
@@ -31,7 +38,7 @@ pub struct Lock {
     _file: std::fs::File,
 }
 
-/// Acquires `path` exclusively, retrying in 50ms steps for at most
+/// Acquires `path` exclusively, retrying in short steps for at most
 /// `max_wait_ms`. `stale_secs` is kept for signature compatibility only:
 /// neither backend needs a staleness heuristic — a dead holder's lock dies
 /// with its process.
@@ -53,7 +60,7 @@ pub fn acquire(path: &Path, max_wait_ms: u64, _stale_secs: u64) -> Option<Lock> 
         if elapsed >= max_wait {
             return None;
         }
-        std::thread::sleep((max_wait - elapsed).min(Duration::from_millis(50)));
+        std::thread::sleep((max_wait - elapsed).min(RETRY_INTERVAL));
     }
 }
 
@@ -95,7 +102,7 @@ pub fn acquire(path: &Path, max_wait_ms: u64, _stale_secs: u64) -> Option<Lock> 
         if elapsed >= max_wait {
             return None;
         }
-        std::thread::sleep((max_wait - elapsed).min(Duration::from_millis(50)));
+        std::thread::sleep((max_wait - elapsed).min(RETRY_INTERVAL));
     }
 }
 
