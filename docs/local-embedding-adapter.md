@@ -171,7 +171,7 @@ unique input indices and the profile attestation:
     "internal_precision": "<recorded native numeric path>",
     "placement_evidence_sha256": "<placement report digest>",
     "supported_max_tokens": 2048,
-    "supported_sequence_buckets": [32, 64, 128, 256, 512, 1024, 2048],
+    "supported_sequence_buckets": [32, 64, 128, 257, 512, 1024, 2048],
     "supported_max_batch_size": 64,
     "sequence_capability_evidence_sha256": "<sequence report digest>",
     "performance_evidence_sha256": "<per-bucket performance report digest>",

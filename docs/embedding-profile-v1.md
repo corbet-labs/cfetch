@@ -110,7 +110,7 @@ document backends. That query-dependent adversary is stricter than any real
 store, whose producer is fixed per content hash.
 
 SciFact does not exercise every compiled sequence shape, so a separate
-profile-pinned semantic fixture runs twice through each 32, 64, 128, 256, 512,
+profile-pinned semantic fixture runs twice through each 32, 64, 128, 257, 512,
 1,024, and 2,048-token bucket. Its query and both documents must tokenize to
 the exact limit of the selected bucket under the frozen tokenizer. At every
 bucket, the relevant document must rank strictly before the irrelevant
@@ -121,6 +121,12 @@ and the former must still rank strictly first. The public report retains the
 exact integer dots, norms, checks, and counts needed to replay those decisions;
 cache hashes bind the canonical probe arrays without publishing them in the
 report.
+
+The 257-token boundary is intentional. Pre-activation physical diagnostics on
+the first Lunar Lake NPU cohort found a deterministic semantic failure only at
+an exact static length of 256; 255, 257, 258, and the other profile shapes
+passed. Since no producer had been activated, the shared profile moved the
+published bucket to 257 instead of disguising an internal padding workaround.
 
 Every pairing must independently meet the same fixed absolute SciFact floors:
 

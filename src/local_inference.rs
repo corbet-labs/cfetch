@@ -16,7 +16,7 @@ use serde::de::{self, MapAccess, Visitor};
 
 const REGISTRY_JSON: &str = include_str!("../release/inference-backends.json");
 const REQUIRED_SELECTION: &str = "first available admitted scope in NPU, GPU, accelerated CPU order; each signed request and response is bound to the requested scope id";
-const REQUIRED_SEQUENCE_BUCKETS: &[usize] = &[32, 64, 128, 256, 512, 1024, 2048];
+const REQUIRED_SEQUENCE_BUCKETS: &[usize] = &[32, 64, 128, 257, 512, 1024, 2048];
 
 /// The sibling process that owns target-native runtime initialization.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

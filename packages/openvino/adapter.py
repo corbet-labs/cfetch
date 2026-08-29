@@ -285,6 +285,16 @@ class EmbeddingService:
         self._engines: dict[str, InferenceEngine] = {}
         self._unavailable: set[str] = set()
 
+    def close(self) -> None:
+        """Release native engines before CPython begins interpreter teardown."""
+
+        engines = tuple(self._engines.values())
+        self._engines.clear()
+        for engine in engines:
+            close = getattr(engine, "close", None)
+            if callable(close):
+                close()
+
     def _engine_for(self, scope: Scope) -> InferenceEngine:
         if scope.scope_id in self._unavailable:
             raise ScopeUnavailableError(scope.scope_id)
@@ -433,6 +443,14 @@ class OpenVinoEngine:
         self._execution_devices: dict[int, tuple[str, ...]] = {}
         self._artifact = artifact
         self._scope = scope
+
+    def close(self) -> None:
+        """Destroy compiled models and the plugin core in dependency order."""
+
+        self._compiled.clear()
+        self._execution_devices.clear()
+        self._model = None
+        self._core = None
 
     def _compiled_bucket(self, bucket: int):
         compiled = self._compiled.get(bucket)
@@ -1207,9 +1225,10 @@ def serve(
     engine_factory: Callable[[PackageManifest, Scope], InferenceEngine],
     signers: Mapping[str, Signer],
 ) -> None:
+    service = EmbeddingService(package, tokenizer, engine_factory, signers)
     server = AdapterServer(
         ("127.0.0.1", 0),
-        EmbeddingService(package, tokenizer, engine_factory, signers),
+        service,
         bearer,
     )
     monitor = threading.Thread(
@@ -1226,6 +1245,10 @@ def serve(
         server.serve_forever(poll_interval=0.1)
     finally:
         server.server_close()
+        monitor.join(timeout=5)
+        if monitor.is_alive():
+            raise RuntimeError("parent-lifetime monitor did not finish after EOF")
+        service.close()
 
 
 def parser() -> argparse.ArgumentParser:

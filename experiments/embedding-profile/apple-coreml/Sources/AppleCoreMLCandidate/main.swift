@@ -9,7 +9,7 @@ private let artifactRevision = "d1dc305086782e958f91fa278de97e4af9caeaf0"
 private let artifactWeightSHA256 = "62e84aaaa99bc7950668742301eaadb0b1a23204b5b9204dfaf20bfdd02bdf9d"
 private let targetModel = "google/embeddinggemma-300m"
 private let targetModelRevision = "57c266a740f537b4dc058e1b0cda161fd15afa75"
-private let targetProfileManifestSHA256 = "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7"
+private let targetProfileManifestSHA256 = "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb"
 
 // These are already prefixed exactly as cfetch sends them to an embedding
 // adapter. Passing task: nil below is deliberate: adding a second prefix would

@@ -167,7 +167,7 @@ For example:
       --supported-sequence-bucket 32 \
       --supported-sequence-bucket 64 \
       --supported-sequence-bucket 128 \
-      --supported-sequence-bucket 256 \
+      --supported-sequence-bucket 257 \
       --supported-sequence-bucket 512 \
       --supported-sequence-bucket 1024 \
       --supported-sequence-bucket 2048 \
@@ -241,7 +241,7 @@ wire grouping's signed request/response transactions.
 The exporter never invents sequence capability from the profile. The package
 must explicitly record its supported maximum and every supported bucket plus
 the evidence location. The global gate loader requires the complete profile set
-`32, 64, 128, 256, 512, 1024, 2048`; a fixed-seq256 artifact can produce a
+`32, 64, 128, 257, 512, 1024, 2048`; a fixed-seq256 artifact can produce a
 diagnostic cache but cannot pass the profile gate by succeeding on short
 SciFact text alone.
 

@@ -178,7 +178,7 @@ for result in "$CFETCH_OPS_ROOT"/preflight-{npu,gpu,cpu}.json; do
     .openvino_property_device == .required_execution_devices[0] and
     .host_binding_source ==
       "operator-selected-paths-sha256-before-and-after-compilation" and
-    (.bucket_results | map(.bucket) == [32,64,128,256,512,1024,2048])
+    (.bucket_results | map(.bucket) == [32,64,128,257,512,1024,2048])
   ' "$result" >/dev/null
 done
 ```

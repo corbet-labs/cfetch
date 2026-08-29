@@ -61,7 +61,7 @@ def metadata(scope_id: str, device_class: str) -> dict[str, object]:
         "internal_precision": "int8",
         "placement_evidence_sha256": "d" * 64,
         "supported_max_tokens": 2048,
-        "supported_sequence_buckets": [32, 64, 128, 256, 512, 1024, 2048],
+        "supported_sequence_buckets": [32, 64, 128, 257, 512, 1024, 2048],
         "supported_max_batch_size": 64,
         "sequence_capability_evidence_sha256": "e" * 64,
         "performance_evidence_sha256": "f" * 64,

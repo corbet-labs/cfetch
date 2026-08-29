@@ -17,12 +17,12 @@ pub const NETWORK_MAJOR: u32 = 1;
 pub const PROFILE_ID: &str = "cfetch-embedding-v1";
 pub const PROFILE_STATUS: &str = "candidate";
 pub const PROFILE_MANIFEST_SHA256: &str =
-    "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7";
+    "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb";
 pub const ADMISSION_POLICY_VERSION: u32 = 1;
 pub const ADMISSION_POLICY_SHA256: &str =
-    "ab5463e1c131a7331240e626817bcfc109fe7af658369a8abec437e4a56b2b44";
+    "4f731158e5c9edb7bd111dbfa1ae91eeabd181b4bf15ec473818f64f074567ce";
 pub const ADMISSION_IMPLEMENTATION_BUNDLE_SHA256: &str =
-    "6f32e4a30d4b43435d3310567444db3ec6733aaee6741e81120c44192b56622b";
+    "51fa13e6d3685c49f2d80da39c18d9b43e6e62582d7d5f1c09730dd7088440f2";
 
 /// Immutable semantic source for the candidate profile. Every native package
 /// records its actual lineage and artifact digest; direct derivation is never
@@ -62,7 +62,7 @@ pub const ADMISSION_DATASET: &str = "mteb/scifact";
 pub const ADMISSION_DATASET_REVISION: &str = "cf10ab6856b15b0e670ef8ae5dae4e266c12d035";
 pub const SEQUENCE_SEMANTIC_FIXTURE_ID: &str = "cfetch-sequence-semantic-v1-cat-vs-music";
 pub const SEQUENCE_SEMANTIC_FIXTURE_SHA256: &str =
-    "3f76380d8169fa0b500270d55ff80fa242c93f6ac26bd16d2994c2e7d76a3af2";
+    "567fac02f2d55ad2b98b54d89e4b8f0ae81aa2b65a2361603adca9f167543203";
 pub const SEQUENCE_SEMANTIC_GATE: &str = "every-profile-sequence-bucket-global-ordered-query-document-scope-plus-adversarial-relevant-minimum-irrelevant-maximum-exact-int8-strict-ranking";
 pub const ADMISSION_REQUIRED_DEVICE_CLASSES: &[&str] = &["npu", "gpu", "cpu"];
 pub const ADMISSION_NDCG_AT_10_MINIMUM: &str = "0.767907905520953";
@@ -87,7 +87,7 @@ pub const SPECIAL_TOKENS_MAP_SHA256: &str =
     "2f7b0adf4fb469770bb1490e3e35df87b1dc578246c5e7e6fc76ecf33213a397";
 pub const DIMENSIONS: usize = 768;
 pub const MAX_TOKENS: usize = 2048;
-pub const SEQUENCE_BUCKETS: &[usize] = &[32, 64, 128, 256, 512, 1024, 2048];
+pub const SEQUENCE_BUCKETS: &[usize] = &[32, 64, 128, 257, 512, 1024, 2048];
 pub const TOKEN_COUNTING: &str = "prefixed-input-including-all-special-tokens";
 pub const SEQUENCE_BUCKET_SELECTION: &str =
     "smallest-supported-bucket-greater-than-or-equal-to-token-count";
@@ -573,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             policy.sequence_semantic_fixture_sha256,
-            "3f76380d8169fa0b500270d55ff80fa242c93f6ac26bd16d2994c2e7d76a3af2"
+            "567fac02f2d55ad2b98b54d89e4b8f0ae81aa2b65a2361603adca9f167543203"
         );
         assert_eq!(
             policy.sequence_semantic_gate,

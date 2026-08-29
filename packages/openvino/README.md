@@ -17,9 +17,13 @@ The package keeps these boundaries explicit:
 - the IR contains the pinned transformer, attention-mask-weighted mean pooling
   including the supplied prompt, the bias-free 768 -> 3072 and 3072 -> 768
   identity projections, and L2 normalization.
-- each OpenVINO model is reshaped and compiled statically at 32, 64, 128, 256,
+- each OpenVINO model is reshaped and compiled statically at 32, 64, 128, 257,
   512, 1,024, or 2,048 tokens. Input over 2,048 tokens is rejected; it is never
-  truncated.
+  truncated. The otherwise conventional 256 boundary is deliberately 257:
+  the first Lunar Lake NPU cohort produced a deterministic semantic failure
+  only for the exact 256-token static graph while adjacent 255, 257, 258, and
+  all other profile shapes passed. The public shape is changed honestly rather
+  than executing a hidden padded shape.
 - a request names a package-admitted scope ID. The manifest alone maps that ID
   to exactly `NPU`, `GPU`, or `CPU`; `AUTO`, `MULTI`, `HETERO`, and implicit
   cross-device fallback are forbidden.
@@ -206,7 +210,7 @@ this shape; angle-bracket values are intentionally not usable evidence:
       },
       "placement_evidence_sha256": null,
       "supported_max_tokens": 2048,
-      "supported_sequence_buckets": [32, 64, 128, 256, 512, 1024, 2048],
+      "supported_sequence_buckets": [32, 64, 128, 257, 512, 1024, 2048],
       "supported_max_batch_size": 64,
       "sequence_capability_evidence_sha256": null,
       "performance_evidence_sha256": null,

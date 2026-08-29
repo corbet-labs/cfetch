@@ -13,7 +13,7 @@
   },
   "shared_identity": {
     "semantic_profile": "frozen",
-    "profile_manifest_sha256": "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7",
+    "profile_manifest_sha256": "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb",
     "dimensions": 768,
     "output_index_codec": "signed-int8x768",
     "vector_bytes": 768
@@ -80,7 +80,7 @@
     "internal_precision": "recorded target-native numeric path",
     "placement_evidence_sha256": "64 lowercase hexadecimal characters",
     "supported_max_tokens": 2048,
-    "supported_sequence_buckets": [32, 64, 128, 256, 512, 1024, 2048],
+    "supported_sequence_buckets": [32, 64, 128, 257, 512, 1024, 2048],
     "supported_max_batch_size": 64,
     "sequence_capability_evidence_sha256": "64 lowercase hexadecimal characters",
     "performance_evidence_sha256": "64 lowercase hexadecimal characters",
@@ -95,14 +95,14 @@
   },
   "admission": {
     "policy_version": 1,
-    "policy_manifest_sha256": "ab5463e1c131a7331240e626817bcfc109fe7af658369a8abec437e4a56b2b44",
-    "implementation_bundle_sha256": "6f32e4a30d4b43435d3310567444db3ec6733aaee6741e81120c44192b56622b",
+    "policy_manifest_sha256": "4f731158e5c9edb7bd111dbfa1ae91eeabd181b4bf15ec473818f64f074567ce",
+    "implementation_bundle_sha256": "51fa13e6d3685c49f2d80da39c18d9b43e6e62582d7d5f1c09730dd7088440f2",
     "dataset": "mteb/scifact",
     "dataset_revision": "cf10ab6856b15b0e670ef8ae5dae4e266c12d035",
     "sequence_semantic_fixture": {
       "id": "cfetch-sequence-semantic-v1-cat-vs-music",
-      "sha256": "3f76380d8169fa0b500270d55ff80fa242c93f6ac26bd16d2994c2e7d76a3af2",
-      "buckets": [32, 64, 128, 256, 512, 1024, 2048]
+      "sha256": "567fac02f2d55ad2b98b54d89e4b8f0ae81aa2b65a2361603adca9f167543203",
+      "buckets": [32, 64, 128, 257, 512, 1024, 2048]
     },
     "sequence_semantic_gate": "every-profile-sequence-bucket-global-ordered-query-document-scope-plus-adversarial-relevant-minimum-irrelevant-maximum-exact-int8-strict-ranking",
     "required_device_classes": [

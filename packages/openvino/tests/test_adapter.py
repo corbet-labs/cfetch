@@ -221,6 +221,12 @@ class AdapterContractTests(unittest.TestCase):
             response["cfetch_execution"]["compatibility_report_sha256"]
         )
 
+    def test_service_releases_cached_native_engines_explicitly(self) -> None:
+        self.service.response_for(self.request_body(["short"]))
+        self.assertEqual(list(self.service._engines), ["intel-test-npu"])
+        self.service.close()
+        self.assertEqual(self.service._engines, {})
+
     def test_wrong_requested_scope_is_rejected(self) -> None:
         with self.assertRaisesRegex(adapter.RequestError, "exact scope"):
             self.service.response_for(

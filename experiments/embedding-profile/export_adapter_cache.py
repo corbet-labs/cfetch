@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 PROFILE_ID = "cfetch-embedding-v1"
 PROFILE_MANIFEST_SHA256 = (
-    "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7"
+    "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb"
 )
 MODEL = "google/embeddinggemma-300m"
 MODEL_REVISION = "57c266a740f537b4dc058e1b0cda161fd15afa75"

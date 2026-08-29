@@ -83,7 +83,7 @@ def scope_document(scope_id: str, device_class: str) -> dict[str, object]:
         "required_host": host_binding(),
         "placement_evidence_sha256": None,
         "supported_max_tokens": 2048,
-        "supported_sequence_buckets": [32, 64, 128, 256, 512, 1024, 2048],
+        "supported_sequence_buckets": [32, 64, 128, 257, 512, 1024, 2048],
         "supported_max_batch_size": 64,
         "sequence_capability_evidence_sha256": None,
         "performance_evidence_sha256": None,
@@ -100,10 +100,10 @@ def package_document() -> dict[str, object]:
         "package_state": "physical-probe",
         "profile_id": "cfetch-embedding-v1",
         "profile_manifest_sha256": (
-            "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7"
+            "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb"
         ),
         "admission_policy_sha256": (
-            "ab5463e1c131a7331240e626817bcfc109fe7af658369a8abec437e4a56b2b44"
+            "4f731158e5c9edb7bd111dbfa1ae91eeabd181b4bf15ec473818f64f074567ce"
         ),
         "model": "google/embeddinggemma-300m",
         "model_revision": "57c266a740f537b4dc058e1b0cda161fd15afa75",
@@ -340,10 +340,10 @@ class PhysicalEvidenceTests(unittest.TestCase):
                     "model": "google/embeddinggemma-300m",
                     "cfetch_profile": "cfetch-embedding-v1",
                     "cfetch_profile_manifest_sha256": (
-                        "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7"
+                        "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb"
                     ),
                     "cfetch_admission_policy_sha256": (
-                        "ab5463e1c131a7331240e626817bcfc109fe7af658369a8abec437e4a56b2b44"
+                        "4f731158e5c9edb7bd111dbfa1ae91eeabd181b4bf15ec473818f64f074567ce"
                     ),
                     "cfetch_model_revision": (
                         "57c266a740f537b4dc058e1b0cda161fd15afa75"

@@ -32,7 +32,7 @@ class SemanticFixtureSmokeTests(unittest.TestCase):
         )
         self.assertEqual(
             [row["bucket"] for row in results],
-            [32, 64, 128, 256, 512, 1024, 2048],
+            [32, 64, 128, 257, 512, 1024, 2048],
         )
         self.assertTrue(
             all(row["token_counts"] == [row["bucket"]] * 3 for row in results)
