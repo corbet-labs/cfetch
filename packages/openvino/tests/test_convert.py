@@ -290,14 +290,14 @@ class ConversionContractTests(unittest.TestCase):
                     FakeShape(
                         FakeDimension(1),
                         FakeDimension(1),
-                        FakeDimension(1, 2048),
+                        FakeDimension(0, -1),
                     )
                 )
                 self.result = FakePort(
                     FakeShape(
                         FakeDimension(1),
                         FakeDimension(128),
-                        FakeDimension(1, 2048),
+                        FakeDimension(0, -1),
                     )
                 )
 
@@ -329,7 +329,7 @@ class ConversionContractTests(unittest.TestCase):
                     FakeShape(
                         FakeDimension(1),
                         FakeDimension(128),
-                        FakeDimension(1, 2048),
+                        FakeDimension(0, -1),
                     )
                 )
 

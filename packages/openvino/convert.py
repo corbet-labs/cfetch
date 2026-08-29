@@ -368,7 +368,11 @@ def rewrite_unit_reduction_matmuls(model: Any) -> None:
     multiplication and no addition.  Broadcasting ``Multiply`` is therefore
     algebraically identical here, while avoiding an Intel GPU plugin shape
     lowering bug for ``[1,128,1] x [1,1,S]``.  Refuse graph drift rather than
-    rewriting any additional MatMul selected only by shape.
+    rewriting any additional MatMul selected only by shape.  The converted
+    OpenVINO graph does not retain the input sequence bounds on this internal
+    position-id edge, so only the dimensions relevant to the K=1 identity are
+    frozen here.  ``convert_graph`` separately verifies the bounded model
+    inputs before calling this rewrite.
     """
 
     import openvino.opset13 as ops
@@ -405,12 +409,10 @@ def rewrite_unit_reduction_matmuls(model: Any) -> None:
             or right_shape[0].get_length() != 1
             or not right_shape[1].is_static
             or right_shape[1].get_length() != 1
-            or right_shape[2].get_min_length() != 1
-            or right_shape[2].get_max_length() != MAX_TOKENS
         ):
             raise ConversionError(
                 f"{name} does not have the frozen [1,128,1] x "
-                f"[1,1,1..{MAX_TOKENS}] contract"
+                "[1,1,S] unit-reduction contract"
             )
         replacement = ops.multiply(left, right)
         replacement.set_friendly_name(name)
@@ -457,7 +459,6 @@ def convert_graph(source_dir: Path, output_dir: Path, weight_storage: str) -> No
                 ("attention_mask", dynamic_mask, ov.Type.i64),
             ],
         )
-    rewrite_unit_reduction_matmuls(model)
     if len(model.inputs) != 2 or len(model.outputs) != 1:
         raise ConversionError(
             f"converted graph has {len(model.inputs)} inputs and "
@@ -484,6 +485,7 @@ def convert_graph(source_dir: Path, output_dir: Path, weight_storage: str) -> No
                 f"converted {name} contract is {port.element_type} "
                 f"{port.partial_shape}, expected i64 {expected_shape}"
             )
+    rewrite_unit_reduction_matmuls(model)
     # Before serialization, prove that every required static compilation shape
     # can be derived from this exact graph.  Physical device compilation and
     # placement are deliberately later evidence, not a conversion claim.
