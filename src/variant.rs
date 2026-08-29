@@ -175,12 +175,34 @@ mod tests {
     fn catalog_accepts_a_package_local_out_of_process_variant() {
         let mut local = catalog().clone();
         let mut variant = local.variants[0].clone();
-        variant.id = "linux-cfetch-local-intel-lunar-lake-x86_64".into();
+        variant.id = "linux-cfetch-local-test-one-x86_64".into();
         variant.backend = "local".into();
         local.variants.push(variant.clone());
-        variant.id = "linux-cfetch-local-amd-strix-point-x86_64".into();
+        variant.id = "linux-cfetch-local-test-two-x86_64".into();
         local.variants.push(variant);
         local.validate().unwrap();
+    }
+
+    #[test]
+    fn lunar_lake_local_variant_exists_but_does_not_replace_portable_linux() {
+        let local = catalog()
+            .variants
+            .iter()
+            .find(|variant| variant.id == "linux-cfetch-local-intel-lunar-lake-x86_64")
+            .expect("the first exact local package needs an activation target");
+        assert_eq!(local.backend, "local");
+        assert_eq!((local.os.as_str(), local.arch.as_str()), ("linux", "x86_64"));
+
+        let portable = catalog()
+            .variants
+            .iter()
+            .find(|variant| {
+                variant.os == "linux"
+                    && variant.arch == "x86_64"
+                    && variant.backend == "endpoint"
+            })
+            .expect("the portable endpoint variant remains the default");
+        assert_eq!(portable.id, "linux-cfetch-remote-x86_64");
     }
 
     #[test]

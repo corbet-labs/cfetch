@@ -24,6 +24,17 @@
       "cargo_features": ""
     },
     {
+      "id": "linux-cfetch-local-intel-lunar-lake-x86_64",
+      "os": "linux",
+      "arch": "x86_64",
+      "runner": "ubuntu-22.04",
+      "target": "",
+      "binary": "cfetch",
+      "archive": "tar.gz",
+      "backend": "local",
+      "cargo_features": ""
+    },
+    {
       "id": "mac-cfetch-remote-arm64",
       "os": "mac",
       "arch": "aarch64",
