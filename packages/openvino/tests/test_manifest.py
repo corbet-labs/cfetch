@@ -41,6 +41,11 @@ class ManifestTests(unittest.TestCase):
             "source": {
                 "model": manifest.MODEL,
                 "revision": manifest.MODEL_REVISION,
+                "acquisition": {
+                    "repository": manifest.SOURCE_MIRROR,
+                    "revision": manifest.SOURCE_MIRROR_REVISION,
+                    "mode": "public-byte-identical-mirror",
+                },
                 "files": manifest.PINNED_SOURCE_FILE_SHA256,
             },
             "semantic_pipeline": {

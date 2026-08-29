@@ -52,9 +52,11 @@ and an exact glibc 2.35 build floor. It:
 
 1. installs only binary wheels from `requirements-build.lock` with
    `--require-hashes`, using PyPI plus the official PyTorch CPU wheel index;
-2. fetches only `google/embeddinggemma-300m` commit
-   `57c266a740f537b4dc058e1b0cda161fd15afa75` using the gated `HF_TOKEN`
-   secret and verifies every required source file hash;
+2. fetches the public immutable mirror `unsloth/embeddinggemma-300m` commit
+   `bfa3c846ac738e62aa61806ef9112d34acb1dc5a`, whose 13 required files are
+   byte-identical to the frozen `google/embeddinggemma-300m` commit
+   `57c266a740f537b4dc058e1b0cda161fd15afa75`, and verifies every file against
+   the canonical SHA-256 allowlist without sending credentials;
 3. fetches, extracts, and hash-checks the pinned official Gemma Terms and
    Prohibited Use Policy;
 4. converts the exact graph and runs a real CPU PyTorch-to-OpenVINO parity
@@ -62,9 +64,10 @@ and an exact glibc 2.35 build floor. It:
 5. freezes the runtime, executes its integrity launcher and CPU plugin
    self-check, and emits regular-file-only content-addressed archives.
 
-The token exists only in the source-fetch step and is never written to output.
-The parity report is a broken-export smoke check, not compatibility admission
-evidence.
+The fetch report and artifact manifest record both the canonical Google source
+identity and the exact public acquisition commit. The mirror is transport,
+not a new model identity: a single differing byte aborts the build. The parity
+report is a broken-export smoke check, not compatibility admission evidence.
 
 The equivalent local conversion commands, after obtaining the exact source
 under the Gemma terms, are:
@@ -275,8 +278,9 @@ secret package possession. Remote service scopes require a separate
 
 ## Remaining physical work
 
-The manual build must first succeed against the gated source. Then an exact
-`physical-probe` package must run on the target Intel cohort. The external
+The manual build must first reproduce the canonical bytes from the pinned
+public mirror. Then an exact `physical-probe` package must run on the target
+Intel cohort. The external
 physical collector—not this build recipe—must retain signed raw transactions
 covering all seven buckets, live placement/properties/host identity, latency,
 RSS, 1-through-64 wire grouping, output digests, and repeatability. Energy may

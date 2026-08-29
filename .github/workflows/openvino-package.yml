@@ -1,4 +1,4 @@
-# Manual, gated build for the first exact Intel OpenVINO artifact and frozen
+# Manual, hash-pinned build for the first exact Intel OpenVINO artifact and frozen
 # Linux x86_64 runtime.  This produces build inputs, not admitted hardware
 # scopes: physical NPU/GPU/CPU evidence is collected on the target host later.
 name: OpenVINO pinned package inputs
@@ -57,11 +57,8 @@ jobs:
             --output-dir "$RUNNER_TEMP/gemma-legal" \
             > "$RUNNER_TEMP/legal-result.json"
 
-      - name: Fetch and verify only the exact gated model commit
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: Fetch and verify the byte-identical public mirror commit
         run: |
-          test -n "$HF_TOKEN"
           python packages/openvino/fetch_source.py \
             --output-dir "$RUNNER_TEMP/embeddinggemma-source" \
             --cache-dir "$RUNNER_TEMP/huggingface-cache" \

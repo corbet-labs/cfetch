@@ -40,7 +40,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("safe lookup failure", stderr.getvalue())
 
-    def test_gated_fetch_uses_exact_commit_allowlist_and_never_returns_token(self) -> None:
+    def test_public_mirror_fetch_uses_exact_commit_allowlist_without_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             snapshot = root / "snapshot"
@@ -69,18 +69,28 @@ class PackagingTests(unittest.TestCase):
                 mock.patch.dict(sys.modules, {"huggingface_hub": fake_module}),
                 mock.patch.object(fetch_source, "MODEL", "test/model"),
                 mock.patch.object(fetch_source, "MODEL_REVISION", "test-revision"),
+                mock.patch.object(fetch_source, "SOURCE_MIRROR", "test/mirror"),
+                mock.patch.object(
+                    fetch_source, "SOURCE_MIRROR_REVISION", "test-revision"
+                ),
                 mock.patch.object(
                     fetch_source, "PINNED_SOURCE_FILE_SHA256", expected
                 ),
-                mock.patch.dict("os.environ", {"TEST_HF_TOKEN": "secret-value"}),
             ):
-                report = fetch_source.fetch(
-                    root / "output", root / "cache", "TEST_HF_TOKEN"
-                )
+                report = fetch_source.fetch(root / "output", root / "cache")
             self.assertEqual(report["revision"], "test-revision")
-            self.assertNotIn("secret-value", repr(report))
+            self.assertEqual(
+                report["acquisition"],
+                {
+                    "repository": "test/mirror",
+                    "revision": "test-revision",
+                    "mode": "public-byte-identical-mirror",
+                },
+            )
+            self.assertIs(calls["model_info"]["token"], False)
             download = calls["snapshot_download"]
             self.assertEqual(download["revision"], "test-revision")
+            self.assertIs(download["token"], False)
             self.assertEqual(download["allow_patterns"], ["nested/source.bin"])
             self.assertEqual((root / "output/nested/source.bin").read_bytes(), payload)
 

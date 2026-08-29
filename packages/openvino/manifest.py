@@ -30,6 +30,11 @@ ADMISSION_POLICY_SHA256 = (
 )
 MODEL = "google/embeddinggemma-300m"
 MODEL_REVISION = "57c266a740f537b4dc058e1b0cda161fd15afa75"
+# The canonical Google repository is gated at the transport layer.  This
+# immutable public mirror commit contains the exact same required bytes; every
+# file is still accepted only by the canonical SHA-256 allowlist below.
+SOURCE_MIRROR = "unsloth/embeddinggemma-300m"
+SOURCE_MIRROR_REVISION = "bfa3c846ac738e62aa61806ef9112d34acb1dc5a"
 DIMENSIONS = 768
 MAX_TOKENS = 2048
 MAX_WIRE_BATCH_SIZE = 64
@@ -406,11 +411,22 @@ def load_artifact(root: Path, relative_manifest: Any, expected_sha256: Any) -> A
     source = document["source"]
     if not isinstance(source, dict):
         raise ManifestError("artifact manifest source must be an object")
-    _require_exact_keys(source, {"model", "revision", "files"}, set(), "artifact source")
+    _require_exact_keys(
+        source,
+        {"model", "revision", "files", "acquisition"},
+        set(),
+        "artifact source",
+    )
     if source["model"] != MODEL or source["revision"] != MODEL_REVISION:
         raise ManifestError("artifact source does not match the frozen model and revision")
     if source["files"] != PINNED_SOURCE_FILE_SHA256:
         raise ManifestError("artifact source file digests do not match the pinned exact revision")
+    if source["acquisition"] != {
+        "repository": SOURCE_MIRROR,
+        "revision": SOURCE_MIRROR_REVISION,
+        "mode": "public-byte-identical-mirror",
+    }:
+        raise ManifestError("artifact source acquisition is not the pinned byte mirror")
     pipeline = document["semantic_pipeline"]
     expected_pipeline = {
         "dimensions": DIMENSIONS,

@@ -27,6 +27,8 @@ if __package__:
         MODEL_REVISION,
         PINNED_SOURCE_FILE_SHA256,
         SEQUENCE_BUCKETS,
+        SOURCE_MIRROR,
+        SOURCE_MIRROR_REVISION,
     )
 else:
     from legal import (  # type: ignore[no-redef]
@@ -41,6 +43,8 @@ else:
         MODEL_REVISION,
         PINNED_SOURCE_FILE_SHA256,
         SEQUENCE_BUCKETS,
+        SOURCE_MIRROR,
+        SOURCE_MIRROR_REVISION,
     )
 
 
@@ -343,6 +347,11 @@ def write_artifact_manifest(
         "source": {
             "model": MODEL,
             "revision": MODEL_REVISION,
+            "acquisition": {
+                "repository": SOURCE_MIRROR,
+                "revision": SOURCE_MIRROR_REVISION,
+                "mode": "public-byte-identical-mirror",
+            },
             "files": dict(PINNED_SOURCE_FILE_SHA256),
         },
         "semantic_pipeline": {
