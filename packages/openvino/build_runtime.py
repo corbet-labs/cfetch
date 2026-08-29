@@ -47,24 +47,32 @@ class RuntimeBuildError(ValueError):
     """The frozen dispatcher could not be built as one validated payload."""
 
 
-def _is_optional_requested_marker(relative: Path) -> bool:
+def _is_optional_empty_marker(relative: Path) -> bool:
     parts = relative.parts
-    if len(parts) != 3 or parts[0] != "_internal" or parts[2] != "REQUESTED":
+    if not parts or parts[0] != "_internal":
         return False
-    directory = parts[1]
-    suffix = ".dist-info"
-    distribution = directory[: -len(suffix)] if directory.endswith(suffix) else ""
-    return bool(distribution) and all(
-        character.isascii() and (character.isalnum() or character in "._-")
-        for character in distribution
-    )
+    if len(parts) == 3 and parts[2] == "REQUESTED":
+        directory = parts[1]
+        suffix = ".dist-info"
+        distribution = directory[: -len(suffix)] if directory.endswith(suffix) else ""
+        return bool(distribution) and all(
+            character.isascii() and (character.isalnum() or character in "._-")
+            for character in distribution
+        )
+    if len(parts) >= 3 and parts[-1] == "py.typed":
+        return all(
+            component.isidentifier() and component.isascii()
+            for component in parts[1:-1]
+        )
+    return False
 
 
 def _prune_optional_empty_metadata(root: Path) -> None:
-    """Remove only pip's empty REQUESTED markers from the frozen payload."""
+    """Remove only runtime-irrelevant empty installer and typing markers."""
 
     root = root.resolve()
-    requested_markers: list[Path] = []
+    optional_markers: list[Path] = []
+    unexpected: list[str] = []
     for directory, directory_names, file_names in os.walk(root, followlinks=False):
         current = Path(directory)
         directory_names.sort()
@@ -84,12 +92,18 @@ def _prune_optional_empty_metadata(root: Path) -> None:
                 )
             if path.stat().st_size != 0:
                 continue
-            if not _is_optional_requested_marker(relative):
-                raise RuntimeBuildError(
-                    f"PyInstaller emitted unsupported empty file {relative.as_posix()}"
-                )
-            requested_markers.append(path)
-    for path in requested_markers:
+            if _is_optional_empty_marker(relative):
+                optional_markers.append(path)
+            else:
+                unexpected.append(relative.as_posix())
+    if unexpected:
+        detail = ", ".join(unexpected[:64])
+        if len(unexpected) > 64:
+            detail += f", and {len(unexpected) - 64} more"
+        raise RuntimeBuildError(
+            f"PyInstaller emitted unsupported empty file(s): {detail}"
+        )
+    for path in optional_markers:
         path.unlink()
 
 

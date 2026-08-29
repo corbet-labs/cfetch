@@ -28,18 +28,28 @@ class PackagingTests(unittest.TestCase):
             empty_requested = root / "_internal/pyinstaller-6.22.2.dist-info/REQUESTED"
             empty_requested.parent.mkdir(parents=True)
             empty_requested.write_bytes(b"")
+            empty_typing_marker = root / "_internal/cryptography/py.typed"
+            empty_typing_marker.parent.mkdir(parents=True)
+            empty_typing_marker.write_bytes(b"")
             retained_requested = root / "_internal/openvino-2026.3.1.dist-info/REQUESTED"
             retained_requested.parent.mkdir(parents=True)
             retained_requested.write_bytes(b"runtime-meaningful")
+            retained_typing_marker = root / "_internal/openvino/py.typed"
+            retained_typing_marker.parent.mkdir(parents=True)
+            retained_typing_marker.write_bytes(b"runtime-meaningful")
             build_runtime._prune_optional_empty_metadata(root)
             self.assertFalse(empty_requested.exists())
+            self.assertFalse(empty_typing_marker.exists())
             self.assertEqual(retained_requested.read_bytes(), b"runtime-meaningful")
+            self.assertEqual(
+                retained_typing_marker.read_bytes(), b"runtime-meaningful"
+            )
 
             unrelated = root / "_internal/runtime-resource.bin"
             unrelated.write_bytes(b"")
             with self.assertRaisesRegex(
                 build_runtime.RuntimeBuildError,
-                r"unsupported empty file _internal/runtime-resource\.bin",
+                r"unsupported empty file\(s\): _internal/runtime-resource\.bin",
             ):
                 build_runtime._prune_optional_empty_metadata(root)
 
