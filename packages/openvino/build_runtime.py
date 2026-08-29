@@ -47,6 +47,52 @@ class RuntimeBuildError(ValueError):
     """The frozen dispatcher could not be built as one validated payload."""
 
 
+def _is_optional_requested_marker(relative: Path) -> bool:
+    parts = relative.parts
+    if len(parts) != 3 or parts[0] != "_internal" or parts[2] != "REQUESTED":
+        return False
+    directory = parts[1]
+    suffix = ".dist-info"
+    distribution = directory[: -len(suffix)] if directory.endswith(suffix) else ""
+    return bool(distribution) and all(
+        character.isascii() and (character.isalnum() or character in "._-")
+        for character in distribution
+    )
+
+
+def _prune_optional_empty_metadata(root: Path) -> None:
+    """Remove only pip's empty REQUESTED markers from the frozen payload."""
+
+    root = root.resolve()
+    requested_markers: list[Path] = []
+    for directory, directory_names, file_names in os.walk(root, followlinks=False):
+        current = Path(directory)
+        directory_names.sort()
+        file_names.sort()
+        for name in directory_names:
+            path = current / name
+            if path.is_symlink():
+                raise RuntimeBuildError(
+                    f"PyInstaller emitted symlink after materialization: {path}"
+                )
+        for name in file_names:
+            path = current / name
+            relative = path.relative_to(root)
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeBuildError(
+                    f"PyInstaller emitted unsupported filesystem entry {path}"
+                )
+            if path.stat().st_size != 0:
+                continue
+            if not _is_optional_requested_marker(relative):
+                raise RuntimeBuildError(
+                    f"PyInstaller emitted unsupported empty file {relative.as_posix()}"
+                )
+            requested_markers.append(path)
+    for path in requested_markers:
+        path.unlink()
+
+
 def _materialize_file_symlinks(root: Path) -> None:
     """Turn PyInstaller's relocatable in-tree library links into bound files."""
 
@@ -209,6 +255,7 @@ def build(output_dir: Path, minimum_glibc: str, compiler: str) -> tuple[Path, st
     if not output_dir.is_dir():
         raise RuntimeBuildError("PyInstaller did not create the expected onedir payload")
     _materialize_file_symlinks(output_dir)
+    _prune_optional_empty_metadata(output_dir)
     _compile_launcher(recipe_dir / "launcher.c", output_dir / LAUNCHER, compiler)
     manifest = create_manifest(output_dir, minimum_glibc)
     _temporary_runtime_self_check(output_dir)

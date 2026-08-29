@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +22,27 @@ from packages.openvino import runtime_bundle
 
 
 class PackagingTests(unittest.TestCase):
+    def test_runtime_build_prunes_only_empty_requested_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            empty_requested = root / "_internal/pyinstaller-6.22.2.dist-info/REQUESTED"
+            empty_requested.parent.mkdir(parents=True)
+            empty_requested.write_bytes(b"")
+            retained_requested = root / "_internal/openvino-2026.3.1.dist-info/REQUESTED"
+            retained_requested.parent.mkdir(parents=True)
+            retained_requested.write_bytes(b"runtime-meaningful")
+            build_runtime._prune_optional_empty_metadata(root)
+            self.assertFalse(empty_requested.exists())
+            self.assertEqual(retained_requested.read_bytes(), b"runtime-meaningful")
+
+            unrelated = root / "_internal/runtime-resource.bin"
+            unrelated.write_bytes(b"")
+            with self.assertRaisesRegex(
+                build_runtime.RuntimeBuildError,
+                r"unsupported empty file _internal/runtime-resource\.bin",
+            ):
+                build_runtime._prune_optional_empty_metadata(root)
+
     def test_runtime_build_cli_keeps_failure_diagnostic_out_of_result_stdout(
         self,
     ) -> None:
@@ -154,7 +174,6 @@ class PackagingTests(unittest.TestCase):
             payload = base / "payload"
             (payload / "nested").mkdir(parents=True)
             (payload / "root.txt").write_bytes(b"root")
-            (payload / "nested/empty-metadata").write_bytes(b"")
             executable = payload / "nested/tool"
             executable.write_bytes(b"#!/bin/sh\nexit 0\n")
             executable.chmod(0o755)
@@ -169,11 +188,9 @@ class PackagingTests(unittest.TestCase):
             with tarfile.open(first, "r:gz") as bundle:
                 members = bundle.getmembers()
             self.assertEqual(
-                [member.name for member in members],
-                ["nested/empty-metadata", "nested/tool", "root.txt"],
+                [member.name for member in members], ["nested/tool", "root.txt"]
             )
             self.assertTrue(all(member.isreg() for member in members))
-            self.assertEqual(members[0].size, 0)
 
     def test_gemma_archive_refuses_missing_redistribution_payload(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -219,7 +236,6 @@ class PackagingTests(unittest.TestCase):
             native = root / "_internal/native.so"
             native.parent.mkdir()
             native.write_bytes(b"native-one")
-            (root / "_internal/empty-metadata").write_bytes(b"")
             inventory, digest = package_inventory.create(root)
             self.assertEqual(
                 hashlib.sha256(inventory.read_bytes()).hexdigest(), digest
@@ -280,9 +296,6 @@ class PackagingTests(unittest.TestCase):
             native = root / "_internal/native.so"
             native.parent.mkdir()
             native.write_bytes(b"runtime-native")
-            empty_metadata = root / "_internal/pyinstaller.dist-info/REQUESTED"
-            empty_metadata.parent.mkdir()
-            empty_metadata.write_bytes(b"")
             with (
                 mock.patch.object(runtime_bundle, "_require_build_target"),
                 mock.patch.object(
@@ -299,32 +312,11 @@ class PackagingTests(unittest.TestCase):
                     return_value="6.22.2",
                 ),
             ):
-                manifest_path, manifest_sha256 = runtime_bundle.create_manifest(
-                    root, "2.35"
-                )
-            manifest = json.loads(manifest_path.read_bytes())
-            self.assertIn(
-                {
-                    "path": "_internal/pyinstaller.dist-info/REQUESTED",
-                    "sha256": hashlib.sha256(b"").hexdigest(),
-                    "bytes": 0,
-                    "executable": False,
-                },
-                manifest["files"],
-            )
+                _, manifest_sha256 = runtime_bundle.create_manifest(root, "2.35")
             runtime_bundle.load_and_verify(root, manifest_sha256)
             package_manifest = root / "package-manifest.json"
             package_manifest.write_bytes(b'{"package_state":"candidate"}\n')
-            inventory_path, inventory_sha256 = package_inventory.create(root)
-            self.assertIn(
-                (
-                    hashlib.sha256(b"").hexdigest(),
-                    0,
-                    False,
-                    "_internal/pyinstaller.dist-info/REQUESTED",
-                ),
-                package_inventory.parse(inventory_path.read_bytes()),
-            )
+            _, inventory_sha256 = package_inventory.create(root)
             package_inventory.patch_launcher(root, inventory_sha256)
             package_inventory.verify_bound(root, inventory_sha256)
             runtime_bundle.load_and_verify(

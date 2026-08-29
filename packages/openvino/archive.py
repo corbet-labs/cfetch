@@ -45,6 +45,8 @@ def _entries(root: Path) -> list[Path]:
             if path.is_symlink() or not path.is_file():
                 raise ArchiveError(f"package entry is not a regular file: {path}")
             size = path.stat().st_size
+            if size < 1:
+                raise ArchiveError(f"package file is empty: {path}")
             total_bytes += size
             if total_bytes > MAX_BYTES:
                 raise ArchiveError(f"package exceeds the {MAX_BYTES}-byte limit")

@@ -111,6 +111,8 @@ def _files(root: Path) -> list[tuple[str, Path]]:
             if path.is_symlink() or not path.is_file():
                 raise InventoryError(f"package entry is not regular: {relative}")
             size = path.stat().st_size
+            if size < 1:
+                raise InventoryError(f"package inventory cannot bind empty file {relative}")
             total_bytes += size
             if total_bytes > MAX_BYTES:
                 raise InventoryError(f"package exceeds the {MAX_BYTES}-byte inventory limit")
@@ -182,11 +184,7 @@ def parse(raw: bytes) -> list[tuple[str, int, bool, str]]:
         digest, size_text, executable_text, relative = fields
         if DIGEST_RE.fullmatch(digest) is None:
             raise InventoryError(f"package inventory line {index + 2} has invalid SHA-256")
-        if (
-            not size_text.isascii()
-            or not size_text.isdecimal()
-            or (size_text.startswith("0") and size_text != "0")
-        ):
+        if not size_text.isascii() or not size_text.isdecimal() or size_text.startswith("0"):
             raise InventoryError(f"package inventory line {index + 2} has invalid size")
         size = int(size_text)
         total_bytes += size

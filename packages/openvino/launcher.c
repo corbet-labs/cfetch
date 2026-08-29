@@ -266,7 +266,7 @@ static int load_inventory(const char *path, inventory_entry **output, size_t *ou
             goto fail;
         if (count > 0 && strcmp(entries[count - 1].path, relative) >= 0)
             goto fail;
-        if (*size_text == '\0' || (size_text[0] == '0' && size_text[1] != '\0'))
+        if (*size_text == '\0' || *size_text == '0')
             goto fail;
         {
             const char *cursor;
@@ -277,7 +277,7 @@ static int load_inventory(const char *path, inventory_entry **output, size_t *ou
         }
         errno = 0;
         bytes = strtoull(size_text, &end, 10);
-        if (errno != 0 || *end != '\0' || bytes > MAX_TOTAL_BYTES)
+        if (errno != 0 || *end != '\0' || bytes == 0 || bytes > MAX_TOTAL_BYTES)
             goto fail;
         if (strcmp(mode_text, "0") != 0 && strcmp(mode_text, "1") != 0)
             goto fail;
