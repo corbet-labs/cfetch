@@ -359,6 +359,18 @@ enum CodeGraphAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show bounded incoming and outgoing import context around one file
+    Context {
+        target: String,
+        /// Maximum import hops to traverse in either direction (1-32)
+        #[arg(long, default_value_t = graph::DEFAULT_CONTEXT_DEPTH)]
+        depth: usize,
+        /// Maximum related files to return (1-200)
+        #[arg(long, default_value_t = graph::DEFAULT_CONTEXT_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1236,6 +1248,52 @@ fn code_graph_cmd(action: CodeGraphAction) -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&impact)?);
             } else {
                 println!("{}", graph::render_dependency_impact(&impact));
+            }
+        }
+        CodeGraphAction::Context { target, depth, limit, json } => {
+            if let Some(cs) = &cfg.client.serving {
+                let response = serve::client_call(
+                    cs,
+                    serde_json::json!({
+                        "op": "code-context",
+                        "path": target,
+                        "depth": depth,
+                        "limit": limit,
+                    }),
+                    serve::QUERY_TIMEOUT,
+                )?;
+                let context = response.dependency_context.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("serving host {} returned no dependency context", cs.addr)
+                })?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "context": context,
+                            "origin": response.origin,
+                            "generation": response.generation,
+                            "fresh": response.fresh,
+                            "stale_note": response.stale_note,
+                        }))?
+                    );
+                } else {
+                    println!("{}", graph::render_dependency_context(context));
+                    print_served_by(&response);
+                }
+                return Ok(());
+            }
+            let conn = index::open(&paths::state_dir())?;
+            let context = graph::dependency_context(
+                &conn,
+                &cfg.effective_code_roots(),
+                &target,
+                depth,
+                limit,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&context)?);
+            } else {
+                println!("{}", graph::render_dependency_context(&context));
             }
         }
     }

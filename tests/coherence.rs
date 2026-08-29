@@ -686,6 +686,33 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
         "TCP and local serving must expose the identical blast radius"
     );
 
+    let context_request = json!({
+        "op": "code-context",
+        "path": "proj/src/lib.rs",
+        "depth": 1,
+        "limit": 10,
+    });
+    let sock_context = daemon.local().req(&context_request);
+    assert_eq!(sock_context["ok"], true, "{sock_context}");
+    assert_eq!(sock_context["dependency_context"]["total"], 1, "{sock_context}");
+    assert_eq!(
+        sock_context["dependency_context"]["nodes"][0]["edge"]["source"],
+        "proj/src/main.rs"
+    );
+    assert_eq!(
+        sock_context["dependency_context"]["nodes"][0]["edge"]["target"],
+        "proj/src/lib.rs"
+    );
+    assert!(
+        !sock_context.to_string().contains(storage_root.as_ref()),
+        "served dependency context must not expose the storage host root: {sock_context}"
+    );
+    let tcp_context = tcp_req(&addr, token, &context_request);
+    assert_eq!(
+        tcp_context["dependency_context"], sock_context["dependency_context"],
+        "TCP and local serving must expose identical dependency context"
+    );
+
     // The serving host's own CLI, reading its local index directly.
     let cli_home = tempfile::tempdir().unwrap();
     let local_out = Command::new(BIN)
@@ -766,6 +793,32 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
     let remote_path: Value = serde_json::from_slice(&remote_path.stdout).unwrap();
     assert_eq!(remote_path["path"], sock_path["dependency_path"]);
     assert_eq!(remote_path["origin"], "storage-host");
+
+    let remote_context = Command::new(BIN)
+        .args([
+            "code-graph",
+            "context",
+            "proj/src/lib.rs",
+            "--depth",
+            "1",
+            "--limit",
+            "10",
+            "--json",
+        ])
+        .env("CFETCH_STATE_DIR", client_state.path())
+        .env("CFETCH_CONFIG", &client_cfg)
+        .env("HOME", client_home.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        remote_context.status.success(),
+        "none-tier dependency context failed: {}",
+        String::from_utf8_lossy(&remote_context.stderr)
+    );
+    let remote_context: Value = serde_json::from_slice(&remote_context.stdout).unwrap();
+    assert_eq!(remote_context["context"], sock_context["dependency_context"]);
+    assert_eq!(remote_context["origin"], "storage-host");
     assert!(
         !client_state.path().join("index.db").exists(),
         "none-tier map and graph queries must open no local index"

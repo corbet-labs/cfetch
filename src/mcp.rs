@@ -28,6 +28,7 @@ const TOOL_NAMES: &[&str] = &[
     "cfetch_find",
     "cfetch_code_path",
     "cfetch_code_impact",
+    "cfetch_code_context",
     "cfetch_runtime_status",
     "cfetch_maintenance_packet",
     "cfetch_maintenance_show",
@@ -117,6 +118,20 @@ fn tool_defs() -> Vec<Tool> {
                     "target": {"type": "string", "description": "file path or unambiguous suffix"},
                     "depth": {"type": "integer", "default": graph::DEFAULT_IMPACT_DEPTH, "minimum": 1, "maximum": graph::MAX_DEPENDENCY_DEPTH},
                     "limit": {"type": "integer", "default": graph::DEFAULT_IMPACT_LIMIT, "minimum": 1, "maximum": graph::MAX_IMPACT_LIMIT}
+                },
+                "required": ["target"]
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_code_context",
+            "Show bounded incoming and outgoing import context around one indexed source file. Every related file carries one deterministic shortest explanation edge with its real direction, typed relation, and extraction evidence; omitted files are counted.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "file path or unambiguous suffix"},
+                    "depth": {"type": "integer", "default": graph::DEFAULT_CONTEXT_DEPTH, "minimum": 1, "maximum": graph::MAX_DEPENDENCY_DEPTH},
+                    "limit": {"type": "integer", "default": graph::DEFAULT_CONTEXT_LIMIT, "minimum": 1, "maximum": graph::MAX_CONTEXT_LIMIT}
                 },
                 "required": ["target"]
             })),
@@ -286,6 +301,13 @@ fn run_tool_remote(
                 .unwrap_or(graph::DEFAULT_IMPACT_DEPTH as u64),
             "limit": if limit == 0 { graph::DEFAULT_IMPACT_LIMIT } else { limit },
         }),
+        "cfetch_code_context" => json!({
+            "op": "code-context",
+            "path": args.get("target").and_then(Value::as_str).unwrap_or(""),
+            "depth": args.get("depth").and_then(Value::as_u64)
+                .unwrap_or(graph::DEFAULT_CONTEXT_DEPTH as u64),
+            "limit": if limit == 0 { graph::DEFAULT_CONTEXT_LIMIT } else { limit },
+        }),
         other => anyhow::bail!("unknown tool: {other}"),
     };
     let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
@@ -349,6 +371,13 @@ fn run_tool_remote(
                 .as_ref()
                 .context("serving host returned no dependency impact")?;
             graph::render_dependency_impact(impact)
+        }
+        "cfetch_code_context" => {
+            let context = resp
+                .dependency_context
+                .as_ref()
+                .context("serving host returned no dependency context")?;
+            graph::render_dependency_context(context)
         }
         other => anyhow::bail!("unknown tool: {other}"),
     };
@@ -508,6 +537,23 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                 limit,
             )?;
             Ok(graph::render_dependency_impact(&impact))
+        }
+        "cfetch_code_context" => {
+            let target = args.get("target").and_then(Value::as_str).unwrap_or("");
+            let depth = args
+                .get("depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(graph::DEFAULT_CONTEXT_DEPTH as u64) as usize;
+            let limit = if limit == 0 { graph::DEFAULT_CONTEXT_LIMIT } else { limit };
+            let conn = index::open(&paths::state_dir())?;
+            let context = graph::dependency_context(
+                &conn,
+                &cfg.effective_code_roots(),
+                target,
+                depth,
+                limit,
+            )?;
+            Ok(graph::render_dependency_context(&context))
         }
         other => anyhow::bail!("unknown tool: {other}"),
     }

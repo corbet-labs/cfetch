@@ -610,8 +610,11 @@ pub fn prune_edges(conn: &Connection) -> anyhow::Result<()> {
 pub const DEFAULT_PATH_DEPTH: usize = 12;
 pub const DEFAULT_IMPACT_DEPTH: usize = 4;
 pub const DEFAULT_IMPACT_LIMIT: usize = 50;
+pub const DEFAULT_CONTEXT_DEPTH: usize = 1;
+pub const DEFAULT_CONTEXT_LIMIT: usize = 50;
 pub const MAX_DEPENDENCY_DEPTH: usize = 32;
 pub const MAX_IMPACT_LIMIT: usize = 200;
+pub const MAX_CONTEXT_LIMIT: usize = 200;
 
 /// One stable, typed explanation step from the rebuildable source graph.
 ///
@@ -654,6 +657,26 @@ pub struct DependencyImpact {
     pub total: usize,
     pub omitted: usize,
     pub nodes: Vec<ImpactNode>,
+}
+
+/// One file in a bounded bidirectional neighborhood. `edge` is the exact
+/// directed import that first reached this file from the requested target;
+/// it therefore explains the relationship without pretending the traversal
+/// direction changes the source relationship.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextNode {
+    pub path: String,
+    pub depth: usize,
+    pub edge: DependencyEdge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyContext {
+    pub target: String,
+    pub max_depth: usize,
+    pub total: usize,
+    pub omitted: usize,
+    pub nodes: Vec<ContextNode>,
 }
 
 struct DependencyIndex {
@@ -938,6 +961,90 @@ pub fn dependency_impact(
     })
 }
 
+/// Builds a bounded neighborhood around one file by traversing imports in
+/// both directions. Every reached file retains exactly one deterministic
+/// shortest explanation edge, keeping the result linear in the node limit
+/// instead of returning an unbounded induced subgraph.
+pub fn dependency_context(
+    conn: &Connection,
+    roots: &[PathBuf],
+    target: &str,
+    max_depth: usize,
+    limit: usize,
+) -> anyhow::Result<DependencyContext> {
+    anyhow::ensure!(
+        (1..=MAX_DEPENDENCY_DEPTH).contains(&max_depth),
+        "max depth must be between 1 and {MAX_DEPENDENCY_DEPTH}"
+    );
+    anyhow::ensure!(
+        (1..=MAX_CONTEXT_LIMIT).contains(&limit),
+        "limit must be between 1 and {MAX_CONTEXT_LIMIT}"
+    );
+    let index = dependency_index(conn, roots)?;
+    let target = resolve_file(&index, target)?;
+    let mut explanation = vec![None; index.display.len()];
+    let mut depth = vec![usize::MAX; index.display.len()];
+    let mut queue = VecDeque::from([target]);
+    depth[target] = 0;
+    while let Some(node) = queue.pop_front() {
+        if depth[node] >= max_depth {
+            continue;
+        }
+        // Sort both traversal directions together by the newly reached file,
+        // then by the real directed edge. This also settles two-way imports
+        // identically on every platform.
+        let mut neighbors: Vec<(usize, usize, usize)> = index.outgoing[node]
+            .iter()
+            .map(|&neighbor| (neighbor, node, neighbor))
+            .chain(index.incoming[node].iter().map(|&neighbor| (neighbor, neighbor, node)))
+            .collect();
+        neighbors.sort_by(|left, right| {
+            index.display[left.0]
+                .cmp(&index.display[right.0])
+                .then(index.display[left.1].cmp(&index.display[right.1]))
+                .then(index.display[left.2].cmp(&index.display[right.2]))
+        });
+        neighbors.dedup();
+        for (neighbor, source, imported) in neighbors {
+            if depth[neighbor] != usize::MAX {
+                continue;
+            }
+            depth[neighbor] = depth[node] + 1;
+            explanation[neighbor] = Some((source, imported));
+            queue.push_back(neighbor);
+        }
+    }
+    let mut reached: Vec<usize> = (0..index.display.len())
+        .filter(|&node| node != target && depth[node] != usize::MAX)
+        .collect();
+    reached.sort_by(|&left, &right| {
+        depth[left]
+            .cmp(&depth[right])
+            .then(index.display[left].cmp(&index.display[right]))
+    });
+    let total = reached.len();
+    reached.truncate(limit);
+    let nodes = reached
+        .into_iter()
+        .map(|node| {
+            let (source, imported) =
+                explanation[node].expect("a context-reached node has an explanation edge");
+            ContextNode {
+                path: index.display[node].clone(),
+                depth: depth[node],
+                edge: dependency_edge(&index, source, imported),
+            }
+        })
+        .collect();
+    Ok(DependencyContext {
+        target: index.display[target].clone(),
+        max_depth,
+        total,
+        omitted: total.saturating_sub(limit),
+        nodes,
+    })
+}
+
 pub fn render_dependency_path(path: &DependencyPath) -> String {
     if !path.found {
         return format!(
@@ -976,6 +1083,27 @@ pub fn render_dependency_impact(impact: &DependencyImpact) -> String {
     }));
     if impact.omitted > 0 {
         lines.push(format!("... {} more file(s) omitted by the limit", impact.omitted));
+    }
+    lines.join("\n")
+}
+
+pub fn render_dependency_context(context: &DependencyContext) -> String {
+    let mut lines = vec![format!(
+        "dependency context: {} with {} related file(s), depth <= {}",
+        context.target, context.total, context.max_depth
+    )];
+    lines.extend(context.nodes.iter().map(|node| {
+        format!(
+            "d{} {} --{}--> {} [{}]",
+            node.depth,
+            node.edge.source,
+            node.edge.relation,
+            node.edge.target,
+            node.edge.evidence
+        )
+    }));
+    if context.omitted > 0 {
+        lines.push(format!("... {} more file(s) omitted by the limit", context.omitted));
     }
     lines.join("\n")
 }
@@ -1672,6 +1800,70 @@ mod tests {
             &[dir.path().to_path_buf()],
             "b.rs",
             4,
+            2,
+        )
+        .unwrap();
+        assert_eq!(clipped.nodes.len(), 2);
+        assert_eq!(clipped.omitted, 1, "bounded answers must name what they omit");
+    }
+
+    #[test]
+    fn dependency_context_walks_both_directions_with_one_explanation_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        branching_rust_project(dir.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let context = dependency_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "a.rs",
+            2,
+            10,
+        )
+        .unwrap();
+        assert_eq!(context.target, "a.rs");
+        assert_eq!(context.total, 3);
+        assert_eq!(context.omitted, 0);
+        assert_eq!(
+            context.nodes.iter().map(|node| (&*node.path, node.depth)).collect::<Vec<_>>(),
+            vec![("b.rs", 1), ("main.rs", 1), ("z.rs", 2)]
+        );
+
+        let imported = context.nodes.iter().find(|node| node.path == "b.rs").unwrap();
+        assert_eq!(imported.edge.source, "a.rs");
+        assert_eq!(imported.edge.target, "b.rs");
+        assert_eq!(imported.edge.relation, "imports");
+        assert_eq!(imported.edge.evidence, "source-file-head");
+
+        let importer = context.nodes.iter().find(|node| node.path == "main.rs").unwrap();
+        assert_eq!(importer.edge.source, "main.rs");
+        assert_eq!(importer.edge.target, "a.rs");
+
+        let transitive = context.nodes.iter().find(|node| node.path == "z.rs").unwrap();
+        assert_eq!(transitive.edge.source, "z.rs");
+        assert_eq!(
+            transitive.edge.target, "b.rs",
+            "equal shortest explanations must settle lexically"
+        );
+
+        let direct = dependency_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "a.rs",
+            1,
+            10,
+        )
+        .unwrap();
+        assert_eq!(direct.total, 2, "the depth bound must be real, not advisory");
+        assert!(direct.nodes.iter().all(|node| node.depth == 1));
+
+        let clipped = dependency_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "a.rs",
+            2,
             2,
         )
         .unwrap();
