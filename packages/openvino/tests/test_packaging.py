@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 from pathlib import Path
 import subprocess
 import sys
@@ -19,6 +21,25 @@ from packages.openvino import runtime_bundle
 
 
 class PackagingTests(unittest.TestCase):
+    def test_fetch_cli_keeps_safe_failure_out_of_result_stdout(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                fetch_source,
+                "fetch",
+                side_effect=fetch_source.SourceFetchError("safe lookup failure"),
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = fetch_source.main(
+                ["--output-dir", "unused-output", "--cache-dir", "unused-cache"]
+            )
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("safe lookup failure", stderr.getvalue())
+
     def test_gated_fetch_uses_exact_commit_allowlist_and_never_returns_token(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 from typing import Sequence
 
 if __package__:
@@ -102,7 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = fetch(args.output_dir, args.cache_dir, args.token_environment)
     except (ConversionError, OSError, SourceFetchError) as error:
         # The credential is deliberately never interpolated into diagnostics.
-        print(f"pinned EmbeddingGemma source fetch refused: {error}")
+        print(f"pinned EmbeddingGemma source fetch refused: {error}", file=sys.stderr)
         return 1
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0
