@@ -475,7 +475,10 @@ def load_artifact(root: Path, relative_manifest: Any, expected_sha256: Any) -> A
     )
     if conversion["recipe"] != "packages/openvino/convert.py":
         raise ManifestError("artifact conversion recipe is not the pinned OpenVINO recipe")
-    if conversion["export"] != "torch-export-bounded-dynamic-sequence-1-to-2048":
+    if conversion["export"] != (
+        "torch-export-bounded-dynamic-sequence-1-to-2048-"
+        "unit-reduction-matmul-rewrite-v1"
+    ):
         raise ManifestError("artifact conversion did not use the bounded dynamic export")
     if conversion["weight_storage"] not in ("f16", "f32"):
         raise ManifestError("artifact conversion weight_storage must be f16 or f32")

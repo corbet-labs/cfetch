@@ -218,6 +218,163 @@ class ConversionContractTests(unittest.TestCase):
         self.assertIs(mask_shapes[1], dimensions[0])
         self.assertIs(kwargs["strict"], False)
 
+    def test_unit_reduction_matmuls_are_rewritten_exactly(self) -> None:
+        class FakeDimension:
+            def __init__(self, minimum, maximum=None):
+                self.minimum = minimum
+                self.maximum = minimum if maximum is None else maximum
+
+            @property
+            def is_static(self):
+                return self.minimum == self.maximum
+
+            def get_length(self):
+                if not self.is_static:
+                    raise AssertionError("dynamic dimension has no static length")
+                return self.minimum
+
+            def get_min_length(self):
+                return self.minimum
+
+            def get_max_length(self):
+                return self.maximum
+
+            def signature(self):
+                return (self.minimum, self.maximum)
+
+        class FakeRank:
+            def __init__(self, length):
+                self.length = length
+                self.is_static = True
+
+            def get_length(self):
+                return self.length
+
+        class FakeShape:
+            def __init__(self, *dimensions):
+                self.dimensions = dimensions
+                self.rank = FakeRank(len(dimensions))
+
+            def __getitem__(self, index):
+                return self.dimensions[index]
+
+            def __eq__(self, other):
+                return isinstance(other, FakeShape) and [
+                    value.signature() for value in self.dimensions
+                ] == [value.signature() for value in other.dimensions]
+
+        class FakePort:
+            def __init__(self, shape, element_type="f32"):
+                self.shape = shape
+                self.element_type = element_type
+                self.replacement = None
+
+            def get_partial_shape(self):
+                return self.shape
+
+            def get_element_type(self):
+                return self.element_type
+
+            def replace(self, replacement):
+                self.replacement = replacement
+
+        class FakeNode:
+            def __init__(self, name):
+                self.name = name
+                self.left = FakePort(
+                    FakeShape(
+                        FakeDimension(1), FakeDimension(128), FakeDimension(1)
+                    )
+                )
+                self.right = FakePort(
+                    FakeShape(
+                        FakeDimension(1),
+                        FakeDimension(1),
+                        FakeDimension(1, 2048),
+                    )
+                )
+                self.result = FakePort(
+                    FakeShape(
+                        FakeDimension(1),
+                        FakeDimension(128),
+                        FakeDimension(1, 2048),
+                    )
+                )
+
+            def get_type_name(self):
+                return "MatMul"
+
+            def get_friendly_name(self):
+                return self.name
+
+            def get_attributes(self):
+                return {"transpose_a": False, "transpose_b": False}
+
+            def input_value(self, index):
+                return (self.left, self.right)[index]
+
+            def output(self, index):
+                self.assert_zero(index)
+                return self.result
+
+            @staticmethod
+            def assert_zero(index):
+                if index != 0:
+                    raise AssertionError("fixture has one output")
+
+        class FakeMultiply:
+            def __init__(self, left, right):
+                self.name = None
+                self.result = FakePort(
+                    FakeShape(
+                        FakeDimension(1),
+                        FakeDimension(128),
+                        FakeDimension(1, 2048),
+                    )
+                )
+
+            def set_friendly_name(self, name):
+                self.name = name
+
+            def output(self, index):
+                FakeNode.assert_zero(index)
+                return self.result
+
+        class FakeModel:
+            def __init__(self, nodes):
+                self.nodes = nodes
+                self.validated = False
+
+            def get_ordered_ops(self):
+                return self.nodes
+
+            def validate_nodes_and_infer_types(self):
+                self.validated = True
+
+        nodes = [FakeNode(name) for name in convert.DEGENERATE_OUTER_PRODUCT_NODES]
+        model = FakeModel(nodes)
+        fake_openvino = ModuleType("openvino")
+        fake_openvino.__path__ = []
+        fake_ops = ModuleType("openvino.opset13")
+        fake_ops.multiply = FakeMultiply
+        with mock.patch.dict(
+            "sys.modules",
+            {"openvino": fake_openvino, "openvino.opset13": fake_ops},
+        ):
+            convert.rewrite_unit_reduction_matmuls(model)
+
+        self.assertTrue(model.validated)
+        self.assertTrue(all(node.result.replacement is not None for node in nodes))
+        missing = FakeModel(nodes[:1])
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {"openvino": fake_openvino, "openvino.opset13": fake_ops},
+            ),
+            self.assertRaisesRegex(convert.ConversionError, "lacks the two frozen"),
+        ):
+            convert.rewrite_unit_reduction_matmuls(missing)
+
     def test_cli_keeps_failure_diagnostic_out_of_result_stdout(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()

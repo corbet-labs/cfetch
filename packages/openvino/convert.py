@@ -4,8 +4,10 @@
 This command never downloads a model.  It first verifies every semantic source
 file against the cfetch profile, then builds one dynamic-sequence IR containing
 the transformer, masked mean, both identity-activation dense projections, and
-L2 normalization.  The adapter reshapes that IR into all seven static buckets
-before compiling it for one exact manifest-selected device.
+L2 normalization.  It rewrites only the two frozen K=1 rotary outer products
+to algebraically identical broadcast multiplication.  The adapter reshapes
+that IR into all seven static buckets before compiling it for one exact
+manifest-selected device.
 """
 
 from __future__ import annotations
@@ -351,6 +353,84 @@ def export_torch_pipeline(pipeline: Any, example_ids: Any, example_mask: Any) ->
     )
 
 
+DEGENERATE_OUTER_PRODUCT_NODES = frozenset(
+    {
+        "bmm_22/aten.bmm.default/MatMul",
+        "bmm_23/aten.bmm.default/MatMul",
+    }
+)
+
+
+def rewrite_unit_reduction_matmuls(model: Any) -> None:
+    """Replace the two K=1 rotary outer products with exact multiplication.
+
+    A matrix product whose reduction dimension is exactly one performs one
+    multiplication and no addition.  Broadcasting ``Multiply`` is therefore
+    algebraically identical here, while avoiding an Intel GPU plugin shape
+    lowering bug for ``[1,128,1] x [1,1,S]``.  Refuse graph drift rather than
+    rewriting any additional MatMul selected only by shape.
+    """
+
+    import openvino.opset13 as ops
+
+    rewritten: set[str] = set()
+    for node in list(model.get_ordered_ops()):
+        if node.get_type_name() != "MatMul":
+            continue
+        name = node.get_friendly_name()
+        if name not in DEGENERATE_OUTER_PRODUCT_NODES:
+            continue
+        if node.get_attributes() != {
+            "transpose_a": False,
+            "transpose_b": False,
+        }:
+            raise ConversionError(f"{name} is not the frozen non-transposed MatMul")
+        left = node.input_value(0)
+        right = node.input_value(1)
+        left_shape = left.get_partial_shape()
+        right_shape = right.get_partial_shape()
+        expected_shape = node.output(0).get_partial_shape()
+        if (
+            not left_shape.rank.is_static
+            or left_shape.rank.get_length() != 3
+            or not right_shape.rank.is_static
+            or right_shape.rank.get_length() != 3
+            or not left_shape[0].is_static
+            or left_shape[0].get_length() != 1
+            or not left_shape[1].is_static
+            or left_shape[1].get_length() != 128
+            or not left_shape[2].is_static
+            or left_shape[2].get_length() != 1
+            or not right_shape[0].is_static
+            or right_shape[0].get_length() != 1
+            or not right_shape[1].is_static
+            or right_shape[1].get_length() != 1
+            or right_shape[2].get_min_length() != 1
+            or right_shape[2].get_max_length() != MAX_TOKENS
+        ):
+            raise ConversionError(
+                f"{name} does not have the frozen [1,128,1] x "
+                f"[1,1,1..{MAX_TOKENS}] contract"
+            )
+        replacement = ops.multiply(left, right)
+        replacement.set_friendly_name(name)
+        if (
+            replacement.output(0).get_partial_shape() != expected_shape
+            or replacement.output(0).get_element_type()
+            != node.output(0).get_element_type()
+        ):
+            raise ConversionError(f"{name} multiplication rewrite changed its contract")
+        node.output(0).replace(replacement.output(0))
+        rewritten.add(name)
+    if rewritten != DEGENERATE_OUTER_PRODUCT_NODES:
+        missing = sorted(DEGENERATE_OUTER_PRODUCT_NODES - rewritten)
+        raise ConversionError(
+            "converted graph lacks the two frozen unit-reduction MatMul nodes: "
+            + ", ".join(missing)
+        )
+    model.validate_nodes_and_infer_types()
+
+
 def convert_graph(source_dir: Path, output_dir: Path, weight_storage: str) -> None:
     import openvino as ov
     import torch
@@ -377,6 +457,7 @@ def convert_graph(source_dir: Path, output_dir: Path, weight_storage: str) -> No
                 ("attention_mask", dynamic_mask, ov.Type.i64),
             ],
         )
+    rewrite_unit_reduction_matmuls(model)
     if len(model.inputs) != 2 or len(model.outputs) != 1:
         raise ConversionError(
             f"converted graph has {len(model.inputs)} inputs and "
@@ -509,7 +590,10 @@ def write_artifact_manifest(
         "files": files,
         "conversion": {
             "recipe": "packages/openvino/convert.py",
-            "export": "torch-export-bounded-dynamic-sequence-1-to-2048",
+            "export": (
+                "torch-export-bounded-dynamic-sequence-1-to-2048-"
+                "unit-reduction-matmul-rewrite-v1"
+            ),
             "weight_storage": weight_storage,
             "openvino": _version("openvino"),
             "safetensors": _version("safetensors"),

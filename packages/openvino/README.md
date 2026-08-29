@@ -60,7 +60,9 @@ and an exact glibc 2.35 build floor. It:
 3. fetches, extracts, and hash-checks the pinned official Gemma Terms and
    Prohibited Use Policy;
 4. converts the exact graph and runs a real CPU PyTorch-to-OpenVINO parity
-   smoke at the 32, 128, and 2,048 static buckets;
+   smoke at the 32, 128, and 2,048 static buckets; conversion replaces exactly
+   the two rotary-position MatMuls whose reduction dimension is one with the
+   algebraically identical broadcast multiplication, refusing any graph drift;
 5. freezes the runtime, executes its integrity launcher and CPU plugin
    self-check, and emits regular-file-only content-addressed archives.
 
@@ -91,7 +93,9 @@ python packages/openvino/smoke_parity.py \
 `f16` compresses constants stored in the IR; it is not a cross-device
 arithmetic claim. The converter verifies all source and semantic configuration
 hashes before loading weights and proves that all seven required static shapes
-can be formed before serialization.
+can be formed before serialization. The unit-reduction rewrite avoids a GPU
+shape-lowering defect without changing the model function: one multiplication
+and no accumulation is exactly the original K=1 matrix product.
 
 ## Gemma redistribution boundary
 
