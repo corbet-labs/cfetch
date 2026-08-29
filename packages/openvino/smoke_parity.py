@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Sequence
 
 if __package__:
@@ -187,7 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_bytes(raw)
     except (ConversionError, OSError, ParityError, RuntimeError) as error:
-        print(f"OpenVINO conversion parity smoke refused: {error}")
+        print(f"OpenVINO conversion parity smoke refused: {error}", file=sys.stderr)
         return 1
     print(
         json.dumps(

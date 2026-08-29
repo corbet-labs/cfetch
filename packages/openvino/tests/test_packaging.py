@@ -21,6 +21,32 @@ from packages.openvino import runtime_bundle
 
 
 class PackagingTests(unittest.TestCase):
+    def test_parity_cli_keeps_failure_diagnostic_out_of_result_stdout(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                smoke_parity,
+                "run",
+                side_effect=smoke_parity.ParityError("safe parity failure"),
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = smoke_parity.main(
+                [
+                    "--source-dir",
+                    "unused-source",
+                    "--artifact-dir",
+                    "unused-artifact",
+                    "--output",
+                    "unused-output",
+                ]
+            )
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("safe parity failure", stderr.getvalue())
+
     def test_fetch_cli_keeps_safe_failure_out_of_result_stdout(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
