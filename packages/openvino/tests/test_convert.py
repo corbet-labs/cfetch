@@ -14,6 +14,67 @@ from packages.openvino import convert
 
 
 class ConversionContractTests(unittest.TestCase):
+    def test_masked_mean_selects_real_tokens_before_reduction(self) -> None:
+        calls = []
+
+        class FakeMask:
+            def unsqueeze(self, axis):
+                calls.append(("unsqueeze", axis))
+                return self
+
+            def bool(self):
+                calls.append(("bool",))
+                return "real-token-mask"
+
+            def sum(self, **kwargs):
+                calls.append(("mask-sum", kwargs))
+                return FakeDenominator()
+
+        class FakeDenominator:
+            def to(self, dtype):
+                calls.append(("denominator-to", dtype))
+                return self
+
+            def clamp_min(self, value):
+                calls.append(("clamp-min", value))
+                return "safe-denominator"
+
+        class FakeEmbeddings:
+            dtype = "embedding-dtype"
+
+        class FakeSelected:
+            def sum(self, **kwargs):
+                calls.append(("selected-sum", kwargs))
+                return FakeNumerator()
+
+        class FakeNumerator:
+            def __truediv__(self, denominator):
+                calls.append(("divide", denominator))
+                return "pooled"
+
+        embeddings = FakeEmbeddings()
+        fake_torch = SimpleNamespace(
+            zeros_like=lambda value: calls.append(("zeros-like", value)) or "zeros",
+            where=lambda condition, value, zero: calls.append(
+                ("where", condition, value, zero)
+            )
+            or FakeSelected(),
+        )
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
+            result = convert.masked_mean(embeddings, FakeMask())
+
+        self.assertEqual(result, "pooled")
+        where_index = next(
+            index for index, call in enumerate(calls) if call[0] == "where"
+        )
+        reduction_index = next(
+            index for index, call in enumerate(calls) if call[0] == "selected-sum"
+        )
+        self.assertLess(where_index, reduction_index)
+        self.assertIn(("where", "real-token-mask", embeddings, "zeros"), calls)
+        self.assertIn(("selected-sum", {"dim": 1}), calls)
+        self.assertIn(("mask-sum", {"dim": 1, "keepdim": True}), calls)
+
     def test_torch_export_binds_one_bounded_sequence_symbol_to_both_inputs(
         self,
     ) -> None:

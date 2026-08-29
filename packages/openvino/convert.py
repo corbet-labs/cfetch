@@ -206,6 +206,29 @@ def _load_dense_weight(path: Path, expected_shape: tuple[int, int]):
     return weight
 
 
+def masked_mean(token_embeddings: Any, attention_mask: Any) -> Any:
+    """Reduce only real token rows, even if a backend poisons padded rows.
+
+    Some accelerator decompositions of scaled dot-product attention return
+    NaN for a fully masked padded-query row.  Multiplication is not a mask for
+    that value because IEEE-754 defines ``NaN * 0`` as NaN.  Elementwise
+    selection makes the sentence-transformers pooling contract explicit:
+    padded rows do not participate in the reduction at all.
+    """
+    import torch
+
+    real_tokens = attention_mask.unsqueeze(-1).bool()
+    selected = torch.where(
+        real_tokens, token_embeddings, torch.zeros_like(token_embeddings)
+    )
+    denominator = (
+        attention_mask.sum(dim=1, keepdim=True)
+        .to(token_embeddings.dtype)
+        .clamp_min(1.0)
+    )
+    return selected.sum(dim=1) / denominator
+
+
 def build_torch_pipeline(source_dir: Path):
     import torch
     import torch.nn.functional as functional
@@ -238,10 +261,7 @@ def build_torch_pipeline(source_dir: Path):
                 use_cache=False,
                 return_dict=False,
             )[0]
-            float_mask = attention_mask.unsqueeze(-1).to(token_embeddings.dtype)
-            pooled = (token_embeddings * float_mask).sum(dim=1) / float_mask.sum(
-                dim=1
-            ).clamp_min(1.0)
+            pooled = masked_mean(token_embeddings, attention_mask)
             # Both upstream Dense modules use Identity activation and no bias.
             projected = functional.linear(
                 pooled.to(torch.float32), self.dense_2_weight
