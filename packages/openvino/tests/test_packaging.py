@@ -31,6 +31,23 @@ class PackagingTests(unittest.TestCase):
             empty_typing_marker = root / "_internal/cryptography/py.typed"
             empty_typing_marker.parent.mkdir(parents=True)
             empty_typing_marker.write_bytes(b"")
+            empty_typing_stub = root / "_internal/numpy/core/_dtype.pyi"
+            empty_typing_stub.parent.mkdir(parents=True)
+            empty_typing_stub.write_bytes(b"")
+            empty_test_package = root / "_internal/numpy/tests/__init__.py"
+            empty_test_package.parent.mkdir(parents=True)
+            empty_test_package.write_bytes(b"")
+            empty_testing_package = (
+                root / "_internal/numpy/testing/_private/__init__.py"
+            )
+            empty_testing_package.parent.mkdir(parents=True)
+            empty_testing_package.write_bytes(b"")
+            nested_requested = (
+                root
+                / "_internal/setuptools/_vendor/importlib_metadata-8.7.1.dist-info/REQUESTED"
+            )
+            nested_requested.parent.mkdir(parents=True)
+            nested_requested.write_bytes(b"")
             retained_requested = root / "_internal/openvino-2026.3.1.dist-info/REQUESTED"
             retained_requested.parent.mkdir(parents=True)
             retained_requested.write_bytes(b"runtime-meaningful")
@@ -40,9 +57,18 @@ class PackagingTests(unittest.TestCase):
             build_runtime._prune_optional_empty_metadata(root)
             self.assertFalse(empty_requested.exists())
             self.assertFalse(empty_typing_marker.exists())
+            self.assertFalse(empty_typing_stub.exists())
+            self.assertFalse(empty_test_package.exists())
+            self.assertFalse(empty_testing_package.exists())
+            self.assertFalse(nested_requested.exists())
             self.assertEqual(retained_requested.read_bytes(), b"runtime-meaningful")
             self.assertEqual(
                 retained_typing_marker.read_bytes(), b"runtime-meaningful"
+            )
+            self.assertFalse(
+                build_runtime._is_optional_empty_marker(
+                    Path("_internal/runtime/__init__.py")
+                )
             )
 
             unrelated = root / "_internal/runtime-resource.bin"

@@ -51,19 +51,21 @@ def _is_optional_empty_marker(relative: Path) -> bool:
     parts = relative.parts
     if not parts or parts[0] != "_internal":
         return False
-    if len(parts) == 3 and parts[2] == "REQUESTED":
-        directory = parts[1]
+    if len(parts) >= 3 and parts[-1] == "REQUESTED":
+        directory = parts[-2]
         suffix = ".dist-info"
         distribution = directory[: -len(suffix)] if directory.endswith(suffix) else ""
         return bool(distribution) and all(
             character.isascii() and (character.isalnum() or character in "._-")
             for character in distribution
         )
-    if len(parts) >= 3 and parts[-1] == "py.typed":
-        return all(
-            component.isidentifier() and component.isascii()
-            for component in parts[1:-1]
-        )
+    if len(parts) >= 3 and (parts[-1] == "py.typed" or parts[-1].endswith(".pyi")):
+        return True
+    if parts[-1] == "__init__.py" and any(
+        component in {"tests", "testing", "_pyinstaller"}
+        for component in parts[1:-1]
+    ):
+        return True
     return False
 
 
