@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Sequence
 
@@ -233,7 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         RuntimeBundleError,
         subprocess.SubprocessError,
     ) as error:
-        print(f"OpenVINO runtime build refused: {error}")
+        print(f"OpenVINO runtime build refused: {error}", file=sys.stderr)
         return 1
     print(
         json.dumps(

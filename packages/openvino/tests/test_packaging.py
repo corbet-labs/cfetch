@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from packages.openvino import archive
+from packages.openvino import build_runtime
 from packages.openvino import fetch_source
 from packages.openvino import legal
 from packages.openvino import package_inventory
@@ -21,6 +22,32 @@ from packages.openvino import runtime_bundle
 
 
 class PackagingTests(unittest.TestCase):
+    def test_runtime_build_cli_keeps_failure_diagnostic_out_of_result_stdout(
+        self,
+    ) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                build_runtime,
+                "build",
+                side_effect=build_runtime.RuntimeBuildError("safe runtime failure"),
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = build_runtime.main(
+                [
+                    "--output-dir",
+                    "unused-output",
+                    "--minimum-glibc",
+                    "2.35",
+                ]
+            )
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("safe runtime failure", stderr.getvalue())
+
     def test_parity_cli_keeps_failure_diagnostic_out_of_result_stdout(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
