@@ -50,25 +50,46 @@ class ParityError(ValueError):
 
 
 def validate_pair(
-    reference: Sequence[float], candidate: Sequence[float]
+    reference: Sequence[float],
+    candidate: Sequence[float],
+    *,
+    label: str = "parity case",
 ) -> tuple[float, float, float]:
     if len(reference) != DIMENSIONS or len(candidate) != DIMENSIONS:
-        raise ParityError(f"parity vectors must both contain {DIMENSIONS} components")
-    if not all(math.isfinite(value) for value in (*reference, *candidate)):
-        raise ParityError("parity vectors must contain only finite components")
+        raise ParityError(
+            f"{label}: parity vectors must both contain {DIMENSIONS} components"
+        )
+    reference_nonfinite = [
+        index for index, value in enumerate(reference) if not math.isfinite(value)
+    ]
+    candidate_nonfinite = [
+        index for index, value in enumerate(candidate) if not math.isfinite(value)
+    ]
+    if reference_nonfinite or candidate_nonfinite:
+        raise ParityError(
+            f"{label}: parity vectors contain non-finite components: "
+            f"PyTorch={len(reference_nonfinite)} "
+            f"(first indices {reference_nonfinite[:8]}), "
+            f"OpenVINO={len(candidate_nonfinite)} "
+            f"(first indices {candidate_nonfinite[:8]})"
+        )
     reference_norm = math.sqrt(sum(value * value for value in reference))
     candidate_norm = math.sqrt(sum(value * value for value in candidate))
     if (
         abs(reference_norm - 1.0) > MAXIMUM_NORM_ERROR
         or abs(candidate_norm - 1.0) > MAXIMUM_NORM_ERROR
     ):
-        raise ParityError("PyTorch and OpenVINO outputs must both be L2 normalized")
+        raise ParityError(
+            f"{label}: PyTorch and OpenVINO outputs must both be L2 normalized "
+            f"(PyTorch={reference_norm:.9f}, OpenVINO={candidate_norm:.9f})"
+        )
     cosine = sum(left * right for left, right in zip(reference, candidate)) / (
         reference_norm * candidate_norm
     )
     if not math.isfinite(cosine) or cosine < MINIMUM_COSINE:
         raise ParityError(
-            f"OpenVINO/PyTorch cosine {cosine:.9f} is below {MINIMUM_COSINE}"
+            f"{label}: OpenVINO/PyTorch cosine {cosine:.9f} is below "
+            f"{MINIMUM_COSINE}"
         )
     return reference_norm, candidate_norm, cosine
 
@@ -145,7 +166,9 @@ def run(source_dir: Path, artifact_dir: Path) -> dict[str, Any]:
             )
         reference = reference_array[0].tolist()
         candidate = candidate_array[0].tolist()
-        reference_norm, candidate_norm, cosine = validate_pair(reference, candidate)
+        reference_norm, candidate_norm, cosine = validate_pair(
+            reference, candidate, label=label
+        )
         results.append(
             {
                 "label": label,

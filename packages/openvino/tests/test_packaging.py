@@ -329,6 +329,19 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(smoke_parity.ParityError, "cosine"):
             smoke_parity.validate_pair(reference, [-1.0] + [0.0] * 767)
 
+    def test_parity_gate_identifies_nonfinite_side_and_case(self) -> None:
+        reference = [1.0] + [0.0] * 767
+        candidate = reference.copy()
+        reference[4] = float("nan")
+        candidate[7] = float("inf")
+        with self.assertRaisesRegex(
+            smoke_parity.ParityError,
+            r"short-query.*PyTorch=1.*\[4\].*OpenVINO=1.*\[7\]",
+        ):
+            smoke_parity.validate_pair(
+                reference, candidate, label="short-query"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
