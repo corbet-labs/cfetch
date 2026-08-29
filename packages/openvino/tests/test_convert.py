@@ -6,7 +6,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -14,6 +14,114 @@ from packages.openvino import convert
 
 
 class ConversionContractTests(unittest.TestCase):
+    def test_empty_attention_rows_gain_only_their_diagonal(self) -> None:
+        class FakeRows:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def any(self, *, dim, keepdim):
+                self_outer = self
+
+                class FakeColumns:
+                    def __init__(self, values):
+                        self.values = values
+
+                    def __invert__(self):
+                        return FakeColumns([not value for value in self.values])
+
+                    def __and__(self, matrix):
+                        return FakeRows(
+                            [
+                                [enabled and value for value in row]
+                                for enabled, row in zip(self.values, matrix.rows)
+                            ]
+                        )
+
+                if dim != -1 or keepdim is not True:
+                    raise AssertionError("attention repair must inspect the last axis")
+                return FakeColumns([any(row) for row in self_outer.rows])
+
+            def __or__(self, other):
+                return FakeRows(
+                    [
+                        [left or right for left, right in zip(left_row, right_row)]
+                        for left_row, right_row in zip(self.rows, other.rows)
+                    ]
+                )
+
+        allowed = FakeRows(
+            [
+                [True, False, False],
+                [False, False, False],
+                [False, True, False],
+            ]
+        )
+        diagonal = FakeRows(
+            [
+                [True, False, False],
+                [False, True, False],
+                [False, False, True],
+            ]
+        )
+        repaired = convert._ensure_nonempty_attention_rows(allowed, diagonal)
+        self.assertEqual(
+            repaired.rows,
+            [
+                [True, False, False],
+                [False, True, False],
+                [False, True, False],
+            ],
+        )
+
+    def test_backbone_attention_backend_is_frozen_to_sdpa(self) -> None:
+        calls = []
+
+        class FakeModule:
+            def register_buffer(self, name, value):
+                setattr(self, name, value)
+
+            def eval(self):
+                return self
+
+            def parameters(self):
+                return []
+
+        class FakeWeight:
+            def to(self, **kwargs):
+                return self
+
+        class FakeAutoModel:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                calls.append((args, kwargs))
+                return object()
+
+        fake_torch = ModuleType("torch")
+        fake_torch.float32 = "float32"
+        fake_nn = ModuleType("torch.nn")
+        fake_nn.Module = FakeModule
+        fake_functional = ModuleType("torch.nn.functional")
+        fake_nn.functional = fake_functional
+        fake_torch.nn = fake_nn
+        fake_transformers = ModuleType("transformers")
+        fake_transformers.AutoModel = FakeAutoModel
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "torch": fake_torch,
+                    "torch.nn": fake_nn,
+                    "torch.nn.functional": fake_functional,
+                    "transformers": fake_transformers,
+                },
+            ),
+            mock.patch.object(convert, "_load_dense_weight", return_value=FakeWeight()),
+        ):
+            convert.build_torch_pipeline(Path("unused-source"))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["attn_implementation"], "sdpa")
+
     def test_masked_mean_selects_real_tokens_before_reduction(self) -> None:
         calls = []
 
@@ -163,6 +271,7 @@ class ConversionContractTests(unittest.TestCase):
                     "model_type": "gemma3_text",
                     "num_hidden_layers": 24,
                     "pad_token_id": 0,
+                    "sliding_window": 512,
                     "use_bidirectional_attention": True,
                 },
             }

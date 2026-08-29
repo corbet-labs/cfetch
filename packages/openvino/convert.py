@@ -104,6 +104,7 @@ EXPECTED_DENSE_3 = {
     "activation_function": "torch.nn.modules.linear.Identity",
 }
 EXPECTED_SENTENCE_BERT = {"max_seq_length": 2048, "do_lower_case": False}
+EXPECTED_SLIDING_WINDOW = 512
 
 
 class ConversionError(ValueError):
@@ -181,6 +182,7 @@ def validate_semantic_source(source_dir: Path) -> None:
         "model_type": "gemma3_text",
         "num_hidden_layers": 24,
         "pad_token_id": 0,
+        "sliding_window": EXPECTED_SLIDING_WINDOW,
         "use_bidirectional_attention": True,
     }
     for field, expected in expected_model_fields.items():
@@ -229,6 +231,48 @@ def masked_mean(token_embeddings: Any, attention_mask: Any) -> Any:
     return selected.sum(dim=1) / denominator
 
 
+def _ensure_nonempty_attention_rows(allowed: Any, diagonal: Any) -> Any:
+    """Add only the diagonal bit of an otherwise fully masked query row."""
+    empty_rows = ~allowed.any(dim=-1, keepdim=True)
+    return allowed | (empty_rows & diagonal)
+
+
+def safe_bidirectional_attention_masks(
+    attention_mask: Any, sliding_window: int = EXPECTED_SLIDING_WINDOW
+) -> dict[str, Any]:
+    """Build Gemma3's exact full/local masks without empty query rows.
+
+    ``True`` means that the key participates in PyTorch SDPA.  For every row
+    that already has an admitted real key, these masks are identical to the
+    pinned bidirectional Gemma3 mask construction.  A padded query farther
+    than the local window from every real key would otherwise have no admitted
+    key at all; only such a row receives its own diagonal bit.  Padding keys
+    remain invisible to every real-token query.
+    """
+    import torch
+
+    sequence_length = attention_mask.shape[1]
+    positions = torch.arange(sequence_length, device=attention_mask.device)
+    offsets = positions.unsqueeze(1) - positions.unsqueeze(0)
+    diagonal = (offsets == 0).unsqueeze(0).unsqueeze(0)
+    local_window = (offsets.abs() < sliding_window).unsqueeze(0).unsqueeze(0)
+    real_keys = attention_mask.bool().unsqueeze(1).unsqueeze(1)
+
+    # Materialize the query axis while retaining broadcast over the frozen
+    # batch dimension.  The pinned full-attention layers admit every real key;
+    # the sliding layers admit real keys at exclusive distance < 512.
+    full_attention = torch.ones_like(local_window) & real_keys
+    sliding_attention = local_window & real_keys
+    return {
+        "full_attention": _ensure_nonempty_attention_rows(
+            full_attention, diagonal
+        ),
+        "sliding_attention": _ensure_nonempty_attention_rows(
+            sliding_attention, diagonal
+        ),
+    }
+
+
 def build_torch_pipeline(source_dir: Path):
     import torch
     import torch.nn.functional as functional
@@ -239,6 +283,9 @@ def build_torch_pipeline(source_dir: Path):
         local_files_only=True,
         trust_remote_code=False,
         torch_dtype=torch.float32,
+        # Transformers 5.2 defaults to SDPA when available. Freeze it instead
+        # of allowing dependency or host capability to select another graph.
+        attn_implementation="sdpa",
     )
     dense_2 = _load_dense_weight(
         source_dir / "2_Dense/model.safetensors", (3072, 768)
@@ -255,9 +302,12 @@ def build_torch_pipeline(source_dir: Path):
             self.register_buffer("dense_3_weight", dense_3)
 
         def forward(self, input_ids, attention_mask):
+            backbone_attention = safe_bidirectional_attention_masks(
+                attention_mask
+            )
             token_embeddings = self.backbone(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=backbone_attention,
                 use_cache=False,
                 return_dict=False,
             )[0]
