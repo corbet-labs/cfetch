@@ -7,7 +7,7 @@
 //! closes the connection. Ops: ping, resident, health, scan-code,
 //! scan-status, serve-status, shutdown — plus, when serving mode is enabled
 //! (config `serve.enabled`), the barrier-gated query ops recall, expand,
-//! find, map, code-path, code-impact, code-context, graph, slices, generation
+//! find, map, code-path, code-impact, code-context, code-symbol, graph, slices, generation
 //! and checksum.
 //!
 //! A serving daemon also keeps its OWN code index current: once the tree
@@ -170,6 +170,8 @@ pub struct Response {
     pub dependency_impact: Option<crate::graph::DependencyImpact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependency_context: Option<crate::graph::DependencyContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_context: Option<crate::graph::SymbolContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub knowledge_graph: Option<crate::knowledge_graph::KnowledgeGraph>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -724,6 +726,7 @@ impl Channel {
                     | "code-path"
                     | "code-impact"
                     | "code-context"
+                    | "code-symbol"
                     | "graph"
                     | "slices"
                     | "generation"
@@ -1632,6 +1635,26 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
                 false,
             )
         }
+        "code-symbol" => {
+            let query = req.query.clone().unwrap_or_default();
+            let limit = req.limit.unwrap_or(crate::graph::DEFAULT_SYMBOL_LIMIT);
+            (
+                serve_query(ctx, |conn| {
+                    let cfg = Config::load()?;
+                    let context = crate::graph::symbol_context(
+                        conn,
+                        &cfg.effective_code_roots(),
+                        &query,
+                        limit,
+                    )?;
+                    Ok(Response {
+                        symbol_context: Some(context),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
         "graph" => {
             let focus = req.focus.as_deref();
             let limit = req.limit.unwrap_or(40);
@@ -2236,6 +2259,7 @@ mod tests {
             "code-path",
             "code-impact",
             "code-context",
+            "code-symbol",
             "graph",
             "slices",
             "generation",

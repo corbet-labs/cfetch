@@ -371,6 +371,15 @@ enum CodeGraphAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show parser-proven calls and type references around an exact symbol
+    Symbol {
+        query: String,
+        /// Maximum matching symbols and relationships to return (1-200)
+        #[arg(long, default_value_t = graph::DEFAULT_SYMBOL_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1294,6 +1303,50 @@ fn code_graph_cmd(action: CodeGraphAction) -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&context)?);
             } else {
                 println!("{}", graph::render_dependency_context(&context));
+            }
+        }
+        CodeGraphAction::Symbol { query, limit, json } => {
+            if let Some(cs) = &cfg.client.serving {
+                let response = serve::client_call(
+                    cs,
+                    serde_json::json!({
+                        "op": "code-symbol",
+                        "query": query,
+                        "limit": limit,
+                    }),
+                    serve::QUERY_TIMEOUT,
+                )?;
+                let context = response.symbol_context.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("serving host {} returned no symbol context", cs.addr)
+                })?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "symbol": context,
+                            "origin": response.origin,
+                            "generation": response.generation,
+                            "fresh": response.fresh,
+                            "stale_note": response.stale_note,
+                        }))?
+                    );
+                } else {
+                    println!("{}", graph::render_symbol_context(context));
+                    print_served_by(&response);
+                }
+                return Ok(());
+            }
+            let conn = index::open(&paths::state_dir())?;
+            let context = graph::symbol_context(
+                &conn,
+                &cfg.effective_code_roots(),
+                &query,
+                limit,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&context)?);
+            } else {
+                println!("{}", graph::render_symbol_context(&context));
             }
         }
     }

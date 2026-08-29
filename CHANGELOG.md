@@ -10,9 +10,12 @@ listed here is a fix or an internal change with no effect on behavior.
   reverse imports for a bounded blast radius and `cfetch code-graph context`
   traverses both directions around one file. Context retains one deterministic
   shortest explanation edge per related file and counts limit omissions. Typed
-  steps name their extraction evidence, ambiguous suffixes fail closed, relative
-  paths are stable across serving hosts, and equivalent read-only MCP tools use
-  the same graph query pipeline.
+  steps now retain exact source ranges. `cfetch code-graph symbol` adds
+  parser-proven `contains`, direct `calls`, and type `references` edges,
+  resolving them only through explicit imports to one unambiguous file-level
+  definition. Ambiguous names fail closed, relative paths are stable across
+  serving hosts, and equivalent read-only MCP tools use the same graph query
+  pipeline.
 - **Selective nixcards knowledge.** `cfetch cards` initializes and manages the
   public nixcards catalogue as a blobless sparse checkout at
   `knowledge/cards`, with dotted branch selectors, JSON status, explicit

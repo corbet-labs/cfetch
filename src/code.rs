@@ -21,6 +21,22 @@ pub struct Symbol {
     pub kind: String,
     pub start_line: usize, // 1-indexed, inclusive
     pub end_line: usize,   // 1-indexed, inclusive
+    /// Start line of the nearest enclosing symbol. `None` means the symbol is
+    /// a file-level definition and may be the target of an explicit import.
+    pub parent_start_line: Option<usize>,
+}
+
+/// A parser-observed use inside one containing symbol. It is deliberately
+/// unresolved here: graph resolution later requires an explicit import
+/// binding and exactly one file-level target definition.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SymbolUse {
+    pub name: String,
+    pub qualifier: Option<String>,
+    pub relation: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub container_start_line: usize,
 }
 
 pub struct FindHit {
@@ -144,13 +160,15 @@ pub struct Extraction {
     /// exact and the list is the file's whole symbol table; where `gap` is
     /// set, neither holds — see [`Gap`].
     pub symbols: Vec<Symbol>,
+    /// Direct calls and type references proved by the language grammar.
+    pub(crate) uses: Vec<SymbolUse>,
     /// `None` when the list is complete; see [`Gap`].
     pub gap: Option<Gap>,
 }
 
 impl Extraction {
     fn unavailable(gap: Gap) -> Self {
-        Extraction { symbols: Vec::new(), gap: Some(gap) }
+        Extraction { symbols: Vec::new(), uses: Vec::new(), gap: Some(gap) }
     }
 }
 
@@ -180,24 +198,115 @@ pub fn extract(path: &Path, source: &str) -> Extraction {
     let src = source.as_bytes();
     let mut out = Vec::new();
     let root = tree.root_node();
-    walk(root, kinds, src, &mut out);
-    Extraction { symbols: out, gap: root.has_error().then_some(Gap::SyntaxErrors) }
+    walk_symbols(root, kinds, src, None, &mut out);
+    let mut uses = Vec::new();
+    walk_uses(root, &lang, kinds, src, None, &mut uses);
+    Extraction { symbols: out, uses, gap: root.has_error().then_some(Gap::SyntaxErrors) }
 }
 
-fn walk(node: Node, kinds: &[&str], src: &[u8], out: &mut Vec<Symbol>) {
+fn walk_symbols(
+    node: Node,
+    kinds: &[&str],
+    src: &[u8],
+    parent_start_line: Option<usize>,
+    out: &mut Vec<Symbol>,
+) {
+    let mut child_parent = parent_start_line;
     if kinds.contains(&node.kind())
         && let Some(name) = node_name(&node, src)
     {
+        let start_line = node.start_position().row + 1;
         out.push(Symbol {
             name,
             kind: node.kind().to_string(),
-            start_line: node.start_position().row + 1,
+            start_line,
             end_line: node.end_position().row + 1,
+            parent_start_line,
         });
+        child_parent = Some(start_line);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, kinds, src, out);
+        walk_symbols(child, kinds, src, child_parent, out);
+    }
+}
+
+fn qualified_name(node: Node, src: &[u8]) -> Option<(Option<String>, String)> {
+    let text = node.utf8_text(src).ok()?.trim();
+    let parts: Vec<&str> = text
+        .split([':', '.'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    match parts.as_slice() {
+        [name] if name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '$')) => {
+            Some((None, (*name).to_string()))
+        }
+        [qualifier, name]
+            if qualifier.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
+                && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '$')) =>
+        {
+            Some((Some((*qualifier).to_string()), (*name).to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn call_target(node: Node, lang: &Lang, src: &[u8]) -> Option<(Option<String>, String)> {
+    let expected = match lang {
+        Lang::Python => "call",
+        _ => "call_expression",
+    };
+    if node.kind() != expected {
+        return None;
+    }
+    qualified_name(node.child_by_field_name("function")?, src)
+}
+
+fn type_reference(node: Node, lang: &Lang, src: &[u8]) -> Option<(Option<String>, String)> {
+    let is_type = match lang {
+        Lang::Rust => matches!(node.kind(), "type_identifier" | "scoped_type_identifier"),
+        Lang::TypeScript | Lang::Tsx => {
+            matches!(node.kind(), "type_identifier" | "nested_type_identifier")
+        }
+        Lang::Go => matches!(node.kind(), "type_identifier" | "qualified_type"),
+        // These grammars do not distinguish a safe imported-symbol reference
+        // from an ordinary identifier. No edge is better than a guessed one.
+        Lang::JavaScript | Lang::Python => false,
+    };
+    is_type.then(|| qualified_name(node, src)).flatten()
+}
+
+fn walk_uses(
+    node: Node,
+    lang: &Lang,
+    kinds: &[&str],
+    src: &[u8],
+    container_start_line: Option<usize>,
+    out: &mut Vec<SymbolUse>,
+) {
+    let container_start_line = if kinds.contains(&node.kind()) && node_name(&node, src).is_some() {
+        Some(node.start_position().row + 1)
+    } else {
+        container_start_line
+    };
+    if let Some(container_start_line) = container_start_line {
+        let observed = call_target(node, lang, src)
+            .map(|target| ("calls", target))
+            .or_else(|| type_reference(node, lang, src).map(|target| ("references", target)));
+        if let Some((relation, (qualifier, name))) = observed {
+            out.push(SymbolUse {
+                name,
+                qualifier,
+                relation: relation.to_string(),
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                container_start_line,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_uses(child, lang, kinds, src, container_start_line, out);
     }
 }
 
@@ -239,18 +348,7 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
            norm_stem TEXT NOT NULL DEFAULT '',
            norm_path TEXT NOT NULL DEFAULT '',
            unmeasured TEXT
-         );
-         CREATE TABLE IF NOT EXISTS symbols(
-           id INTEGER PRIMARY KEY,
-           file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
-           name TEXT NOT NULL,
-           kind TEXT NOT NULL,
-           norm TEXT NOT NULL DEFAULT '',
-           start_line INTEGER NOT NULL,
-           end_line INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS symbols_norm ON symbols(norm);
-         CREATE INDEX IF NOT EXISTS code_files_norm_stem ON code_files(norm_stem);",
+         );",
     )?;
     // A cache built before the column existed cannot say which of its rows
     // are complete, and a row that merely LOOKS complete is the one thing the
@@ -267,6 +365,43 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
              UPDATE code_files SET mtime = {REMEASURE};"
         ))?;
     }
+    let symbol_schema_current = conn
+        .prepare("SELECT 1 FROM pragma_table_info('symbols') WHERE name='parent_start_line'")?
+        .exists([])?;
+    if !symbol_schema_current {
+        // This index is a disposable cache. Rebuild old rows so parentage and
+        // uses can never silently describe different parses.
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS symbol_uses;
+             DROP TABLE IF EXISTS symbols;
+             UPDATE code_files SET mtime = {REMEASURE};"
+        ))?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS symbols(
+           id INTEGER PRIMARY KEY,
+           file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
+           name TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           norm TEXT NOT NULL DEFAULT '',
+           start_line INTEGER NOT NULL,
+           end_line INTEGER NOT NULL,
+           parent_start_line INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS symbol_uses(
+           file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
+           name TEXT NOT NULL,
+           qualifier TEXT,
+           relation TEXT NOT NULL,
+           start_line INTEGER NOT NULL,
+           end_line INTEGER NOT NULL,
+           container_start_line INTEGER NOT NULL,
+           PRIMARY KEY(file_id, relation, start_line, end_line, name, container_start_line)
+         );
+         CREATE INDEX IF NOT EXISTS symbols_norm ON symbols(norm);
+         CREATE INDEX IF NOT EXISTS symbol_uses_file ON symbol_uses(file_id);
+         CREATE INDEX IF NOT EXISTS code_files_norm_stem ON code_files(norm_stem);",
+    )?;
     crate::graph::ensure_schema(conn)?;
     Ok(())
 }
@@ -289,8 +424,9 @@ enum WalkMsg {
         mtime: i64,
         size: i64,
         symbols: Vec<Symbol>,
+        uses: Vec<SymbolUse>,
         gap: Option<Gap>,
-        edges: Vec<PathBuf>,
+        imports: Vec<crate::graph::ImportFact>,
     },
 }
 
@@ -372,18 +508,19 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                             let Ok(source) = std::fs::read_to_string(entry.path()) else {
                                 return ignore::WalkState::Continue;
                             };
-                            let Extraction { symbols, gap } = extract(entry.path(), &source);
+                            let Extraction { symbols, uses, gap } = extract(entry.path(), &source);
                             // Import edges refresh with the file that declares
                             // them; targets added later self-heal on the
                             // importer's next change.
-                            let edges = crate::graph::extract_edges(entry.path(), &source, root);
+                            let imports = crate::graph::extract_imports(entry.path(), &source, root);
                             let _ = msg_tx.send(WalkMsg::Parsed {
                                 path,
                                 mtime,
                                 size,
                                 symbols,
+                                uses,
                                 gap,
-                                edges,
+                                imports,
                             });
                             ignore::WalkState::Continue
                         })
@@ -397,8 +534,8 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                         seen.insert(path);
                         report.files += 1;
                     }
-                    WalkMsg::Parsed { path, mtime, size, symbols, gap, edges } => {
-                        crate::graph::replace_file_edges(&tx, &path, &edges)?;
+                    WalkMsg::Parsed { path, mtime, size, symbols, uses, gap, imports } => {
+                        crate::graph::replace_file_edges(&tx, &path, &imports)?;
                         // prepare_cached: these two run once per changed file
                         // and once per symbol — re-preparing them would make
                         // the single writer the bottleneck under the parallel
@@ -421,8 +558,9 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                         ])?;
                         let file_id = tx.last_insert_rowid();
                         let mut ins = tx.prepare_cached(
-                            "INSERT INTO symbols(file_id, name, kind, norm, start_line, end_line)
-                             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                            "INSERT INTO symbols(file_id, name, kind, norm, start_line, end_line,
+                                                 parent_start_line)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         )?;
                         for s in &symbols {
                             ins.execute(rusqlite::params![
@@ -431,10 +569,28 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                                 s.kind,
                                 norm_ident(&s.name),
                                 s.start_line as i64,
-                                s.end_line as i64
+                                s.end_line as i64,
+                                s.parent_start_line.map(|line| line as i64)
                             ])?;
                         }
                         drop(ins);
+                        let mut ins_use = tx.prepare_cached(
+                            "INSERT INTO symbol_uses(file_id, name, qualifier, relation, start_line,
+                                                     end_line, container_start_line)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        )?;
+                        for u in &uses {
+                            ins_use.execute(rusqlite::params![
+                                file_id,
+                                u.name,
+                                u.qualifier,
+                                u.relation,
+                                u.start_line as i64,
+                                u.end_line as i64,
+                                u.container_start_line as i64,
+                            ])?;
+                        }
+                        drop(ins_use);
                         seen.insert(path);
                         report.files += 1;
                         report.symbols += symbols.len();
@@ -462,8 +618,11 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
     // never commit files whose stored percentiles describe an older graph.
     crate::graph::prune_edges(&tx)?;
     crate::graph::recompute_ranks(&tx, roots)?;
-    report.edges =
-        tx.query_row("SELECT count(*) FROM import_edges", [], |r| r.get::<_, i64>(0))? as usize;
+    report.edges = tx.query_row(
+        "SELECT count(*) FROM (SELECT DISTINCT src, dst FROM import_edges)",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? as usize;
     tx.commit()?;
     Ok(report)
 }
@@ -616,8 +775,8 @@ mod tests {
         assert_eq!(
             syms,
             vec![
-                Symbol { name: "alpha".into(), kind: "function_item".into(), start_line: 1, end_line: 3 },
-                Symbol { name: "Beta".into(), kind: "struct_item".into(), start_line: 5, end_line: 7 },
+                Symbol { name: "alpha".into(), kind: "function_item".into(), start_line: 1, end_line: 3, parent_start_line: None },
+                Symbol { name: "Beta".into(), kind: "struct_item".into(), start_line: 5, end_line: 7, parent_start_line: None },
             ]
         );
     }
@@ -641,6 +800,55 @@ mod tests {
         assert_eq!(py.gap, None);
         let go = extract(Path::new("a.go"), "package m\n\nfunc Baz() {\n}\n");
         assert_eq!(go.symbols[0].name, "Baz");
+    }
+
+    #[test]
+    fn parser_uses_keep_direct_and_qualified_calls_without_name_guessing() {
+        for (path, source, expected) in [
+            (
+                "x.rs",
+                "fn caller(input: Thing) { run(); worker::go(); }\n",
+                vec![("calls", None, "run"), ("calls", Some("worker"), "go"), ("references", None, "Thing")],
+            ),
+            (
+                "x.ts",
+                "function caller(input: Thing) { run(); worker.go(); }\n",
+                vec![("calls", None, "run"), ("calls", Some("worker"), "go"), ("references", None, "Thing")],
+            ),
+            (
+                "x.go",
+                "package x\nfunc caller(input Thing) { run(); worker.Go() }\n",
+                vec![("calls", None, "run"), ("calls", Some("worker"), "Go"), ("references", None, "Thing")],
+            ),
+        ] {
+            let extraction = extract(Path::new(path), source);
+            let actual: Vec<(&str, Option<&str>, &str)> = extraction
+                .uses
+                .iter()
+                .map(|usage| {
+                    (
+                        usage.relation.as_str(),
+                        usage.qualifier.as_deref(),
+                        usage.name.as_str(),
+                    )
+                })
+                .collect();
+            for use_fact in expected {
+                assert!(actual.contains(&use_fact), "{path}: missing {use_fact:?} in {actual:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn nested_symbols_retain_their_enclosing_definition() {
+        let extraction = extract(
+            Path::new("x.ts"),
+            "class Outer {\n  method() { return 1; }\n}\n",
+        );
+        let outer = extraction.symbols.iter().find(|symbol| symbol.name == "Outer").unwrap();
+        let method = extraction.symbols.iter().find(|symbol| symbol.name == "method").unwrap();
+        assert_eq!(outer.parent_start_line, None);
+        assert_eq!(method.parent_start_line, Some(outer.start_line));
     }
 
     #[test]

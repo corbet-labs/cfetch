@@ -40,6 +40,33 @@ enum EdgeLang {
     Go,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ImportBinding {
+    pub local_name: String,
+    pub target_name: Option<String>,
+    pub namespace: bool,
+    pub type_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportFact {
+    pub target: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub bindings: Vec<ImportBinding>,
+}
+
+impl ImportFact {
+    fn new(
+        target: PathBuf,
+        start_line: usize,
+        end_line: usize,
+        bindings: Vec<ImportBinding>,
+    ) -> Self {
+        Self { target, start_line, end_line, bindings }
+    }
+}
+
 fn edge_lang(path: &Path) -> Option<EdgeLang> {
     match path.extension()?.to_str()? {
         "rs" => Some(EdgeLang::Rust),
@@ -67,9 +94,19 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// Extracts the project-internal import edges of one file. Returned paths are
-/// normalized, deduplicated, inside `root`, and never the file itself.
-pub fn extract_edges(file: &Path, source: &str, root: &Path) -> Vec<PathBuf> {
+/// Compatibility view used by extraction tests and callers that need only
+/// topology. Exact source ranges and bindings live in [`extract_imports`].
+#[cfg(test)]
+fn extract_edges(file: &Path, source: &str, root: &Path) -> Vec<PathBuf> {
+    let paths: BTreeSet<PathBuf> =
+        extract_imports(file, source, root).into_iter().map(|fact| fact.target).collect();
+    paths.into_iter().collect()
+}
+
+/// Extracts resolvable project-internal import facts. Every fact retains the
+/// exact source statement range and any explicit local binding that can later
+/// resolve a parser-observed symbol use without guessing by name alone.
+pub(crate) fn extract_imports(file: &Path, source: &str, root: &Path) -> Vec<ImportFact> {
     let Some(lang) = edge_lang(file) else { return Vec::new() };
     let head: Vec<&str> = source.lines().take(HEAD_MAX_LINES).collect();
     let raw = match lang {
@@ -79,14 +116,26 @@ pub fn extract_edges(file: &Path, source: &str, root: &Path) -> Vec<PathBuf> {
         EdgeLang::Go => go_edges(file, &head, root),
     };
     let self_path = normalize(file);
-    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
-    for t in raw {
-        let t = normalize(&t);
-        if t != self_path && t.starts_with(root) && crate::code::is_indexable(&t) {
-            out.insert(t);
+    let mut out: BTreeMap<(PathBuf, usize, usize), Vec<ImportBinding>> = BTreeMap::new();
+    for mut fact in raw {
+        fact.target = normalize(&fact.target);
+        if fact.target != self_path
+            && fact.target.starts_with(root)
+            && crate::code::is_indexable(&fact.target)
+        {
+            let bindings = out
+                .entry((fact.target, fact.start_line, fact.end_line))
+                .or_default();
+            bindings.append(&mut fact.bindings);
         }
     }
-    out.into_iter().collect()
+    out.into_iter()
+        .map(|((target, start_line, end_line), mut bindings)| {
+            bindings.sort();
+            bindings.dedup();
+            ImportFact::new(target, start_line, end_line, bindings)
+        })
+        .collect()
 }
 
 fn first_file<const N: usize>(candidates: [PathBuf; N]) -> Option<PathBuf> {
@@ -116,11 +165,12 @@ fn strip_vis(line: &str) -> &str {
     rest
 }
 
-fn rust_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
+fn rust_edges(file: &Path, head: &[&str], root: &Path) -> Vec<ImportFact> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut in_block_comment = false;
     while i < head.len() {
+        let start_line = i + 1;
         let line = head[i].trim();
         i += 1;
         if in_block_comment {
@@ -141,8 +191,19 @@ fn rust_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
             if rest.contains('{') {
                 break; // inline module body: the import head is over
             }
-            if let Some(p) = resolve_rust_mod(file, rest.trim_end_matches(';').trim()) {
-                out.push(p);
+            let name = rest.trim_end_matches(';').trim();
+            if let Some(p) = resolve_rust_mod(file, name) {
+                out.push(ImportFact::new(
+                    p,
+                    start_line,
+                    start_line,
+                    vec![ImportBinding {
+                        local_name: name.to_string(),
+                        target_name: None,
+                        namespace: true,
+                        type_only: false,
+                    }],
+                ));
             }
             continue;
         }
@@ -156,9 +217,26 @@ fn rust_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
                 joined += 1;
             }
             let stmt = stmt.split(';').next().unwrap_or("").trim().to_string();
-            for segs in expand_use_paths(&stmt) {
-                if let Some(p) = resolve_use_crate(file, root, &segs) {
-                    out.push(p);
+            for expanded in expand_use_paths(&stmt) {
+                if let Some((p, resolved_segments)) =
+                    resolve_use_crate(file, root, &expanded.segments)
+                {
+                    let namespace = resolved_segments == expanded.segments.len();
+                    out.push(ImportFact::new(
+                        p,
+                        start_line,
+                        i,
+                        vec![ImportBinding {
+                            local_name: expanded.local_name,
+                            target_name: if namespace {
+                                None
+                            } else {
+                                expanded.segments.last().cloned()
+                            },
+                            namespace,
+                            type_only: false,
+                        }],
+                    ));
                 }
             }
             continue;
@@ -171,11 +249,16 @@ fn rust_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
     out
 }
 
+struct ExpandedUse {
+    segments: Vec<String>,
+    local_name: String,
+}
+
 /// Expands `crate::a::{b, c::d}` into segment lists (one brace level; nested
 /// groups are skipped — unresolvable means no edge, never a guessed one).
 /// Non-`crate` paths (std, external crates) are dropped: they cannot be
 /// project files.
-fn expand_use_paths(stmt: &str) -> Vec<Vec<String>> {
+fn expand_use_paths(stmt: &str) -> Vec<ExpandedUse> {
     let (prefix, items): (&str, Vec<&str>) = match stmt.find('{') {
         Some(open) => {
             let Some(close) = stmt.rfind('}') else { return Vec::new() };
@@ -199,13 +282,25 @@ fn expand_use_paths(stmt: &str) -> Vec<Vec<String>> {
         } else {
             format!("{prefix}::{item}")
         };
-        let segs: Vec<String> = full
+        let (path, alias) = full
+            .rsplit_once(" as ")
+            .map_or((full.as_str(), None), |(path, alias)| (path.trim(), Some(alias.trim())));
+        let mut segs: Vec<String> = path
             .split("::")
-            .map(|s| s.split_whitespace().next().unwrap_or("").to_string()) // drops " as alias"
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s != "*")
             .collect();
         if segs.first().map(String::as_str) == Some("crate") && segs.len() > 1 {
-            out.push(segs[1..].to_vec());
+            let self_import = segs.last().map(String::as_str) == Some("self");
+            if self_import {
+                segs.pop();
+            }
+            let segments = segs[1..].to_vec();
+            let local_name = alias
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| segments.last().cloned().unwrap_or_default());
+            out.push(ExpandedUse { segments, local_name });
         }
     }
     out
@@ -241,7 +336,11 @@ fn crate_src_root(file: &Path, root: &Path) -> Option<PathBuf> {
 
 /// Resolves `use crate::a::b::c` longest-prefix-first, so a trailing symbol
 /// name falls back to its containing module file.
-fn resolve_use_crate(file: &Path, root: &Path, segs: &[String]) -> Option<PathBuf> {
+fn resolve_use_crate(
+    file: &Path,
+    root: &Path,
+    segs: &[String],
+) -> Option<(PathBuf, usize)> {
     let src_root = crate_src_root(file, root)?;
     for take in (1..=segs.len()).rev() {
         let mut base = src_root.clone();
@@ -249,7 +348,7 @@ fn resolve_use_crate(file: &Path, root: &Path, segs: &[String]) -> Option<PathBu
             base.push(s);
         }
         if let Some(p) = first_file([base.with_extension("rs"), base.join("mod.rs")]) {
-            return Some(p);
+            return Some((p, take));
         }
     }
     None
@@ -259,11 +358,12 @@ fn resolve_use_crate(file: &Path, root: &Path, segs: &[String]) -> Option<PathBu
 
 const TS_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
-fn tsjs_edges(file: &Path, head: &[&str]) -> Vec<PathBuf> {
+fn tsjs_edges(file: &Path, head: &[&str]) -> Vec<ImportFact> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut in_block_comment = false;
     while i < head.len() {
+        let start_line = i + 1;
         let line = head[i].trim();
         i += 1;
         if in_block_comment {
@@ -299,7 +399,12 @@ fn tsjs_edges(file: &Path, head: &[&str]) -> Vec<PathBuf> {
             if let Some(spec) = quoted(&stmt)
                 && let Some(p) = resolve_tsjs(file, &spec)
             {
-                out.push(p);
+                let bindings = if is_import {
+                    ts_import_bindings(&stmt)
+                } else {
+                    Vec::new()
+                };
+                out.push(ImportFact::new(p, start_line, i, bindings));
             }
             continue;
         }
@@ -307,13 +412,82 @@ fn tsjs_edges(file: &Path, head: &[&str]) -> Vec<PathBuf> {
             if let Some(spec) = quoted(&line[pos..])
                 && let Some(p) = resolve_tsjs(file, &spec)
             {
-                out.push(p);
+                let binding = line[..pos]
+                    .split('=')
+                    .next_back()
+                    .and_then(|left| left.split_whitespace().last())
+                    .filter(|name| {
+                        !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+                    })
+                    .map(|name| ImportBinding {
+                        local_name: name.to_string(),
+                        target_name: None,
+                        namespace: true,
+                        type_only: false,
+                    });
+                out.push(ImportFact::new(
+                    p,
+                    start_line,
+                    start_line,
+                    binding.into_iter().collect(),
+                ));
             }
             continue;
         }
         break;
     }
     out
+}
+
+fn ts_import_bindings(stmt: &str) -> Vec<ImportBinding> {
+    let Some(before_from) = stmt.split(" from ").next() else { return Vec::new() };
+    let mut clause = before_from.trim().strip_prefix("import").unwrap_or("").trim();
+    let clause_type_only = clause.starts_with("type ");
+    clause = clause.strip_prefix("type ").unwrap_or(clause).trim();
+    if clause.is_empty() || clause.starts_with(['\'', '"']) {
+        return Vec::new();
+    }
+    let mut bindings = Vec::new();
+    if let Some(star) = clause.find("* as ")
+        && let Some(name) = clause[star + 5..]
+            .split([',', ' ', '\t'])
+            .find(|part| !part.is_empty())
+    {
+        bindings.push(ImportBinding {
+            local_name: name.to_string(),
+            target_name: None,
+            namespace: true,
+            type_only: clause_type_only,
+        });
+    }
+    if let Some(open) = clause.find('{')
+        && let Some(close) = clause.rfind('}')
+    {
+        for item in clause[open + 1..close].split(',') {
+            let item = item.trim();
+            let item_type_only = clause_type_only || item.starts_with("type ");
+            let item = item.strip_prefix("type ").unwrap_or(item);
+            if item.is_empty() {
+                continue;
+            }
+            let (target, local) = item
+                .split_once(" as ")
+                .map_or((item, item), |(target, local)| (target.trim(), local.trim()));
+            if !target.is_empty() && !local.is_empty() {
+                bindings.push(ImportBinding {
+                    local_name: local.to_string(),
+                    target_name: Some(target.to_string()),
+                    namespace: false,
+                    type_only: item_type_only,
+                });
+            }
+        }
+    }
+    // A default import carries no source symbol name. Linking it to a
+    // coincidentally same-named declaration would be a guess, so only named
+    // and namespace imports become symbol bindings.
+    bindings
 }
 
 /// Node/TS relative-specifier resolution: literal file, `.js`→`.ts` swap
@@ -377,12 +551,13 @@ fn resolve_py_module(dir: &Path, module: &str) -> Option<PathBuf> {
     first_file([p.with_extension("py"), p.join("__init__.py")])
 }
 
-fn python_edges(file: &Path, head: &[&str]) -> Vec<PathBuf> {
+fn python_edges(file: &Path, head: &[&str]) -> Vec<ImportFact> {
     let Some(dir) = file.parent().map(Path::to_path_buf) else { return Vec::new() };
     let mut out = Vec::new();
     let mut i = 0;
     let mut in_docstring: Option<&str> = None;
     while i < head.len() {
+        let start_line = i + 1;
         let line = head[i].trim();
         i += 1;
         if let Some(q) = in_docstring {
@@ -402,10 +577,29 @@ fn python_edges(file: &Path, head: &[&str]) -> Vec<PathBuf> {
         }
         if let Some(rest) = line.strip_prefix("import ") {
             for part in rest.split(',') {
-                if let Some(module) = part.split_whitespace().next()
+                let mut words = part.split_whitespace();
+                if let Some(module) = words.next()
                     && let Some(p) = resolve_py_module(&dir, module)
                 {
-                    out.push(p);
+                    let alias = match (words.next(), words.next()) {
+                        (Some("as"), Some(alias)) => Some(alias),
+                        _ => None,
+                    };
+                    let local_name = alias.or_else(|| (!module.contains('.')).then_some(module));
+                    out.push(ImportFact::new(
+                        p,
+                        start_line,
+                        start_line,
+                        local_name
+                            .map(|local_name| ImportBinding {
+                                local_name: local_name.to_string(),
+                                target_name: None,
+                                namespace: true,
+                                type_only: false,
+                            })
+                            .into_iter()
+                            .collect(),
+                    ));
                 }
             }
             continue;
@@ -419,7 +613,7 @@ fn python_edges(file: &Path, head: &[&str]) -> Vec<PathBuf> {
                 i += 1;
                 joined += 1;
             }
-            python_from_edges(&dir, &stmt, &mut out);
+            python_from_edges(&dir, &stmt, start_line, i, &mut out);
             continue;
         }
         break;
@@ -431,7 +625,13 @@ fn python_edges(file: &Path, head: &[&str]) -> Vec<PathBuf> {
 /// first (`from .pkg import mod` is a real module edge); names that do not
 /// resolve fall back to one edge on the module itself — that is where the
 /// symbol lives.
-fn python_from_edges(dir: &Path, stmt: &str, out: &mut Vec<PathBuf>) {
+fn python_from_edges(
+    dir: &Path,
+    stmt: &str,
+    start_line: usize,
+    end_line: usize,
+    out: &mut Vec<ImportFact>,
+) {
     let Some((module_part, names_part)) = stmt.split_once(" import ") else { return };
     let module_part = module_part.trim();
     let dots = module_part.chars().take_while(|c| *c == '.').count();
@@ -442,21 +642,45 @@ fn python_from_edges(dir: &Path, stmt: &str, out: &mut Vec<PathBuf>) {
         base = parent.to_path_buf();
     }
     let module_dir = if rel.is_empty() { base.clone() } else { join_dotted(&base, rel) };
-    let mut any_unmatched = false;
+    let mut unmatched = Vec::new();
+    let mut needs_fallback = false;
     for name in names_part.split(',') {
         let name = name.trim().trim_start_matches('(').trim_end_matches(')').trim();
-        let Some(name) = name.split_whitespace().next() else { continue };
-        if name == "*" {
-            any_unmatched = true;
+        let mut words = name.split_whitespace();
+        let Some(target_name) = words.next() else { continue };
+        let local_name = match (words.next(), words.next()) {
+            (Some("as"), Some(alias)) => alias,
+            _ => target_name,
+        };
+        if target_name == "*" {
+            needs_fallback = true;
             continue;
         }
-        let target = module_dir.join(name);
+        let target = module_dir.join(target_name);
         match first_file([target.with_extension("py"), target.join("__init__.py")]) {
-            Some(p) => out.push(p),
-            None => any_unmatched = true,
+            Some(p) => out.push(ImportFact::new(
+                p,
+                start_line,
+                end_line,
+                vec![ImportBinding {
+                    local_name: local_name.to_string(),
+                    target_name: None,
+                    namespace: true,
+                    type_only: false,
+                }],
+            )),
+            None => {
+                needs_fallback = true;
+                unmatched.push(ImportBinding {
+                    local_name: local_name.to_string(),
+                    target_name: Some(target_name.to_string()),
+                    namespace: false,
+                    type_only: false,
+                });
+            }
         }
     }
-    if any_unmatched {
+    if needs_fallback {
         let fallback = if rel.is_empty() {
             first_file([base.join("__init__.py")])
         } else {
@@ -464,7 +688,7 @@ fn python_from_edges(dir: &Path, stmt: &str, out: &mut Vec<PathBuf>) {
             first_file([m.with_extension("py"), m.join("__init__.py")])
         };
         if let Some(p) = fallback {
-            out.push(p);
+            out.push(ImportFact::new(p, start_line, end_line, unmatched));
         }
     }
 }
@@ -493,17 +717,18 @@ fn go_module(file: &Path, root: &Path) -> Option<(PathBuf, String)> {
 
 /// A Go import names a package (directory); the edge targets are that
 /// package's non-test `.go` files.
-fn go_pkg_edges(mod_dir: &Path, mod_path: &str, spec: &str, out: &mut Vec<PathBuf>) {
+fn go_pkg_targets(mod_dir: &Path, mod_path: &str, spec: &str) -> Vec<PathBuf> {
     let sub = if spec == mod_path {
         String::new()
     } else {
         match spec.strip_prefix(&format!("{mod_path}/")) {
             Some(s) => s.to_string(),
-            None => return, // external package: no edge
+            None => return Vec::new(), // external package: no edge
         }
     };
     let dir = if sub.is_empty() { mod_dir.to_path_buf() } else { mod_dir.join(sub) };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
         let is_go = p.extension().and_then(|x| x.to_str()) == Some("go");
@@ -515,15 +740,72 @@ fn go_pkg_edges(mod_dir: &Path, mod_path: &str, spec: &str, out: &mut Vec<PathBu
             out.push(p);
         }
     }
+    out
 }
 
-fn go_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
+fn go_import_binding(clause: &str, targets: &[PathBuf]) -> Vec<ImportBinding> {
+    let prefix = clause
+        .split(['\'', '"'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("import")
+        .unwrap_or_else(|| clause.split(['\'', '"']).next().unwrap_or(""))
+        .trim();
+    if matches!(prefix, "." | "_") {
+        return Vec::new();
+    }
+    let local_name: String = if prefix.is_empty() {
+        let packages: BTreeSet<String> = targets
+            .iter()
+            .filter_map(|target| std::fs::read_to_string(target).ok())
+            .filter_map(|source| {
+                source.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix("package ")
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(str::to_string)
+                })
+            })
+            .collect();
+        if packages.len() != 1 {
+            return Vec::new();
+        }
+        packages.iter().next().expect("one Go package name").clone()
+    } else {
+        prefix.split_whitespace().last().unwrap_or(prefix).to_string()
+    };
+    vec![ImportBinding {
+        local_name,
+        target_name: None,
+        namespace: true,
+        type_only: false,
+    }]
+}
+
+fn push_go_import(
+    mod_dir: &Path,
+    mod_path: &str,
+    clause: &str,
+    spec: &str,
+    line: usize,
+    out: &mut Vec<ImportFact>,
+) {
+    let targets = go_pkg_targets(mod_dir, mod_path, spec);
+    let bindings = go_import_binding(clause, &targets);
+    for target in targets {
+        out.push(ImportFact::new(target, line, line, bindings.clone()));
+    }
+}
+
+fn go_edges(file: &Path, head: &[&str], root: &Path) -> Vec<ImportFact> {
     let Some((mod_dir, mod_path)) = go_module(file, root) else { return Vec::new() };
     let mut out = Vec::new();
     let mut i = 0;
     let mut in_block_comment = false;
     let mut in_import_block = false;
     while i < head.len() {
+        let line_number = i + 1;
         let line = head[i].trim();
         i += 1;
         if in_block_comment {
@@ -543,7 +825,14 @@ fn go_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
             if line.starts_with(')') {
                 in_import_block = false;
             } else if let Some(spec) = quoted(line) {
-                go_pkg_edges(&mod_dir, &mod_path, &spec, &mut out);
+                push_go_import(
+                    &mod_dir,
+                    &mod_path,
+                    line,
+                    &spec,
+                    line_number,
+                    &mut out,
+                );
             }
             continue;
         }
@@ -556,7 +845,14 @@ fn go_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
         }
         if line.starts_with("import ") {
             if let Some(spec) = quoted(line) {
-                go_pkg_edges(&mod_dir, &mod_path, &spec, &mut out);
+                push_go_import(
+                    &mod_dir,
+                    &mod_path,
+                    line,
+                    &spec,
+                    line_number,
+                    &mut out,
+                );
             }
             continue;
         }
@@ -568,13 +864,36 @@ fn go_edges(file: &Path, head: &[&str], root: &Path) -> Vec<PathBuf> {
 // ------------------------------------------------------------ persistence
 
 pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
+    let current = conn
+        .prepare("SELECT 1 FROM pragma_table_info('import_edges') WHERE name='start_line'")?
+        .exists([])?;
+    if !current {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS import_bindings;
+             DROP TABLE IF EXISTS import_edges;",
+        )?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS import_edges(
            src TEXT NOT NULL,
            dst TEXT NOT NULL,
-           PRIMARY KEY(src, dst)
+           start_line INTEGER NOT NULL,
+           end_line INTEGER NOT NULL,
+           evidence TEXT NOT NULL,
+           PRIMARY KEY(src, dst, start_line, end_line)
          );
-         CREATE INDEX IF NOT EXISTS import_edges_dst ON import_edges(dst);",
+         CREATE TABLE IF NOT EXISTS import_bindings(
+           src TEXT NOT NULL,
+           dst TEXT NOT NULL,
+           start_line INTEGER NOT NULL,
+           end_line INTEGER NOT NULL,
+           local_name TEXT NOT NULL,
+           target_name TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           PRIMARY KEY(src, dst, start_line, end_line, local_name, target_name, kind)
+         );
+         CREATE INDEX IF NOT EXISTS import_edges_dst ON import_edges(dst);
+         CREATE INDEX IF NOT EXISTS import_bindings_src ON import_bindings(src);",
     )?;
     Ok(())
 }
@@ -582,13 +901,41 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
 /// Replaces the outgoing edges of one file. Keyed by path, not rowid:
 /// `code_files` rows are re-inserted on change and rowids must not carry
 /// meaning across scans.
-pub fn replace_file_edges(conn: &Connection, src: &str, dsts: &[PathBuf]) -> anyhow::Result<()> {
+pub(crate) fn replace_file_edges(
+    conn: &Connection,
+    src: &str,
+    imports: &[ImportFact],
+) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM import_bindings WHERE src=?1", [src])?;
     conn.execute("DELETE FROM import_edges WHERE src=?1", [src])?;
-    for d in dsts {
+    for import in imports {
+        let dst = import.target.to_string_lossy();
         conn.execute(
-            "INSERT OR IGNORE INTO import_edges(src, dst) VALUES(?1, ?2)",
-            rusqlite::params![src, d.to_string_lossy()],
+            "INSERT OR IGNORE INTO import_edges(src, dst, start_line, end_line, evidence)
+             VALUES(?1, ?2, ?3, ?4, 'resolved')",
+            rusqlite::params![src, dst, import.start_line as i64, import.end_line as i64],
         )?;
+        for binding in &import.bindings {
+            conn.execute(
+                "INSERT OR IGNORE INTO import_bindings(
+                   src, dst, start_line, end_line, local_name, target_name, kind
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    src,
+                    dst,
+                    import.start_line as i64,
+                    import.end_line as i64,
+                    binding.local_name,
+                    binding.target_name.as_deref().unwrap_or(""),
+                    match (binding.namespace, binding.type_only) {
+                        (true, true) => "namespace-type",
+                        (true, false) => "namespace",
+                        (false, true) => "symbol-type",
+                        (false, false) => "symbol",
+                    },
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -596,6 +943,12 @@ pub fn replace_file_edges(conn: &Connection, src: &str, dsts: &[PathBuf]) -> any
 /// Drops edges whose endpoints left the index (deleted or newly ignored
 /// files) so the ranking never references ghosts.
 pub fn prune_edges(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM import_bindings
+         WHERE src NOT IN (SELECT path FROM code_files)
+            OR dst NOT IN (SELECT path FROM code_files)",
+        [],
+    )?;
     conn.execute(
         "DELETE FROM import_edges
          WHERE src NOT IN (SELECT path FROM code_files)
@@ -615,19 +968,34 @@ pub const DEFAULT_CONTEXT_LIMIT: usize = 50;
 pub const MAX_DEPENDENCY_DEPTH: usize = 32;
 pub const MAX_IMPACT_LIMIT: usize = 200;
 pub const MAX_CONTEXT_LIMIT: usize = 200;
+pub const DEFAULT_SYMBOL_LIMIT: usize = 50;
+pub const MAX_SYMBOL_LIMIT: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SourceEvidence {
+    pub class: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+fn render_evidence(evidence: &SourceEvidence) -> String {
+    format!(
+        "{} {}:{}-{}",
+        evidence.class, evidence.path, evidence.start_line, evidence.end_line
+    )
+}
 
 /// One stable, typed explanation step from the rebuildable source graph.
 ///
 /// Import extraction deliberately accepts only resolvable project-internal
-/// imports in the source-file head. Until the index records exact import line
-/// spans, that extraction class is the honest evidence granularity: callers
-/// can inspect `source`, while cfetch never invents a more precise citation.
+/// imports in the source-file head and retains the exact source range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyEdge {
     pub source: String,
     pub relation: String,
     pub target: String,
-    pub evidence: String,
+    pub evidence: SourceEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,7 +1015,7 @@ pub struct ImpactNode {
     pub depth: usize,
     pub via: String,
     pub relation: String,
-    pub evidence: String,
+    pub evidence: SourceEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,11 +1047,45 @@ pub struct DependencyContext {
     pub nodes: Vec<ContextNode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CodeGraphNode {
+    pub node_kind: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TypedGraphEdge {
+    pub source: CodeGraphNode,
+    pub relation: String,
+    pub target: CodeGraphNode,
+    pub evidence: SourceEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolContext {
+    pub query: String,
+    pub total_symbols: usize,
+    pub omitted_symbols: usize,
+    pub symbols: Vec<CodeGraphNode>,
+    pub total_edges: usize,
+    pub omitted_edges: usize,
+    pub edges: Vec<TypedGraphEdge>,
+}
+
 struct DependencyIndex {
     absolute: Vec<String>,
     display: Vec<String>,
     outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
+    evidence: BTreeMap<(usize, usize), SourceEvidence>,
 }
 
 fn portable_path(path: &Path) -> String {
@@ -733,11 +1135,21 @@ fn dependency_index(conn: &Connection, roots: &[PathBuf]) -> anyhow::Result<Depe
         absolute.iter().enumerate().map(|(index, path)| (path.as_str(), index)).collect();
     let mut outgoing = vec![Vec::new(); absolute.len()];
     let mut incoming = vec![Vec::new(); absolute.len()];
-    let mut edges = conn.prepare("SELECT src, dst FROM import_edges ORDER BY src, dst")?;
+    let mut evidence = BTreeMap::new();
+    let mut edges = conn.prepare(
+        "SELECT src, dst, start_line, end_line, evidence
+         FROM import_edges ORDER BY src, dst, start_line, end_line",
+    )?;
     let rows = edges.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as usize,
+            row.get::<_, i64>(3)? as usize,
+            row.get::<_, String>(4)?,
+        ))
     })?;
-    for (source, target) in rows.filter_map(Result::ok) {
+    for (source, target, start_line, end_line, class) in rows.filter_map(Result::ok) {
         let (Some(&source), Some(&target)) =
             (by_absolute.get(source.as_str()), by_absolute.get(target.as_str()))
         else {
@@ -745,12 +1157,18 @@ fn dependency_index(conn: &Connection, roots: &[PathBuf]) -> anyhow::Result<Depe
         };
         outgoing[source].push(target);
         incoming[target].push(source);
+        evidence.entry((source, target)).or_insert_with(|| SourceEvidence {
+            class,
+            path: display[source].clone(),
+            start_line,
+            end_line,
+        });
     }
     for neighbors in outgoing.iter_mut().chain(incoming.iter_mut()) {
         neighbors.sort_by(|left, right| display[*left].cmp(&display[*right]));
         neighbors.dedup();
     }
-    Ok(DependencyIndex { absolute, display, outgoing, incoming })
+    Ok(DependencyIndex { absolute, display, outgoing, incoming, evidence })
 }
 
 fn normalized_query(query: &str) -> String {
@@ -834,7 +1252,11 @@ fn dependency_edge(index: &DependencyIndex, source: usize, target: usize) -> Dep
         source: index.display[source].clone(),
         relation: "imports".to_string(),
         target: index.display[target].clone(),
-        evidence: "source-file-head".to_string(),
+        evidence: index
+            .evidence
+            .get(&(source, target))
+            .cloned()
+            .expect("every dependency edge has persisted evidence"),
     }
 }
 
@@ -949,7 +1371,11 @@ pub fn dependency_impact(
             depth: depth[node],
             via: index.display[via[node].expect("a reverse-reached node has a next hop")].clone(),
             relation: "imports".to_string(),
-            evidence: "source-file-head".to_string(),
+            evidence: index
+                .evidence
+                .get(&(node, via[node].expect("a reverse-reached node has a next hop")))
+                .cloned()
+                .expect("every dependency edge has persisted evidence"),
         })
         .collect();
     Ok(DependencyImpact {
@@ -1045,6 +1471,305 @@ pub fn dependency_context(
     })
 }
 
+#[derive(Clone)]
+struct StoredSymbol {
+    file: String,
+    name: String,
+    kind: String,
+    start_line: usize,
+    end_line: usize,
+    parent_start_line: Option<usize>,
+}
+
+impl StoredSymbol {
+    fn identity(&self) -> (&str, usize, &str) {
+        (&self.file, self.start_line, &self.name)
+    }
+
+    fn node(&self, displays: &BTreeMap<&str, &str>) -> CodeGraphNode {
+        CodeGraphNode {
+            node_kind: "symbol".to_string(),
+            path: displays.get(self.file.as_str()).copied().unwrap_or(&self.file).to_string(),
+            name: Some(self.name.clone()),
+            symbol_kind: Some(self.kind.clone()),
+            start_line: Some(self.start_line),
+            end_line: Some(self.end_line),
+        }
+    }
+}
+
+struct StoredUse {
+    file: String,
+    name: String,
+    qualifier: Option<String>,
+    relation: String,
+    start_line: usize,
+    end_line: usize,
+    container_start_line: usize,
+}
+
+type DirectBindings<'a> = BTreeMap<(&'a str, &'a str), Vec<(&'a str, &'a str, bool)>>;
+type NamespaceBindings<'a> = BTreeMap<(&'a str, &'a str), Vec<(&'a str, bool)>>;
+
+/// Returns parser-proven symbol relationships around an exact symbol name.
+/// A call/reference resolves only through an explicit import binding and only
+/// when that binding leads to exactly one file-level definition. Ambiguity or
+/// grammar uncertainty therefore removes an edge instead of inventing one.
+pub fn symbol_context(
+    conn: &Connection,
+    roots: &[PathBuf],
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<SymbolContext> {
+    anyhow::ensure!(
+        (1..=MAX_SYMBOL_LIMIT).contains(&limit),
+        "limit must be between 1 and {MAX_SYMBOL_LIMIT}"
+    );
+    let normalized = crate::code::norm_ident(query);
+    anyhow::ensure!(!normalized.is_empty(), "symbol query must contain a name");
+    let index = dependency_index(conn, roots)?;
+    let displays: BTreeMap<&str, &str> = index
+        .absolute
+        .iter()
+        .zip(&index.display)
+        .map(|(absolute, display)| (absolute.as_str(), display.as_str()))
+        .collect();
+
+    let mut statement = conn.prepare(
+        "SELECT f.path, s.name, s.kind, s.start_line, s.end_line, s.parent_start_line
+         FROM symbols s JOIN code_files f ON f.id=s.file_id
+         ORDER BY f.path, s.start_line, s.name",
+    )?;
+    let symbols: Vec<StoredSymbol> = statement
+        .query_map([], |row| {
+            Ok(StoredSymbol {
+                file: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                start_line: row.get::<_, i64>(3)? as usize,
+                end_line: row.get::<_, i64>(4)? as usize,
+                parent_start_line: row.get::<_, Option<i64>>(5)?.map(|line| line as usize),
+            })
+        })?
+        .filter_map(Result::ok)
+        .filter(|symbol| displays.contains_key(symbol.file.as_str()))
+        .collect();
+    let matched_all: Vec<StoredSymbol> = symbols
+        .iter()
+        .filter(|symbol| crate::code::norm_ident(&symbol.name) == normalized)
+        .cloned()
+        .collect();
+    let total_symbols = matched_all.len();
+    let mut matched = matched_all.clone();
+    matched.truncate(limit);
+    let matched_ids: BTreeSet<(String, usize, String)> = matched_all
+        .iter()
+        .map(|symbol| (symbol.file.clone(), symbol.start_line, symbol.name.clone()))
+        .collect();
+    let nodes: Vec<CodeGraphNode> = matched.iter().map(|symbol| symbol.node(&displays)).collect();
+
+    let mut edges: BTreeSet<TypedGraphEdge> = BTreeSet::new();
+    for symbol in &matched_all {
+        let path = displays.get(symbol.file.as_str()).copied().unwrap_or(&symbol.file);
+        edges.insert(TypedGraphEdge {
+            source: CodeGraphNode {
+                node_kind: "file".to_string(),
+                path: path.to_string(),
+                name: None,
+                symbol_kind: None,
+                start_line: None,
+                end_line: None,
+            },
+            relation: "contains".to_string(),
+            target: symbol.node(&displays),
+            evidence: SourceEvidence {
+                class: "extracted".to_string(),
+                path: path.to_string(),
+                start_line: symbol.start_line,
+                end_line: symbol.end_line,
+            },
+        });
+    }
+
+    let mut direct = DirectBindings::new();
+    let mut namespaces = NamespaceBindings::new();
+    let mut bindings = conn.prepare(
+        "SELECT src, dst, local_name, target_name, kind
+         FROM import_bindings ORDER BY src, local_name, dst, target_name",
+    )?;
+    let binding_rows = bindings.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let binding_rows: Vec<(String, String, String, String, String)> =
+        binding_rows.filter_map(Result::ok).collect();
+    for (src, dst, local, target, kind) in &binding_rows {
+        let type_only = kind.ends_with("-type");
+        if kind.starts_with("namespace") {
+            namespaces.entry((src, local)).or_default().push((dst, type_only));
+        } else {
+            direct.entry((src, local)).or_default().push((dst, target, type_only));
+        }
+    }
+    let mut top_level: BTreeMap<(&str, &str), Vec<&StoredSymbol>> = BTreeMap::new();
+    let mut containers: BTreeMap<(&str, usize), &StoredSymbol> = BTreeMap::new();
+    for symbol in &symbols {
+        containers.insert((symbol.file.as_str(), symbol.start_line), symbol);
+        if symbol.parent_start_line.is_none() {
+            top_level.entry((symbol.file.as_str(), symbol.name.as_str())).or_default().push(symbol);
+        }
+    }
+
+    let mut uses = conn.prepare(
+        "SELECT f.path, u.name, u.qualifier, u.relation, u.start_line, u.end_line,
+                u.container_start_line
+         FROM symbol_uses u JOIN code_files f ON f.id=u.file_id
+         ORDER BY f.path, u.start_line, u.end_line, u.relation, u.name",
+    )?;
+    let uses = uses.query_map([], |row| {
+        Ok(StoredUse {
+            file: row.get(0)?,
+            name: row.get(1)?,
+            qualifier: row.get(2)?,
+            relation: row.get(3)?,
+            start_line: row.get::<_, i64>(4)? as usize,
+            end_line: row.get::<_, i64>(5)? as usize,
+            container_start_line: row.get::<_, i64>(6)? as usize,
+        })
+    })?;
+    for usage in uses.filter_map(Result::ok) {
+        let Some(source) = containers.get(&(usage.file.as_str(), usage.container_start_line)) else {
+            continue;
+        };
+        let mut candidates: Vec<&StoredSymbol> = Vec::new();
+        match usage.qualifier.as_deref() {
+            Some(qualifier) => {
+                for (dst, type_only) in namespaces
+                    .get(&(usage.file.as_str(), qualifier))
+                    .into_iter()
+                    .flatten()
+                {
+                    if *type_only && usage.relation != "references" {
+                        continue;
+                    }
+                    candidates.extend(
+                        top_level
+                            .get(&(*dst, usage.name.as_str()))
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                }
+            }
+            None => {
+                for (dst, target_name, type_only) in direct
+                    .get(&(usage.file.as_str(), usage.name.as_str()))
+                    .into_iter()
+                    .flatten()
+                {
+                    if *type_only && usage.relation != "references" {
+                        continue;
+                    }
+                    candidates.extend(
+                        top_level
+                            .get(&(*dst, *target_name))
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                }
+            }
+        }
+        candidates.sort_by_key(|candidate| candidate.identity());
+        candidates.dedup_by_key(|candidate| candidate.identity());
+        let [target] = candidates.as_slice() else { continue };
+        let source_id = (source.file.clone(), source.start_line, source.name.clone());
+        let target_id = (target.file.clone(), target.start_line, target.name.clone());
+        if !matched_ids.contains(&source_id) && !matched_ids.contains(&target_id) {
+            continue;
+        }
+        let evidence_path = displays
+            .get(usage.file.as_str())
+            .copied()
+            .unwrap_or(usage.file.as_str());
+        edges.insert(TypedGraphEdge {
+            source: source.node(&displays),
+            relation: usage.relation,
+            target: target.node(&displays),
+            evidence: SourceEvidence {
+                class: "resolved".to_string(),
+                path: evidence_path.to_string(),
+                start_line: usage.start_line,
+                end_line: usage.end_line,
+            },
+        });
+    }
+    let total_edges = edges.len();
+    let kept_ids: BTreeSet<(String, usize, String)> = nodes
+        .iter()
+        .filter_map(|node| {
+            Some((
+                node.path.clone(),
+                node.start_line?,
+                node.name.clone()?,
+            ))
+        })
+        .collect();
+    let incident_to_kept = |node: &CodeGraphNode| {
+        node.node_kind == "symbol"
+            && node
+                .start_line
+                .zip(node.name.as_ref())
+                .is_some_and(|(line, name)| kept_ids.contains(&(node.path.clone(), line, name.clone())))
+    };
+    let edges: Vec<TypedGraphEdge> = edges
+        .into_iter()
+        .filter(|edge| incident_to_kept(&edge.source) || incident_to_kept(&edge.target))
+        .take(limit)
+        .collect();
+    Ok(SymbolContext {
+        query: query.to_string(),
+        total_symbols,
+        omitted_symbols: total_symbols.saturating_sub(nodes.len()),
+        symbols: nodes,
+        total_edges,
+        omitted_edges: total_edges.saturating_sub(edges.len()),
+        edges,
+    })
+}
+
+pub fn render_symbol_context(context: &SymbolContext) -> String {
+    let mut lines = vec![format!(
+        "symbol context: {:?} matched {} symbol(s), {} edge(s)",
+        context.query, context.total_symbols, context.total_edges
+    )];
+    lines.extend(context.edges.iter().map(|edge| {
+        let source = edge.source.name.as_deref().unwrap_or(&edge.source.path);
+        let target = edge.target.name.as_deref().unwrap_or(&edge.target.path);
+        format!(
+            "{}#{} --{}--> {}#{} [{}]",
+            edge.source.path,
+            source,
+            edge.relation,
+            edge.target.path,
+            target,
+            render_evidence(&edge.evidence)
+        )
+    }));
+    if context.omitted_symbols + context.omitted_edges > 0 {
+        lines.push(format!(
+            "... {} symbol(s) and {} edge(s) omitted by the limit",
+            context.omitted_symbols, context.omitted_edges
+        ));
+    }
+    lines.join("\n")
+}
+
 pub fn render_dependency_path(path: &DependencyPath) -> String {
     if !path.found {
         return format!(
@@ -1064,7 +1789,7 @@ pub fn render_dependency_path(path: &DependencyPath) -> String {
     lines.extend(path.edges.iter().map(|edge| {
         format!(
             "{} --{}--> {} [{}]",
-            edge.source, edge.relation, edge.target, edge.evidence
+            edge.source, edge.relation, edge.target, render_evidence(&edge.evidence)
         )
     }));
     lines.join("\n")
@@ -1078,7 +1803,11 @@ pub fn render_dependency_impact(impact: &DependencyImpact) -> String {
     lines.extend(impact.nodes.iter().map(|node| {
         format!(
             "d{} {} --{}--> {} [{}]",
-            node.depth, node.path, node.relation, node.via, node.evidence
+            node.depth,
+            node.path,
+            node.relation,
+            node.via,
+            render_evidence(&node.evidence)
         )
     }));
     if impact.omitted > 0 {
@@ -1099,7 +1828,7 @@ pub fn render_dependency_context(context: &DependencyContext) -> String {
             node.edge.source,
             node.edge.relation,
             node.edge.target,
-            node.edge.evidence
+            render_evidence(&node.edge.evidence)
         )
     }));
     if context.omitted > 0 {
@@ -1186,7 +1915,7 @@ fn files_under(conn: &Connection, root: &Path) -> anyhow::Result<Vec<(String, u6
 }
 
 fn edges_among(conn: &Connection, index: &BTreeMap<&str, usize>) -> anyhow::Result<Vec<(usize, usize)>> {
-    let mut stmt = conn.prepare("SELECT src, dst FROM import_edges")?;
+    let mut stmt = conn.prepare("SELECT DISTINCT src, dst FROM import_edges")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     Ok(rows
         .filter_map(Result::ok)
@@ -1751,7 +2480,9 @@ mod tests {
         assert_eq!(path.edges[0].source, "main.rs");
         assert_eq!(path.edges[0].target, "a.rs", "equal shortest paths use lexical order");
         assert_eq!(path.edges[0].relation, "imports");
-        assert_eq!(path.edges[0].evidence, "source-file-head");
+        assert_eq!(path.edges[0].evidence.class, "resolved");
+        assert_eq!(path.edges[0].evidence.path, "main.rs");
+        assert_eq!((path.edges[0].evidence.start_line, path.edges[0].evidence.end_line), (1, 1));
         assert_eq!(path.edges[1].source, "a.rs");
         assert_eq!(path.edges[1].target, "b.rs");
 
@@ -1793,7 +2524,7 @@ mod tests {
         let main = impact.nodes.iter().find(|node| node.path == "main.rs").unwrap();
         assert_eq!(main.via, "a.rs", "the lexical shortest explanation is stable");
         assert_eq!(main.relation, "imports");
-        assert_eq!(main.evidence, "source-file-head");
+        assert_eq!(main.evidence.class, "resolved");
 
         let clipped = dependency_impact(
             &conn,
@@ -1835,7 +2566,7 @@ mod tests {
         assert_eq!(imported.edge.source, "a.rs");
         assert_eq!(imported.edge.target, "b.rs");
         assert_eq!(imported.edge.relation, "imports");
-        assert_eq!(imported.edge.evidence, "source-file-head");
+        assert_eq!(imported.edge.evidence.class, "resolved");
 
         let importer = context.nodes.iter().find(|node| node.path == "main.rs").unwrap();
         assert_eq!(importer.edge.source, "main.rs");
@@ -1869,6 +2600,202 @@ mod tests {
         .unwrap();
         assert_eq!(clipped.nodes.len(), 2);
         assert_eq!(clipped.omitted, 1, "bounded answers must name what they omit");
+    }
+
+    #[test]
+    fn dependency_import_evidence_keeps_the_exact_multiline_statement_range() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "lib.rs",
+            "use crate::worker::{\n    run,\n};\npub fn caller() { run(); }\n",
+        );
+        write(dir.path(), "worker.rs", "pub fn run() {}\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let path = dependency_path(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "lib.rs",
+            "worker.rs",
+            2,
+        )
+        .unwrap();
+        assert!(path.found);
+        assert_eq!(path.edges.len(), 1);
+        assert_eq!(path.edges[0].evidence.path, "lib.rs");
+        assert_eq!((path.edges[0].evidence.start_line, path.edges[0].evidence.end_line), (1, 3));
+    }
+
+    #[test]
+    fn symbol_context_resolves_only_parser_uses_bound_by_explicit_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "lib.rs",
+            "mod worker;\nuse crate::worker::{run, Thing};\npub fn caller(input: Thing) {\n    run();\n}\n",
+        );
+        write(dir.path(), "worker.rs", "pub struct Thing;\npub fn run() {}\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let context = symbol_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "caller",
+            20,
+        )
+        .unwrap();
+        assert_eq!(context.total_symbols, 1);
+        assert_eq!(context.symbols[0].name.as_deref(), Some("caller"));
+        let contains = context.edges.iter().find(|edge| edge.relation == "contains").unwrap();
+        assert_eq!(contains.source.node_kind, "file");
+        assert_eq!(contains.target.name.as_deref(), Some("caller"));
+        assert_eq!(contains.evidence.class, "extracted");
+        assert_eq!((contains.evidence.start_line, contains.evidence.end_line), (3, 5));
+
+        let call = context.edges.iter().find(|edge| edge.relation == "calls").unwrap();
+        assert_eq!(call.source.name.as_deref(), Some("caller"));
+        assert_eq!(call.target.name.as_deref(), Some("run"));
+        assert_eq!(call.target.path, "worker.rs");
+        assert_eq!(call.evidence.class, "resolved");
+        assert_eq!((call.evidence.start_line, call.evidence.end_line), (4, 4));
+
+        let reference = context.edges.iter().find(|edge| edge.relation == "references").unwrap();
+        assert_eq!(reference.source.name.as_deref(), Some("caller"));
+        assert_eq!(reference.target.name.as_deref(), Some("Thing"));
+        assert_eq!(reference.target.path, "worker.rs");
+        assert_eq!((reference.evidence.start_line, reference.evidence.end_line), (3, 3));
+    }
+
+    #[test]
+    fn ambiguous_imported_symbol_uses_produce_no_invented_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "lib.rs",
+            "mod a;\nmod b;\nuse crate::a::run;\nuse crate::b::run;\npub fn caller() { run(); }\n",
+        );
+        write(dir.path(), "a.rs", "pub fn run() {}\n");
+        write(dir.path(), "b.rs", "pub fn run() {}\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let context = symbol_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "caller",
+            20,
+        )
+        .unwrap();
+        assert!(
+            context.edges.iter().all(|edge| edge.relation != "calls"),
+            "an ambiguous name must remain unresolved: {:?}",
+            context.edges
+        );
+    }
+
+    #[test]
+    fn symbol_context_counts_relationships_hidden_with_omitted_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.rs", "pub fn caller() {}\n");
+        write(dir.path(), "b.rs", "pub fn caller() {}\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let context = symbol_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "caller",
+            1,
+        )
+        .unwrap();
+        assert_eq!((context.total_symbols, context.symbols.len(), context.omitted_symbols), (2, 1, 1));
+        assert_eq!((context.total_edges, context.edges.len(), context.omitted_edges), (2, 1, 1));
+    }
+
+    #[test]
+    fn typescript_type_only_imports_never_invent_value_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "app.ts",
+            "import type { Thing } from './worker';\nexport function caller(input: Thing) { Thing(); }\n",
+        );
+        write(dir.path(), "worker.ts", "export class Thing {}\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let context = symbol_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "caller",
+            10,
+        )
+        .unwrap();
+        assert!(context.edges.iter().any(|edge| edge.relation == "references"));
+        assert!(context.edges.iter().all(|edge| edge.relation != "calls"));
+    }
+
+    #[test]
+    fn explicit_calls_resolve_across_every_supported_parser_family() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "ts/app.ts",
+            "import { run } from './worker';\nexport function caller() { run(); }\n",
+        );
+        write(dir.path(), "ts/worker.ts", "export function run() {}\n");
+        write(
+            dir.path(),
+            "js/app.js",
+            "import { run } from './worker.js';\nexport function caller() { run(); }\n",
+        );
+        write(dir.path(), "js/worker.js", "export function run() {}\n");
+        write(
+            dir.path(),
+            "py/app.py",
+            "from worker import run\ndef caller():\n    run()\n",
+        );
+        write(dir.path(), "py/worker.py", "def run():\n    pass\n");
+        write(dir.path(), "go/go.mod", "module example\n");
+        write(
+            dir.path(),
+            "go/app.go",
+            "package app\nimport \"example/worker\"\nfunc caller() { worker.Run() }\n",
+        );
+        write(
+            dir.path(),
+            "go/worker/worker.go",
+            "package worker\nfunc Run() {}\n",
+        );
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        crate::code::scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+
+        let context = symbol_context(
+            &conn,
+            &[dir.path().to_path_buf()],
+            "caller",
+            20,
+        )
+        .unwrap();
+        let targets: BTreeSet<&str> = context
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == "calls")
+            .map(|edge| edge.target.path.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            BTreeSet::from(["go/worker/worker.go", "js/worker.js", "py/worker.py", "ts/worker.ts"])
+        );
     }
 
     #[test]

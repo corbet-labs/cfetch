@@ -658,7 +658,9 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
     assert_eq!(sock_path["ok"], true, "{sock_path}");
     assert_eq!(sock_path["dependency_path"]["found"], true, "{sock_path}");
     assert_eq!(sock_path["dependency_path"]["edges"][0]["relation"], "imports");
-    assert_eq!(sock_path["dependency_path"]["edges"][0]["evidence"], "source-file-head");
+    assert_eq!(sock_path["dependency_path"]["edges"][0]["evidence"]["class"], "resolved");
+    assert_eq!(sock_path["dependency_path"]["edges"][0]["evidence"]["path"], "proj/src/main.rs");
+    assert_eq!(sock_path["dependency_path"]["edges"][0]["evidence"]["start_line"], 1);
     let storage_root = code.path().to_string_lossy();
     assert!(
         !sock_path.to_string().contains(storage_root.as_ref()),
@@ -711,6 +713,29 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
     assert_eq!(
         tcp_context["dependency_context"], sock_context["dependency_context"],
         "TCP and local serving must expose identical dependency context"
+    );
+
+    let symbol_request = json!({"op": "code-symbol", "query": "main", "limit": 10});
+    let sock_symbol = daemon.local().req(&symbol_request);
+    assert_eq!(sock_symbol["ok"], true, "{sock_symbol}");
+    assert_eq!(sock_symbol["symbol_context"]["total_symbols"], 1, "{sock_symbol}");
+    assert_eq!(
+        sock_symbol["symbol_context"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| edge["relation"] == "calls")
+            .unwrap()["target"]["name"],
+        "alpha_helper"
+    );
+    assert!(
+        !sock_symbol.to_string().contains(storage_root.as_ref()),
+        "served symbol context must not expose the storage host root: {sock_symbol}"
+    );
+    let tcp_symbol = tcp_req(&addr, token, &symbol_request);
+    assert_eq!(
+        tcp_symbol["symbol_context"], sock_symbol["symbol_context"],
+        "TCP and local serving must expose identical symbol context"
     );
 
     // The serving host's own CLI, reading its local index directly.
@@ -819,6 +844,23 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
     let remote_context: Value = serde_json::from_slice(&remote_context.stdout).unwrap();
     assert_eq!(remote_context["context"], sock_context["dependency_context"]);
     assert_eq!(remote_context["origin"], "storage-host");
+
+    let remote_symbol = Command::new(BIN)
+        .args(["code-graph", "symbol", "main", "--limit", "10", "--json"])
+        .env("CFETCH_STATE_DIR", client_state.path())
+        .env("CFETCH_CONFIG", &client_cfg)
+        .env("HOME", client_home.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        remote_symbol.status.success(),
+        "none-tier symbol context failed: {}",
+        String::from_utf8_lossy(&remote_symbol.stderr)
+    );
+    let remote_symbol: Value = serde_json::from_slice(&remote_symbol.stdout).unwrap();
+    assert_eq!(remote_symbol["symbol"], sock_symbol["symbol_context"]);
+    assert_eq!(remote_symbol["origin"], "storage-host");
     assert!(
         !client_state.path().join("index.db").exists(),
         "none-tier map and graph queries must open no local index"

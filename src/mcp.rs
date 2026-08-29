@@ -29,6 +29,7 @@ const TOOL_NAMES: &[&str] = &[
     "cfetch_code_path",
     "cfetch_code_impact",
     "cfetch_code_context",
+    "cfetch_code_symbol",
     "cfetch_runtime_status",
     "cfetch_maintenance_packet",
     "cfetch_maintenance_show",
@@ -134,6 +135,19 @@ fn tool_defs() -> Vec<Tool> {
                     "limit": {"type": "integer", "default": graph::DEFAULT_CONTEXT_LIMIT, "minimum": 1, "maximum": graph::MAX_CONTEXT_LIMIT}
                 },
                 "required": ["target"]
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_code_symbol",
+            "Show parser-proven calls and type references around an exact indexed symbol. A relationship resolves only through an explicit import binding to exactly one file-level definition; ambiguity produces no edge. Every edge carries an exact source range.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "exact symbol name"},
+                    "limit": {"type": "integer", "default": graph::DEFAULT_SYMBOL_LIMIT, "minimum": 1, "maximum": graph::MAX_SYMBOL_LIMIT}
+                },
+                "required": ["query"]
             })),
         )
         .with_annotations(read_only()),
@@ -308,6 +322,11 @@ fn run_tool_remote(
                 .unwrap_or(graph::DEFAULT_CONTEXT_DEPTH as u64),
             "limit": if limit == 0 { graph::DEFAULT_CONTEXT_LIMIT } else { limit },
         }),
+        "cfetch_code_symbol" => json!({
+            "op": "code-symbol",
+            "query": args.get("query").and_then(Value::as_str).unwrap_or(""),
+            "limit": if limit == 0 { graph::DEFAULT_SYMBOL_LIMIT } else { limit },
+        }),
         other => anyhow::bail!("unknown tool: {other}"),
     };
     let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
@@ -378,6 +397,13 @@ fn run_tool_remote(
                 .as_ref()
                 .context("serving host returned no dependency context")?;
             graph::render_dependency_context(context)
+        }
+        "cfetch_code_symbol" => {
+            let context = resp
+                .symbol_context
+                .as_ref()
+                .context("serving host returned no symbol context")?;
+            graph::render_symbol_context(context)
         }
         other => anyhow::bail!("unknown tool: {other}"),
     };
@@ -554,6 +580,18 @@ fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
                 limit,
             )?;
             Ok(graph::render_dependency_context(&context))
+        }
+        "cfetch_code_symbol" => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let limit = if limit == 0 { graph::DEFAULT_SYMBOL_LIMIT } else { limit };
+            let conn = index::open(&paths::state_dir())?;
+            let context = graph::symbol_context(
+                &conn,
+                &cfg.effective_code_roots(),
+                query,
+                limit,
+            )?;
+            Ok(graph::render_symbol_context(&context))
         }
         other => anyhow::bail!("unknown tool: {other}"),
     }
