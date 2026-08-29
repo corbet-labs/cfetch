@@ -146,8 +146,10 @@ jobs:
           cp "$RUNNER_TEMP/runtime-result.json" "$RUNNER_TEMP/openvino-archives/"
           cp "$RUNNER_TEMP/artifact-archive-result.json" "$RUNNER_TEMP/openvino-archives/"
           cp "$RUNNER_TEMP/runtime-archive-result.json" "$RUNNER_TEMP/openvino-archives/"
-          sha256sum "$RUNNER_TEMP"/openvino-archives/* \
-            > "$RUNNER_TEMP/openvino-archives/SHA256SUMS"
+          (
+            cd "$RUNNER_TEMP/openvino-archives"
+            sha256sum -- *.json *.tar.gz > SHA256SUMS
+          )
 
       - name: Upload content-addressed build inputs
         uses: actions/upload-artifact@v7
