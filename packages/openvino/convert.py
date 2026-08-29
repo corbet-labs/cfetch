@@ -16,6 +16,7 @@ import importlib.metadata
 import json
 from pathlib import Path
 import shutil
+import sys
 from typing import Any, Mapping, Sequence
 
 if __package__:
@@ -454,7 +455,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.source_dir, args.legal_dir, args.output_dir, args.weight_storage
         )
     except (ConversionError, LegalError, OSError, RuntimeError) as error:
-        print(f"OpenVINO conversion refused: {error}")
+        print(f"OpenVINO conversion refused: {error}", file=sys.stderr)
         return 1
     print(
         json.dumps(

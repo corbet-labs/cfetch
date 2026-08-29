@@ -1,15 +1,44 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from packages.openvino import convert
 
 
 class ConversionContractTests(unittest.TestCase):
+    def test_cli_keeps_failure_diagnostic_out_of_result_stdout(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                convert,
+                "convert",
+                side_effect=convert.ConversionError("safe conversion failure"),
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = convert.main(
+                [
+                    "--source-dir",
+                    "unused-source",
+                    "--legal-dir",
+                    "unused-legal",
+                    "--output-dir",
+                    "unused-output",
+                ]
+            )
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("safe conversion failure", stderr.getvalue())
+
     def test_source_file_verification_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
