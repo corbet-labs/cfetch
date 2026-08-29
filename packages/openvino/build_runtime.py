@@ -23,6 +23,7 @@ if __package__:
     )
     from .runtime_bundle import (
         DISPATCHER,
+        HOST_CXX_RUNTIME_SONAMES,
         LAUNCHER,
         RuntimeBundleError,
         create_manifest,
@@ -37,6 +38,7 @@ else:
     )
     from runtime_bundle import (  # type: ignore[no-redef]
         DISPATCHER,
+        HOST_CXX_RUNTIME_SONAMES,
         LAUNCHER,
         RuntimeBundleError,
         create_manifest,
@@ -45,6 +47,21 @@ else:
 
 class RuntimeBuildError(ValueError):
     """The frozen dispatcher could not be built as one validated payload."""
+
+
+def _remove_bundled_cxx_runtime(root: Path) -> None:
+    """Remove PyInstaller's top-level copies of the target driver ABI runtime."""
+
+    internal = root.resolve() / "_internal"
+    for soname in HOST_CXX_RUNTIME_SONAMES:
+        path = internal / soname
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeBuildError(
+                f"PyInstaller emitted unsafe host C++ runtime entry: {path}"
+            )
+        path.unlink()
 
 
 def _is_optional_empty_marker(relative: Path) -> bool:
@@ -271,6 +288,7 @@ def build(output_dir: Path, minimum_glibc: str, compiler: str) -> tuple[Path, st
     if not output_dir.is_dir():
         raise RuntimeBuildError("PyInstaller did not create the expected onedir payload")
     _materialize_file_symlinks(output_dir)
+    _remove_bundled_cxx_runtime(output_dir)
     _prune_optional_empty_metadata(output_dir)
     _compile_launcher(recipe_dir / "launcher.c", output_dir / LAUNCHER, compiler)
     manifest = create_manifest(output_dir, minimum_glibc)

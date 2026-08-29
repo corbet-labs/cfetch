@@ -129,6 +129,11 @@ class ManifestTests(unittest.TestCase):
                 "machine": "x86_64",
                 "kernel_release": "test-kernel",
                 "files": [
+                    {
+                        "path": "/usr/lib/libstdc++.so.6.0.30",
+                        "sha256": "a" * 64,
+                    },
+                    {"path": "/usr/lib/libgcc_s.so.1", "sha256": "b" * 64},
                     {"path": "/usr/lib/test-npu-driver.so", "sha256": "8" * 64}
                 ],
             },
@@ -223,6 +228,37 @@ class ManifestTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(manifest.ManifestError, "not present"):
                 package.scope("intel-test-unknown")
+
+    def test_scope_requires_resolved_host_cxx_runtime_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            path = self.fixture(root)
+            document = json.loads(path.read_bytes())
+            real_hash = manifest._sha256_file
+
+            def hash_fixture(file_path: Path) -> str:
+                if file_path.name == "tokenizer.json":
+                    return manifest.PINNED_SOURCE_FILE_SHA256["tokenizer.json"]
+                if file_path.name in legal.LEGAL_FILES:
+                    return legal.PINNED_LEGAL_SHA256[file_path.name]
+                return real_hash(file_path)
+
+            for missing_name in ("libstdc++.so.6.0.30", "libgcc_s.so.1"):
+                mutated = json.loads(json.dumps(document))
+                mutated["scopes"][0]["required_host"]["files"] = [
+                    entry
+                    for entry in mutated["scopes"][0]["required_host"]["files"]
+                    if Path(entry["path"]).name != missing_name
+                ]
+                path.write_bytes(compact(mutated))
+                with self.subTest(missing_name=missing_name), self.assertRaisesRegex(
+                    manifest.ManifestError,
+                    r"must bind the resolved regular target file",
+                ):
+                    with mock.patch.object(
+                        manifest, "_sha256_file", side_effect=hash_fixture
+                    ):
+                        manifest.load_package_manifest(path)
 
     def test_aggregate_or_wrong_class_device_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

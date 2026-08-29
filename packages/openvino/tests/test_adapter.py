@@ -153,6 +153,30 @@ class AdapterContractTests(unittest.TestCase):
             {self.scope.scope_id: self.signer},
         )
 
+    def test_execution_devices_normalizes_scalar_and_sequence_forms(self) -> None:
+        self.assertEqual(adapter._normalize_execution_devices("NPU"), ("NPU",))
+        self.assertEqual(
+            adapter._normalize_execution_devices(["GPU.0", "GPU.1"]),
+            ("GPU.0", "GPU.1"),
+        )
+
+    def test_execution_devices_rejects_invalid_raw_values(self) -> None:
+        invalid_values = (
+            "",
+            (),
+            ["NPU", ""],
+            ["NPU", 1],
+            b"NPU",
+            bytearray(b"NPU"),
+            memoryview(b"NPU"),
+            {"NPU"},
+            iter(("NPU",)),
+            None,
+        )
+        for raw in invalid_values:
+            with self.subTest(raw=raw), self.assertRaises((TypeError, ValueError)):
+                adapter._normalize_execution_devices(raw)
+
     @staticmethod
     def request_body(inputs: list[str], requested_scope: str = "intel-test-npu") -> bytes:
         return json.dumps(

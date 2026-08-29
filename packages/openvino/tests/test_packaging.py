@@ -22,6 +22,25 @@ from packages.openvino import runtime_bundle
 
 
 class PackagingTests(unittest.TestCase):
+    def test_runtime_build_removes_only_top_level_bundled_cxx_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            internal = root / "_internal"
+            nested = internal / "vendor"
+            nested.mkdir(parents=True)
+            for soname in runtime_bundle.HOST_CXX_RUNTIME_SONAMES:
+                (internal / soname).write_bytes(b"build-host-runtime")
+                (nested / soname).write_bytes(b"nested-copy")
+            retained = internal / "libc.so.6"
+            retained.write_bytes(b"host-neutral-runtime")
+
+            build_runtime._remove_bundled_cxx_runtime(root)
+
+            for soname in runtime_bundle.HOST_CXX_RUNTIME_SONAMES:
+                self.assertFalse((internal / soname).exists())
+                self.assertEqual((nested / soname).read_bytes(), b"nested-copy")
+            self.assertEqual(retained.read_bytes(), b"host-neutral-runtime")
+
     def test_runtime_build_prunes_only_empty_requested_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -349,7 +368,11 @@ class PackagingTests(unittest.TestCase):
                 ),
             ):
                 _, manifest_sha256 = runtime_bundle.create_manifest(root, "2.35")
-            runtime_bundle.load_and_verify(root, manifest_sha256)
+            runtime_document = runtime_bundle.load_and_verify(root, manifest_sha256)
+            self.assertEqual(
+                set(runtime_document["external_prerequisites"]),
+                {"npu", "gpu", "cpu", "cxx_runtime"},
+            )
             package_manifest = root / "package-manifest.json"
             package_manifest.write_bytes(b'{"package_state":"candidate"}\n')
             _, inventory_sha256 = package_inventory.create(root)
@@ -389,6 +412,55 @@ class PackagingTests(unittest.TestCase):
                         "package-manifest.json",
                     ),
                 )
+
+    def test_runtime_manifest_rejects_bundled_cxx_runtime_at_any_depth(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            launcher = root / runtime_bundle.LAUNCHER
+            launcher.write_bytes(runtime_bundle.LAUNCHER_DIGEST_PLACEHOLDER)
+            launcher.chmod(0o755)
+            dispatcher = root / runtime_bundle.DISPATCHER
+            dispatcher.write_bytes(b"#!/bin/sh\nexit 0\n")
+            dispatcher.chmod(0o755)
+            nested = root / "_internal/vendor"
+            nested.mkdir(parents=True)
+            with (
+                mock.patch.object(runtime_bundle, "_require_build_target"),
+                mock.patch.object(
+                    runtime_bundle,
+                    "dependency_versions",
+                    return_value={
+                        name: "1.2.3"
+                        for name in runtime_bundle.RUNTIME_DISTRIBUTIONS
+                    },
+                ),
+                mock.patch.object(
+                    runtime_bundle.importlib.metadata,
+                    "version",
+                    return_value="6.22.2",
+                ),
+            ):
+                for soname in runtime_bundle.HOST_CXX_RUNTIME_SONAMES:
+                    forbidden = nested / soname
+                    forbidden.write_bytes(b"build-host-runtime")
+                    with self.assertRaisesRegex(
+                        runtime_bundle.RuntimeBundleError,
+                        r"must not vendor host C\+\+ runtime library",
+                    ):
+                        runtime_bundle.create_manifest(root, "2.35")
+                    forbidden.unlink()
+                _, manifest_sha256 = runtime_bundle.create_manifest(root, "2.35")
+            for soname in runtime_bundle.HOST_CXX_RUNTIME_SONAMES:
+                forbidden = nested / soname
+                forbidden.write_bytes(b"build-host-runtime")
+                with self.assertRaisesRegex(
+                    runtime_bundle.RuntimeBundleError,
+                    r"must not vendor host C\+\+ runtime library",
+                ):
+                    runtime_bundle.load_and_verify(root, manifest_sha256)
+                forbidden.unlink()
 
     def test_generated_legal_notices_have_pinned_bytes(self) -> None:
         generated = {

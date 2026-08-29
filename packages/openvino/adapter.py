@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence as RuntimeSequence
 import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -98,6 +99,26 @@ RUNTIME_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 MAX_PREFLIGHT_CONFIG_BYTES = 64 * 1024
 MAX_PREFLIGHT_OUTPUT_BYTES = 1024 * 1024
 PREFLIGHT_PURPOSE = "physical-probe-scope-config-input-not-admission-evidence"
+
+
+def _normalize_execution_devices(raw: Any) -> tuple[str, ...]:
+    """Normalize OpenVINO's scalar-or-sequence execution-device property."""
+
+    if isinstance(raw, str):
+        values = (raw,)
+    elif isinstance(raw, (bytes, bytearray, memoryview)):
+        raise TypeError("EXECUTION_DEVICES must not be bytes")
+    elif isinstance(raw, RuntimeSequence):
+        values = tuple(raw)
+    else:
+        raise TypeError("EXECUTION_DEVICES must be a string or sequence of strings")
+    if not values:
+        raise ValueError("EXECUTION_DEVICES must not be empty")
+    if any(not isinstance(value, str) for value in values):
+        raise TypeError("EXECUTION_DEVICES values must be strings")
+    if any(not value for value in values):
+        raise ValueError("EXECUTION_DEVICES values must not be empty")
+    return values
 
 
 class RequestError(ValueError):
@@ -434,9 +455,8 @@ class OpenVinoEngine:
             dict(self._scope.openvino_compile_config),
         )
         try:
-            execution_devices = tuple(
-                str(device)
-                for device in compiled.get_property("EXECUTION_DEVICES")
+            execution_devices = _normalize_execution_devices(
+                compiled.get_property("EXECUTION_DEVICES")
             )
         except Exception as error:
             raise RuntimeError(
@@ -769,10 +789,9 @@ def collect_host_preflight(
                 openvino_device,
                 dict(compile_config),
             )
-            raw_execution_devices = compiled.get_property("EXECUTION_DEVICES")
-            if isinstance(raw_execution_devices, (str, bytes)):
-                raise TypeError("EXECUTION_DEVICES was not an array")
-            execution_devices = tuple(str(value) for value in raw_execution_devices)
+            execution_devices = _normalize_execution_devices(
+                compiled.get_property("EXECUTION_DEVICES")
+            )
         except Exception as error:
             raise RuntimeError(
                 f"host-preflight could not compile bucket {bucket} or query EXECUTION_DEVICES"

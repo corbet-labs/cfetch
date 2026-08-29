@@ -280,6 +280,21 @@ def _host_binding(value: Any, label: str) -> HostBinding:
                 sha256=_digest(entry["sha256"], f"{file_label}.sha256"),
             )
         )
+    bound_names = {binding.path.name for binding in files}
+    required_cxx_runtime = {
+        "libstdc++.so.6": re.compile(r"libstdc\+\+\.so\.6(?:\.[0-9]+)*"),
+        "libgcc_s.so.1": re.compile(r"libgcc_s\.so\.1(?:\.[0-9]+)*"),
+    }
+    missing = [
+        soname
+        for soname, pattern in required_cxx_runtime.items()
+        if not any(pattern.fullmatch(name) is not None for name in bound_names)
+    ]
+    if missing:
+        raise ManifestError(
+            f"{label}.files must bind the resolved regular target file for "
+            + " and ".join(missing)
+        )
     return HostBinding(
         system="Linux",
         machine="x86_64",

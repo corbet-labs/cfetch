@@ -22,6 +22,7 @@ LAUNCHER = "cfetch-openvino-adapter"
 DISPATCHER = "cfetch-openvino-adapter-runtime"
 MANIFEST_NAME = "runtime-manifest.json"
 RUNTIME_DISTRIBUTIONS = ("cryptography", "numpy", "openvino", "tokenizers")
+HOST_CXX_RUNTIME_SONAMES = ("libgcc_s.so.1", "libstdc++.so.6")
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_FILES = 50_000
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024 * 1024
@@ -120,6 +121,7 @@ def _bundle_files(root: Path) -> list[dict[str, Any]]:
             relative = path.relative_to(root).as_posix()
             if relative in (MANIFEST_NAME, LAUNCHER):
                 continue
+            _reject_bundled_cxx_runtime(relative)
             if path.is_symlink() or not path.is_file():
                 raise RuntimeBundleError(
                     f"runtime bundle entry is not a regular file: {relative}"
@@ -190,6 +192,10 @@ def create_manifest(root: Path, minimum_glibc: str) -> tuple[Path, str]:
             "npu": "matching Intel NPU kernel driver and firmware",
             "gpu": "matching Intel GPU kernel and user-mode compute drivers",
             "cpu": "admitted x86_64 accelerated CPU family",
+            "cxx_runtime": (
+                "target-system libstdc++.so.6 and libgcc_s.so.1 compatible with "
+                "the installed accelerator drivers"
+            ),
         },
         "files": files,
     }
@@ -220,6 +226,15 @@ def _safe_relative_file(value: Any, label: str) -> str:
     return value
 
 
+def _reject_bundled_cxx_runtime(relative: str) -> None:
+    """Keep the host driver ABI's GNU C++ runtime outside the frozen bundle."""
+
+    if PurePosixPath(relative).name in HOST_CXX_RUNTIME_SONAMES:
+        raise RuntimeBundleError(
+            f"runtime bundle must not vendor host C++ runtime library: {relative}"
+        )
+
+
 def _actual_files(root: Path) -> set[str]:
     result: set[str] = set()
     for directory, directory_names, file_names in os.walk(root, followlinks=False):
@@ -233,6 +248,7 @@ def _actual_files(root: Path) -> set[str]:
         for name in file_names:
             path = current / name
             relative = path.relative_to(root).as_posix()
+            _reject_bundled_cxx_runtime(relative)
             if path.is_symlink() or not path.is_file():
                 raise RuntimeBundleError(
                     f"runtime directory entry is not regular: {relative}"
@@ -338,6 +354,7 @@ def load_and_verify(
         "npu",
         "gpu",
         "cpu",
+        "cxx_runtime",
     }:
         raise RuntimeBundleError("runtime external prerequisites are incomplete")
     if any(
@@ -364,6 +381,7 @@ def load_and_verify(
         relative = _safe_relative_file(
             entry["path"], f"runtime files[{index}].path"
         )
+        _reject_bundled_cxx_runtime(relative)
         pure = PurePosixPath(relative)
         if (
             relative in seen

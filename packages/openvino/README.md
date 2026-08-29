@@ -125,7 +125,11 @@ python packages/openvino/build_runtime.py \
 The result contains a native root executable `cfetch-openvino-adapter`, a
 PyInstaller-frozen `cfetch-openvino-adapter-runtime`, CPython, and the exact
 packaged `cryptography`, `numpy`, `openvino`, and `tokenizers` dependencies. It
-does not depend on a target host's system Python.
+does not depend on a target host's system Python. The bundle deliberately
+excludes `libstdc++.so.6` and `libgcc_s.so.1`: those two libraries define the
+ABI used by the installed accelerator drivers and must come from the target
+system. Manifest creation and verification reject either soname at any bundle
+depth so a build-host copy cannot shadow a newer host driver dependency.
 
 Final assembly inventories every runtime, interpreter, native-library,
 adapter, manifest, graph, tokenizer, legal, and key file. The inventory digest
@@ -137,9 +141,12 @@ files. The frozen adapter verifies the same inventory again.
 This relocation claim is intentionally narrow: Linux x86_64 with glibc 2.35 or
 newer. Kernel drivers, firmware, Level Zero/OpenCL user-mode drivers, and
 admitted CPU instruction support remain host prerequisites and are not
-vendored. Each scope therefore binds exact OpenVINO properties, the observed
-`EXECUTION_DEVICES`, kernel release, and hashes of the relevant regular driver
-libraries. A driver or kernel change requires recertification.
+vendored. Compatible target-system `libstdc++.so.6` and `libgcc_s.so.1` are an
+explicit prerequisite for every device class. Each scope therefore binds exact
+OpenVINO properties, the observed `EXECUTION_DEVICES`, kernel release, and
+hashes of the resolved regular files behind those two C++ runtime sonames plus
+the relevant regular driver libraries. A driver, C++ runtime, or kernel change
+requires recertification.
 
 OpenVINO IR is shipped instead of a compiled blob because compiled blobs are
 not stable across OpenVINO/device versions. The exact runtime compiles the IR
@@ -188,6 +195,8 @@ this shape; angle-bracket values are intentionally not usable evidence:
         "machine": "x86_64",
         "kernel_release": "<observed>",
         "files": [
+          {"path": "/usr/lib/<exact-resolved-libstdc++-file>", "sha256": "<sha256>"},
+          {"path": "/usr/lib/<exact-resolved-libgcc_s-file>", "sha256": "<sha256>"},
           {"path": "/usr/lib/<exact-driver-library>", "sha256": "<sha256>"}
         ]
       },
@@ -209,9 +218,11 @@ this shape; angle-bracket values are intentionally not usable evidence:
 GPU requires exact `FULL_DEVICE_NAME`, `DEVICE_ARCHITECTURE`,
 `GPU_UARCH_VERSION`, and `GPU_DEVICE_ID`; CPU requires exact
 `FULL_DEVICE_NAME` and `DEVICE_ARCHITECTURE`. The host-file bindings cover
-operator-selected libraries that OpenVINO does not expose as supported device
-properties; they do not prove that the selected files were driver-loaded. All
-three classes and a distinct Ed25519 key per scope are mandatory.
+the exact normalized, regular, non-symlink resolutions of `libstdc++.so.6` and
+`libgcc_s.so.1` for every scope, plus operator-selected libraries that OpenVINO
+does not expose as supported device properties. They do not prove that the
+selected files were driver-loaded. All three classes and a distinct Ed25519
+key per scope are mandatory.
 
 Create correctly encoded, distinct package keys without using the unrelated
 raw-binary admission receipt key command:
@@ -240,6 +251,8 @@ Obtain required properties, host-file hashes, and exact compile-time
   --device-class npu \
   --device NPU \
   --compile-config-json '{}' \
+  --host-file /usr/lib/<exact-resolved-regular-libstdc++-file> \
+  --host-file /usr/lib/<exact-resolved-regular-libgcc_s-file> \
   --host-file /usr/lib/<exact-regular-non-symlink-driver-library>
 ```
 

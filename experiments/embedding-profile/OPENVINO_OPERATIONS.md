@@ -103,6 +103,8 @@ start:
 
 - Linux system, `x86_64` machine, exact kernel release, and one through sixteen
   explicitly selected regular driver/library paths plus their SHA-256 values;
+- the exact normalized, regular, non-symlink resolutions of the target's
+  `libstdc++.so.6` and `libgcc_s.so.1` in every NPU, GPU, and CPU host binding;
 - NPU `FULL_DEVICE_NAME`, `DEVICE_ARCHITECTURE`, `NPU_DRIVER_VERSION`, and
   `NPU_COMPILER_VERSION` with exact JSON types;
 - GPU `FULL_DEVICE_NAME`, `DEVICE_ARCHITECTURE`, `GPU_UARCH_VERSION`, and
@@ -122,12 +124,28 @@ reference to its own adjacent manifest. System Python is not involved.
 Select one through sixteen exact regular driver/library files for each scope.
 Paths must already be normalized, absolute, non-symlink paths below an
 allowlisted system library prefix. Selection is an explicit operator input; the
-command hashes files but does not guess which libraries define the device.
+command hashes files but does not guess which libraries define the device. The
+frozen runtime intentionally excludes `libstdc++.so.6` and `libgcc_s.so.1` so
+it cannot shadow newer target drivers. Resolve both sonames to their real files
+and include those two files in every scope; add the device-specific driver and
+loader files for that scope.
 
 ```bash
-declare -a NPU_HOST_FILES=("<exact-npu-driver-or-library-path>")
-declare -a GPU_HOST_FILES=("<exact-gpu-driver-or-library-path>")
-declare -a CPU_HOST_FILES=("<exact-cpu-runtime-library-path>")
+HOST_LIBSTDCXX="<exact-normalized-regular-resolution-of-libstdc++.so.6>"
+HOST_LIBGCC="<exact-normalized-regular-resolution-of-libgcc_s.so.1>"
+declare -a CXX_RUNTIME_HOST_FILES=("$HOST_LIBSTDCXX" "$HOST_LIBGCC")
+declare -a NPU_HOST_FILES=(
+  "${CXX_RUNTIME_HOST_FILES[@]}"
+  "<exact-npu-driver-or-library-path>"
+)
+declare -a GPU_HOST_FILES=(
+  "${CXX_RUNTIME_HOST_FILES[@]}"
+  "<exact-gpu-driver-or-library-path>"
+)
+declare -a CPU_HOST_FILES=(
+  "${CXX_RUNTIME_HOST_FILES[@]}"
+  "<exact-cpu-runtime-library-path>"
+)
 
 run_preflight() {
   local device_class="$1" device="$2" compile_config="$3" output="$4"
