@@ -95,13 +95,13 @@
   },
   "admission": {
     "policy_version": 1,
-    "policy_manifest_sha256": "f21f6d0fcc1a48fb4e95dab9b47fe1e97d56036a44b4005b27eee0b8eb26cf44",
-    "implementation_bundle_sha256": "57130cfe69d5874257c0ae6988225eea142add77058fc0c0a360b46e21cad6f2",
+    "policy_manifest_sha256": "ab5463e1c131a7331240e626817bcfc109fe7af658369a8abec437e4a56b2b44",
+    "implementation_bundle_sha256": "6f32e4a30d4b43435d3310567444db3ec6733aaee6741e81120c44192b56622b",
     "dataset": "mteb/scifact",
     "dataset_revision": "cf10ab6856b15b0e670ef8ae5dae4e266c12d035",
     "sequence_semantic_fixture": {
       "id": "cfetch-sequence-semantic-v1-cat-vs-music",
-      "sha256": "fccd9309f8e97f4f4750ea0d733670ded08e7cc6824da4f6aa66616cd402c417",
+      "sha256": "3f76380d8169fa0b500270d55ff80fa242c93f6ac26bd16d2994c2e7d76a3af2",
       "buckets": [32, 64, 128, 256, 512, 1024, 2048]
     },
     "sequence_semantic_gate": "every-profile-sequence-bucket-global-ordered-query-document-scope-plus-adversarial-relevant-minimum-irrelevant-maximum-exact-int8-strict-ranking",

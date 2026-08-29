@@ -23,7 +23,7 @@ WIRE_BATCH_QUERY_ITEMS = 32
 WIRE_BATCH_DOCUMENT_ITEMS = 32
 SEQUENCE_SEMANTIC_FIXTURE_ID = "cfetch-sequence-semantic-v1-cat-vs-music"
 SEQUENCE_SEMANTIC_FIXTURE_SHA256 = (
-    "fccd9309f8e97f4f4750ea0d733670ded08e7cc6824da4f6aa66616cd402c417"
+    "3f76380d8169fa0b500270d55ff80fa242c93f6ac26bd16d2994c2e7d76a3af2"
 )
 SUPERVISED_LOCAL_TRANSPORT = "supervised-local"
 REMOTE_ATTESTED_TRANSPORT = "remote-attested"
@@ -45,12 +45,19 @@ EVIDENCE_IDENTITY_FIELDS = (
 
 
 def sequence_semantic_probe_inputs(bucket: int) -> tuple[str, str, str]:
-    repetitions = max(1, bucket * 5 // 8 - 4)
-    query_topic = " ".join(["cat"] * repetitions)
-    irrelevant_topic = " ".join(["music"] * repetitions)
+    if bucket not in SEQUENCE_BUCKETS:
+        raise ValueError(f"unsupported sequence semantic probe bucket {bucket}")
+    # With the profile's frozen tokenizer and explicit BOS/EOS handling, the
+    # query prefix contributes nine tokens and the document prefix eight.
+    # Both topic words contribute exactly one token per repetition.  Keep the
+    # three inputs independently sized so every probe exercises the requested
+    # static bucket at its exact token limit instead of relying on a heuristic.
+    query_topic = " ".join(["cat"] * (bucket - 9))
+    relevant_topic = " ".join(["cat"] * (bucket - 8))
+    irrelevant_topic = " ".join(["music"] * (bucket - 8))
     return (
         QUERY_PREFIX + query_topic,
-        DOCUMENT_PREFIX + query_topic,
+        DOCUMENT_PREFIX + relevant_topic,
         DOCUMENT_PREFIX + irrelevant_topic,
     )
 

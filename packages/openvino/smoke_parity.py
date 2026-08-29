@@ -11,6 +11,17 @@ from pathlib import Path
 import sys
 from typing import Any, Sequence
 
+PROFILE_TOOLS = (
+    Path(__file__).resolve().parents[2] / "experiments" / "embedding-profile"
+)
+if str(PROFILE_TOOLS) not in sys.path:
+    sys.path.insert(0, str(PROFILE_TOOLS))
+
+from admission_evidence import (  # noqa: E402
+    SEQUENCE_BUCKETS as SEMANTIC_SEQUENCE_BUCKETS,
+    sequence_semantic_probe_inputs,
+)
+
 if __package__:
     from .convert import ConversionError, build_torch_pipeline, verify_source_files
     from .manifest import DIMENSIONS, load_artifact
@@ -100,6 +111,24 @@ def _token_ids(tokenizer: Any, text: str) -> list[int]:
     return [2, *pieces, 1]
 
 
+def validate_sequence_semantic_fixture(tokenizer: Any) -> list[dict[str, Any]]:
+    """Prove the policy's three texts reach every exact static bucket."""
+
+    results: list[dict[str, Any]] = []
+    for bucket in SEMANTIC_SEQUENCE_BUCKETS:
+        counts = [
+            len(_token_ids(tokenizer, text))
+            for text in sequence_semantic_probe_inputs(bucket)
+        ]
+        if counts != [bucket, bucket, bucket]:
+            raise ParityError(
+                f"sequence semantic fixture bucket {bucket} tokenized to {counts}, "
+                f"expected three exact {bucket}-token inputs"
+            )
+        results.append({"bucket": bucket, "token_counts": counts})
+    return results
+
+
 def run(source_dir: Path, artifact_dir: Path) -> dict[str, Any]:
     import numpy as np
     import openvino as ov
@@ -119,6 +148,7 @@ def run(source_dir: Path, artifact_dir: Path) -> dict[str, Any]:
     tokenizer = Tokenizer.from_file(str(artifact.tokenizer_json))
     tokenizer.no_truncation()
     tokenizer.no_padding()
+    semantic_fixture = validate_sequence_semantic_fixture(tokenizer)
     pipeline = build_torch_pipeline(source_dir)
     core = ov.Core()
     if "CPU" not in core.available_devices:
@@ -187,6 +217,7 @@ def run(source_dir: Path, artifact_dir: Path) -> dict[str, Any]:
         "purpose": "conversion-smoke-not-admission-evidence",
         "device": "CPU",
         "minimum_cosine": MINIMUM_COSINE,
+        "sequence_semantic_fixture": semantic_fixture,
         "cases": results,
     }
 

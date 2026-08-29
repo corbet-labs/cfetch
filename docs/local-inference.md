@@ -121,9 +121,11 @@ mixture.
 The same derive-once construction is applied separately at every compiled
 sequence bucket to a profile-pinned semantic fixture. This closes the gap where
 short SciFact inputs pass but a deterministic long-shape graph is semantically
-wrong. Each bucket is executed twice for byte repeatability; the global gate
-then checks every ordered scope pair and requires the lowest relevant score
-across document scopes to remain strictly above the highest irrelevant score.
+wrong. Each of the three inputs reaches the bucket's exact token limit under
+the frozen tokenizer, and each bucket is executed twice for byte
+repeatability. The global gate then checks every ordered scope pair and
+requires the lowest relevant score across document scopes to remain strictly
+above the highest irrelevant score.
 
 Admission is scoped to the exact artifact, runtime, device family, compiler
 settings, and placement evidence in its manifest. A result from one Apple,

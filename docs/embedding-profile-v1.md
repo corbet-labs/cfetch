@@ -111,14 +111,16 @@ store, whose producer is fixed per content hash.
 
 SciFact does not exercise every compiled sequence shape, so a separate
 profile-pinned semantic fixture runs twice through each 32, 64, 128, 256, 512,
-1,024, and 2,048-token bucket. At every bucket, the relevant document must
-rank strictly before the irrelevant document for every ordered query/document
-scope pair. The gate also constructs the derive-once adversary for each query
-scope and bucket: the minimum relevant score and maximum irrelevant score may
-come from different document scopes, and the former must still rank strictly
-first. The public report retains the exact integer dots, norms, checks, and
-counts needed to replay those decisions; cache hashes bind the canonical probe
-arrays without publishing them in the report.
+1,024, and 2,048-token bucket. Its query and both documents must tokenize to
+the exact limit of the selected bucket under the frozen tokenizer. At every
+bucket, the relevant document must rank strictly before the irrelevant
+document for every ordered query/document scope pair. The gate also constructs
+the derive-once adversary for each query scope and bucket: the minimum relevant
+score and maximum irrelevant score may come from different document scopes,
+and the former must still rank strictly first. The public report retains the
+exact integer dots, norms, checks, and counts needed to replay those decisions;
+cache hashes bind the canonical probe arrays without publishing them in the
+report.
 
 Every pairing must independently meet the same fixed absolute SciFact floors:
 

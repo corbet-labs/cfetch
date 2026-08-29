@@ -57,10 +57,13 @@ scope. Arrays from different scopes do not have to be byte-identical.
 Cross-backend equality and cosine may be computed out of band for debugging,
 but are not serialized in the authoritative report and never determine
 admission. The sequence-shape semantic fixture is the narrow exception: for
-every query-producer x document-producer pairing and every bucket, its relevant
-document must rank strictly before its irrelevant document under production's
-exact INT8 comparator. For each query producer and bucket, the gate also takes
-the relevant minimum and irrelevant maximum across all document producers and
+every query-producer x document-producer pairing and every bucket, all three
+fixture inputs must tokenize to that bucket's exact token limit and its
+relevant document must rank strictly before its irrelevant document under
+production's exact INT8 comparator. The conversion smoke rechecks those token
+counts with the frozen tokenizer, so tokenizer or prefix drift aborts the
+package build. For each query producer and bucket, the gate also takes the
+relevant minimum and irrelevant maximum across all document producers and
 requires that adversarial mixed-scope ordering to pass.
 
 ## Collect physical package evidence

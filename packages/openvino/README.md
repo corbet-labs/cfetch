@@ -12,8 +12,8 @@ The package keeps these boundaries explicit:
 
 - cfetch's portable boundary is signed `INT8x768`. OpenVINO executes the
   target-native internal precision recorded by each scope; internal INT8 is
-  not assumed. Current Intel NPU documentation states that internal hardware
-  computation can remain FP16 for quantized or mixed graphs.
+  not assumed. The IR stores weights as F16, but that is an archive property,
+  not a claim that every device executes one common F16 numeric path.
 - the IR contains the pinned transformer, attention-mask-weighted mean pooling
   including the supplied prompt, the bias-free 768 -> 3072 and 3072 -> 768
   identity projections, and L2 normalization.
@@ -182,7 +182,7 @@ this shape; angle-bracket values are intentionally not usable evidence:
       "package_target": "linux-x86_64-glibc2.35",
       "artifact_source": "google/embeddinggemma-300m@57c266a740f537b4dc058e1b0cda161fd15afa75",
       "artifact_sha256": "<filled-by-assemble.py>",
-      "internal_precision": "fp16-hardware-compute",
+      "internal_precision": "f16-weight-storage-target-native-compute",
       "device_class": "npu",
       "device": "<exact-device-family>",
       "openvino_device": "NPU",
