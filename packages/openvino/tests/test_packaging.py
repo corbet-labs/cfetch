@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -275,6 +276,9 @@ class PackagingTests(unittest.TestCase):
             native = root / "_internal/native.so"
             native.parent.mkdir()
             native.write_bytes(b"runtime-native")
+            empty_metadata = root / "_internal/pyinstaller.dist-info/REQUESTED"
+            empty_metadata.parent.mkdir()
+            empty_metadata.write_bytes(b"")
             with (
                 mock.patch.object(runtime_bundle, "_require_build_target"),
                 mock.patch.object(
@@ -291,11 +295,32 @@ class PackagingTests(unittest.TestCase):
                     return_value="6.22.2",
                 ),
             ):
-                _, manifest_sha256 = runtime_bundle.create_manifest(root, "2.35")
+                manifest_path, manifest_sha256 = runtime_bundle.create_manifest(
+                    root, "2.35"
+                )
+            manifest = json.loads(manifest_path.read_bytes())
+            self.assertIn(
+                {
+                    "path": "_internal/pyinstaller.dist-info/REQUESTED",
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "bytes": 0,
+                    "executable": False,
+                },
+                manifest["files"],
+            )
             runtime_bundle.load_and_verify(root, manifest_sha256)
             package_manifest = root / "package-manifest.json"
             package_manifest.write_bytes(b'{"package_state":"candidate"}\n')
-            _, inventory_sha256 = package_inventory.create(root)
+            inventory_path, inventory_sha256 = package_inventory.create(root)
+            self.assertIn(
+                (
+                    hashlib.sha256(b"").hexdigest(),
+                    0,
+                    False,
+                    "_internal/pyinstaller.dist-info/REQUESTED",
+                ),
+                package_inventory.parse(inventory_path.read_bytes()),
+            )
             package_inventory.patch_launcher(root, inventory_sha256)
             package_inventory.verify_bound(root, inventory_sha256)
             runtime_bundle.load_and_verify(

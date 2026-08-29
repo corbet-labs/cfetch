@@ -125,8 +125,6 @@ def _bundle_files(root: Path) -> list[dict[str, Any]]:
                     f"runtime bundle entry is not a regular file: {relative}"
                 )
             metadata = path.stat()
-            if metadata.st_size < 1:
-                raise RuntimeBundleError(f"runtime bundle file is empty: {relative}")
             total_bytes += metadata.st_size
             if total_bytes > MAX_BUNDLE_BYTES:
                 raise RuntimeBundleError(
@@ -374,7 +372,7 @@ def load_and_verify(
             entry["sha256"]
         ) is None:
             raise RuntimeBundleError(f"runtime files[{index}].sha256 is invalid")
-        if type(entry["bytes"]) is not int or entry["bytes"] < 1:
+        if type(entry["bytes"]) is not int or entry["bytes"] < 0:
             raise RuntimeBundleError(f"runtime files[{index}].bytes is invalid")
         if type(entry["executable"]) is not bool:
             raise RuntimeBundleError(f"runtime files[{index}].executable is invalid")
