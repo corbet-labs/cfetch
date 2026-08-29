@@ -260,6 +260,27 @@ def _set_tensor_name(port: Any, name: str) -> None:
     port.get_tensor().set_names({name})
 
 
+def export_torch_pipeline(pipeline: Any, example_ids: Any, example_mask: Any) -> Any:
+    """Export both inputs with one shared, bounded sequence dimension.
+
+    OpenVINO's convenience ``dynamo=True`` path currently derives a distinct
+    ``torch.export.Dim`` for each input shape. EmbeddingGemma requires the
+    sequence axes of ``input_ids`` and ``attention_mask`` to be equal, so the
+    shared symbol must be expressed explicitly before OpenVINO conversion.
+    """
+    import torch
+
+    sequence = torch.export.Dim("sequence", min=1, max=MAX_TOKENS)
+    return torch.export.export(
+        pipeline,
+        (example_ids, example_mask),
+        dynamic_shapes=({1: sequence}, {1: sequence}),
+        # Match OpenVINO 2026.3.1's supported non-strict ExportedProgram path;
+        # the explicit shared Dim still carries the equality and bounds.
+        strict=False,
+    )
+
+
 def convert_graph(source_dir: Path, output_dir: Path, weight_storage: str) -> None:
     import openvino as ov
     import torch
@@ -270,17 +291,21 @@ def convert_graph(source_dir: Path, output_dir: Path, weight_storage: str) -> No
     dynamic_ids = ov.PartialShape([1, ov.Dimension(1, MAX_TOKENS)])
     dynamic_mask = ov.PartialShape([1, ov.Dimension(1, MAX_TOKENS)])
     with torch.no_grad():
+        # A static torch.jit trace at length 32 cannot prove that the
+        # 2,048-token graph is the same semantic pipeline. Export the bounded
+        # shared dimension ourselves because OpenVINO's dynamo convenience
+        # path otherwise assigns independent symbols to the two inputs.
+        exported = export_torch_pipeline(pipeline, example_ids, example_mask)
+        # The OpenVINO ExportedProgram decoder intentionally generalizes
+        # symbolic inputs to fully dynamic shapes. Reapply the frozen batch
+        # and sequence bounds during IR conversion; this does not re-export
+        # the PyTorch program or split its shared sequence constraint.
         model = ov.convert_model(
-            pipeline,
+            exported,
             input=[
                 ("input_ids", dynamic_ids, ov.Type.i64),
                 ("attention_mask", dynamic_mask, ov.Type.i64),
             ],
-            example_input=(example_ids, example_mask),
-            # torch.export carries the bounded sequence dimension through the
-            # transformer.  A static torch.jit trace at length 32 cannot prove
-            # that the 2,048-token graph is the same semantic pipeline.
-            dynamo=True,
         )
     if len(model.inputs) != 2 or len(model.outputs) != 1:
         raise ConversionError(
@@ -290,6 +315,24 @@ def convert_graph(source_dir: Path, output_dir: Path, weight_storage: str) -> No
     _set_tensor_name(model.inputs[0], "input_ids")
     _set_tensor_name(model.inputs[1], "attention_mask")
     _set_tensor_name(model.outputs[0], "embedding")
+    for port, expected_shape, name in (
+        (model.input("input_ids"), dynamic_ids, "input_ids"),
+        (model.input("attention_mask"), dynamic_mask, "attention_mask"),
+    ):
+        shape = port.partial_shape
+        bounded_shape = (
+            shape.rank.is_static
+            and shape.rank.get_length() == 2
+            and shape[0].is_static
+            and shape[0].get_length() == 1
+            and shape[1].get_min_length() == 1
+            and shape[1].get_max_length() == MAX_TOKENS
+        )
+        if not bounded_shape or port.element_type != ov.Type.i64:
+            raise ConversionError(
+                f"converted {name} contract is {port.element_type} "
+                f"{port.partial_shape}, expected i64 {expected_shape}"
+            )
     # Before serialization, prove that every required static compilation shape
     # can be derived from this exact graph.  Physical device compilation and
     # placement are deliberately later evidence, not a conversion claim.

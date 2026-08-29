@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -13,6 +14,41 @@ from packages.openvino import convert
 
 
 class ConversionContractTests(unittest.TestCase):
+    def test_torch_export_binds_one_bounded_sequence_symbol_to_both_inputs(
+        self,
+    ) -> None:
+        dimensions = []
+        calls = []
+
+        class FakeDim:
+            def __init__(self, name, **bounds):
+                self.name = name
+                self.bounds = bounds
+                dimensions.append(self)
+
+        def fake_export(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "exported-program"
+
+        fake_torch = SimpleNamespace(
+            export=SimpleNamespace(Dim=FakeDim, export=fake_export)
+        )
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
+            result = convert.export_torch_pipeline(
+                "pipeline", "example-ids", "example-mask"
+            )
+
+        self.assertEqual(result, "exported-program")
+        self.assertEqual(len(dimensions), 1)
+        self.assertEqual(dimensions[0].name, "sequence")
+        self.assertEqual(dimensions[0].bounds, {"min": 1, "max": 2048})
+        args, kwargs = calls[0]
+        self.assertEqual(args, ("pipeline", ("example-ids", "example-mask")))
+        id_shapes, mask_shapes = kwargs["dynamic_shapes"]
+        self.assertIs(id_shapes[1], dimensions[0])
+        self.assertIs(mask_shapes[1], dimensions[0])
+        self.assertIs(kwargs["strict"], False)
+
     def test_cli_keeps_failure_diagnostic_out_of_result_stdout(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
