@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 import hashlib
 import json
@@ -37,6 +37,10 @@ from cross_backend_eval import (
     verify_implementation_bundle,
 )
 from export_adapter_cache import (
+    MODEL,
+    MODEL_REVISION,
+    PROFILE_ID,
+    PROFILE_MANIFEST_SHA256,
     RequestFunction,
     SEQUENCE_PROBE_ARRAY_NAMES,
     SequenceProbeRequestFunction,
@@ -49,6 +53,7 @@ from export_adapter_cache import (
     validate_loopback_endpoint,
     verify_wire_batch_contract,
 )
+from profile_identity import ADMISSION_POLICY_SHA256
 
 if TYPE_CHECKING:
     import numpy as np
@@ -343,7 +348,14 @@ def _read_ready_line(stream: object) -> bytes:
     return value
 
 
-def _package_scope_ids(root: Path, expected_manifest_sha256: str) -> list[str]:
+def _package_scope_ids(
+    root: Path,
+    expected_manifest_sha256: str,
+    requested_scope_id: str,
+    expected_execution: Mapping[str, object],
+    expected_attestation_public_key: str,
+) -> list[str]:
+    """Bind the requested scope to the cache and report in exact manifest bytes."""
     manifest_path = root / "package-manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise ValueError("exact package has no regular root package-manifest.json")
@@ -354,11 +366,22 @@ def _package_scope_ids(root: Path, expected_manifest_sha256: str) -> list[str]:
         raise ValueError(
             "exact package manifest bytes do not match the externally pinned package plan"
         )
-    try:
-        manifest = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("exact package manifest is not valid UTF-8 JSON") from error
-    if not isinstance(manifest, dict) or manifest.get("package_state") != "release":
+    manifest = parse_evidence_json(raw, "exact package manifest")
+    frozen_identity = {
+        "schema_version": 1,
+        "profile_id": PROFILE_ID,
+        "profile_manifest_sha256": PROFILE_MANIFEST_SHA256,
+        "admission_policy_sha256": ADMISSION_POLICY_SHA256,
+        "model": MODEL,
+        "model_revision": MODEL_REVISION,
+    }
+    for field, expected in frozen_identity.items():
+        if manifest.get(field) != expected:
+            raise ValueError(
+                f"exact package manifest {field}={manifest.get(field)!r}, "
+                f"expected {expected!r}"
+            )
+    if manifest.get("package_state") != "release":
         raise ValueError("exact package manifest must be in release state")
     scopes = manifest.get("scopes") if isinstance(manifest, dict) else None
     if (
@@ -370,9 +393,40 @@ def _package_scope_ids(root: Path, expected_manifest_sha256: str) -> list[str]:
     scope_ids = [scope.get("scope_id") for scope in scopes]
     if (
         any(not isinstance(scope_id, str) for scope_id in scope_ids)
+        or any(
+            len(scope_id) > 128 or PACKAGE_ID_RE.fullmatch(scope_id) is None
+            for scope_id in scope_ids
+            if isinstance(scope_id, str)
+        )
         or len(scope_ids) != len(set(scope_ids))
     ):
         raise ValueError("exact package manifest has invalid or duplicate scope ids")
+    if requested_scope_id not in scope_ids:
+        raise ValueError(
+            f"exact package manifest does not contain requested scope {requested_scope_id!r}"
+        )
+    required_execution_fields = set(FINAL_EXECUTION_FIELDS) | {
+        "compatibility_report_sha256"
+    }
+    if set(expected_execution) != required_execution_fields:
+        raise ValueError("expected final execution binding has an invalid schema")
+    requested_scope = scopes[scope_ids.index(requested_scope_id)]
+    for field, expected in expected_execution.items():
+        if requested_scope.get(field) != expected:
+            raise ValueError(
+                f"exact package manifest scope {requested_scope_id!r} {field}="
+                f"{requested_scope.get(field)!r}, expected {expected!r}"
+            )
+    if (
+        not isinstance(expected_attestation_public_key, str)
+        or SHA256_RE.fullmatch(expected_attestation_public_key) is None
+        or requested_scope.get("attestation_public_key")
+        != expected_attestation_public_key
+    ):
+        raise ValueError(
+            f"exact package manifest scope {requested_scope_id!r} does not bind "
+            "the admission-cache attestation key"
+        )
     return scope_ids
 
 
@@ -384,6 +438,9 @@ def launch_exact_package(
     dispatcher_sha256: str,
     package_manifest_sha256: str,
     expected_scope_ids: Sequence[str],
+    requested_scope_id: str,
+    expected_execution: Mapping[str, object],
+    expected_attestation_public_key: str,
 ):
     """Launch only the dispatcher extracted from the exact receipt-bound ZIP."""
     if file_sha256(package_asset) != package_sha256:
@@ -395,7 +452,13 @@ def launch_exact_package(
         members = _extract_exact_package(package_asset, temporary)
         if dispatcher_name not in members:
             raise ValueError("exact package does not contain its declared dispatcher")
-        packaged_scopes = _package_scope_ids(temporary, package_manifest_sha256)
+        packaged_scopes = _package_scope_ids(
+            temporary,
+            package_manifest_sha256,
+            requested_scope_id,
+            expected_execution,
+            expected_attestation_public_key,
+        )
         if packaged_scopes != list(expected_scope_ids):
             raise ValueError(
                 "exact package manifest scope order does not match its staged package plan"
@@ -735,6 +798,10 @@ def replay_retained_outputs(
     """Run all 64 groupings and seven two-run bucket probes against one package."""
     import numpy as np
 
+    if sequence_report.get("supported_sequence_buckets") != SEQUENCE_BUCKETS:
+        raise ValueError(
+            "final package sequence evidence must cover every admitted sequence bucket"
+        )
     live_wire_outputs = verify_wire_batch_contract(
         endpoint,
         requested_scope_id,
@@ -885,12 +952,17 @@ def main() -> None:
             ordered_scope_ids = package_plan.get("ordered_scope_ids")
             dispatcher = package_plan.get("dispatcher")
             package_manifest_sha256 = package_plan.get("package_manifest_sha256")
+            final_execution = expected_final_execution(
+                metadata, args.compatibility_report_sha256
+            )
+            attestation_public_key = metadata.get("attestation_public_key")
             if (
                 not isinstance(ordered_scope_ids, list)
                 or any(not isinstance(item, str) for item in ordered_scope_ids)
                 or not isinstance(dispatcher, dict)
                 or not isinstance(dispatcher.get("sha256"), str)
                 or not isinstance(package_manifest_sha256, str)
+                or not isinstance(attestation_public_key, str)
             ):
                 raise ValueError("staged package plan has invalid runtime bindings")
             with launch_exact_package(
@@ -900,6 +972,9 @@ def main() -> None:
                 dispatcher["sha256"],
                 package_manifest_sha256,
                 ordered_scope_ids,
+                scope_id,
+                final_execution,
+                attestation_public_key,
             ) as (endpoint, bearer_token):
                 args.endpoint = endpoint
                 internal_bearer_env = "CFETCH_FINAL_PACKAGE_INTERNAL_BEARER"

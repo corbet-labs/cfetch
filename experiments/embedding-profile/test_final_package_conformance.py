@@ -36,6 +36,36 @@ from final_package_conformance import (
     replay_retained_outputs,
     write_conformance_receipt,
 )
+from profile_identity import ADMISSION_POLICY_SHA256
+
+
+REPORT_SHA256 = "4" * 64
+ATTESTATION_PUBLIC_KEY = "a" * 64
+
+
+def final_execution(scope_id: str) -> dict[str, object]:
+    device_class = scope_id.removeprefix("synthetic-")
+    return {
+        "scope_id": scope_id,
+        "transport": "supervised-local",
+        "backend": "synthetic-adapter",
+        "runtime": "synthetic-runtime-1",
+        "compiler": "synthetic-compiler-1",
+        "package_target": "synthetic-target",
+        "artifact_source": "synthetic-source@revision/model",
+        "device_class": device_class,
+        "device": f"synthetic-{device_class}-family",
+        "artifact_sha256": "1" * 64,
+        "internal_precision": "target-native",
+        "placement_evidence_sha256": "2" * 64,
+        "supported_max_tokens": 2048,
+        "supported_sequence_buckets": SEQUENCE_BUCKETS,
+        "supported_max_batch_size": SUPPORTED_MAX_BATCH_SIZE,
+        "sequence_capability_evidence_sha256": "3" * 64,
+        "performance_evidence_sha256": "5" * 64,
+        "accelerated_placement": True,
+        "compatibility_report_sha256": REPORT_SHA256,
+    }
 
 
 def deterministic_floats(texts: Sequence[str]) -> np.ndarray:
@@ -117,7 +147,12 @@ def retained_probe_outputs() -> tuple[np.ndarray, ...]:
 
 class FinalPackageConformanceTests(unittest.TestCase):
     @staticmethod
-    def write_launchable_package(path: Path) -> tuple[str, str, str]:
+    def write_launchable_package(
+        path: Path,
+        *,
+        requested_scope_overrides: dict[str, object] | None = None,
+        manifest_overrides: dict[str, object] | None = None,
+    ) -> tuple[str, str, str]:
         dispatcher_name = "cfetch-inference"
         dispatcher = b"""#!/usr/bin/env python3
 import json
@@ -134,16 +169,32 @@ while sys.stdin.buffer.read(4096):
     pass
 server.close()
 """
+        scopes = []
+        for scope_id in ("synthetic-npu", "synthetic-gpu", "synthetic-cpu"):
+            scope = {
+                **final_execution(scope_id),
+                "attestation_public_key": ATTESTATION_PUBLIC_KEY,
+            }
+            if scope_id == "synthetic-npu" and requested_scope_overrides is not None:
+                scope.update(requested_scope_overrides)
+            scopes.append(scope)
+        manifest_document = {
+            "schema_version": 1,
+            "package_state": "release",
+            "profile_id": "cfetch-embedding-v1",
+            "profile_manifest_sha256": (
+                "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb"
+            ),
+            "admission_policy_sha256": ADMISSION_POLICY_SHA256,
+            "model": "google/embeddinggemma-300m",
+            "model_revision": "57c266a740f537b4dc058e1b0cda161fd15afa75",
+            "scopes": scopes,
+        }
+        if manifest_overrides is not None:
+            manifest_document.update(manifest_overrides)
         manifest = (
             json.dumps(
-                {
-                    "package_state": "release",
-                    "scopes": [
-                        {"scope_id": "synthetic-npu"},
-                        {"scope_id": "synthetic-gpu"},
-                        {"scope_id": "synthetic-cpu"},
-                    ]
-                },
+                manifest_document,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -179,6 +230,9 @@ server.close()
                     dispatcher_sha256,
                     manifest_sha256,
                     ["synthetic-npu", "synthetic-gpu", "synthetic-cpu"],
+                    "synthetic-npu",
+                    final_execution("synthetic-npu"),
+                    ATTESTATION_PUBLIC_KEY,
                 ) as (endpoint, bearer):
                     self.assertRegex(endpoint, r"^http://127\.0\.0\.1:[0-9]+/v1/embeddings$")
                     self.assertEqual(len(bearer), 64)
@@ -200,8 +254,65 @@ server.close()
                     dispatcher_sha256,
                     wrong_manifest_sha256,
                     ["synthetic-npu", "synthetic-gpu", "synthetic-cpu"],
+                    "synthetic-npu",
+                    final_execution("synthetic-npu"),
+                    ATTESTATION_PUBLIC_KEY,
                 ):
                     self.fail("manifest drift must fail before launch")
+
+    def test_receipt_launcher_rejects_injected_report_cache_or_key_drift(self) -> None:
+        cases = (
+            ("newest report", {"compatibility_report_sha256": "6" * 64}, None),
+            ("cache execution", {"runtime": "other-runtime"}, None),
+            ("scope key", {"attestation_public_key": "b" * 64}, None),
+            ("semantic profile", None, {"profile_id": "other-profile"}),
+        )
+        for label, scope_overrides, manifest_overrides in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                package = Path(directory) / "package.zip"
+                dispatcher, dispatcher_sha256, manifest_sha256 = (
+                    self.write_launchable_package(
+                        package,
+                        requested_scope_overrides=scope_overrides,
+                        manifest_overrides=manifest_overrides,
+                    )
+                )
+                digest = hashlib.sha256(package.read_bytes()).hexdigest()
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "compatibility_report_sha256|runtime|attestation key|profile_id",
+                ):
+                    with launch_exact_package(
+                        package,
+                        digest,
+                        dispatcher,
+                        dispatcher_sha256,
+                        manifest_sha256,
+                        ["synthetic-npu", "synthetic-gpu", "synthetic-cpu"],
+                        "synthetic-npu",
+                        final_execution("synthetic-npu"),
+                        ATTESTATION_PUBLIC_KEY,
+                    ):
+                        self.fail("manifest/cache/report/key drift must fail before launch")
+
+    def test_receipt_launcher_rejects_a_scope_not_in_the_exact_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "package.zip"
+            dispatcher, dispatcher_sha256, manifest_sha256 = self.write_launchable_package(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError, "requested scope"):
+                with launch_exact_package(
+                    package,
+                    digest,
+                    dispatcher,
+                    dispatcher_sha256,
+                    manifest_sha256,
+                    ["synthetic-npu", "synthetic-gpu", "synthetic-cpu"],
+                    "unpackaged-scope",
+                    final_execution("synthetic-npu"),
+                    ATTESTATION_PUBLIC_KEY,
+                ):
+                    self.fail("an unpackaged requested scope must fail before launch")
 
     def test_exact_package_extraction_rejects_path_escape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -375,6 +486,23 @@ server.close()
                 wire_inputs,
                 report,
                 changed_wire,
+                retained_probes,
+                5.0,
+                None,
+                wire_request,
+                probe_request,
+            )
+
+        incomplete_report = json.loads(json.dumps(report))
+        incomplete_report["supported_sequence_buckets"] = list(SEQUENCE_BUCKETS[:-1])
+        incomplete_report["bucket_results"] = incomplete_report["bucket_results"][:-1]
+        with self.assertRaisesRegex(ValueError, "every admitted sequence bucket"):
+            replay_retained_outputs(
+                "http://127.0.0.1:1234/embeddings",
+                "exact-package-scope",
+                wire_inputs,
+                incomplete_report,
+                retained_wire,
                 retained_probes,
                 5.0,
                 None,
