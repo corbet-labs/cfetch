@@ -327,6 +327,7 @@ for scope_id in intel-lnl-npu intel-lnl-gpu intel-lnl-cpu; do
     --performance-evidence "$(jq -er .performance_evidence "$result")" \
     --performance-evidence-sha256 "$(jq -er .performance_evidence_sha256 "$result")" \
     --accelerated-placement --batch-size 64 \
+    --scifact-snapshot "$CFETCH_OPS_ROOT/scifact" \
     --bearer-token-env CFETCH_ADAPTER_BEARER
 done
 
@@ -357,6 +358,8 @@ Build `admission-transaction.json` using the exact schema in `README.md`. Use:
 - the candidate package directory and manifest;
 - the exact current `release/inference-backends.json` and
   `release/variants.json` digests;
+- `scifact_snapshot` as the normalized manifest-relative path to the exact
+  pinned raw SciFact directory used by every cache export;
 - the public key printed by `keygen` and a fixed, not previously mutated,
   release tag.
 
@@ -372,12 +375,14 @@ Run the complete local boundary once on the physical Lunar Lake host:
 ```
 
 The command replays the current admitted registry, reconstructs the measured
-probe manifest, runs the full all-pairs gate, injects the report binding,
-builds the exact target ZIP, launches it for every NPU/GPU/CPU scope, retains
-all signed final-conformance receipts, and creates the activation bundle. It
-then writes one digest-named `*.publication.json` plan binding every upload,
-remote URL, repository byte, and ordering constraint. A failure removes the
-partial output. The command performs no upload or repository mutation.
+probe manifest, verifies the manifest-bound SciFact raw snapshot against its
+three frozen file digests, runs the full all-pairs gate, injects the report
+binding, builds the exact target ZIP, launches it for every NPU/GPU/CPU scope
+against that same snapshot, retains all signed final-conformance receipts, and
+creates the activation bundle. It then writes one digest-named
+`*.publication.json` plan binding every upload, remote URL, repository byte,
+and ordering constraint. A failure removes the partial output. The command
+performs no upload or repository mutation and persists no local snapshot path.
 
 ## 7. Immutable publication and activation
 

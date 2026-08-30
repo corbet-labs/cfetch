@@ -11,6 +11,7 @@ import stat
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 import warnings
 import zipfile
 
@@ -32,8 +33,10 @@ from export_adapter_cache import SEQUENCE_PROBE_ARRAY_NAMES, canonical_i8, utf8_
 from final_package_conformance import (
     ADMISSION_IMPLEMENTATION_BUNDLE_SHA256,
     _extract_exact_package,
+    build_parser,
     launch_exact_package,
     replay_retained_outputs,
+    run_final_package_conformance,
     write_conformance_receipt,
 )
 from profile_identity import ADMISSION_POLICY_SHA256
@@ -239,6 +242,42 @@ server.close()
             self.assertFalse(
                 [warning for warning in caught if warning.category is ResourceWarning]
             )
+
+    def test_raw_scifact_snapshot_is_explicit_and_optional(self) -> None:
+        action = next(
+            item for item in build_parser()._actions if item.dest == "scifact_snapshot"
+        )
+        self.assertFalse(action.required)
+        self.assertIsNone(action.default)
+        self.assertEqual(action.type, Path)
+
+    @patch("final_package_conformance.load_scifact_inputs")
+    @patch("final_package_conformance.load_retained_conformance")
+    def test_final_replay_loads_the_explicit_snapshot(
+        self, load_retained: object, load_inputs: object
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "scifact"
+            load_retained.return_value = (
+                {
+                    "scope_id": "synthetic-npu",
+                    "attestation_public_key": ATTESTATION_PUBLIC_KEY,
+                },
+                {},
+                np.zeros((1, 1), dtype=np.int8),
+                (),
+            )
+            load_inputs.side_effect = RuntimeError("snapshot loaded")
+            args = SimpleNamespace(
+                endpoint="http://127.0.0.1:1234/v1/embeddings",
+                cache=Path(directory) / "cache.npz",
+                cache_sha256="1" * 64,
+                bearer_token_env=None,
+                scifact_snapshot=snapshot,
+            )
+            with self.assertRaisesRegex(RuntimeError, "snapshot loaded"):
+                run_final_package_conformance(args)
+            load_inputs.assert_called_once_with(snapshot)
 
     def test_receipt_launcher_rejects_package_manifest_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

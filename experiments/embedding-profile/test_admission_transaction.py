@@ -29,6 +29,7 @@ from admission_transaction import (
     _load_and_bind_package_manifest,
     _load_variant_catalog,
     _profile_source_promotion,
+    _run_final_conformance_receipt,
     _sha256_bytes,
     _stage_id,
     _validate_dispatcher,
@@ -911,6 +912,7 @@ class OneCommandTransactionTests(unittest.TestCase):
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         ).hex()
+        (root / "scifact").mkdir()
         transaction: dict[str, object] = {
             "schema_version": 1,
             "base_registry": registry.name,
@@ -919,6 +921,7 @@ class OneCommandTransactionTests(unittest.TestCase):
             "base_variants_sha256": file_sha256(variants),
             "release_tag": "synthetic-admission-v1",
             "receipt_attestation_public_key": public_hex,
+            "scifact_snapshot": "scifact",
             "candidate_scopes": ["scope-npu"],
             "scopes": [{}],
             "packages": [{}],
@@ -935,10 +938,12 @@ class OneCommandTransactionTests(unittest.TestCase):
     @patch("admission_transaction._load_stage_plan")
     @patch("admission_transaction.stage_transaction")
     @patch("admission_transaction.verify_release_registry")
+    @patch("admission_transaction.load_scifact_contract")
     @patch("admission_transaction.verify_implementation_bundle")
     def test_one_command_runs_replay_stage_all_receipts_activation_and_plan(
         self,
         verify_bundle: object,
+        load_scifact: object,
         verify_registry: object,
         stage: object,
         load_plan: object,
@@ -948,7 +953,7 @@ class OneCommandTransactionTests(unittest.TestCase):
         activate: object,
         build_publication: object,
     ) -> None:
-        del verify_bundle, validate_stage
+        del verify_bundle, load_scifact, validate_stage
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, private_key, _ = self.transaction_inputs(root)
@@ -984,8 +989,10 @@ class OneCommandTransactionTests(unittest.TestCase):
                 row: dict[str, object],
                 key: Path,
                 receipts: Path,
+                scifact_snapshot: Path,
             ) -> Path:
                 self.assertEqual(key, private_key.resolve())
+                self.assertEqual(scifact_snapshot, root / "scifact")
                 result = receipts / f"{row['scope_id']}.json"
                 result.write_bytes(b"{}\n")
                 return result
@@ -1018,15 +1025,17 @@ class OneCommandTransactionTests(unittest.TestCase):
                 root / "complete" / f"{publication_digest}.publication.json",
             )
             self.assertEqual(result.read_bytes(), publication_bytes)
+            self.assertNotIn(str(root).encode("utf-8"), result.read_bytes())
             self.assertEqual(conform.call_count, 2)
             build_publication.assert_called_once()
             self.assertEqual(build_publication.call_args.args[1], replay)
 
+    @patch("admission_transaction.load_scifact_contract")
     @patch("admission_transaction.verify_implementation_bundle")
     def test_one_command_refuses_a_receipt_key_not_bound_by_manifest(
-        self, verify_bundle: object
+        self, verify_bundle: object, load_scifact: object
     ) -> None:
-        del verify_bundle
+        del verify_bundle, load_scifact
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, _, _ = self.transaction_inputs(root)
@@ -1035,6 +1044,79 @@ class OneCommandTransactionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not match"):
                 run_transaction(manifest, wrong, root / "blocked")
             self.assertFalse((root / "blocked").exists())
+
+    @patch("admission_transaction.verify_implementation_bundle")
+    def test_one_command_requires_a_valid_manifest_bound_snapshot(
+        self, verify_bundle: object
+    ) -> None:
+        del verify_bundle
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, private_key, transaction = self.transaction_inputs(root)
+
+            transaction.pop("scifact_snapshot")
+            manifest.write_bytes(_canonical_json(transaction, pretty=True))
+            with self.assertRaisesRegex(ValueError, "requires scifact_snapshot"):
+                run_transaction(manifest, private_key, root / "missing")
+
+            transaction["scifact_snapshot"] = "../outside"
+            manifest.write_bytes(_canonical_json(transaction, pretty=True))
+            with self.assertRaisesRegex(ValueError, "normalized relative path"):
+                run_transaction(manifest, private_key, root / "escaped")
+
+            transaction["scifact_snapshot"] = "scifact"
+            manifest.write_bytes(_canonical_json(transaction, pretty=True))
+            with self.assertRaisesRegex(ValueError, "snapshot is invalid"):
+                run_transaction(manifest, private_key, root / "invalid")
+
+            self.assertFalse((root / "missing").exists())
+            self.assertFalse((root / "escaped").exists())
+            self.assertFalse((root / "invalid").exists())
+
+    @patch("admission_transaction._load_stage_plan")
+    @patch("admission_transaction.subprocess.run")
+    def test_final_conformance_receipt_receives_the_verified_snapshot(
+        self, run: object, load_plan: object
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            snapshot = root / "scifact"
+            snapshot.mkdir()
+            stage_plan = root / "stage-plan.json"
+            stage_plan.write_bytes(b"{}\n")
+            private_key = root / "receipt.key"
+            private_key.write_bytes(b"x" * 32)
+            row = {
+                "cache_asset": root / "cache.npz",
+                "cache_sha256": "1" * 64,
+                "package_id": "package-one",
+                "package_asset": root / "package.zip",
+                "package_sha256": "2" * 64,
+                "dispatcher": "cfetch-inference",
+                "scope_id": "scope-npu",
+            }
+            load_plan.return_value = (
+                {
+                    "stage_id": "3" * 64,
+                    "compatibility_report_sha256": "4" * 64,
+                },
+                root,
+            )
+
+            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+                del kwargs
+                option = command.index("--scifact-snapshot")
+                self.assertEqual(command[option + 1], str(snapshot))
+                (receipts / "receipt.json").write_bytes(b"{}\n")
+                return subprocess.CompletedProcess(command, 0)
+
+            run.side_effect = fake_run
+            result = _run_final_conformance_receipt(
+                stage_plan, row, private_key, receipts, snapshot
+            )
+            self.assertEqual(result, receipts / "receipt.json")
 
     @patch("admission_transaction.verify_implementation_bundle")
     def test_publication_plan_binds_exact_release_and_repository_bytes(

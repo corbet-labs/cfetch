@@ -68,6 +68,7 @@ from cross_backend_eval import (
     verify_release_registry,
 )
 from measurement_bundle import build_measurement_bundle
+from scifact_contract import load_scifact_contract
 
 
 SCHEMA_VERSION = 1
@@ -362,7 +363,7 @@ def _parse_manifest(path: Path) -> tuple[dict[str, Any], Path]:
             "scopes",
             "packages",
         },
-        set(),
+        {"scifact_snapshot"},
         "transaction manifest",
     )
     if manifest["schema_version"] != SCHEMA_VERSION:
@@ -392,6 +393,26 @@ def _parse_manifest(path: Path) -> tuple[dict[str, Any], Path]:
     if len(manifest["packages"]) > MAX_PACKAGES:
         raise TransactionError("packages exceeds the transaction bound")
     return manifest, path.resolve(strict=True).parent
+
+
+def _transaction_scifact_snapshot(
+    manifest: Mapping[str, object], root: Path
+) -> Path:
+    relative = manifest.get("scifact_snapshot")
+    if relative is None:
+        raise TransactionError(
+            "run requires scifact_snapshot as a manifest-relative input"
+        )
+    snapshot = _resolve_input(
+        root, relative, "scifact_snapshot", directory=True
+    )
+    try:
+        load_scifact_contract(snapshot_directory=snapshot)
+    except (OSError, ValueError) as error:
+        raise TransactionError(
+            f"manifest-bound pinned SciFact snapshot is invalid: {error}"
+        ) from error
+    return snapshot
 
 
 def _load_variant_catalog(path: Path, expected_digest: str) -> dict[str, dict[str, Any]]:
@@ -1935,6 +1956,7 @@ def _run_final_conformance_receipt(
     row: Mapping[str, object],
     private_key: Path,
     receipt_directory: Path,
+    scifact_snapshot: Path,
 ) -> Path:
     before = set(receipt_directory.iterdir())
     plan, _ = _load_stage_plan(stage_plan)
@@ -1963,6 +1985,8 @@ def _run_final_conformance_receipt(
         str(private_key),
         "--receipt-directory",
         str(receipt_directory),
+        "--scifact-snapshot",
+        str(scifact_snapshot),
     ]
     completed = subprocess.run(
         command,
@@ -2106,6 +2130,7 @@ def run_transaction(
     """Run the complete local transaction without publishing or editing the checkout."""
     verify_implementation_bundle()
     manifest, root = _parse_manifest(manifest_path)
+    scifact_snapshot = _transaction_scifact_snapshot(manifest, root)
     private_key = _validate_receipt_private_key(
         private_key_path, manifest["receipt_attestation_public_key"]
     )
@@ -2139,7 +2164,11 @@ def run_transaction(
         receipts_directory.mkdir()
         receipts = [
             _run_final_conformance_receipt(
-                stage_plan, row, private_key, receipts_directory
+                stage_plan,
+                row,
+                private_key,
+                receipts_directory,
+                scifact_snapshot,
             )
             for row in rows
         ]

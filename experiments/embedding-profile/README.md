@@ -149,6 +149,15 @@ Transport is also scope identity: package-owned adapters use
 `supervised-local`, while an explicitly configured endpoint is admitted as
 `remote-attested`; one cannot impersonate the other by reusing provenance.
 
+An offline host without `datasets` may pass `--scifact-snapshot` naming a
+directory with `corpus.jsonl`, `queries.jsonl`, and `qrels/test.jsonl`. The
+loader accepts only the frozen raw bytes (SHA-256 `f0d32db0d156b526d75921ed7a76f2cb912902631c87248c5c97c617bad0b60c`,
+`9db7df096f7414435d52bafcbacf814c30cea50eb565c1e8fa6d11440759bba8`,
+and `da33fc0edc7447d43908ea92bf11de010e361ac43228295f09bdcd33ce14730c`,
+respectively) and then enforces the same schemas, counts, IDs, order, and
+semantics as the pinned `datasets` path. Local snapshot paths are never stored
+in an admission cache.
+
 For example:
 
     python experiments/embedding-profile/export_adapter_cache.py \
@@ -418,6 +427,7 @@ path and prints the raw public-key hex for the manifest:
       "base_variants_sha256": "<exact digest>",
       "release_tag": "admission-v0.9.10-intel-lnl-1",
       "receipt_attestation_public_key": "<raw Ed25519 public key hex>",
+      "scifact_snapshot": "inputs/scifact",
       "candidate_scopes": ["intel-lnl-npu", "intel-lnl-gpu", "intel-lnl-cpu"],
       "scopes": [
         {
@@ -472,12 +482,16 @@ command on the physical package host:
 `run` first replays the current release registry. Existing admitted assets are
 downloaded only from their exact credential-free GitHub HTTPS locators; every
 redirect remains on GitHub, and byte bounds plus SHA-256 are checked before
-parsing. It then stages the complete local cohort, launches every exact staged
-package/scope pair for final conformance, creates the complete activation
-bundle, and emits a digest-named `*.publication.json` plan. The plan binds the
-fixed release tag, every content-addressed upload and URL, the repository
-changes, and their required order. The command is atomic with respect to its
-new output directory. It neither uploads nor edits the checkout.
+parsing. The required `scifact_snapshot` input is resolved below the manifest
+directory, rejected if it or a member is a symlink, and checked against the
+three frozen raw-file digests before staging. `run` then stages the complete
+local cohort, launches every exact staged package/scope pair for final
+conformance using that snapshot, creates the complete activation bundle, and
+emits a digest-named `*.publication.json` plan. The plan binds the fixed release
+tag, every content-addressed upload and URL, the repository changes, and their
+required order. The command is atomic with respect to its new output directory.
+It neither uploads nor edits the checkout, and no host snapshot path enters the
+publication output.
 
 The lower-level commands below remain useful for inspecting a failed stage.
 Run the offline stage into a new path:

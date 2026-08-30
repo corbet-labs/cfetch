@@ -163,6 +163,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout-seconds", type=positive_float, default=120.0)
     parser.add_argument(
+        "--scifact-snapshot",
+        type=Path,
+        help=(
+            "explicit directory containing the exact pinned raw SciFact "
+            "corpus.jsonl, queries.jsonl, and qrels/test.jsonl bytes; when absent, "
+            "load the pinned revision through datasets"
+        ),
+    )
+    parser.add_argument(
         "--bearer-token-env",
         metavar="NAME",
         help="read an optional loopback adapter bearer token from this environment variable",
@@ -852,7 +861,7 @@ def run_final_package_conformance(
                 f"environment variable {args.bearer_token_env!r} is missing or empty"
             )
 
-    query_inputs, document_inputs = load_scifact_inputs()
+    query_inputs, document_inputs = load_scifact_inputs(args.scifact_snapshot)
     canonical_wire_inputs = wire_batch_inputs(query_inputs, document_inputs)
     validate_wire_batch_output_cache(
         args.cache, ordered_input_json_sha256(canonical_wire_inputs)
