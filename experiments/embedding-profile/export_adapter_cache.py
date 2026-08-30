@@ -225,6 +225,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=supported_batch_size, default=32)
     parser.add_argument("--timeout-seconds", type=positive_float, default=120.0)
     parser.add_argument(
+        "--scifact-snapshot",
+        type=Path,
+        help=(
+            "explicit directory containing the exact pinned raw SciFact "
+            "corpus.jsonl, queries.jsonl, and qrels/test.jsonl bytes; when absent, "
+            "load the pinned revision through datasets"
+        ),
+    )
+    parser.add_argument(
         "--bearer-token-env",
         metavar="NAME",
         help="read an optional loopback adapter bearer token from this environment variable",
@@ -949,8 +958,12 @@ def collect_sequence_probe_arrays(
     )
 
 
-def load_scifact_inputs() -> tuple[list[str], list[str]]:
-    contract = load_scifact_contract(QUERY_PREFIX, DOCUMENT_PREFIX)
+def load_scifact_inputs(
+    snapshot_directory: Path | None = None,
+) -> tuple[list[str], list[str]]:
+    contract = load_scifact_contract(
+        QUERY_PREFIX, DOCUMENT_PREFIX, snapshot_directory
+    )
     return contract.query_texts, contract.document_texts
 
 
@@ -1101,7 +1114,10 @@ def main() -> None:
                 f"environment variable {args.bearer_token_env!r} is missing or empty"
             )
 
-    query_inputs, document_inputs = load_scifact_inputs()
+    try:
+        query_inputs, document_inputs = load_scifact_inputs(args.scifact_snapshot)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"pinned SciFact loading failed: {error}") from error
     expected_execution = {
         "scope_id": args.scope_id,
         "transport": args.transport,

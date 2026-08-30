@@ -416,6 +416,7 @@ class ExportAdapterCacheTests(unittest.TestCase):
             ),
             performance_evidence_sha256="4" * 64,
             accelerated_placement=True,
+            scifact_snapshot=Path("/home/private-user/models/scifact-snapshot"),
         )
 
         metadata = build_cache_metadata(args)
@@ -432,6 +433,14 @@ class ExportAdapterCacheTests(unittest.TestCase):
         self.assertEqual(
             metadata["performance_evidence"], "npz:performance_evidence_bytes"
         )
+
+    def test_raw_scifact_snapshot_is_explicit_and_optional(self) -> None:
+        action = next(
+            item for item in build_parser()._actions if item.dest == "scifact_snapshot"
+        )
+        self.assertFalse(action.required)
+        self.assertIsNone(action.default)
+        self.assertEqual(action.type, Path)
 
     def test_canonical_codec_is_signed_int8_and_rounds_ties_to_even(self) -> None:
         values = np.zeros((1, DIMENSIONS), dtype=np.float32)
