@@ -18,6 +18,7 @@ from scripts.apply_admission_activation import (
     ActivationError,
     PROFILE_STATUS_ACTIVE_TEXT,
     PROFILE_STATUS_CANDIDATE_TEXT,
+    _release_asset_url,
     apply_activation,
     main,
 )
@@ -29,6 +30,35 @@ def encoded(value: object) -> bytes:
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+class FakeResponse(io.BytesIO):
+    def __init__(self, payload: bytes, final_url: str) -> None:
+        super().__init__(payload)
+        self.headers = {"Content-Length": str(len(payload))}
+        self._final_url = final_url
+
+    def geturl(self) -> str:
+        return self._final_url
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+class FakePublicationOpener:
+    def __init__(
+        self, payloads: dict[str, bytes], final_url: str | None = None
+    ) -> None:
+        self.payloads = payloads
+        self.final_url = final_url
+
+    def open(self, request: object, timeout: int) -> FakeResponse:
+        self.timeout = timeout
+        url = request.full_url
+        return FakeResponse(self.payloads[url], self.final_url or url)
 
 
 class ActivationFixture:
@@ -92,6 +122,8 @@ class ActivationFixture:
         asset_bytes = b"canonical cache bytes\n"
         asset_digest = sha256(asset_bytes)
         asset_name = f"{asset_digest}.npz"
+        self.asset_bytes = asset_bytes
+        self.asset_name = asset_name
         (self.bundle / "assets" / asset_name).write_bytes(asset_bytes)
         receipt_bytes = b'{"receipt":"verified upstream"}\n'
         receipt_digest = sha256(receipt_bytes)
@@ -147,6 +179,12 @@ class ActivationFixture:
         }
         self.manifest = self.rewrite_manifest()
 
+    def publication_opener(self, payload: bytes | None = None) -> FakePublicationOpener:
+        url = _release_asset_url(str(self.activation["release_tag"]), self.asset_name)
+        return FakePublicationOpener(
+            {url: self.asset_bytes if payload is None else payload}
+        )
+
     def rewrite_manifest(self) -> Path:
         for old in self.bundle.glob("*.activation.json"):
             old.unlink()
@@ -160,7 +198,9 @@ class ApplyAdmissionActivationTests(unittest.TestCase):
     def test_applies_exact_registry_report_and_only_bound_source_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = ActivationFixture(Path(directory))
-            result = apply_activation(fixture.manifest, fixture.repository)
+            result = apply_activation(
+                fixture.manifest, fixture.repository, fixture.publication_opener()
+            )
 
             self.assertEqual(result["status"], "applied")
             self.assertEqual(
@@ -182,6 +222,38 @@ class ApplyAdmissionActivationTests(unittest.TestCase):
                 (fixture.repository / "release/variants.json").read_bytes(),
                 fixture.variants_bytes,
             )
+            self.assertEqual(result["published_assets_verified"], 1)
+            self.assertEqual(
+                result["published_asset_bytes_verified"], len(fixture.asset_bytes)
+            )
+
+    def test_refuses_unpublished_or_changed_release_asset_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ActivationFixture(Path(directory))
+            with self.assertRaisesRegex(ActivationError, "Content-Length|downloaded bytes"):
+                apply_activation(
+                    fixture.manifest,
+                    fixture.repository,
+                    fixture.publication_opener(b"changed"),
+                )
+            self.assertEqual(
+                (fixture.repository / "release/inference-backends.json").read_bytes(),
+                fixture.base_registry_bytes,
+            )
+            self.assertFalse((fixture.repository / fixture.report_relative).exists())
+
+    def test_refuses_release_asset_redirect_outside_github(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ActivationFixture(Path(directory))
+            url = _release_asset_url(
+                str(fixture.activation["release_tag"]), fixture.asset_name
+            )
+            opener = FakePublicationOpener(
+                {url: fixture.asset_bytes}, "https://example.invalid/asset"
+            )
+            with self.assertRaisesRegex(ActivationError, "GitHub HTTPS"):
+                apply_activation(fixture.manifest, fixture.repository, opener)
+            self.assertFalse((fixture.repository / fixture.report_relative).exists())
 
     def test_refuses_manifest_filename_or_bundle_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +293,14 @@ class ApplyAdmissionActivationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ActivationError, "schema mismatch"):
                     apply_activation(fixture.manifest, fixture.repository)
 
+    def test_refuses_a_mutable_release_tag_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ActivationFixture(Path(directory))
+            fixture.activation["release_tag"] = "latest"
+            fixture.rewrite_manifest()
+            with self.assertRaisesRegex(ActivationError, "release_tag"):
+                apply_activation(fixture.manifest, fixture.repository)
+
     def test_refuses_nonexact_status_replacement_even_when_hash_claim_is_updated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = ActivationFixture(Path(directory))
@@ -255,7 +335,10 @@ class ApplyAdmissionActivationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = ActivationFixture(Path(directory))
             stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
+            with contextlib.redirect_stdout(stdout), patch(
+                "scripts.apply_admission_activation._verify_published_assets",
+                return_value={"assets": 1, "bytes": len(fixture.asset_bytes)},
+            ):
                 code = main(
                     [
                         "--activation-manifest",
@@ -297,7 +380,11 @@ class ApplyAdmissionActivationTests(unittest.TestCase):
                 "scripts.apply_admission_activation.os.replace",
                 side_effect=fail_source_once,
             ), self.assertRaisesRegex(OSError, "synthetic source"):
-                apply_activation(fixture.manifest, fixture.repository)
+                apply_activation(
+                    fixture.manifest,
+                    fixture.repository,
+                    fixture.publication_opener(),
+                )
 
             self.assertEqual(
                 (fixture.repository / "release/inference-backends.json").read_bytes(),

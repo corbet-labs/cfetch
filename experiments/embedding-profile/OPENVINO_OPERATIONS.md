@@ -360,75 +360,53 @@ Build `admission-transaction.json` using the exact schema in `README.md`. Use:
 - the public key printed by `keygen` and a fixed, not previously mutated,
   release tag.
 
-Then stage offline:
+Run the complete local boundary once on the physical Lunar Lake host:
 
 ```bash
 "$CFETCH_OPS_ROOT/venv/bin/python" \
-  experiments/embedding-profile/admission_transaction.py stage \
+  experiments/embedding-profile/admission_transaction.py run \
   --manifest "$CFETCH_OPS_ROOT/admission-transaction.json" \
-  --output "$CFETCH_OPS_ROOT/staged-admission"
-```
-
-Staging reconstructs the measured probe manifest, proves the candidate changed
-only the permitted evidence bindings, runs the full all-pairs report, injects
-the report binding into a release-state copy, and builds the exact target ZIP.
-It performs no upload or repository mutation.
-
-## 7. Final physical release replay and activation
-
-Run one receipt command for every row in
-`stage-plan.json.expected_conformance_receipts` on the Lunar Lake host. For a
-row, locate its cache and package assets by `kind` and `owner_id` in
-`stage-plan.json.assets`, then run:
-
-```bash
-"$CFETCH_OPS_ROOT/venv/bin/python" \
-  experiments/embedding-profile/final_package_conformance.py \
-  --cache "$CFETCH_OPS_ROOT/staged-admission/assets/<cache-sha256>.npz" \
-  --cache-sha256 "<cache-sha256>" \
-  --compatibility-report-sha256 "<report-sha256>" \
-  --stage-id "<stage-id>" \
-  --stage-plan "$CFETCH_OPS_ROOT/staged-admission/stage-plan.json" \
-  --package-id linux-openvino-lunar-lake-x86_64 \
-  --package-asset "$CFETCH_OPS_ROOT/staged-admission/assets/<package-sha256>.zip" \
-  --package-sha256 "<package-sha256>" \
-  --dispatcher cfetch-openvino-adapter \
   --receipt-attestation-private-key \
     "$CFETCH_OPS_ROOT/receipt-attestation.key" \
-  --receipt-directory "$CFETCH_OPS_ROOT/receipts"
+  --output "$CFETCH_OPS_ROOT/complete-admission"
 ```
 
-After all three distinct signed receipts exist:
+The command replays the current admitted registry, reconstructs the measured
+probe manifest, runs the full all-pairs gate, injects the report binding,
+builds the exact target ZIP, launches it for every NPU/GPU/CPU scope, retains
+all signed final-conformance receipts, and creates the activation bundle. It
+then writes one digest-named `*.publication.json` plan binding every upload,
+remote URL, repository byte, and ordering constraint. A failure removes the
+partial output. The command performs no upload or repository mutation.
 
-```bash
-receipt_args=()
-while IFS= read -r receipt; do receipt_args+=(--receipt "$receipt"); done \
-  < <(find "$CFETCH_OPS_ROOT/receipts" -maxdepth 1 -type f -name '*.json' | sort)
-"$CFETCH_OPS_ROOT/venv/bin/python" \
-  experiments/embedding-profile/admission_transaction.py activate \
-  --stage-plan "$CFETCH_OPS_ROOT/staged-admission/stage-plan.json" \
-  "${receipt_args[@]}" \
-  --output "$CFETCH_OPS_ROOT/release-ready-admission"
-```
+## 7. Immutable publication and activation
 
-Activation ends in `release-ready-not-published`. Upload every file in its
-`assets/` directory to the activation manifest's exact fixed `release_tag`,
-download those assets into a new verification directory, and recheck every
-filename digest before changing source. There is currently no repository-owned
-publisher for this step, so it remains an explicit operator boundary.
+The one-command transaction ends with a `ready-not-published` publication
+plan; its activation manifest remains `release-ready-not-published`. Upload
+every release asset named by the publication plan to its exact fixed
+`release_tag`. There is no
+repository-owned publisher for this external mutation, so it remains an
+explicit operator boundary. Do not edit the plan, rename an asset, or replace
+an asset at the tag.
 
-Only after the immutable assets are remotely present may the checkout be
+Only after every immutable asset is remotely present may the checkout be
 mutated:
 
 ```bash
 "$CFETCH_OPS_ROOT/venv/bin/python" scripts/apply_admission_activation.py \
   --activation-manifest \
-    "$CFETCH_OPS_ROOT/release-ready-admission/<sha256>.activation.json" \
+  "$CFETCH_OPS_ROOT/complete-admission/activation/<sha256>.activation.json" \
   --repository .
 "$CFETCH_OPS_ROOT/venv/bin/python" \
   experiments/embedding-profile/cross_backend_eval.py \
   --verify-release-registry
 ```
+
+The activation command itself downloads every planned asset through
+credential-free GitHub HTTPS, constrains all redirects to GitHub, and verifies
+the exact size and SHA-256 before writing the report, registry, or active
+profile status. The following registry replay repeats the same bounded remote
+verification and recomputes the global gate from the published evidence.
 
 Any absent command, placeholder, failed scope, missing receipt, or unpublished
 asset means stop. It is not permission to synthesize a value or weaken a gate.

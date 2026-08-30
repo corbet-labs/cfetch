@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Stage and activate one hermetic, nonempty backend admission transaction.
+"""Run one hermetic, nonempty backend admission transaction.
 
 The stage phase is intentionally offline.  It consumes a complete local cohort,
 builds deterministic content-addressed assets, and writes a proposed registry.
 It never edits the repository or uploads a release.  The activate phase still
 does not publish anything: it creates a release-ready activation bundle only
 after exact final-package conformance receipts cover every package/scope pair.
+The run command owns the complete local sequence and emits an immutable
+publication plan without uploading assets or changing the repository.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from typing import Any, Iterable, Mapping, Sequence
@@ -62,6 +65,7 @@ from cross_backend_eval import (
     validate_loaded_scope_bindings,
     validate_measurement_bundle,
     verify_implementation_bundle,
+    verify_release_registry,
 )
 from measurement_bundle import build_measurement_bundle
 
@@ -75,6 +79,7 @@ MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_PACKAGES = 64
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_ACTIVATION_BYTES = 4 * 1024 * 1024 * 1024
+MAX_PUBLICATION_PLAN_BYTES = 4 * 1024 * 1024
 EXPECTED_SIGNED_REQUESTS = sum((64 + size - 1) // size for size in range(1, 65)) + 14
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -91,6 +96,7 @@ PROFILE_SOURCE_PATH = "src/embedding_profile.rs"
 PROFILE_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 PROFILE_STATUS_CANDIDATE_TEXT = 'pub const PROFILE_STATUS: &str = "candidate";'
 PROFILE_STATUS_ACTIVE_TEXT = 'pub const PROFILE_STATUS: &str = "active";'
+RELEASE_REPOSITORY = "corbet-labs/cfetch"
 
 
 class TransactionError(ValueError):
@@ -1775,6 +1781,383 @@ def activate_transaction(
         raise
 
 
+def _validate_receipt_private_key(path: Path, expected_public_hex: str) -> Path:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    resolved = path.resolve(strict=True)
+    if path.is_symlink() or not resolved.is_file():
+        raise TransactionError(
+            "receipt attestation private key must be a regular non-symlink file"
+        )
+    private_bytes = _read_bounded(
+        resolved, 32, "receipt attestation private key"
+    )
+    if len(private_bytes) != 32:
+        raise TransactionError(
+            "receipt attestation private key must contain exactly 32 raw bytes"
+        )
+    try:
+        private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    except ValueError as error:
+        raise TransactionError("receipt attestation private key is invalid") from error
+    public_hex = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    ).hex()
+    if public_hex != expected_public_hex:
+        raise TransactionError(
+            "receipt attestation private key does not match the transaction manifest"
+        )
+    return resolved
+
+
+def _asset_for(
+    plan: Mapping[str, object], kind: str, owner_id: str
+) -> Mapping[str, object]:
+    assets = plan.get("assets")
+    if not isinstance(assets, list):
+        raise TransactionError("stage plan assets must be an array")
+    matches = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict)
+        and asset.get("kind") == kind
+        and asset.get("owner_id") == owner_id
+    ]
+    if len(matches) != 1:
+        raise TransactionError(
+            f"stage plan must contain one {kind} asset for {owner_id!r}"
+        )
+    return matches[0]
+
+
+def _receipt_execution_rows(
+    plan: dict[str, Any], stage_root: Path
+) -> list[dict[str, object]]:
+    registry_path = _resolve_input(
+        stage_root, plan["proposed_registry"], "proposed_registry", directory=False
+    )
+    registry, _ = _read_json(
+        registry_path, MAX_ADMISSION_REGISTRY_BYTES, "proposed registry"
+    )
+    packages = registry.get("local_packages")
+    if not isinstance(packages, list) or not packages:
+        raise TransactionError("proposed registry has no local packages")
+    packages_by_id: dict[str, dict[str, object]] = {}
+    for index, package in enumerate(packages):
+        if not isinstance(package, dict):
+            raise TransactionError(f"local_packages[{index}] must be an object")
+        package_id = _slug(package.get("package_id"), f"local_packages[{index}].package_id")
+        if package_id in packages_by_id:
+            raise TransactionError("proposed registry repeats a local package id")
+        packages_by_id[package_id] = package
+
+    expected = plan.get("expected_conformance_receipts")
+    if not isinstance(expected, list) or not expected:
+        raise TransactionError("stage plan has no expected conformance receipts")
+    rows: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, row in enumerate(expected):
+        label = f"expected_conformance_receipts[{index}]"
+        if not isinstance(row, dict):
+            raise TransactionError(f"{label} must be an object")
+        _exact_keys(
+            row,
+            {
+                "package_id",
+                "package_sha256",
+                "scope_id",
+                "cache_sha256",
+                "compatibility_report_sha256",
+            },
+            set(),
+            label,
+        )
+        package_id = _slug(row["package_id"], f"{label}.package_id")
+        scope_id = _slug(row["scope_id"], f"{label}.scope_id")
+        pair = (package_id, scope_id)
+        if pair in seen:
+            raise TransactionError("stage plan repeats a package/scope receipt")
+        seen.add(pair)
+        package_digest = _digest(row["package_sha256"], f"{label}.package_sha256")
+        cache_digest = _digest(row["cache_sha256"], f"{label}.cache_sha256")
+        if row["compatibility_report_sha256"] != plan["compatibility_report_sha256"]:
+            raise TransactionError(f"{label} does not bind the newest cohort report")
+        package_asset = _asset_for(plan, "target-package", package_id)
+        cache_asset = _asset_for(plan, "admission-cache", scope_id)
+        if (
+            package_asset.get("sha256") != package_digest
+            or package_asset.get("format") != "zip"
+            or cache_asset.get("sha256") != cache_digest
+            or cache_asset.get("format") != "npz"
+        ):
+            raise TransactionError(f"{label} does not bind its exact staged assets")
+        package = packages_by_id.get(package_id)
+        if package is None:
+            raise TransactionError(f"{label} names an unknown local package")
+        ordered = package.get("ordered_scope_ids")
+        dispatcher = package.get("dispatcher")
+        if (
+            not isinstance(ordered, list)
+            or scope_id not in ordered
+            or not isinstance(dispatcher, dict)
+            or not isinstance(dispatcher.get("binary"), str)
+            or PurePosixPath(dispatcher["binary"]).name != dispatcher["binary"]
+        ):
+            raise TransactionError(f"{label} has no valid staged dispatcher binding")
+        rows.append(
+            {
+                "package_id": package_id,
+                "scope_id": scope_id,
+                "package_sha256": package_digest,
+                "cache_sha256": cache_digest,
+                "package_asset": _resolve_input(
+                    stage_root,
+                    f"assets/{package_asset['filename']}",
+                    f"{label} package asset",
+                    directory=False,
+                ),
+                "cache_asset": _resolve_input(
+                    stage_root,
+                    f"assets/{cache_asset['filename']}",
+                    f"{label} cache asset",
+                    directory=False,
+                ),
+                "dispatcher": dispatcher["binary"],
+            }
+        )
+    return rows
+
+
+def _run_final_conformance_receipt(
+    stage_plan: Path,
+    row: Mapping[str, object],
+    private_key: Path,
+    receipt_directory: Path,
+) -> Path:
+    before = set(receipt_directory.iterdir())
+    plan, _ = _load_stage_plan(stage_plan)
+    command = [
+        sys.executable,
+        str(REPOSITORY_ROOT / "experiments/embedding-profile/final_package_conformance.py"),
+        "--cache",
+        str(row["cache_asset"]),
+        "--cache-sha256",
+        str(row["cache_sha256"]),
+        "--compatibility-report-sha256",
+        str(plan["compatibility_report_sha256"]),
+        "--stage-id",
+        str(plan["stage_id"]),
+        "--stage-plan",
+        str(stage_plan),
+        "--package-id",
+        str(row["package_id"]),
+        "--package-asset",
+        str(row["package_asset"]),
+        "--package-sha256",
+        str(row["package_sha256"]),
+        "--dispatcher",
+        str(row["dispatcher"]),
+        "--receipt-attestation-private-key",
+        str(private_key),
+        "--receipt-directory",
+        str(receipt_directory),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        stdout=subprocess.DEVNULL,
+    )
+    if completed.returncode != 0:
+        raise TransactionError(
+            "final package conformance failed for "
+            f"{row['package_id']!r}/{row['scope_id']!r}"
+        )
+    created = set(receipt_directory.iterdir()).difference(before)
+    receipt = next(iter(created)) if len(created) == 1 else None
+    if receipt is None or receipt.is_symlink() or not receipt.is_file():
+        raise TransactionError(
+            "final package conformance did not create exactly one receipt"
+        )
+    return receipt
+
+
+def _build_publication_plan(
+    activation_manifest: Path, base_registry_replay: Mapping[str, object]
+) -> tuple[dict[str, object], bytes, str]:
+    activation, raw = _read_json(
+        activation_manifest,
+        MAX_STAGE_PLAN_BYTES,
+        "activation manifest",
+    )
+    activation_digest = _sha256_bytes(raw)
+    if activation_manifest.name != f"{activation_digest}.activation.json":
+        raise TransactionError(
+            "activation manifest filename does not match its exact bytes"
+        )
+    if activation.get("status") != "release-ready-not-published":
+        raise TransactionError("activation bundle is not release ready")
+    release_tag = activation.get("release_tag")
+    if (
+        not isinstance(release_tag, str)
+        or RELEASE_TAG_RE.fullmatch(release_tag) is None
+        or release_tag.lower() in {"latest", "current", "draft"}
+    ):
+        raise TransactionError("activation release tag is invalid")
+    assets = activation.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise TransactionError("activation bundle has no release assets")
+    release_assets = []
+    for index, asset in enumerate(assets):
+        label = f"activation assets[{index}]"
+        if not isinstance(asset, dict):
+            raise TransactionError(f"{label} must be an object")
+        digest = _digest(asset.get("sha256"), f"{label}.sha256")
+        size = asset.get("bytes")
+        filename = asset.get("filename")
+        source = asset.get("path")
+        if type(size) is not int or size < 1 or not isinstance(filename, str):
+            raise TransactionError(f"{label} has invalid size or filename")
+        if source != f"assets/{filename}" or filename != f"{digest}.{asset.get('format')}":
+            raise TransactionError(f"{label} is not canonically content-addressed")
+        source_path = _resolve_input(
+            activation_manifest.parent, source, label, directory=False
+        )
+        if source_path.stat().st_size != size or file_sha256(source_path) != digest:
+            raise TransactionError(f"{label} bytes do not match the activation")
+        release_assets.append(
+            {
+                "kind": asset.get("kind"),
+                "owner_id": asset.get("owner_id"),
+                "source": f"activation/{source}",
+                "filename": filename,
+                "sha256": digest,
+                "bytes": size,
+                "url": (
+                    f"https://github.com/{RELEASE_REPOSITORY}/releases/download/"
+                    f"{release_tag}/{filename}"
+                ),
+            }
+        )
+
+    report_source = _resolve_input(
+        activation_manifest.parent,
+        activation["compatibility_report"],
+        "activation compatibility report",
+        directory=False,
+    )
+    registry_source = _resolve_input(
+        activation_manifest.parent,
+        activation["registry"],
+        "activation registry",
+        directory=False,
+    )
+    if (
+        file_sha256(report_source) != activation["compatibility_report_sha256"]
+        or file_sha256(registry_source) != activation["registry_sha256"]
+    ):
+        raise TransactionError("activation repository bytes changed")
+    publication: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ready-not-published",
+        "repository": RELEASE_REPOSITORY,
+        "release_tag": release_tag,
+        "stage_id": activation["stage_id"],
+        "activation_manifest": {
+            "path": f"activation/{activation_manifest.name}",
+            "sha256": activation_digest,
+            "bytes": len(raw),
+        },
+        "base_registry_replay": dict(base_registry_replay),
+        "release_assets": release_assets,
+        "repository_activation": {
+            "compatibility_report": {
+                "source": f"activation/{activation['compatibility_report']}",
+                "destination": activation["compatibility_report"],
+                "sha256": activation["compatibility_report_sha256"],
+                "bytes": activation["compatibility_report_bytes"],
+            },
+            "registry": {
+                "source": f"activation/{activation['registry']}",
+                "destination": activation["registry"],
+                "sha256": activation["registry_sha256"],
+                "bytes": activation["registry_bytes"],
+            },
+            "profile_source_promotion": activation["profile_source_promotion"],
+        },
+        "required_order": [
+            "publish every release asset to the fixed tag",
+            "download every asset through credential-free GitHub HTTPS and verify exact bytes",
+            "apply the bound repository activation",
+            "replay the nonempty release registry",
+        ],
+    }
+    publication_bytes = _canonical_json(publication, pretty=True)
+    if len(publication_bytes) > MAX_PUBLICATION_PLAN_BYTES:
+        raise TransactionError("publication plan exceeds its byte bound")
+    return publication, publication_bytes, _sha256_bytes(publication_bytes)
+
+
+def run_transaction(
+    manifest_path: Path, private_key_path: Path, output: Path
+) -> Path:
+    """Run the complete local transaction without publishing or editing the checkout."""
+    verify_implementation_bundle()
+    manifest, root = _parse_manifest(manifest_path)
+    private_key = _validate_receipt_private_key(
+        private_key_path, manifest["receipt_attestation_public_key"]
+    )
+    current_registry = REPOSITORY_ROOT / "release/inference-backends.json"
+    current_variants = REPOSITORY_ROOT / "release/variants.json"
+    manifest_registry = _resolve_input(
+        root, manifest["base_registry"], "base_registry", directory=False
+    )
+    manifest_variants = _resolve_input(
+        root, manifest["base_variants"], "base_variants", directory=False
+    )
+    if (
+        file_sha256(manifest_registry) != file_sha256(current_registry)
+        or manifest["base_registry_sha256"] != file_sha256(current_registry)
+        or file_sha256(manifest_variants) != file_sha256(current_variants)
+        or manifest["base_variants_sha256"] != file_sha256(current_variants)
+    ):
+        raise TransactionError(
+            "one-command transaction inputs must bind the current checkout registry and variants"
+        )
+    base_replay = verify_release_registry()
+
+    parent, target = _safe_output_parent(output)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=parent))
+    try:
+        stage_plan = stage_transaction(manifest_path, temporary / "stage")
+        plan, stage_root = _load_stage_plan(stage_plan)
+        _validate_stage_bytes(plan, stage_root)
+        rows = _receipt_execution_rows(plan, stage_root)
+        receipts_directory = temporary / "receipts"
+        receipts_directory.mkdir()
+        receipts = [
+            _run_final_conformance_receipt(
+                stage_plan, row, private_key, receipts_directory
+            )
+            for row in rows
+        ]
+        activation_manifest = activate_transaction(
+            stage_plan, receipts, temporary / "activation"
+        )
+        _, publication_bytes, publication_digest = _build_publication_plan(
+            activation_manifest, base_replay
+        )
+        publication_name = f"{publication_digest}.publication.json"
+        (temporary / publication_name).write_bytes(publication_bytes)
+        os.replace(temporary, target)
+        return target / publication_name
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
 def generate_receipt_attestation_key(output: Path) -> str:
     """Create one raw private key and return its manifest-safe public key hex."""
     from cryptography.hazmat.primitives import serialization
@@ -1821,6 +2204,18 @@ def _parser() -> argparse.ArgumentParser:
     activate.add_argument("--stage-plan", required=True, type=Path)
     activate.add_argument("--receipt", action="append", required=True, type=Path)
     activate.add_argument("--output", required=True, type=Path)
+    run = commands.add_parser(
+        "run",
+        help=(
+            "replay the current registry, stage the cohort, run every exact "
+            "package receipt, and build an immutable publication plan"
+        ),
+    )
+    run.add_argument("--manifest", required=True, type=Path)
+    run.add_argument(
+        "--receipt-attestation-private-key", required=True, type=Path
+    )
+    run.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -1831,8 +2226,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = generate_receipt_attestation_key(args.output)
         elif args.command == "stage":
             result = stage_transaction(args.manifest, args.output)
-        else:
+        elif args.command == "activate":
             result = activate_transaction(args.stage_plan, args.receipt, args.output)
+        else:
+            result = run_transaction(
+                args.manifest,
+                args.receipt_attestation_private_key,
+                args.output,
+            )
     except (OSError, RuntimeError, TransactionError, ValueError) as error:
         print(f"admission transaction refused: {error}")
         return 1

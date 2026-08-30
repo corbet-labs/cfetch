@@ -5,6 +5,13 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Atomic local admission release boundary.** One hash-locked command replays
+  the current admitted cohort, stages bounded physical evidence, runs every
+  exact target-package/scope conformance challenge, creates the activation
+  bundle, and emits a content-addressed immutable publication plan. It performs
+  no external mutation. After an operator publishes the planned assets, source
+  activation downloads each one through credential-free GitHub HTTPS, confines
+  redirects to GitHub, and verifies its exact size and SHA-256 before writing.
 - **Explainable source dependency graph.** `cfetch code-graph path` returns one
   deterministic shortest import chain, while `cfetch code-graph impact` walks
   reverse imports for a bounded blast radius and `cfetch code-graph context`

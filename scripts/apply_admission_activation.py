@@ -13,6 +13,8 @@ import stat
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
+import urllib.parse
+import urllib.request
 
 
 MAX_ACTIVATION_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -29,6 +31,7 @@ PROFILE_STATUS_CANDIDATE_TEXT = 'pub const PROFILE_STATUS: &str = "candidate";'
 PROFILE_STATUS_ACTIVE_TEXT = 'pub const PROFILE_STATUS: &str = "active";'
 REGISTRY_PATH = "release/inference-backends.json"
 VARIANTS_PATH = "release/variants.json"
+RELEASE_REPOSITORY = "corbet-labs/cfetch"
 
 ACTIVATION_FIELDS = {
     "schema_version",
@@ -151,6 +154,121 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _validate_download_url(url: str) -> None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise ActivationError(
+            "published admission asset redirected to an invalid URL"
+        ) from error
+    hostname = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or not (
+            hostname == "github.com"
+            or hostname.endswith(".githubusercontent.com")
+        )
+    ):
+        raise ActivationError(
+            "published admission assets must remain on credential-free GitHub HTTPS"
+        )
+
+
+class _HttpsGithubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: object,
+        code: int,
+        message: str,
+        headers: object,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        _validate_download_url(new_url)
+        return super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
+
+
+def _release_asset_url(release_tag: str, filename: str) -> str:
+    return (
+        f"https://github.com/{RELEASE_REPOSITORY}/releases/download/"
+        f"{release_tag}/{filename}"
+    )
+
+
+def _verify_published_assets(
+    activation: Mapping[str, object], opener: object | None = None
+) -> dict[str, int]:
+    """Download every bound release asset before any checkout mutation."""
+    assets = activation["assets"]
+    if not isinstance(assets, list) or not assets:
+        raise ActivationError("activation assets must be a nonempty array")
+    active_opener = opener or urllib.request.build_opener(
+        _HttpsGithubRedirectHandler()
+    )
+    verified_bytes = 0
+    for index, asset in enumerate(assets):
+        label = f"published assets[{index}]"
+        if not isinstance(asset, dict):
+            raise ActivationError(f"{label} must be an object")
+        digest = _digest(asset.get("sha256"), f"{label}.sha256")
+        size = _positive_size(asset.get("bytes"), label)
+        filename = asset.get("filename")
+        if not isinstance(filename, str) or filename != (
+            f"{digest}.{asset.get('format')}"
+        ):
+            raise ActivationError(f"{label} is not content-addressed")
+        url = _release_asset_url(str(activation["release_tag"]), filename)
+        _validate_download_url(url)
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "cfetch-admission-activation/1"}
+        )
+        observed_digest = hashlib.sha256()
+        observed_size = 0
+        try:
+            response_context = active_opener.open(request, timeout=60)
+            with response_context as response:
+                _validate_download_url(response.geturl())
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError as error:
+                        raise ActivationError(
+                            f"{label} has an invalid Content-Length"
+                        ) from error
+                    if declared_size != size:
+                        raise ActivationError(
+                            f"{label} Content-Length does not match the activation"
+                        )
+                while chunk := response.read(1024 * 1024):
+                    observed_size += len(chunk)
+                    if observed_size > size:
+                        raise ActivationError(
+                            f"{label} exceeds its activation byte count"
+                        )
+                    observed_digest.update(chunk)
+        except ActivationError:
+            raise
+        except OSError as error:
+            raise ActivationError(f"{label} could not be downloaded: {error}") from error
+        if observed_size != size or observed_digest.hexdigest() != digest:
+            raise ActivationError(
+                f"{label} downloaded bytes do not match the activation"
+            )
+        verified_bytes += observed_size
+        if verified_bytes > MAX_ACTIVATION_BYTES:
+            raise ActivationError(
+                "published admission assets exceed the activation byte bound"
+            )
+    return {"assets": len(assets), "bytes": verified_bytes}
+
+
 def _verified_bundle_file(
     root: Path,
     relative: str,
@@ -226,6 +344,7 @@ def _load_activation(path: Path) -> tuple[dict[str, Any], Path, str]:
     if (
         not isinstance(activation["release_tag"], str)
         or RELEASE_TAG_RE.fullmatch(activation["release_tag"]) is None
+        or activation["release_tag"].lower() in {"latest", "current", "draft"}
     ):
         raise ActivationError("activation release_tag is not canonical")
     _validate_promotion(activation["profile_source_promotion"])
@@ -416,7 +535,11 @@ def _restore_file(target: Path, data: bytes, mode: int) -> None:
     os.replace(temporary, target)
 
 
-def apply_activation(activation_manifest: Path, repository: Path) -> dict[str, object]:
+def apply_activation(
+    activation_manifest: Path,
+    repository: Path,
+    publication_opener: object | None = None,
+) -> dict[str, object]:
     activation, bundle_root, activation_digest = _load_activation(activation_manifest)
     registry_source, report_source = _validate_inventory(
         activation, bundle_root, activation_manifest.resolve(strict=True).name
@@ -465,6 +588,9 @@ def apply_activation(activation_manifest: Path, repository: Path) -> dict[str, o
         active_registry,
         activation["compatibility_report"],
         activation["compatibility_report_sha256"],
+    )
+    publication_verification = _verify_published_assets(
+        activation, publication_opener
     )
 
     report_target = repository.joinpath(
@@ -566,6 +692,8 @@ def apply_activation(activation_manifest: Path, repository: Path) -> dict[str, o
         "profile_source": PROFILE_SOURCE_PATH,
         "profile_source_sha256": promotion["active_sha256"],
         "variants_sha256": activation["base_variants_sha256"],
+        "published_assets_verified": publication_verification["assets"],
+        "published_asset_bytes_verified": publication_verification["bytes"],
     }
 
 

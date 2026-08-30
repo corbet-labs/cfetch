@@ -24,6 +24,7 @@ from admission_transaction import (
     PROFILE_ID,
     PROFILE_MANIFEST_SHA256,
     _build_package_zip,
+    _build_publication_plan,
     _canonical_json,
     _load_and_bind_package_manifest,
     _load_variant_catalog,
@@ -37,6 +38,7 @@ from admission_transaction import (
     activate_transaction,
     file_sha256,
     generate_receipt_attestation_key,
+    run_transaction,
     stage_transaction,
 )
 from packages.openvino import package_inventory
@@ -885,6 +887,186 @@ class ActivationTests(unittest.TestCase):
             forged_path.write_bytes(forged_bytes)
             with self.assertRaisesRegex(ValueError, "signature is invalid"):
                 activate_transaction(stage_plan, [forged_path], root / "blocked")
+
+
+class OneCommandTransactionTests(unittest.TestCase):
+    def transaction_inputs(
+        self, root: Path
+    ) -> tuple[Path, Path, dict[str, object]]:
+        repository = Path(__file__).resolve().parents[2]
+        registry = root / "inference-backends.json"
+        variants = root / "variants.json"
+        registry.write_bytes((repository / "release/inference-backends.json").read_bytes())
+        variants.write_bytes((repository / "release/variants.json").read_bytes())
+        private_key = Ed25519PrivateKey.generate()
+        private_path = root / "receipt.key"
+        private_path.write_bytes(
+            private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+        public_hex = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        ).hex()
+        transaction: dict[str, object] = {
+            "schema_version": 1,
+            "base_registry": registry.name,
+            "base_registry_sha256": file_sha256(registry),
+            "base_variants": variants.name,
+            "base_variants_sha256": file_sha256(variants),
+            "release_tag": "synthetic-admission-v1",
+            "receipt_attestation_public_key": public_hex,
+            "candidate_scopes": ["scope-npu"],
+            "scopes": [{}],
+            "packages": [{}],
+        }
+        manifest = root / "transaction.json"
+        manifest.write_bytes(_canonical_json(transaction, pretty=True))
+        return manifest, private_path, transaction
+
+    @patch("admission_transaction._build_publication_plan")
+    @patch("admission_transaction.activate_transaction")
+    @patch("admission_transaction._run_final_conformance_receipt")
+    @patch("admission_transaction._receipt_execution_rows")
+    @patch("admission_transaction._validate_stage_bytes")
+    @patch("admission_transaction._load_stage_plan")
+    @patch("admission_transaction.stage_transaction")
+    @patch("admission_transaction.verify_release_registry")
+    @patch("admission_transaction.verify_implementation_bundle")
+    def test_one_command_runs_replay_stage_all_receipts_activation_and_plan(
+        self,
+        verify_bundle: object,
+        verify_registry: object,
+        stage: object,
+        load_plan: object,
+        validate_stage: object,
+        receipt_rows: object,
+        conform: object,
+        activate: object,
+        build_publication: object,
+    ) -> None:
+        del verify_bundle, validate_stage
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, private_key, _ = self.transaction_inputs(root)
+            replay = {
+                "admitted_scopes": 0,
+                "measurement_bundles_verified": 0,
+                "reports_replayed": 0,
+                "status": "empty-no-op",
+            }
+            verify_registry.return_value = replay
+            plan = {
+                "stage_id": "1" * 64,
+                "compatibility_report_sha256": "2" * 64,
+            }
+
+            def fake_stage(source: Path, destination: Path) -> Path:
+                self.assertEqual(source, manifest)
+                destination.mkdir()
+                result = destination / "stage-plan.json"
+                result.write_bytes(b"{}\n")
+                return result
+
+            stage.side_effect = fake_stage
+            load_plan.side_effect = lambda path: (plan, path.parent)
+            rows = [
+                {"package_id": "package-one", "scope_id": "scope-npu"},
+                {"package_id": "package-one", "scope_id": "scope-gpu"},
+            ]
+            receipt_rows.return_value = rows
+
+            def fake_conformance(
+                stage_plan: Path,
+                row: dict[str, object],
+                key: Path,
+                receipts: Path,
+            ) -> Path:
+                self.assertEqual(key, private_key.resolve())
+                result = receipts / f"{row['scope_id']}.json"
+                result.write_bytes(b"{}\n")
+                return result
+
+            conform.side_effect = fake_conformance
+
+            def fake_activate(
+                stage_plan: Path, receipts: list[Path], destination: Path
+            ) -> Path:
+                self.assertEqual(len(receipts), 2)
+                destination.mkdir()
+                result = destination / f"{'3' * 64}.activation.json"
+                result.write_bytes(b"{}\n")
+                return result
+
+            activate.side_effect = fake_activate
+            publication = {"schema_version": 1, "status": "ready-not-published"}
+            publication_bytes = _canonical_json(publication, pretty=True)
+            publication_digest = _sha256_bytes(publication_bytes)
+            build_publication.return_value = (
+                publication,
+                publication_bytes,
+                publication_digest,
+            )
+
+            result = run_transaction(manifest, private_key, root / "complete")
+
+            self.assertEqual(
+                result,
+                root / "complete" / f"{publication_digest}.publication.json",
+            )
+            self.assertEqual(result.read_bytes(), publication_bytes)
+            self.assertEqual(conform.call_count, 2)
+            build_publication.assert_called_once()
+            self.assertEqual(build_publication.call_args.args[1], replay)
+
+    @patch("admission_transaction.verify_implementation_bundle")
+    def test_one_command_refuses_a_receipt_key_not_bound_by_manifest(
+        self, verify_bundle: object
+    ) -> None:
+        del verify_bundle
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, _, _ = self.transaction_inputs(root)
+            wrong = root / "wrong.key"
+            wrong.write_bytes(b"x" * 32)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                run_transaction(manifest, wrong, root / "blocked")
+            self.assertFalse((root / "blocked").exists())
+
+    @patch("admission_transaction.verify_implementation_bundle")
+    def test_publication_plan_binds_exact_release_and_repository_bytes(
+        self, verify_bundle: object
+    ) -> None:
+        del verify_bundle
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_root = root / "stage"
+            stage_root.mkdir()
+            helper = ActivationTests()
+            stage_plan, plan, private_path = helper.make_stage(stage_root)
+            receipt = helper.write_receipt(root, plan, private_path)
+            activation = activate_transaction(
+                stage_plan, [receipt], root / "activation"
+            )
+            publication, raw, digest = _build_publication_plan(
+                activation, {"status": "empty-no-op"}
+            )
+            self.assertEqual(digest, _sha256_bytes(raw))
+            self.assertEqual(publication["status"], "ready-not-published")
+            self.assertEqual(
+                publication["activation_manifest"]["sha256"],
+                file_sha256(activation),
+            )
+            for asset in publication["release_assets"]:
+                self.assertTrue(asset["url"].endswith("/" + asset["filename"]))
+
+            first_asset = publication["release_assets"][0]
+            (root / first_asset["source"]).write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "bytes do not match"):
+                _build_publication_plan(activation, {"status": "empty-no-op"})
 
 
 if __name__ == "__main__":

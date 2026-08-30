@@ -461,6 +461,25 @@ Each package must also bind one unique `backend: local` entry from the exact
 hash-pinned release-variant catalog with matching OS, architecture, and a
 different cfetch binary basename.
 
+For the actual admission boundary, run the complete local transaction as one
+command on the physical package host:
+
+    python experiments/embedding-profile/admission_transaction.py run \
+      --manifest results/admission-transaction.json \
+      --receipt-attestation-private-key results/receipt-attestation.key \
+      --output results/complete-admission
+
+`run` first replays the current release registry. Existing admitted assets are
+downloaded only from their exact credential-free GitHub HTTPS locators; every
+redirect remains on GitHub, and byte bounds plus SHA-256 are checked before
+parsing. It then stages the complete local cohort, launches every exact staged
+package/scope pair for final conformance, creates the complete activation
+bundle, and emits a digest-named `*.publication.json` plan. The plan binds the
+fixed release tag, every content-addressed upload and URL, the repository
+changes, and their required order. The command is atomic with respect to its
+new output directory. It neither uploads nor edits the checkout.
+
+The lower-level commands below remain useful for inspecting a failed stage.
 Run the offline stage into a new path:
 
     python experiments/embedding-profile/admission_transaction.py stage \
@@ -525,10 +544,14 @@ promotion explicitly from the repository root:
 The dependency-light command verifies the activation filename and complete
 bundle inventory, every content hash, the checkout's still-current base
 registry and variant catalog, the nonempty active registry/report binding, and
-the exact candidate source digest before writing. It then copies the report and
-registry and changes only the hash-bound `PROFILE_STATUS` constant. Any schema,
-byte, or checkout drift is a hard error with a nonzero exit; success prints a
-machine-readable summary. It does not upload assets or publish a release.
+the exact candidate source digest before writing. Before any checkout mutation,
+it also downloads every planned release asset from the fixed tag through
+credential-free GitHub HTTPS, constrains every redirect to GitHub, and verifies
+the exact byte count and SHA-256. It then copies the report and registry and
+changes only the hash-bound `PROFILE_STATUS` constant. Any schema, remote
+asset, byte, or checkout drift is a hard error with a nonzero exit; success
+prints a machine-readable summary. It does not upload assets or publish a
+release.
 
 ## Activation blockers
 
@@ -539,11 +562,12 @@ tests. They are machinery, not evidence. Before the first nonempty cohort:
 - Capture the complete physical NPU, GPU, and accelerated-CPU caches plus raw
   placement/performance outputs, then run the stage command successfully under
   the hash-locked environment.
-- Extract and start each exact staged target package, run final conformance for
-  every package/scope pair, and supply the complete receipt set to activation.
-- Publish the content-addressed activation assets at the fixed tag, run the
-  bound activation-application command, and pass the nonempty registry replay
-  in normal CI.
+- Run the one-command transaction on the physical package host so every exact
+  staged package/scope pair produces its final-conformance receipt and the
+  immutable activation/publication bundle.
+- Publish the content-addressed assets from that plan at the fixed tag, run the
+  bound activation-application command (which downloads and verifies them
+  again), and pass the nonempty registry replay in normal CI.
 
 `admitted_backends` and `local_packages` remain empty. No target scope or local
 producer is admitted until both boundaries and a real complete cohort pass.
