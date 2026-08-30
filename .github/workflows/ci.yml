@@ -61,8 +61,8 @@ jobs:
         with:
           tool: cargo-deny@0.20.2,cargo-about@0.9.2
           fallback: none
-      - name: Enforce dependency-license policy
-        run: cargo deny check licenses
+      - name: Enforce dependency-license and advisory policy
+        run: cargo deny check advisories licenses
       - name: Verify third-party notices are current
         run: |
           generated=$(mktemp)

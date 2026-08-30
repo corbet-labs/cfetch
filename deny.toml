@@ -46,3 +46,17 @@ exceptions = [
 # BSL-1.0 is the permissive Boost Software License, not the restrictive
 # Business Source License (BUSL-1.1). Neither is globally allowed here; crates
 # offering BSL-1.0 as an alternative are satisfied through Apache-2.0 instead.
+
+# Advisory policy. The license check above gates the supply chain on
+# provenance; this section gates it on known vulnerabilities and yanked
+# releases. Everything not explicitly ignored fails CI.
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # Unmaintained transitive macro utilities. No known exploits; removal
+  # depends on upstream parents migrating off them. Tracked in the
+  # dependency-hygiene issue.
+  { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained transitive; no fixed version exists" },
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained transitive; no fixed version exists" },
+]
