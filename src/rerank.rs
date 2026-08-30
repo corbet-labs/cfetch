@@ -118,10 +118,21 @@ impl RerankClient {
         }
         let mut resp = req.send(body.as_bytes()).with_context(|| format!("POST {}", self.url))?;
         let status = resp.status();
+        // Same bound as the maintenance client: an endpoint that streams an
+        // unbounded body must not be able to OOM the process. A rerank
+        // response is one float per document — 2 MiB is orders of magnitude
+        // beyond any legitimate one.
+        const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
         let text = resp
             .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES as u64)
             .read_to_string()
             .with_context(|| format!("read response from {}", self.url))?;
+        anyhow::ensure!(
+            text.len() <= MAX_RESPONSE_BYTES,
+            "rerank endpoint response exceeds {MAX_RESPONSE_BYTES} bytes"
+        );
         anyhow::ensure!(status.is_success(), "rerank endpoint returned {status}: {}", snippet(&text));
         let parsed: Response = serde_json::from_str(&text)
             .with_context(|| format!("unparseable rerank response: {}", snippet(&text)))?;
