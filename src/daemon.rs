@@ -1769,7 +1769,18 @@ fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, chan: Channel) -> bool {
     };
     let mut stream = reader.into_inner();
     if let Ok(s) = serde_json::to_string(&resp) {
-        let _ = writeln!(stream, "{s}");
+        if s.len() > IROH_MAX_RESPONSE {
+            // The iroh path refuses to build a response past its size bound;
+            // the TCP path must not become the bypass. A client-sized
+            // `limit: usize::MAX` gets the same refusal instead of a
+            // whole-catalog serialization and an equally huge write.
+            let refused = Response::err("response exceeds the 16 MiB serving limit");
+            if let Ok(e) = serde_json::to_string(&refused) {
+                let _ = writeln!(stream, "{e}");
+            }
+        } else {
+            let _ = writeln!(stream, "{s}");
+        }
     }
     shutdown
 }
@@ -1850,12 +1861,28 @@ pub fn run() -> anyhow::Result<()> {
         }
         eprintln!("cfetch daemon serving TCP on {local}");
         let ctx = ctx.clone();
+        // Bound pre-auth connection work, mirroring the iroh accept loop's
+        // permit cap: the token is only known AFTER a full line arrives, so
+        // an unbounded thread-per-connection lets anyone who can open
+        // sockets hold one 2 MiB-stack thread each without knowing the
+        // token. Excess connections are dropped before any read.
+        const MAX_TCP_CONNECTIONS: usize = 64;
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
+                if live.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_TCP_CONNECTIONS {
+                    live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    drop(conn);
+                    continue;
+                }
                 let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
                 let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
                 let ctx = ctx.clone();
-                std::thread::spawn(move || serve_conn(conn, &ctx, Channel::Remote));
+                let live = live.clone();
+                std::thread::spawn(move || {
+                    let _ = serve_conn(conn, &ctx, Channel::Remote);
+                    live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                });
             }
         });
     }
