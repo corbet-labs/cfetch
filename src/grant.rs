@@ -151,6 +151,13 @@ const GRANT_LOCK_WAIT_MS: u64 = 10_000;
 pub fn validate_slice_name(slice: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!slice.is_empty(), "a slice must have a name");
     anyhow::ensure!(slice != "." && slice != "..", "invalid slice name {slice:?}");
+    // `root` is the implicit whole-tree slice in the config model: a grant
+    // with that name would quietly become a grant of everything, which the
+    // config layer reserves and the grant layer must refuse to mint.
+    anyhow::ensure!(
+        slice != crate::config::ROOT_SLICE,
+        "slice name {slice:?} is reserved: a grant may not claim the whole tree"
+    );
     anyhow::ensure!(
         slice
             .chars()
@@ -457,6 +464,15 @@ mod tests {
 
     const PEER: &str = "dd44ee55ff66";
     const OTHER: &str = "9900aabbccdd";
+
+    #[test]
+    fn the_whole_tree_slice_name_cannot_be_granted() {
+        // Config reserves `root` because a grant of it is a grant of
+        // everything; the grant layer must refuse to mint one.
+        let err = validate_slice_name(crate::config::ROOT_SLICE).unwrap_err().to_string();
+        assert!(err.contains("whole tree"), "message must say why: {err}");
+        assert!(validate_slice_name("hosts").is_ok());
+    }
 
     fn origin() -> iroh::EndpointAddr {
         iroh::SecretKey::from_bytes(&[7; 32]).public().into()

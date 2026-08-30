@@ -49,10 +49,18 @@ pub struct HookEvent {
 
 impl HookEvent {
     /// Reads the event from stdin. Any failure yields the empty event — a hook
-    /// must degrade, never crash the harness interaction.
+    /// must degrade, never crash the harness interaction. The read is BOUNDED:
+    /// a forwarded multi-gigabyte tool response must not become a matching
+    /// allocation inside a ten-second hook; past the cap the event degrades
+    /// to empty exactly like unparseable input would.
     pub fn from_stdin() -> HookEvent {
+        const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024 + 1;
         let mut buf = String::new();
-        if std::io::stdin().read_to_string(&mut buf).is_err() {
+        let n = match std::io::stdin().take(MAX_STDIN_BYTES).read_to_string(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return HookEvent::default(),
+        };
+        if n as u64 >= MAX_STDIN_BYTES {
             return HookEvent::default();
         }
         serde_json::from_str(&buf).unwrap_or_default()

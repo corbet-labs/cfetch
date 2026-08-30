@@ -74,6 +74,16 @@ pub fn path_of(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.md"))
 }
 
+/// A staging id is a single filename segment by construction (`slug-<8hex>`).
+/// Every caller that takes an id from OUTSIDE this module (CLI arguments,
+/// maintenance proposal targets) validates here, at the edge, so a
+/// hand-typed `cfetch staging consume ..\..\foo` names nothing at all.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 pub fn dismissed_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(DISMISSED).join(format!("{id}.md"))
 }
@@ -161,6 +171,7 @@ pub fn stats(dir: &Path) -> Stats {
 /// Distillation took the candidate into a curated file: the staged copy is
 /// redundant and goes. Returns false when nothing was pending under that id.
 pub fn consume(dir: &Path, id: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(valid_id(id), "invalid staging id {id:?}");
     let path = path_of(dir, id);
     if !path.is_file() {
         return Ok(false);
@@ -172,6 +183,7 @@ pub fn consume(dir: &Path, id: &str) -> anyhow::Result<bool> {
 /// Not worth promoting — but never destroyed: the file MOVES to `dismissed/`,
 /// where it also serves as the marker that keeps the trap from re-staging it.
 pub fn dismiss(dir: &Path, id: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(valid_id(id), "invalid staging id {id:?}");
     let path = path_of(dir, id);
     if !path.is_file() {
         return Ok(false);
@@ -280,6 +292,19 @@ fn fenced_json(body: &str) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_id_that_is_not_a_single_segment_can_name_nothing() {
+        // consume/dismiss build a path from the id; the edge check must make
+        // traversal-shaped and empty ids errors, not deletions.
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["", "..", "..\\..\\..\\brain", "../../knowledge/x", "/abs", "a/b", "a\\b", "."] {
+            assert!(!valid_id(bad), "{bad:?} must not validate");
+            assert!(consume(dir.path(), bad).is_err(), "consume {bad:?} must be an error");
+            assert!(dismiss(dir.path(), bad).is_err(), "dismiss {bad:?} must be an error");
+        }
+        assert!(valid_id("hot-file-1a2b3c4d"));
+    }
 
     fn candidate(id: &str, host: &str, ts: i64) -> Candidate {
         Candidate {

@@ -127,6 +127,14 @@ mod imp {
             std::fs::remove_file(&sock)?;
         }
         let inner = UnixListener::bind(&sock)?;
+        // Bind does not choose a mode: the default comes from the process
+        // umask, and "socket mode is the access control" only holds if the
+        // mode is ours. Pin it to owner-only regardless of environment; a
+        // chmod that cannot be applied is a socket not worth serving on.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(Listener { inner, path: sock })
     }
 

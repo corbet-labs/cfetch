@@ -1071,6 +1071,13 @@ pub fn get(cfg: &Config, id: &str) -> anyhow::Result<(String, Proposal)> {
 }
 
 pub fn get_review(cfg: &Config, proposal_id: &str) -> anyhow::Result<Option<Review>> {
+    // Same gate as `locate`: every current caller validates first, but this
+    // function builds a path from the id, so the check belongs here too
+    // rather than in the caller's discipline.
+    anyhow::ensure!(
+        proposal_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "invalid proposal id"
+    );
     let path = review_path(&cfg.brain_root, proposal_id);
     if !path.is_file() {
         return Ok(None);
