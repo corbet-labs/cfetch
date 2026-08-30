@@ -67,7 +67,7 @@ class PackagingTests(unittest.TestCase):
             )
             nested_requested.parent.mkdir(parents=True)
             nested_requested.write_bytes(b"")
-            retained_requested = root / "_internal/openvino-2026.3.1.dist-info/REQUESTED"
+            retained_requested = root / "_internal/openvino-2026.2.1.dist-info/REQUESTED"
             retained_requested.parent.mkdir(parents=True)
             retained_requested.write_bytes(b"runtime-meaningful")
             retained_typing_marker = root / "_internal/openvino/py.typed"

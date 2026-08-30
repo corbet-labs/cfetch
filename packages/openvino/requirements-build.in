@@ -2,8 +2,8 @@
 # with --require-hashes; this file is never installed directly.
 cryptography==50.0.1
 huggingface-hub==1.29.0
-numpy==2.5.2
-openvino==2026.3.1
+numpy==2.4.2
+openvino==2026.2.1
 pyinstaller==6.22.2
 safetensors==0.8.0
 tokenizers==0.22.2

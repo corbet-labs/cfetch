@@ -347,7 +347,8 @@ def export_torch_pipeline(pipeline: Any, example_ids: Any, example_mask: Any) ->
         pipeline,
         (example_ids, example_mask),
         dynamic_shapes=({1: sequence}, {1: sequence}),
-        # Match OpenVINO 2026.3.1's supported non-strict ExportedProgram path;
+        # Match the pinned OpenVINO release's supported non-strict
+        # ExportedProgram path;
         # the explicit shared Dim still carries the equality and bounds.
         strict=False,
     )
