@@ -62,7 +62,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// lives in such a range (e.g. a WireGuard/mesh overlay) opt in explicitly
 /// with `embeddings.allow_hosts` in the config.
 fn forbidden_range(host: &str) -> Option<&'static str> {
-    let ip: std::net::IpAddr = host.parse().ok()?;
+    forbidden_ip(&host.parse().ok()?)
+}
+
+/// The range policy as a function of a resolved address, so the literal-host
+/// check and the post-resolution check below can never drift apart.
+fn forbidden_ip(ip: &std::net::IpAddr) -> Option<&'static str> {
     match ip {
         std::net::IpAddr::V4(v4) => {
             if v4.is_private() {
@@ -99,6 +104,7 @@ fn forbidden_range(host: &str) -> Option<&'static str> {
 /// the https requirement): mesh overlays and lab networks opt in by listing
 /// the exact host, general deployments stay closed by default.
 pub fn check_endpoint(url: &str, allow_hosts: &[String]) -> anyhow::Result<()> {
+    use std::net::ToSocketAddrs;
     let (scheme, host) = split_url(url)?;
     anyhow::ensure!(
         scheme == "http" || scheme == "https",
@@ -114,6 +120,31 @@ pub fn check_endpoint(url: &str, allow_hosts: &[String]) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(scheme == "https", "non-loopback endpoint must be https (got http://{host})");
+    // The host STRING passed; hold the same line against the addresses it
+    // actually names. A string check cannot see a DNS name resolving into a
+    // refused range (rebinding), nor resolver spellings of literal IPs
+    // (`0x7f000001`, `2130706433`) that parse as hostnames. Exempted hosts
+    // skip this by definition, and a host that does not resolve here fails
+    // later at connect time — resolution failures are not a policy decision.
+    if !exempted
+        && let Ok(addrs) = (host.as_str(), 0u16).to_socket_addrs()
+    {
+        for addr in addrs {
+            let ip = addr.ip();
+            if ip.is_loopback() {
+                anyhow::bail!(
+                    "endpoint host {host} resolves to loopback {ip} (add it to \
+                     embeddings.allow_hosts to permit deliberately)"
+                );
+            }
+            if let Some(reason) = forbidden_ip(&ip) {
+                anyhow::bail!(
+                    "endpoint host {host} resolves to {ip}, {reason} (add it to \
+                     embeddings.allow_hosts to permit deliberately)"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2138,6 +2169,24 @@ mod tests {
         });
         let client = client_for(&url);
         assert!(client.embed_documents_batch(&["x"]).is_err(), "a 3xx must be an error, never followed");
+    }
+
+    #[test]
+    fn range_policy_covers_resolved_addresses() {
+        // The post-resolution half of check_endpoint: a DNS name (or a
+        // resolver spelling like 0x7f000001) that NAMES one of these must be
+        // refused exactly like the literal string would have been.
+        for refused in ["127.0.0.1", "169.254.169.254", "10.1.2.3", "192.168.0.1", "100.64.0.1", "0.0.0.0"] {
+            let addr: std::net::IpAddr = refused.parse().unwrap();
+            assert!(
+                addr.is_loopback() || forbidden_ip(&addr).is_some(),
+                "{refused} must be refused after resolution"
+            );
+        }
+        for public in ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"] {
+            let addr: std::net::IpAddr = public.parse().unwrap();
+            assert!(forbidden_ip(&addr).is_none(), "{public} is public and must pass");
+        }
     }
 
     #[test]
