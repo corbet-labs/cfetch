@@ -181,7 +181,6 @@ fn start_daemon_env(
         }
     }
     let mut cfg = json!({
-        "brain_root": brain.to_string_lossy(),
         "resident": [],
         "capture": {"enabled": false},
         "serve": serve,
@@ -196,6 +195,7 @@ fn start_daemon_env(
     cmd.args(["daemon", "run"])
         .env("CFETCH_STATE_DIR", state)
         .env("CFETCH_CONFIG", &cfg_path)
+        .env("CFETCH_BRAIN", brain)
         .env("HOME", home.path())
         .env_remove("XDG_RUNTIME_DIR");
     for (k, v) in env {
@@ -765,7 +765,6 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
     std::fs::write(
         &client_cfg,
         serde_json::to_string(&json!({
-            "brain_root": empty_brain.path().to_string_lossy(),
             "resident": [],
             "client": {"serving": {"addr": addr, "token_file": token_file.to_string_lossy()}},
         }))
@@ -776,6 +775,7 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
         .args(["map", "--budget-tokens", "4000"])
         .env("CFETCH_STATE_DIR", client_state.path())
         .env("CFETCH_CONFIG", &client_cfg)
+        .env("CFETCH_BRAIN", empty_brain.path())
         .env("HOME", client_home.path())
         .env_remove("XDG_RUNTIME_DIR")
         .output()
@@ -897,7 +897,6 @@ fn none_tier_cli_routes_remotely_and_opens_no_local_index() {
     std::fs::write(
         &client_cfg,
         serde_json::to_string(&json!({
-            "brain_root": empty_brain.path().to_string_lossy(),
             "resident": [],
             "client": {"serving": {"addr": addr, "token_file": token_file.to_string_lossy()}},
         }))
@@ -909,6 +908,7 @@ fn none_tier_cli_routes_remotely_and_opens_no_local_index() {
             .args(args)
             .env("CFETCH_STATE_DIR", client_state.path())
             .env("CFETCH_CONFIG", &client_cfg)
+            .env("CFETCH_BRAIN", empty_brain.path())
             .env("HOME", client_home.path())
             .env_remove("XDG_RUNTIME_DIR")
             .output()
@@ -936,7 +936,6 @@ fn none_tier_cli_routes_remotely_and_opens_no_local_index() {
     std::fs::write(
         &client_cfg,
         serde_json::to_string(&json!({
-            "brain_root": empty_brain.path().to_string_lossy(),
             "resident": [],
             "client": {"serving": {"addr": "127.0.0.1:9", "token_file": token_file.to_string_lossy()}},
         }))

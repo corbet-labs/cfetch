@@ -956,32 +956,161 @@ impl Default for Config {
     }
 }
 
+/// Config keys that only the machine layer (`CFETCH_CONFIG` or the
+/// machine-local file) may set. The tree's `.cfetch/config.json` lives inside
+/// the brain tree — the thing agents write and other machines clone — so it
+/// describes CONTENT (rings, slices, resident files, budgets); it must never
+/// choose where the brain itself lives, where requests egress, or how this
+/// machine serves.
+const MACHINE_OWNED_KEYS: &[&str] =
+    &["brain_root", "embeddings", "rerank", "maintenance", "serve", "client"];
+
 impl Config {
-    /// Loads the config file; a missing file yields defaults, a corrupt file is
-    /// an error the caller surfaces (a half-applied config is worse than none).
-    /// Search order: an explicit `CFETCH_CONFIG`, then the TREE's own
-    /// `.cfetch/config.json`, then the machine-local file.
+    /// Loads the configuration in two layers.
     ///
-    /// The tree comes before the machine because the thing being configured
-    /// IS the tree: ring rules, slices and resident entries describe content
-    /// every host sees identically, so keeping them per-machine meant four
-    /// hosts free to disagree about what a path means, with no history of why
-    /// any of them said what it said. What genuinely differs per machine —
-    /// tier, ports, endpoints — is what the local file is still for.
+    /// Search order: an explicit `CFETCH_CONFIG` (fully trusted, operator
+    /// hand-written), otherwise the TREE's `.cfetch/config.json` for content
+    /// keys overlaid by the MACHINE-LOCAL file.
     ///
-    /// Finding the tree before reading its config is not circular: the root
-    /// comes from `CFETCH_BRAIN` or the default location, never from the file.
+    /// The tree still comes first for what it owns — ring rules, slices and
+    /// resident entries describe content every host sees identically — but a
+    /// key in [`MACHINE_OWNED_KEYS`] found in the tree is a hard error, not a
+    /// silently honored value: a cloned or agent-edited brain must not get to
+    /// pick this machine's embedding endpoint (and thereby which environment
+    /// variable becomes a bearer token), its serving topology, or the root.
+    ///
+    /// `brain_root` itself never comes from any file: it is always
+    /// `CFETCH_BRAIN` or the default location, which is also what makes
+    /// finding the tree before reading its config non-circular.
     pub fn load() -> anyhow::Result<Config> {
         if let Some(explicit) = std::env::var_os("CFETCH_CONFIG") {
             return Config::load_from(std::path::Path::new(&explicit));
         }
-        let in_tree = paths::tree_config_path(&paths::default_brain_root());
-        if in_tree.is_file() {
-            return Config::load_from(&in_tree);
-        }
-        Config::load_from(&paths::config_path())
+        let tree_path = paths::tree_config_path(&paths::default_brain_root());
+        let machine_path = paths::config_path();
+        let tree = Config::read_raw(&tree_path)?;
+        let machine = Config::read_raw(&machine_path)?;
+        Config::load_layered(
+            tree.as_ref().map(|raw| (tree_path.as_path(), raw.as_str())),
+            machine.as_ref().map(|raw| (machine_path.as_path(), raw.as_str())),
+        )
     }
 
+    fn read_raw(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("read {}: {e}", path.display())),
+        }
+    }
+
+    /// Two-layer load. Each argument is `(label, raw json)`; either may be
+    /// absent. Tree keys land first, machine keys overlay them; machine-owned
+    /// keys are refused outright in the tree layer.
+    fn load_layered(
+        tree: Option<(&std::path::Path, &str)>,
+        machine: Option<(&std::path::Path, &str)>,
+    ) -> anyhow::Result<Config> {
+        let mut merged = serde_json::json!({});
+        if let Some((tpath, raw)) = tree {
+            let v: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| anyhow::anyhow!("parse {}: {e}", tpath.display()))?;
+            for key in MACHINE_OWNED_KEYS {
+                if v.get(*key).map(|x| !x.is_null()).unwrap_or(false) {
+                    anyhow::bail!(
+                        "config {} sets \"{key}\": the tree config lives inside the brain, which \
+                         agents write and other machines clone — endpoints, serving topology and \
+                         the root belong in the machine-local config ({}) or in CFETCH_CONFIG",
+                        tpath.display(),
+                        paths::config_path().display(),
+                    );
+                }
+            }
+            Config::reject_absolute_tree_paths(&v, tpath)?;
+            merged = v;
+        }
+        if let Some((mpath, raw)) = machine {
+            let m: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| anyhow::anyhow!("parse {}: {e}", mpath.display()))?;
+            if let Some(map) = m.as_object() {
+                for (k, val) in map {
+                    if k == "brain_root" {
+                        eprintln!(
+                            "[cfetch] ignoring brain_root set in {} — the root comes from \
+                             CFETCH_BRAIN or the default location, never from a config file",
+                            mpath.display()
+                        );
+                        continue;
+                    }
+                    merged[k.as_str()] = val.clone();
+                }
+            }
+        }
+        Config::parse_and_validate(merged).map(|mut cfg| {
+            cfg.brain_root = paths::default_brain_root();
+            cfg
+        })
+    }
+
+    /// Tree-layer paths may only point INSIDE the tree: a resident entry or
+    /// code root that is absolute (or carries `..`) would let a cloned brain
+    /// aim this host's reads and injections at files outside it. The machine
+    /// layer keeps the absolute-path escape hatch; it is operator state.
+    fn reject_absolute_tree_paths(
+        v: &serde_json::Value,
+        label: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        // `Path::is_absolute` alone is not enough: on Windows a leading `/`
+        // has no drive and parses as relative, and `C:` drive-relative forms
+        // carry a colon no tree-relative path ever needs.
+        fn escapes_tree(p: &str) -> bool {
+            let path = std::path::Path::new(p);
+            path.is_absolute()
+                || p.starts_with('/')
+                || p.starts_with('\\')
+                || p.contains(':')
+                || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        }
+        if let Some(entries) = v.get("resident").and_then(|r| r.as_array()) {
+            for entry in entries {
+                let Some(path) = entry.get("path").and_then(|p| p.as_str()) else { continue };
+                if escapes_tree(path) {
+                    anyhow::bail!(
+                        "resident entry {path:?} in {} is not tree-relative: tree-layer paths \
+                         must stay inside the brain (absolute paths belong in the machine-local \
+                         config)",
+                        label.display(),
+                    );
+                }
+            }
+        }
+        if let Some(roots) = v.get("code_roots").and_then(|r| r.as_array()) {
+            for root in roots {
+                let Some(path) = root.as_str() else { continue };
+                if escapes_tree(path) {
+                    anyhow::bail!(
+                        "code root {path:?} in {} is not tree-relative: tree-layer paths must \
+                         stay inside the brain (absolute paths belong in the machine-local \
+                         config)",
+                        label.display(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_and_validate(v: serde_json::Value) -> anyhow::Result<Config> {
+        let cfg: Config = serde_json::from_value(v)
+            .map_err(|e| anyhow::anyhow!("config: {e}"))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Loads one fully trusted config file (`CFETCH_CONFIG`, tests, tooling).
+    /// Machine-owned keys are honored here; `brain_root` is still never taken
+    /// from the file — the invariant [`Config::load`] documents holds on this
+    /// path too, and a file that tries is warned about, not obeyed.
     pub fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -990,35 +1119,51 @@ impl Config {
             }
             Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
         };
+        let mut v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        let claimed_root = v.as_object_mut().and_then(|obj| obj.remove("brain_root"));
+        if claimed_root.is_some() {
+            eprintln!(
+                "[cfetch] ignoring brain_root set in {} — the root comes from CFETCH_BRAIN \
+                 or the default location, never from a config file",
+                path.display()
+            );
+        }
+        Config::parse_and_validate(v).map(|mut cfg| {
+            cfg.brain_root = paths::default_brain_root();
+            cfg
+        })
+    }
+
+    /// The shared post-parse checks; every load path funnels through here.
+    fn validate(&self) -> anyhow::Result<()> {
         // An explicitly empty `resident` list means "inject nothing" — the
         // default (AGENT.md) applies only when no config file exists at all.
         // On hosts where the harness already auto-loads the ring files,
         // injecting them again would double-pay the context budget.
-        let cfg: Config = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
-        for r in &cfg.resident {
+        for r in &self.resident {
             match r.ring {
                 0 | 1 => {}
                 // Ring 2 is injectable, but only as policy: a scope, and not
                 // an `always` that would smuggle back the unconditional set.
                 2 if !r.scope.is_unscoped() && !r.scope.always => {}
                 2 => anyhow::bail!(
-                    "resident entry {} is ring 2: behavior memories are injected selectively —                      give it a scope (hosts/repos), or leave it to recall",
+                    "resident entry {} is ring 2: behavior memories are injected selectively — give it a scope (hosts/repos), or leave it to recall",
                     r.path.display()
                 ),
                 n => anyhow::bail!(
-                    "resident entry {} has ring {n}; rings 0-1 may be resident anywhere, ring 2                      only under a scope, rings 3+ never",
+                    "resident entry {} has ring {n}; rings 0-1 may be resident anywhere, ring 2 only under a scope, rings 3+ never",
                     r.path.display()
                 ),
             }
         }
-        if cfg.serve.enabled && cfg.client.serving.is_some() {
+        if self.serve.enabled && self.client.serving.is_some() {
             anyhow::bail!(
                 "serve.enabled and client.serving are mutually exclusive: serving needs a local \
                  index, a none-tier client must open none"
             );
         }
-        for r in &cfg.ring_rules {
+        for r in &self.ring_rules {
             if r.ring > MAX_RING {
                 anyhow::bail!(
                     "ring rule {:?} names ring {}; rings run 0-{MAX_RING}",
@@ -1027,31 +1172,31 @@ impl Config {
                 );
             }
         }
-        if cfg.serve.bind.is_some() && cfg.serve.token_file.is_none() {
+        if self.serve.bind.is_some() && self.serve.token_file.is_none() {
             anyhow::bail!(
                 "serve.bind requires serve.token_file: the TCP listener is bearer-token gated, \
                  an open listener is unconfigurable"
             );
         }
-        if cfg.embeddings.enabled {
-            cfg.embeddings.validate_profile()?;
+        if self.embeddings.enabled {
+            self.embeddings.validate_profile()?;
         }
-        let maintenance_endpoint = cfg.maintenance.endpoint.trim();
-        let maintenance_model = cfg.maintenance.model.trim();
+        let maintenance_endpoint = self.maintenance.endpoint.trim();
+        let maintenance_model = self.maintenance.model.trim();
         anyhow::ensure!(
             maintenance_endpoint.is_empty() == maintenance_model.is_empty(),
             "maintenance.endpoint and maintenance.model must be configured together"
         );
-        if let Some(review_model) = cfg.maintenance.review_model.as_deref() {
+        if let Some(review_model) = self.maintenance.review_model.as_deref() {
             anyhow::ensure!(!review_model.trim().is_empty(), "maintenance.review_model may not be empty");
         }
-        anyhow::ensure!(cfg.maintenance.timeout_secs > 0, "maintenance.timeout_secs must be at least 1");
-        anyhow::ensure!(cfg.maintenance.debounce_secs > 0, "maintenance.debounce_secs must be at least 1");
+        anyhow::ensure!(self.maintenance.timeout_secs > 0, "maintenance.timeout_secs must be at least 1");
+        anyhow::ensure!(self.maintenance.debounce_secs > 0, "maintenance.debounce_secs must be at least 1");
         anyhow::ensure!(
-            (1..=MAX_MAINTENANCE_CANDIDATES).contains(&cfg.maintenance.max_candidates),
+            (1..=MAX_MAINTENANCE_CANDIDATES).contains(&self.maintenance.max_candidates),
             "maintenance.max_candidates must be between 1 and {MAX_MAINTENANCE_CANDIDATES}"
         );
-        Ok(cfg)
+        Ok(())
     }
 
     /// The taxonomy this config describes, as one value to hand the indexer.
@@ -1655,5 +1800,94 @@ mod tests {
         assert!(m.is_empty());
         assert_eq!(m.slice_for("anything/at/all.md"), ROOT_SLICE);
         assert_eq!(m.prefixes_of(ROOT_SLICE), None);
+    }
+
+    #[test]
+    fn tree_config_cannot_set_machine_owned_keys() {
+        // The tree config is agent-writable and cloned across machines; any
+        // machine-owned key found there must be a hard error naming the key.
+        for key in ["embeddings", "rerank", "maintenance", "serve", "client", "brain_root"] {
+            let tree = format!("{{\"{key}\": {{}}}}");
+            let err = Config::load_layered(
+                Some((std::path::Path::new("/tree/.cfetch/config.json"), tree.as_str())),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(key), "error must name {key}: {err}");
+        }
+    }
+
+    #[test]
+    fn tree_config_paths_must_stay_inside_the_tree() {
+        let cases = [
+            r#"{"resident": [{"path": "/etc/passwd", "ring": 1}]}"#,
+            r#"{"resident": [{"path": "../outside.md", "ring": 1}]}"#,
+            r#"{"resident": [{"path": "C:/windows/system32/config", "ring": 1}]}"#,
+            r#"{"code_roots": ["/home"]}"#,
+            r#"{"code_roots": ["../.."]}"#,
+        ];
+        for tree in cases {
+            let err = Config::load_layered(
+                Some((std::path::Path::new("/tree/.cfetch/config.json"), tree)),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("tree-relative"), "case {tree}: {err}");
+        }
+        // Relative paths remain fine, and the machine layer may still use
+        // absolute ones (operator state; `resolve` keeps them as given, with
+        // the usual platform drive-root normalization on Windows).
+        let cfg = Config::load_layered(
+            Some((std::path::Path::new("/t"), r#"{"code_roots": ["projects/local"]}"#)),
+            Some((std::path::Path::new("/m"), r#"{"code_roots": ["/opt/repos"]}"#)),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.effective_code_roots(),
+            vec![cfg.resolve(std::path::Path::new("/opt/repos"))]
+        );
+    }
+
+    #[test]
+    fn machine_layer_overlays_tree_content() {
+        let cfg = Config::load_layered(
+            Some((std::path::Path::new("/t"), r#"{"budget_chars": 100, "exclude_prefixes": ["z/"]}"#)),
+            Some((std::path::Path::new("/m"), r#"{"budget_chars": 4321}"#)),
+        )
+        .unwrap();
+        assert_eq!(cfg.budget_chars, 4321);
+        assert!(cfg.exclude_prefixes.iter().any(|p| p == "z/"), "tree content keys survive the overlay");
+    }
+
+    #[test]
+    fn machine_layer_owns_the_embeddings_endpoint() {
+        let cfg = Config::load_layered(
+            Some((std::path::Path::new("/t"), r#"{"resident": []}"#)),
+            Some((
+                std::path::Path::new("/m"),
+                r#"{"embeddings": {"endpoint": "https://embed.example/v1"}}"#,
+            )),
+        )
+        .unwrap();
+        assert_eq!(cfg.embeddings.endpoint, "https://embed.example/v1");
+        assert!(!cfg.embeddings.enabled);
+    }
+
+    #[test]
+    fn brain_root_never_comes_from_a_file() {
+        let cfg = Config::load_layered(
+            None,
+            Some((std::path::Path::new("/m"), r#"{"brain_root": "/elsewhere"}"#)),
+        )
+        .unwrap();
+        assert_eq!(cfg.brain_root, paths::default_brain_root());
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"brain_root": "/also/elsewhere"}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.brain_root, paths::default_brain_root());
     }
 }
