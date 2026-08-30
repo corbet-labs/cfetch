@@ -909,6 +909,16 @@ fn insert_doc(
     if native {
         ring = ring.max(2);
     }
+    // Quarantine locations (ring 5+: staging, logs) are decided by WHERE the
+    // file lives, not by what it claims about itself: a candidate declaring
+    // `ring: 2` in its frontmatter stays unindexed, exactly as one whose
+    // frontmatter was stripped or mangled — the taxonomy's "cannot be edited
+    // away file by file" promise has to hold against a well-formed lie too.
+    // Promotion BELOW the location ring stays available everywhere else: a
+    // knowledge file declaring `ring: 1` is the documented, intended override.
+    if src.default_ring > MAX_INDEXED_RING {
+        ring = ring.max(src.default_ring);
+    }
     if ring > MAX_INDEXED_RING {
         report.skipped_high_ring += 1;
         report.skipped.push(src.doc_path.clone());
@@ -2543,6 +2553,25 @@ mod tests {
         let hits = recall(&conn, "locked decision", 5).unwrap();
         assert_eq!(hits[0].ring, 1);
         assert!(recall(&conn, "quarantined", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn quarantine_locations_ignore_a_self_promoting_frontmatter() {
+        // A staging candidate declaring `ring: 2` is a well-formed lie: the
+        // location decides for ring-5+ directories, so the file must stay
+        // unindexed exactly like one whose frontmatter was stripped.
+        let dir = brain(&[
+            ("todo/staging/smuggled.md", "---\nring: 2\n---\nself promoted candidate\n"),
+            ("knowledge/honest.md", "---\nring: 1\n---\nlegitimate promotion\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "only the knowledge file is indexed");
+        assert_eq!(report.skipped_high_ring, 1, "the staging candidate is skipped, not promoted");
+        assert!(recall(&conn, "self promoted", 5).unwrap().is_empty());
+        let hits = recall(&conn, "legitimate promotion", 5).unwrap();
+        assert_eq!(hits[0].ring, 1, "knowledge-directory promotion keeps working");
     }
 
     #[test]
