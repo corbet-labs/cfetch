@@ -159,7 +159,7 @@ enum EmbedBackend {
     },
     Local {
         agent: ureq::Agent,
-        state: Box<std::sync::Mutex<LocalBackendState>>,
+        state: std::sync::Arc<std::sync::Mutex<LocalBackendState>>,
     },
 }
 
@@ -167,6 +167,35 @@ struct LocalBackendState {
     supervisor: crate::local_adapter::AdapterSupervisor,
     ordered_scope_ids: Vec<String>,
     selected_scope: Option<usize>,
+}
+
+type SharedLocalBackendState = std::sync::Arc<std::sync::Mutex<LocalBackendState>>;
+
+/// One package-local dispatcher and successful-scope cache per cfetch
+/// process. The serving daemon constructs an `EmbedClient` per query, so a
+/// client-owned supervisor would otherwise restart the native runtime and
+/// repeat NPU/GPU/CPU discovery for every recall.
+static LOCAL_BACKEND_STATE: std::sync::OnceLock<Result<SharedLocalBackendState, String>> =
+    std::sync::OnceLock::new();
+
+fn cached_local_backend_state(
+    cache: &std::sync::OnceLock<Result<SharedLocalBackendState, String>>,
+    launch: crate::local_adapter::AdapterLaunch,
+) -> anyhow::Result<SharedLocalBackendState> {
+    match cache.get_or_init(|| {
+        crate::local_adapter::AdapterSupervisor::new(launch)
+            .map(|supervisor| {
+                std::sync::Arc::new(std::sync::Mutex::new(LocalBackendState {
+                    ordered_scope_ids: supervisor.ordered_scope_ids().to_vec(),
+                    supervisor,
+                    selected_scope: None,
+                }))
+            })
+            .map_err(|error| format!("{error:#}"))
+    }) {
+        Ok(state) => Ok(std::sync::Arc::clone(state)),
+        Err(error) => anyhow::bail!("initialize package-local adapter: {error}"),
+    }
 }
 
 #[derive(Debug)]
@@ -812,23 +841,17 @@ impl EmbedClient {
                 .parent()
                 .context("the running cfetch binary has no package directory")?;
             let sibling = package_directory.join(&plan.dispatcher.binary);
-            let supervisor = crate::local_adapter::AdapterSupervisor::new(
+            let state = cached_local_backend_state(
+                &LOCAL_BACKEND_STATE,
                 crate::local_adapter::AdapterLaunch {
                     binary: sibling,
                     sha256: plan.dispatcher.sha256,
                     package_manifest: package_directory.join("package-manifest.json"),
                     package_manifest_sha256: plan.package_manifest_sha256,
-                    ordered_scope_ids: plan.ordered_scope_ids.clone(),
+                    ordered_scope_ids: plan.ordered_scope_ids,
                 },
             )?;
-            EmbedBackend::Local {
-                agent,
-                state: Box::new(std::sync::Mutex::new(LocalBackendState {
-                    supervisor,
-                    ordered_scope_ids: plan.ordered_scope_ids,
-                    selected_scope: None,
-                })),
-            }
+            EmbedBackend::Local { agent, state }
         } else {
             // A configured endpoint is an explicit route and never a hidden
             // fourth step after package-local NPU/GPU/CPU fallback.
@@ -1845,37 +1868,30 @@ mod tests {
             "{:x}",
             sha2::Sha256::digest(std::fs::read(&package_manifest).unwrap())
         );
-        let supervisor = crate::local_adapter::AdapterSupervisor::new(
-            crate::local_adapter::AdapterLaunch {
-                binary: adapter,
-                sha256: digest,
-                package_manifest,
-                package_manifest_sha256,
-                ordered_scope_ids: vec![
-                    "npu-scope".into(),
-                    "gpu-scope".into(),
-                    "cpu-scope".into(),
-                ],
-            },
-        )
-        .unwrap();
-        let agent = ureq::Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
-        let client = EmbedClient {
+        let launch = crate::local_adapter::AdapterLaunch {
+            binary: adapter,
+            sha256: digest,
+            package_manifest,
+            package_manifest_sha256,
+            ordered_scope_ids: vec![
+                "npu-scope".into(),
+                "gpu-scope".into(),
+                "cpu-scope".into(),
+            ],
+        };
+        let cache = std::sync::OnceLock::new();
+        let first_state = cached_local_backend_state(&cache, launch.clone()).unwrap();
+        let second_state = cached_local_backend_state(&cache, launch).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first_state, &second_state));
+
+        let client = |state| EmbedClient {
             backend: EmbedBackend::Local {
-                agent,
-                state: Box::new(std::sync::Mutex::new(LocalBackendState {
-                    supervisor,
-                    ordered_scope_ids: vec![
-                        "npu-scope".into(),
-                        "gpu-scope".into(),
-                        "cpu-scope".into(),
-                    ],
-                    selected_scope: None,
-                })),
+                agent: ureq::Agent::config_builder()
+                    .max_redirects(0)
+                    .http_status_as_error(false)
+                    .build()
+                    .new_agent(),
+                state,
             },
             model: "test-model".into(),
             base_timeout: std::time::Duration::from_secs(2),
@@ -1883,8 +1899,12 @@ mod tests {
             query_prefix: String::new(),
             doc_prefix: String::new(),
         };
-        client.embed_documents_batch(&["first"]).unwrap();
-        client.embed_documents_batch(&["second"]).unwrap();
+        client(first_state)
+            .embed_documents_batch(&["first"])
+            .unwrap();
+        client(second_state)
+            .embed_documents_batch(&["second"])
+            .unwrap();
         assert_eq!(
             *requested.lock().unwrap(),
             ["npu-scope", "gpu-scope", "cpu-scope", "cpu-scope"]

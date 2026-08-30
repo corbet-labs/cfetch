@@ -155,6 +155,9 @@ requested-scope binding, ordered fallback, and successful-scope cache are
 implemented. They deliberately select nothing today because `local_packages`
 and `admitted_backends` are both empty. Actual support begins only when the
 first physical cohort and immutable package payload enter those arrays.
+The serving daemon keeps one supervised dispatcher and successful-scope cache
+for its process lifetime; rebuilding a query client does not restart the native
+runtime or repeat failed accelerator discovery.
 
 ## Current state
 

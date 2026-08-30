@@ -63,6 +63,10 @@ impl AdapterSupervisor {
         })
     }
 
+    pub fn ordered_scope_ids(&self) -> &[String] {
+        &self.launch.ordered_scope_ids
+    }
+
     /// Starts lazily and returns the current authenticated loopback endpoint.
     /// A child found dead is restarted once for this supervisor's lifetime.
     pub fn endpoint(&mut self) -> anyhow::Result<AdapterEndpoint> {

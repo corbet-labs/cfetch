@@ -311,6 +311,7 @@ fn validate_registry(
 
     let mut package_ids = BTreeSet::new();
     let mut release_variant_ids = BTreeSet::new();
+    let mut packaged_scope_ids = BTreeSet::new();
     for plan in &mut registry.local_packages {
         validate_package(
             plan,
@@ -319,8 +320,16 @@ fn validate_registry(
             &mut package_ids,
             &mut release_variant_ids,
         )?;
+        packaged_scope_ids.extend(plan.ordered_scope_ids.iter().cloned());
         plan.compatibility_report.clone_from(&report.0);
         plan.compatibility_report_sha256.clone_from(&report.1);
+    }
+    for (scope_id, scope) in admitted {
+        anyhow::ensure!(
+            scope.transport != crate::embedding_profile::ExecutionTransport::SupervisedLocal
+                || packaged_scope_ids.contains(scope_id),
+            "admitted supervised-local scope {scope_id} is not delivered by any local package"
+        );
     }
     Ok(())
 }
@@ -968,6 +977,31 @@ mod tests {
                 .to_string()
                 .contains("must use supervised-local transport")
         );
+    }
+
+    #[test]
+    fn supervised_local_scopes_must_ship_in_a_package() {
+        let mut registry = valid_registry();
+        let mut orphan = scope("orphan-npu", "npu", "other-npu", '0');
+        orphan["attestation_public_key"] = json!("7".repeat(64));
+        registry["admitted_backends"]
+            .as_array_mut()
+            .unwrap()
+            .push(orphan.clone());
+        assert!(
+            select(&registry)
+                .unwrap_err()
+                .to_string()
+                .contains("not delivered by any local package")
+        );
+
+        orphan["transport"] = json!("remote-attested");
+        registry["admitted_backends"].as_array_mut().unwrap().pop();
+        registry["admitted_backends"]
+            .as_array_mut()
+            .unwrap()
+            .push(orphan);
+        select(&registry).unwrap();
     }
 
     #[test]
