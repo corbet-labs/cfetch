@@ -1,0 +1,6 @@
+work/
+results/usage.jsonl
+results/battery.csv
+tasks/*/seed/
+tasks/T05-scale/smoke-scale/
+tasks/T05-scale/scale-repo/

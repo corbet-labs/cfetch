@@ -1,0 +1,16 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-v1.74.6-stable
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./:/app/config
+    environment:
+      - LITELLM_MASTER_KEY=sk-bench-master
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    command:
+      - --config
+      - /app/config/litellm-config.yaml
+      - --port
+      - "4000"
+    # Usage log appears at ./../results/usage.jsonl (volume-mounted via /app/config)

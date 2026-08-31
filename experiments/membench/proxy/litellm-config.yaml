@@ -1,0 +1,16 @@
+model_list:
+  - model_name: claude-bench
+    litellm_params:
+      model: anthropic/claude-sonnet-4-20250514
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: sk-bench-master
+  # The custom callback (custom_callbacks.py) appends one JSONL line per
+  # request with input/output token counts to results/usage.jsonl. The agent
+  # never talks to the real API directly, so THIS is the scorecard, not the
+  # tools' own token ledgers.
+  callbacks: custom_callbacks.my_logger
