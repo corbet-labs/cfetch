@@ -5,6 +5,60 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Ring-6 traps no longer record healthy commands as failures.** Any
+  non-empty `stderr` used to mark a bash event `failed` — but `git push`,
+  `npm install` and `pip` stream progress to stderr while exiting 0, and
+  every trap (fix-discovered, recurring-failure, failure history) keys on
+  that field. Stderr now signals failure only when the response carries no
+  explicit success marker (`is_error:false`, `exit_code:0`), keeping the
+  legacy-harness path the branch existed for. Found by the 2026-08-31 bug
+  hunt, along with everything below in this block.
+- **The embed queue cannot be frozen by one bad block.** The pending set is
+  ordered and a row-level refusal (degenerate or wrong-width vector) aborted
+  the batch before any write, re-selecting the identical head forever. A
+  failed batch now retries its rows individually — refused rows are skipped
+  with a note and retried next run — and a fully-refused batch bails with a
+  resumable error instead of looping.
+- **A corrupt vector record no longer bricks group semantic recall.** One
+  flipped byte in the shared store hard-failed every hydrate; the read side
+  now skips invalid records (they stay "missing" and re-embed) while
+  write-side validation stays strict.
+- **Maintenance reject is idempotent and submit no longer resurrects.** The
+  autonomous loop re-derives deterministic proposal ids; a rejected twin
+  used to wedge its PENDING copy in place — two model calls and one
+  exception event every cycle, forever. An identical terminal copy now
+  means the decision was already made.
+- **A UTF-8 BOM no longer hides the ring frontmatter.** Windows editors emit
+  BOMs by default; the BOM made the `---` comparison fail, so a BOM'd
+  `ring: 5` quarantine marker was invisible and the file indexed — the
+  documented fail-closed contract inverted by encoding accident.
+- **Unreadable files are visible, and incremental rescans keep their last
+  good rows.** A read failure (invalid UTF-8, an editor's sharing violation)
+  was invisible: the file stayed in the fingerprint claiming fresh, and the
+  rescan path deleted existing rows without reinserting. Full scans report
+  skips; a one-second editor lock must not delete a document.
+- **Semantic and hybrid recall dedup native mirrors**, like lexical recall
+  always did: a mirrored block has the same hash and the same vector and
+  ranked adjacent to itself, doubling one statement and displacing a
+  distinct block.
+- **Redaction fixes: glued short-flag secrets redact themselves** (`mysql
+  -psecret` used to keep the secret and redact the next argument), **and
+  sessionless events no longer merge**: two harness windows without a
+  session id shared one `unknown-session` key, cross-contaminating
+  repeat-read state and disabling the cross-session traps.
+- **Consume is permanent, dotted hosts cannot collide, and prefix flags find
+  the program.** A consumed candidate moves to `dismissed/` (the permanent
+  do-not-restage marker) instead of being deleted and resurrecting when its
+  consume record left the trap window; host ids containing dots can no
+  longer collide with the rotation suffix grammar (one host's live stream
+  is another's rotated generation); `sudo -u nobody pytest` now finds
+  `pytest` instead of eliding the failing assertion from the condensed log.
+- **`src/bin` files resolve `use crate::` against their own crate**, not the
+  library beside them — false edges on module-name collisions and missing
+  edges otherwise; **`cards status` survives a store without an `origin`
+  remote** (`git remote get-url` exits 2 on absence, which was treated as a
+  hard error instead of the designed degraded report). Remaining findings
+  from the hunt are tracked in #27.
 - **The tree config is content-only.** `.cfetch/config.json` inside the brain
   is agent-written and cloned across machines, so it may now carry only
   content keys (rings, slices, resident entries, budgets): `embeddings`,
