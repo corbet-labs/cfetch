@@ -111,6 +111,11 @@ fn initialize(store: &Path, repository: &str) -> anyhow::Result<()> {
 }
 
 fn list(store: &Path, json: bool) -> anyhow::Result<()> {
+    // The store lock is held for reads too: `catalog_index` reads
+    // catalog.json non-atomically and `selected_paths` runs git commands,
+    // both of which can tear or contend while a concurrent `select`/`sync`
+    // rewrites the worktree. The lock exists for exactly this rendezvous.
+    let _lock = acquire_store_lock(store)?;
     let index = catalog_index(store)?;
     let selected: BTreeSet<_> = selected_paths(store)?.into_iter().collect();
     let rows: Vec<_> = index
@@ -218,6 +223,9 @@ fn status(store: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 fn status_report(store: &Path) -> anyhow::Result<CardsStatus> {
+    // Same store lock as the mutators: a status snapshot concurrent with a
+    // sync/select would otherwise be a torn view of the worktree.
+    let _lock = acquire_store_lock(store)?;
     if !store.join(".git").exists() {
         return Ok(CardsStatus {
             store: store.display().to_string(),
