@@ -357,7 +357,19 @@ fn gc(dir: &Path, keep: &Path) {
     let now = SystemTime::now();
     for entry in rd.flatten() {
         let p = entry.path();
-        if p == keep || p.extension().and_then(|x| x.to_str()) != Some("json") {
+        if p == keep {
+            continue;
+        }
+        let ext = p.extension().and_then(|x| x.to_str());
+        // Only session .json files AND their debris: a crash between
+        // writeFileSync(tmp) and renameSync leaves `<id>.json.tmp.<pid>`
+        // behind, and the per-session lock files are `<id>.json.lock`.
+        // Both used to be skipped by the `!= Some("json")` check and
+        // accumulated forever on hosts whose harness kills hooks.
+        let is_session_artifact = ext == Some("json")
+            || p.to_string_lossy().contains(".json.tmp.")
+            || ext == Some("lock");
+        if !is_session_artifact {
             continue;
         }
         let stale = entry

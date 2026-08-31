@@ -305,10 +305,12 @@ impl Exhaust {
     /// An empty query ranks the whole failure history, most recurrent first.
     pub fn failure_history(&self, query: &str, limit: usize) -> FailureHistory {
         let scan = scan_failures(&self.logs_dir);
-        // The query is normalized like a captured command, so a pasted
-        // failing command line meets the stored signatures in one alphabet
-        // instead of never matching over its own paths and digits.
-        let wanted = normalize_command(query);
+        // The query is REDACTED then normalized, exactly like capture: a
+        // pasted failing command carrying a real secret (`deploy --token=x`)
+        // used to normalize against a different alphabet than the stored
+        // (redacted) signatures, so the failure was invisible to the exact
+        // query surface that would look for it.
+        let wanted = normalize_command(&redact_secrets(query));
         let terms: Vec<&str> = wanted.split_whitespace().collect();
         let mut matches: Vec<FailureSignature> = scan
             .by_norm

@@ -143,6 +143,7 @@ pub fn x86_64_level() -> Option<&'static str> {
         if is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("bmi2")
             && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("movbe")
         {
             return Some("v3");
         }

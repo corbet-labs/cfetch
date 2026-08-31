@@ -313,9 +313,23 @@ impl VectorStore {
             idx.display(),
             self.spec.doc_prefix
         );
-        let listed: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let listed_raw: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
         let stored_records = std::fs::metadata(self.bin_path()).map(|m| m.len()).unwrap_or(0) as usize
             / self.stride();
+        // Torn-tail repair: `writeln!` on an unbuffered File is two write(2)
+        // calls (payload, then `\n`), so a crash between them leaves the
+        // final line WITHOUT its newline. `lines()` accepted it as a valid
+        // entry, and the next append's `writeln!` concatenated onto the
+        // partial hash — silently corrupting two records. If the raw text
+        // does not end with a newline, the last line is torn: drop it here
+        // (and the bin matches by the truncate below), so the next append
+        // starts on a clean boundary.
+        let torn = !raw.ends_with('\n') && !listed_raw.is_empty();
+        let listed: Vec<String> = if torn {
+            listed_raw[..listed_raw.len() - 1].iter().map(|s| s.to_string()).collect()
+        } else {
+            listed_raw.iter().map(|s| s.to_string()).collect()
+        };
         self.hashes = listed;
         self.hashes.truncate(stored_records);
         self.present = self.hashes.iter().cloned().collect();
