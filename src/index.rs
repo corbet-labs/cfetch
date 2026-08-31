@@ -1555,27 +1555,38 @@ pub fn recall_in(
     if fts.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(&ranked_match_sql(
-        "b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain",
-        prefixes.len(),
-    ))?;
-    // Twice the candidate pool: duplicate suppression must refill freed
-    // slots with the next-ranked hits, never shrink the result count.
-    let rows = stmt.query_map(rusqlite::params_from_iter(ranked_params(&fts, limit * 2, prefixes)), |r| {
-        let text: String = r.get(5)?;
-        Ok(Hit {
-            cite: r.get(0)?,
-            path: r.get(1)?,
-            ring: r.get::<_, i64>(2)? as u8,
-            start_line: r.get::<_, i64>(3)? as usize,
-            end_line: r.get::<_, i64>(4)? as usize,
-            snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &text),
-            mirrors: Vec::new(),
-            chain: r.get(7)?,
-            text,
-        })
-    })?;
-    let mut hits = dedup_by_content(rows.filter_map(Result::ok).collect());
+    // Candidate pool: `limit * 2` covers the common mirror case (one brain +
+    // one native twin), but a pathological block with >2*limit copies can
+    // exhaust the pool with duplicates and shrink below limit. The pool
+    // expands on demand — capped at a sane multiple — so the dedup never
+    // silently drops a distinct block that ranked below the duplicate wall.
+    let mut pool = limit * 2;
+    let mut hits;
+    loop {
+        let mut stmt = conn.prepare(&ranked_match_sql(
+            "b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain",
+            prefixes.len(),
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ranked_params(&fts, pool, prefixes)), |r| {
+            let text: String = r.get(5)?;
+            Ok(Hit {
+                cite: r.get(0)?,
+                path: r.get(1)?,
+                ring: r.get::<_, i64>(2)? as u8,
+                start_line: r.get::<_, i64>(3)? as usize,
+                end_line: r.get::<_, i64>(4)? as usize,
+                snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &text),
+                mirrors: Vec::new(),
+                chain: r.get(7)?,
+                text,
+            })
+        })?;
+        hits = dedup_by_content(rows.filter_map(Result::ok).collect());
+        if hits.len() >= limit || pool >= limit * 16 {
+            break;
+        }
+        pool *= 2;
+    }
     // Ring-band slot reservation: rings 0-1 are the top-trust band — when
     // any of them matches at all, the top slot carries the best of them.
     // Everything else stays in BM25(+prior) order.
@@ -2120,6 +2131,17 @@ pub fn ensure_fresh(
         // exactly what we were about to.
         if lock.is_some() && stale(&conn, brain_root, native_root, rules)? {
             scan(&mut conn, brain_root, native_root, rules)?;
+        }
+        // A NEVER-SCANNED index must not silently serve an empty catalog:
+        // `lock == None` on a fresh state dir means another scan is running,
+        // and returning generation-0 with zero rows answers every query
+        // with empty hits instead of waiting or erroring. The caller needs
+        // to know this is "not built yet", not "nothing here".
+        if lock.is_none() && generation(&conn) == 0 {
+            anyhow::bail!(
+                "index has never been scanned and another rebuild holds the lock; \
+                 retry once the initial scan completes"
+            );
         }
     }
     Ok(conn)

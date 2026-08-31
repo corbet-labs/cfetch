@@ -1639,9 +1639,18 @@ pub fn symbol_context(
         }
     }
     let mut top_level: BTreeMap<(&str, &str), Vec<&StoredSymbol>> = BTreeMap::new();
+    // Same-start-line collision: one-line nested symbols (`class A: def
+    // m(self): f()` both start at line 1). walk_uses attributes to the
+    // INNERMOST named symbol; last-writer-wins under name sort gave the
+    // wrong one whenever the outer sorted later. Prefer the symbol with the
+    // LARGEST end_line at the same start_line (the innermost scope).
     let mut containers: BTreeMap<(&str, usize), &StoredSymbol> = BTreeMap::new();
     for symbol in &symbols {
-        containers.insert((symbol.file.as_str(), symbol.start_line), symbol);
+        let key = (symbol.file.as_str(), symbol.start_line);
+        match containers.get(&key) {
+            Some(existing) if existing.end_line > symbol.end_line => {}
+            _ => { containers.insert(key, symbol); }
+        }
         if symbol.parent_start_line.is_none() {
             top_level.entry((symbol.file.as_str(), symbol.name.as_str())).or_default().push(symbol);
         }

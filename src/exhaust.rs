@@ -1227,8 +1227,28 @@ fn write_payload(path: &str, brain_root: &Path, rules: &RingRules) -> serde_json
 /// (the hook path never reads whole files). `None` for paths outside the
 /// brain — code files carry no ring and are churn by contract.
 fn brain_ring(brain_root: &Path, path: &str, rules: &RingRules) -> Option<u8> {
-    let rel = Path::new(path).strip_prefix(brain_root).ok()?;
-    let rel = crate::index::rel_doc_path(rel);
+    // `strip_prefix` is case-SENSITIVE on Windows except for the drive
+    // letter: `C:\Users\me\agents` vs `C:\Users\Me\agents\...` (8.3 short
+    // names, subst drives, symlinked homes) all fail, classifying brain
+    // writes as ringless code and blinding the hot-file trap for the whole
+    // tree. Compare case-insensitively on Windows, as the filesystem does.
+    #[cfg(windows)]
+    fn strip_brain(root: &Path, p: &Path) -> Option<std::path::PathBuf> {
+        let root_s = root.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase();
+        let p_s = p.to_string_lossy();
+        if p_s.to_ascii_lowercase().starts_with(&root_s) {
+            let rest = p_s[root_s.len()..].trim_start_matches(['\\', '/']);
+            Some(std::path::PathBuf::from(rest))
+        } else {
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    fn strip_brain(root: &Path, p: &Path) -> Option<std::path::PathBuf> {
+        p.strip_prefix(root).ok().map(std::path::PathBuf::from)
+    }
+    let rel = strip_brain(brain_root, Path::new(path))?;
+    let rel = crate::index::rel_doc_path(&rel);
     // An EXCLUDED path is not brain content, whatever ring its prefix would
     // otherwise imply. Without this the unmatched ring makes every excluded
     // path look like knowledge: `projects/` is code by contract, and a churn
