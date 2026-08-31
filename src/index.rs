@@ -182,7 +182,13 @@ fn generated_blob(body: &str) -> bool {
 /// never fall back to an indexable default.
 pub(crate) fn frontmatter_ring(text: &str) -> (Option<u8>, usize) {
     let mut lines = text.lines();
-    if lines.next().map(str::trim) != Some("---") {
+    // A UTF-8 BOM is legal UTF-8 and editors on Windows emit it by default.
+    // It is not whitespace, so an unstripped BOM would make the first `---`
+    // comparison fail and the whole frontmatter - including a `ring: 5`
+    // quarantine marker - silently invisible: fail-open by encoding
+    // accident. Strip it before the comparison.
+    let first = lines.next().map(|l| l.trim_start_matches('\u{FEFF}').trim());
+    if first != Some("---") {
         return (None, 0);
     }
     let mut ring = None;
@@ -1114,10 +1120,21 @@ pub fn scan(
     let fingerprint = source_fingerprint(&files);
     // Read every body BEFORE the write transaction: the tree may be NFS, and
     // holding SQLite's writer lock across slow I/O starves concurrent readers
-    // into SQLITE_BUSY failures.
+    // into SQLITE_BUSY failures. A read that fails (invalid UTF-8, or a
+    // Windows sharing violation from an editor or antivirus) must be VISIBLE,
+    // not invisible: the file stays in the fingerprint, so stale() reports
+    // fresh forever and nothing would ever retry it. Report it as skipped.
+    let mut report =
+        ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new(), generation: 0 };
     let bodies: Vec<(SourceFile, String)> = files
         .into_iter()
-        .filter_map(|src| std::fs::read_to_string(&src.abs).ok().map(|raw| (src, raw)))
+        .filter_map(|src| match std::fs::read_to_string(&src.abs) {
+            Ok(raw) => Some((src, raw)),
+            Err(_) => {
+                report.skipped.push(src.doc_path.clone());
+                None
+            }
+        })
         .collect();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // Vectors deliberately SURVIVE the rebuild: they are keyed by content
@@ -1137,8 +1154,7 @@ pub fn scan(
     )?;
     set_fingerprint(&tx, &fingerprint)?;
     let generation = bump_generation(&tx)?;
-    let mut report =
-        ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new(), generation };
+    report.generation = generation;
     for (src, raw) in bodies {
         insert_doc(&tx, &src, &raw, &mut report)?;
     }
@@ -1255,7 +1271,17 @@ pub fn rescan_changed(
     for path in &vanished {
         delete_doc(&tx, path)?;
     }
-    for (src, _) in &bodies {
+    let mut unreadable: Vec<&str> = Vec::new();
+    for (src, raw) in &bodies {
+        // A read that failed mid-rescan (transient lock, encoding) must NOT
+        // delete the existing rows: the file still exists, its last good
+        // content is a better answer than nothing, and the next mtime change
+        // retries the read. Deleting here is how a one-second editor lock
+        // turned into a silently vanished document.
+        if raw.is_none() {
+            unreadable.push(&src.doc_path);
+            continue;
+        }
         delete_doc(&tx, &src.doc_path)?;
     }
     set_fingerprint(&tx, &fingerprint)?;
@@ -1266,6 +1292,9 @@ pub fn rescan_changed(
         if let Some(raw) = raw {
             insert_doc(&tx, src, raw, &mut report)?;
         }
+    }
+    for path in unreadable {
+        report.skipped.push(path.to_string());
     }
     resolve_links(&tx)?;
     prune_vectors(&tx)?;
@@ -1982,7 +2011,11 @@ pub fn semantic_recall(
     prefixes: &[String],
 ) -> anyhow::Result<Vec<Hit>> {
     let ids = semantic_block_ids(conn, spec, query_vec, limit, prefixes)?;
-    hits_for_block_ids(conn, &ids)
+    // Same mirror suppression as lexical recall: a block mirrored in the
+    // native store has the SAME content hash and therefore the SAME vector -
+    // it ranks adjacent to itself, and without this pass the fused result
+    // carries one logical statement twice while displacing a distinct block.
+    Ok(dedup_by_content(hits_for_block_ids(conn, &ids)?))
 }
 
 /// BM25-ranked block ids for the same query shape and order [`recall`] uses.
@@ -2032,7 +2065,10 @@ pub fn hybrid_recall(
     let semantic = semantic_block_ids(conn, spec, query_vec, pool, prefixes)?;
     let mut fused = rrf_fuse(&[lexical, semantic], rrf_k);
     fused.truncate(limit);
-    hits_for_block_ids(conn, &fused)
+    // Mirror suppression for the same reason as semantic_recall: both input
+    // lists can contain the native twin of a brain block, and fusion scores
+    // the twin pair twice.
+    Ok(dedup_by_content(hits_for_block_ids(conn, &fused)?))
 }
 
 /// Ensures the index exists and is fresh, rebuilding when stale. Rebuilds are
@@ -2572,6 +2608,64 @@ mod tests {
         assert!(recall(&conn, "self promoted", 5).unwrap().is_empty());
         let hits = recall(&conn, "legitimate promotion", 5).unwrap();
         assert_eq!(hits[0].ring, 1, "knowledge-directory promotion keeps working");
+    }
+
+    #[test]
+    fn a_bom_does_not_hide_the_frontmatter_ring() {
+        // Windows editors emit UTF-8 with BOM by default; the BOM must not
+        // make the `---` comparison fail-open. A BOM'd `ring: 5` quarantine
+        // marker has to quarantine, and a BOM'd `ring: 1` promotion has to
+        // promote.
+        let dir = brain(&[
+            ("todo/staging/bomq.md", "\u{FEFF}---\nring: 5\n---\nzebraxq quarantined payload\n"),
+            ("knowledge/bomp.md", "\u{FEFF}---\nring: 1\n---\npluvixq promoted decision\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "only the promoted knowledge file is indexed");
+        assert_eq!(report.skipped_high_ring, 1, "the BOM'd quarantine marker still quarantines");
+        assert!(recall(&conn, "zebraxq", 5).unwrap().is_empty());
+        assert_eq!(recall(&conn, "pluvixq", 5).unwrap()[0].ring, 1);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_and_kept_on_incremental_rescan() {
+        // Invalid UTF-8 is the reproducible shape of "read failed" (an
+        // editor's sharing violation is the transient one). The full scan
+        // must REPORT the file instead of silently dropping it, and the
+        // incremental rescan (the daemon's steady-state path) must KEEP the
+        // last good rows: a one-second editor lock must not delete a
+        // document.
+        let dir = brain(&[("knowledge/gone.md", "remember the alamo incident\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(recall(&conn, "alamo", 5).unwrap().len(), 1);
+        std::fs::write(dir.path().join("knowledge/gone.md"), b"remember \xff\xfe broken").unwrap();
+
+        // Full rebuild: reported, not invisible.
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(
+            report.skipped.iter().any(|p| p.contains("gone.md")),
+            "unreadable file must be reported: {:?}",
+            report.skipped
+        );
+
+        // Incremental rescan of a previously-indexed file that became
+        // unreadable: keep the last good content.
+        let dir2 = brain(&[("knowledge/gone2.md", "remember the alamo incident\n")]);
+        scan(&mut conn, dir2.path(), None, &RingRules::default()).unwrap();
+        std::fs::write(dir2.path().join("knowledge/gone2.md"), b"remember \xff\xfe broken").unwrap();
+        let report = rescan_changed(&mut conn, dir2.path(), None, &RingRules::default())
+            .unwrap()
+            .expect("incremental rescan should handle one changed file");
+        assert!(report.skipped.iter().any(|p| p.contains("gone2.md")));
+        assert_eq!(
+            recall(&conn, "alamo", 5).unwrap().len(),
+            1,
+            "incremental rescan keeps last good content for an unreadable file"
+        );
     }
 
     #[test]
