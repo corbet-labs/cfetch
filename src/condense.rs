@@ -80,8 +80,18 @@ pub fn leading_program<'a>(
             // direction, because Generic is rewritable and Verification is
             // not, so a test log would get its middle clipped away.
             words.next();
-            // A separated numeric value belongs to the flag, not the command.
-            if words.peek().is_some_and(|v| v.chars().all(|c| c.is_ascii_digit())) {
+            // A BARE flag from the takes-value set consumes its separated
+            // value: `sudo -u nobody pytest` used to make "nobody" the
+            // program. A flag with its value glued on (`-oL`, `-c2`) carries
+            // it inline and consumes nothing; a boolean flag (`-i`) consumes
+            // nothing either, so `sudo -i ls` still finds `ls`.
+            const PREFIX_FLAG_WITH_VALUE: &[&str] =
+                &["-u", "-n", "-c", "-e", "-g", "-p", "-d", "-t", "-l"];
+            let bare = w.len() <= 2;
+            if bare
+                && PREFIX_FLAG_WITH_VALUE.contains(&w)
+                && words.peek().is_some_and(|v| !v.starts_with('-'))
+            {
                 words.next();
             }
         } else {

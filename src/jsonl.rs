@@ -90,13 +90,16 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Filename-safe host token: anything outside `[A-Za-z0-9._-]` becomes `-`, so
-/// a host id can never escape the logs directory or collide with the rotation
-/// suffix grammar.
+/// Filename-safe host token: anything outside `[A-Za-z0-9_-]` becomes `-`.
+/// Dots are REPLACED, not preserved: the rotation suffix grammar is
+/// `<stem>-<host>.<n>.jsonl`, so a dot inside the host token lets one host's
+/// live stream be another host's rotated generation (`exhaust-10.0.0.jsonl`
+/// vs `exhaust-10.0.0.1.jsonl`) - rotation would then delete or overwrite
+/// the other host's data of record.
 pub fn sanitize_host(host: &str) -> String {
     let cleaned: String = host
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '-' })
         .collect();
     if cleaned.is_empty() { "unknown-host".to_string() } else { cleaned }
 }
@@ -412,9 +415,25 @@ mod tests {
             .collect();
         assert_eq!(
             files,
-            vec!["exhaust-..-evil-host.jsonl".to_string()],
-            "a host id can never carry a path separator into the file name"
+            vec!["exhaust----evil-host.jsonl".to_string()],
+            "a host id can never carry a path separator (or a dot - see the rotation-collision test) into the file name"
         );
+    }
+
+    #[test]
+    fn dotted_host_ids_cannot_collide_with_rotation_generations() {
+        // `exhaust-10.0.0.jsonl` is host `10.0.0`'s live stream AND host
+        // `10.0.0.1`'s live stream when dots survive sanitizing - rotation of
+        // one would delete the other's data of record. Dots are replaced so
+        // the two hosts can never share a file name.
+        let dir = tempfile::tempdir().unwrap();
+        let a = stream_path(dir.path(), "exhaust", "10.0.0");
+        let b = stream_path(dir.path(), "exhaust", "10.0.0.1");
+        assert_ne!(a, b, "distinct hosts must map to distinct files");
+        let a2 = stream_path(dir.path(), "exhaust", "10.0.0.1");
+        assert_eq!(a.file_name().unwrap().to_string_lossy().chars().filter(|c| *c == '.').count(), 1, "exactly one dot: the .jsonl suffix");
+        assert!(!a.to_string_lossy().contains("10.0.0."), "dot inside the host token must not survive: {a:?}");
+        assert_eq!(a2, b);
     }
 
     #[test]

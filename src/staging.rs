@@ -169,14 +169,23 @@ pub fn stats(dir: &Path) -> Stats {
 }
 
 /// Distillation took the candidate into a curated file: the staged copy is
-/// redundant and goes. Returns false when nothing was pending under that id.
+/// redundant and goes. It MOVES to `dismissed/` (like [`dismiss`]) instead of
+/// being deleted: the dismissed copy is the permanent marker that keeps the
+/// staging trap from re-staging the same candidate once its `consume` record
+/// has rotated out of the trap's tail window - a delete would let a still-live
+/// write pattern resurrect the id forever.
 pub fn consume(dir: &Path, id: &str) -> anyhow::Result<bool> {
     anyhow::ensure!(valid_id(id), "invalid staging id {id:?}");
     let path = path_of(dir, id);
     if !path.is_file() {
         return Ok(false);
     }
-    std::fs::remove_file(&path).with_context(|| format!("consume {}", path.display()))?;
+    let target = dismissed_path(dir, id);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::rename(&path, &target).with_context(|| format!("consume {}", target.display()))?;
     Ok(true)
 }
 
@@ -345,6 +354,10 @@ mod tests {
         assert!(consume(dir.path(), &keep.id).unwrap());
         assert!(!consume(dir.path(), &keep.id).unwrap(), "consuming twice reports nothing to do");
         assert!(!path_of(dir.path(), &keep.id).exists(), "distillation took it: the copy goes");
+        assert!(
+            dismissed_path(dir.path(), &keep.id).is_file(),
+            "a consumed candidate moves to dismissed/, the permanent anti-resurrection marker"
+        );
 
         assert!(dismiss(dir.path(), &drop.id).unwrap());
         assert!(!dismiss(dir.path(), &drop.id).unwrap());
@@ -357,7 +370,12 @@ mod tests {
         assert_eq!(pending_count(dir.path()), 0);
         // A dismissal is final: the trap must never re-stage that id.
         assert!(exists(dir.path(), &drop.id), "the dismissed file is the do-not-restage marker");
-        assert!(!exists(dir.path(), &keep.id), "consumed ids may legitimately recur");
+        // And so is a consume: the moved-aside copy is the permanent marker,
+        // surviving the trap window's rotation (the old delete let a still-
+        // live write pattern resurrect the candidate once its consume record
+        // left the 1 MiB tail - contradicting the stream's own promise).
+        assert!(exists(dir.path(), &keep.id), "consumed ids stay decided forever");
+        assert!(!write(dir.path(), &keep).unwrap(), "re-staging a consumed id is a no-op");
     }
 
     #[test]
