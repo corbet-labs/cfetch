@@ -87,3 +87,12 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 strip = true
+
+[profile.release-max]
+# Self-hosted maximum-performance build: everything `release` carries, plus
+# whole-program LTO and single-CGU codegen. The distributed binaries stay on
+# the portable `release` baseline — this profile is for a binary that never
+# leaves the machine it was built on. See docs/self-build-performance.md.
+inherits = "release"
+lto = "fat"
+codegen-units = 1
