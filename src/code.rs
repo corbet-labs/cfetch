@@ -574,8 +574,16 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
                             ])?;
                         }
                         drop(ins);
+                        // Two AST nodes can yield one identical use tuple -
+                        // e.g. two calls to the same function written on a
+                        // single line inside the same container
+                        // (`f(a); f(b);`): same relation, start/end line,
+                        // name and container, distinguished only by byte
+                        // offsets the table does not store. The primary key
+                        // is correct; the duplicate carries no information
+                        // and is dropped at the insert.
                         let mut ins_use = tx.prepare_cached(
-                            "INSERT INTO symbol_uses(file_id, name, qualifier, relation, start_line,
+                            "INSERT OR IGNORE INTO symbol_uses(file_id, name, qualifier, relation, start_line,
                                                      end_line, container_start_line)
                              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         )?;
@@ -877,6 +885,26 @@ mod tests {
         let whole = extract(Path::new("x.rs"), "struct Alpha {\n    a: u8,\n}\nfn gamma() {}\n");
         assert_eq!(whole.gap, None, "the same file, closed, is a complete measurement");
         assert_eq!(names(&whole), ["Alpha", "gamma"]);
+    }
+
+    #[test]
+    fn scan_survives_two_same_name_calls_on_one_line() {
+        // Two calls to the same function written on a single line inside one
+        // named container produce two identical (relation, lines, name,
+        // container) tuples - the primary key holds, the second row must be
+        // dropped, and the scan must not abort. Found by pointing the code
+        // index at lodash (fp/_baseConvert.js style ternary helpers).
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.js");
+        std::fs::write(
+            &f,
+            "function g(f, n) {\n  return n == 2 ? function(a, b) { return f(a, b); } : function(a) { return f(a); };\n}\n",
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        let r = scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(r.files, 1, "the file must index, not crash");
     }
 
     #[test]
