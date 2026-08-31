@@ -1057,6 +1057,31 @@ pub fn submit(cfg: &Config, input: ProposalInput) -> anyhow::Result<SubmitResult
         }, "proposal id collision at {}", path.display());
         return Ok(SubmitResult { proposal: existing, created: false });
     }
+    // A proposal whose content-addressed id already sits in a TERMINAL state
+    // must not resurrect: the autonomous loop re-derives deterministic ids
+    // every cycle, and a rejected twin in PENDING would fail the same gate
+    // forever (the loop's reject is now idempotent, but the spend and the
+    // exception history are not free). Terminal REJECTED blocks re-submission
+    // of identical content; REVERTED means the operator rolled an applied
+    // proposal back - also a decision, also respected.
+    for state in [REJECTED, REVERTED] {
+        let terminal = proposal_path(&cfg.brain_root, state, &proposal.id);
+        if terminal.exists() {
+            let existing = load_at(&terminal)?;
+            let same = existing == proposal || {
+                let mut a = existing.clone();
+                a.created_at = 0;
+                let mut b = proposal.clone();
+                b.created_at = 0;
+                a == b
+            };
+            anyhow::ensure!(
+                !same,
+                "proposal {id} was already {state}; identical content will not be re-proposed",
+                id = proposal.id
+            );
+        }
+    }
     fsutil::atomic_write(&path, render(&proposal))?;
     Ok(SubmitResult { proposal, created: true })
 }
@@ -1783,6 +1808,20 @@ pub fn run_once_with<M: MaintenanceModel>(
 pub fn reject(cfg: &Config, id: &str) -> anyhow::Result<()> {
     let _lock = lock(cfg)?;
     locate(&cfg.brain_root, id, &[PENDING])?;
+    // Idempotent: the autonomous loop re-derives deterministic ids, and a
+    // reject that finds its target already REJECTED (with the PENDING twin
+    // still present) used to bail "already exists" - the swallowed error
+    // wedged the twin in PENDING forever, retrying every cycle. An identical
+    // terminal copy means the decision was already made: drop the twin.
+    let rejected = proposal_path(&cfg.brain_root, REJECTED, id);
+    if rejected.exists() {
+        let terminal = proposal_path(&cfg.brain_root, PENDING, id);
+        if terminal.exists() {
+            std::fs::remove_file(&terminal)
+                .with_context(|| format!("remove pending twin {}", terminal.display()))?;
+        }
+        return Ok(());
+    }
     move_proposal(&cfg.brain_root, id, PENDING, REJECTED)
 }
 

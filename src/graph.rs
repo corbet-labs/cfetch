@@ -320,9 +320,31 @@ fn resolve_rust_mod(file: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Nearest ancestor directory holding `lib.rs`/`main.rs` — the crate source
-/// root that `use crate::…` paths are relative to.
+/// root that `use crate::…` paths are relative to. A file under a `bin`
+/// component is its OWN crate: `src/bin/tool.rs` and `src/bin/tool/main.rs`
+/// are separate crates from the `src/lib.rs` beside them, so walking up to
+/// the nearest lib/main would resolve `crate::util` against the LIBRARY's
+/// modules — manufacturing a false edge to `src/util.rs` whenever the names
+/// collide, and a missing edge whenever they do not.
 fn crate_src_root(file: &Path, root: &Path) -> Option<PathBuf> {
-    let mut dir = file.parent()?;
+    let parent = file.parent()?;
+    let stem = file.file_stem()?.to_str()?;
+    // Inside a `bin` (or examples/tests) tree: the file is a crate root of
+    // its own — `tool.rs` resolves modules from `src/bin/tool/…`, and
+    // `src/bin/tool/main.rs` from its own directory.
+    let in_bin_tree = parent
+        .ancestors()
+        .take_while(|d| d.starts_with(root))
+        .any(|d| matches!(d.file_name().and_then(|n| n.to_str()), Some("bin") | Some("examples") | Some("tests")));
+    if in_bin_tree {
+        if stem == "main" || stem == "lib" {
+            return Some(parent.to_path_buf());
+        }
+        // `src/bin/tool.rs`: the crate root IS the file; modules resolve
+        // relative to `src/bin/tool/` (created by resolve_rust_mod).
+        return Some(file.to_path_buf());
+    }
+    let mut dir = parent;
     loop {
         if !dir.starts_with(root) {
             return None;

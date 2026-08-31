@@ -662,13 +662,27 @@ pub fn hydrate(conn: &Connection, store: &VectorStore) -> anyhow::Result<usize> 
     }
     let tx = conn.unchecked_transaction()?;
     let mut imported = 0usize;
+    // One record whose bytes fail validation (a flipped byte on disk, or a
+    // record written by an older build under looser rules) must not brick
+    // semantic recall for every host: the read-side skip keeps the failure
+    // to that one hash - it stays "missing" locally, the next derive
+    // re-embeds it - instead of aborting the whole hydrate. Write-side
+    // validation stays strict.
+    let mut skipped = 0usize;
     if wanted.len() <= SEEK_UNTIL {
         // The everyday case after an edit: a handful of hashes. Seeking to
         // each record beats streaming a 40 MB artifact file to find five.
         for hash in &wanted {
-            if let Some(vector) = store.get(hash)? {
-                index::insert_vector(&tx, hash, spec, &vector)?;
-                imported += 1;
+            match store.get(hash) {
+                Ok(Some(vector)) => {
+                    index::insert_vector(&tx, hash, spec, &vector)?;
+                    imported += 1;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("cfetch: skipping corrupt vector record {hash}: {error:#}");
+                    skipped += 1;
+                }
             }
         }
     } else {
@@ -681,6 +695,11 @@ pub fn hydrate(conn: &Connection, store: &VectorStore) -> anyhow::Result<usize> 
             }
             Ok(())
         })?;
+    }
+    if skipped > 0 {
+        eprintln!(
+            "cfetch: {skipped} corrupt vector record(s) skipped; re-embedding will replace them"
+        );
     }
     tx.commit()?;
     Ok(imported)
