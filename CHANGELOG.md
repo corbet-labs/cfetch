@@ -5,6 +5,19 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Round 3 of the 2026-08-31 bug hunt (#32, #33): boundaries and
+  consistency.** `ensure_fresh` refuses to serve a never-scanned empty
+  catalog instead of silently answering every query with zero hits;
+  same-line symbol containers resolve to the innermost scope; the recall
+  candidate pool expands on demand so a pathological block with many copies
+  cannot shrink the result below the limit; Windows brain-root matching is
+  case-insensitive (8.3 names, subst drives, symlinked homes no longer
+  blind the hot-file trap); `cards list`/`status` hold the same store lock
+  as the mutators; doctor reuses the pre-computed daemon probe instead of
+  issuing its own; doctor and the statusline agree on maintenance priority
+  (exception before model-unavailable); and `daemon status`'s durable
+  observation after a SIGKILL is documented as the designed repair path,
+  not an invariant violation.
 - **Round 2 of the 2026-08-31 bug hunt (#29, #30): accuracy and robustness.**
   Nested `ring:` frontmatter keys no longer self-promote (only unindented
   top-level declarations count); ``` `bash` ``` inside a fence no longer
