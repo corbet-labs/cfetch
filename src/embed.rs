@@ -213,19 +213,36 @@ fn cached_local_backend_state(
     cache: &std::sync::OnceLock<Result<SharedLocalBackendState, String>>,
     launch: crate::local_adapter::AdapterLaunch,
 ) -> anyhow::Result<SharedLocalBackendState> {
-    match cache.get_or_init(|| {
-        crate::local_adapter::AdapterSupervisor::new(launch)
-            .map(|supervisor| {
-                std::sync::Arc::new(std::sync::Mutex::new(LocalBackendState {
-                    ordered_scope_ids: supervisor.ordered_scope_ids().to_vec(),
-                    supervisor,
-                    selected_scope: None,
-                }))
-            })
-            .map_err(|error| format!("{error:#}"))
-    }) {
-        Ok(state) => Ok(std::sync::Arc::clone(state)),
-        Err(error) => anyhow::bail!("initialize package-local adapter: {error}"),
+    // Only SUCCESS is cached: a transient launch failure (binary mid-replace,
+    // AV lock on Windows, ENOMEM) poisoned the OnceLock for the process
+    // lifetime in a long-running daemon — every later query replayed the
+    // same stale error even though a retry would succeed. The supervisor's
+    // own one-restart logic is the pattern; the first launch deserves the
+    // same treatment.
+    if let Some(state) = cache.get() {
+        return match state {
+            Ok(state) => Ok(std::sync::Arc::clone(state)),
+            Err(error) => anyhow::bail!("initialize package-local adapter: {error}"),
+        };
+    }
+    let outcome = crate::local_adapter::AdapterSupervisor::new(launch)
+        .map(|supervisor| {
+            std::sync::Arc::new(std::sync::Mutex::new(LocalBackendState {
+                ordered_scope_ids: supervisor.ordered_scope_ids().to_vec(),
+                supervisor,
+                selected_scope: None,
+            }))
+        })
+        .map_err(|error| format!("{error:#}"));
+    match outcome {
+        Ok(state) => {
+            let _ = cache.set(Ok(std::sync::Arc::clone(&state)));
+            Ok(state)
+        }
+        Err(error) => {
+            // Do NOT cache the failure; the next query retries the launch.
+            anyhow::bail!("initialize package-local adapter: {error}")
+        }
     }
 }
 
