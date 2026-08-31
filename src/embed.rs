@@ -1321,28 +1321,70 @@ pub fn run(
         let mut writer = store.begin_write()?;
         loop {
             let texts: Vec<&str> = pending.iter().map(|(_, t)| t.as_str()).collect();
-            let vectors = client.embed_documents_batch(&texts)?;
+            // One poisoned block must not freeze the whole queue: the pending
+            // set is ordered by id, and a row-level refusal (a degenerate or
+            // wrong-width vector, `fit`) aborts the batch before any write,
+            // so the identical head would be re-selected and re-failed
+            // forever - every block after it never reaches the endpoint.
+            // On a batch failure, fall back to one-row batches: rows that
+            // fail alone are skipped with a note (and retried next run),
+            // the rest proceed. An empty vector marks a skipped row.
+            let vectors = match client.embed_documents_batch(&texts) {
+                Ok(v) => v,
+                Err(first) => {
+                    let first = format!("{first:#}");
+                    eprintln!("cfetch embed-index: batch failed ({first}); retrying rows individually");
+                    let mut single: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+                    for t in &texts {
+                        match client.embed_documents_batch(std::slice::from_ref(t)) {
+                            Ok(mut v) => single.append(&mut v),
+                            Err(row) => {
+                                eprintln!("cfetch embed-index: skipping one block this run: {row:#}");
+                                single.push(Vec::new());
+                            }
+                        }
+                    }
+                    single
+                }
+            };
             // Record first, cache second: the shared artifact is what the
-            // group keeps, the local row is a convenience.
-            let mut cache_vectors = Vec::with_capacity(vectors.len());
+            // group keeps, the local row is a convenience. Pairs, not two
+            // zipped vectors: skipped rows must not shift the alignment.
+            let mut cached: Vec<(&String, Vec<f32>)> = Vec::new();
             for ((hash, _), vector) in pending.iter().zip(&vectors) {
+                if vector.is_empty() {
+                    continue;
+                }
                 if writer.put(hash, vector)? {
-                    cache_vectors.push(vector.clone());
+                    cached.push((hash, vector.clone()));
                 } else {
-                    cache_vectors.push(writer.get_retained(hash)?.with_context(|| {
+                    let retained = writer.get_retained(hash)?.with_context(|| {
                         format!(
                             "derive-once store reported existing content {hash} but retained no record"
                         )
-                    })?);
+                    })?;
+                    cached.push((hash, retained));
                 }
+            }
+            let succeeded = cached.len();
+            // Liveness guard: if EVERY row was refused (per-row fallback
+            // included), nothing is inserted and the refetched pending set
+            // is identical - retrying would loop forever. Stop with the
+            // error; progress from earlier batches is already committed and
+            // the run resumes where it left off once the endpoint recovers.
+            if succeeded == 0 {
+                anyhow::bail!(
+                    "embedding made no progress: every row in the batch was refused; \
+                     fix the endpoint and re-run (progress so far is kept)"
+                );
             }
             writer.flush()?;
             let tx = conn.transaction()?;
-            for ((hash, _), vector) in pending.iter().zip(&cache_vectors) {
+            for (hash, vector) in &cached {
                 index::insert_vector(&tx, hash, &spec, vector)?;
             }
             tx.commit()?;
-            embedded += pending.len();
+            embedded += succeeded;
             let (done, total) = index::vector_coverage(conn, &spec)?;
             println!("embedded {done}/{total} blocks");
             pending = index::hashes_without_vectors(conn, &spec, batch)?;

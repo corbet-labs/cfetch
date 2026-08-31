@@ -401,7 +401,11 @@ fn git_output_optional<const N: usize>(
             .map(Some)
             .context("git returned invalid UTF-8");
     }
-    if output.status.code() == Some(1) {
+    // "Absence" is any failure shape here, not only exit 1: `git remote
+    // get-url origin` exits 2 when the remote does not exist, and treating
+    // that as a hard error killed `cards status` on stores whose origin was
+    // removed - exactly the degraded case the Option exists for.
+    if matches!(output.status.code(), Some(1) | Some(2)) {
         return Ok(None);
     }
     anyhow::bail!(
