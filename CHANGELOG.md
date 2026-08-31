@@ -5,6 +5,21 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Round 2 of the 2026-08-31 bug hunt (#29, #30): accuracy and robustness.**
+  Nested `ring:` frontmatter keys no longer self-promote (only unindented
+  top-level declarations count); ``` `bash` ``` inside a fence no longer
+  closes it (CommonMark trailing-text rule); self-wikilinks stop inflating
+  the unresolved-references metric; hyphenated query terms split into
+  independent prefix terms (`state-machine` finds "the machine's state");
+  rerank refuses an omitted `index` field (matching the embeddings client);
+  the `query_for` 12-term cap now actually caps across payload keys; adapter
+  launch failures retry instead of poisoning the process cache; torn vector
+  index tails (crash between `writeln!`'s two writes) are repaired on the
+  next open instead of corrupting two records; session-state GC covers
+  crash debris (`.tmp.<pid>` and `.lock` files); `failure_history` redacts
+  its query so a pasted failing line with a real secret can actually find
+  its stored (redacted) signature; and `hardware.rs` detects MOVBE for the
+  v3 verdict as its own comment specifies.
 - **Ring-6 traps no longer record healthy commands as failures.** Any
   non-empty `stderr` used to mark a bash event `failed` — but `git push`,
   `npm install` and `pip` stream progress to stderr while exiting 0, and
