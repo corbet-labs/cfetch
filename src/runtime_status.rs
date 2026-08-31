@@ -726,7 +726,12 @@ pub fn record_service(state: ServiceState, failure_code: Option<&str>) {
 
 /// Applies a live daemon probe to a snapshot for immediate display without
 /// persisting it. Cached surfaces remain observation-only and daemon lifecycle
-/// events continue to own the durable service state.
+/// events continue to own the durable service state — with one deliberate
+/// exception: `cfetch daemon status` records its observation durably, because
+/// it is the only repair path for a SIGKILL'd daemon (the shutdown handler
+/// never ran, no lifecycle event will ever arrive). This is a feature, not
+/// a bug; the observation is authoritative until the next lifecycle event
+/// overwrites it.
 pub fn apply_daemon_observation(status: &mut RuntimeStatusV1, running: bool) {
     remove_failure(status, "daemon_unavailable");
     if running {

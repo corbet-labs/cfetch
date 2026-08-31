@@ -403,7 +403,7 @@ fn gather_inner(
         });
     }
 
-    let memory = memory_diagnostic(cfg, state_dir, &runtime, &mut findings);
+    let memory = memory_diagnostic(cfg, state_dir, &runtime, daemon_running, &mut findings);
     let inference = inference_diagnostic(cfg, &runtime, &build_backend, &mut findings);
     let hardware = hardware_diagnostics(&runtime, &build_backend);
     let hardware_detection = if cfg!(target_os = "windows") {
@@ -505,9 +505,10 @@ fn compiled_backend() -> String {
 fn memory_diagnostic(
     cfg: Option<&Config>,
     state_dir: &Path,
-    runtime: &runtime_status::RuntimeStatusV1,
-    findings: &mut Vec<Finding>,
-) -> MemoryDiagnostic {
+        runtime: &runtime_status::RuntimeStatusV1,
+        daemon_running: bool,
+        findings: &mut Vec<Finding>,
+    ) -> MemoryDiagnostic {
     let Some(cfg) = cfg else {
         return MemoryDiagnostic {
             route: "unknown".into(),
@@ -616,7 +617,7 @@ fn memory_diagnostic(
         "profile_inactive"
     } else if authorized_routes == 0 {
         "no_joined_routes"
-    } else if daemon::call("ping", Duration::from_millis(300)).is_some() {
+    } else if daemon_running {
         "ready"
     } else {
         "daemon_stopped"
@@ -773,10 +774,10 @@ fn inference_diagnostic(
                     "paused"
                 } else if !cfg.maintenance.configured() {
                     "setup_needed"
-                } else if runtime.maintenance.last_model_success == Some(false) {
-                    "model_unavailable"
                 } else if runtime.maintenance.last_outcome.as_deref() == Some("exception") {
                     "exception"
+                } else if runtime.maintenance.last_model_success == Some(false) {
+                    "model_unavailable"
                 } else if runtime.maintenance.candidates > 0 {
                     "processing"
                 } else {
