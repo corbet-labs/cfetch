@@ -72,7 +72,16 @@ impl HookEvent {
     }
 
     pub fn session(&self) -> &str {
-        self.session_id.as_deref().unwrap_or("unknown-session")
+        // A harness that sends no session_id gets a per-PROCESS key, not one
+        // shared constant: two concurrent sessionless windows would otherwise
+        // merge into one session - shared repeat-read state, traps that can
+        // never see two distinct sessions, and fix-pairing across unrelated
+        // conversations. Same process = same key, so a sessionless window's
+        // own hooks still aggregate.
+        self.session_id.as_deref().unwrap_or_else(|| {
+            static FALLBACK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            FALLBACK.get_or_init(|| format!("unknown-session-{}", std::process::id()))
+        })
     }
 
     pub fn is_subagent(&self) -> bool {
@@ -239,7 +248,10 @@ mod tests {
     #[test]
     fn garbage_stdin_degrades_to_default() {
         let e: HookEvent = serde_json::from_str("not json").unwrap_or_default();
-        assert_eq!(e.session(), "unknown-session");
+        // Per-process fallback: sessionless windows must not merge into one
+        // shared key, but a single process's events must agree on one.
+        assert!(e.session().starts_with("unknown-session-"), "got {}", e.session());
+        assert_eq!(e.session(), e.session(), "stable within the process");
         assert_eq!(e.start_reason(), "startup");
     }
 

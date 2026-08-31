@@ -1042,8 +1042,17 @@ fn redact_word(word: &str, redact_next: &mut bool) -> String {
         }
         return format!("{key}:{REDACTED}");
     }
-    // --password / --api-key style flags redact their next argument.
+    // --password / --api-key style flags redact their next argument. A SHORT
+    // flag with the value glued on (`mysql -psecret`, `docker -ukey`)
+    // carries the secret inside the token itself: the old behavior set
+    // redact_next for it, which kept the secret verbatim and destroyed the
+    // innocent argument after it. Redact the token itself instead.
     if word.starts_with('-') && !word.contains('=') && keyish(word) {
+        let rest = word.trim_start_matches('-');
+        let short_attached = !word.starts_with("--") && rest.chars().count() > 2;
+        if short_attached {
+            return REDACTED.to_string();
+        }
         *redact_next = true;
         return word.to_string();
     }
@@ -1256,12 +1265,26 @@ fn tool_failed(event: &HookEvent) -> bool {
     else {
         return false;
     };
+    // Non-empty stderr alone is NOT failure: `git push`, `npm install` and
+    // pip stream progress and warnings to stderr while exiting 0, and every
+    // trap keys on this one field. Keep stderr as a failure hint only when
+    // the response carries no explicit success marker - harnesses that
+    // report failure ONLY through stderr (the reason this branch exists)
+    // never set one.
     if obj
         .get("stderr")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|s| !s.trim().is_empty())
     {
-        return true;
+        let explicit_success = ["is_error", "isError"]
+            .iter()
+            .any(|k| obj.get(*k).and_then(serde_json::Value::as_bool) == Some(false))
+            || ["exit_code", "code"]
+                .iter()
+                .any(|k| obj.get(*k).and_then(serde_json::Value::as_i64) == Some(0));
+        if !explicit_success {
+            return true;
+        }
     }
     if ["tool_error", "error"]
         .iter()
@@ -1276,6 +1299,41 @@ fn tool_failed(event: &HookEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stderr_noise_on_an_explicit_success_is_not_failure() {
+        // git push / npm install / pip stream progress to stderr while
+        // exiting 0; with an explicit success marker present (Claude Code's
+        // Bash response always carries is_error), that must not record
+        // `failed: true` - every trap keys on this one field.
+        let ev = |resp: &str| crate::hook_io::HookEvent {
+            tool_response: serde_json::from_str(resp).unwrap(),
+            ..Default::default()
+        };
+        assert!(!tool_failed(&ev(
+            r#"{"stdout":"done","stderr":"warning: 42 packets outdated","is_error":false}"#
+        )));
+        assert!(!tool_failed(&ev(
+            r#"{"stderr":"progress...","exit_code":0}"#
+        )));
+        // Legacy harnesses that signal failure ONLY through stderr keep the
+        // old behavior: no explicit marker, non-empty stderr -> failed.
+        assert!(tool_failed(&ev(r#"{"stderr":"command not found"}"#)));
+        assert!(tool_failed(&ev(r#"{"stderr":"x","is_error":true}"#)));
+    }
+
+    #[test]
+    fn a_glued_short_flag_secret_redacts_itself_not_the_next_word() {
+        // `mysql -psecretpw -h db` used to keep the password verbatim and
+        // redact `-h`; the secret must go and the innocent host survive.
+        let out = redact_secrets("mysql -psecretpw -h db.corp.example");
+        assert!(!out.contains("secretpw"), "secret must be gone: {out}");
+        assert!(out.contains("db.corp.example"), "host must survive: {out}");
+        // Separated form unchanged: flag redacts its next argument.
+        let out = redact_secrets("tool --password hunter2 -v");
+        assert!(!out.contains("hunter2"), "separated value must go: {out}");
+        assert!(out.contains("--password"), "flag name stays: {out}");
+    }
+
     /// Windows is a first-class platform, and a corrupted path is a read that
     /// can never be attributed to the file it touched.
     #[test]
