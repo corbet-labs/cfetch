@@ -5,6 +5,53 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **The tree config is content-only.** `.cfetch/config.json` inside the brain
+  is agent-written and cloned across machines, so it may now carry only
+  content keys (rings, slices, resident entries, budgets): `embeddings`,
+  `rerank`, `maintenance`, `serve`, `client`, and `brain_root` found there are
+  a hard error naming the key, the machine-local file overlays the tree for
+  everything it sets, and the root itself never comes from any file — the
+  documented invariant, now enforced. Tree-layer resident and code-root paths
+  must stay tree-relative; absolute paths remain a machine-local decision.
+- **Quarantine locations ignore self-promoting frontmatter.** A file in a
+  ring-5+ directory (staging, logs) that declares a lower ring is skipped
+  exactly like one whose frontmatter was stripped: the location decides, and
+  the "cannot be edited away file by file" promise now holds against a
+  well-formed lie. Promotion below the location ring is unchanged.
+- **The egress guard resolves hostnames before trusting them.** `check_endpoint`
+  refuses any address a configured host resolves to inside the already-refused
+  ranges (plus loopback), closing DNS-rebinding names and resolver spellings
+  like `0x7f000001`; rerank responses gained the 2 MiB cap the other HTTP
+  clients already had.
+- **Edge-supplied ids and local surfaces hardened.** `cfetch staging`
+  consume/dismiss validate their id as one filename segment, a grant can no
+  longer be named `root` (config reserves the whole-tree slice), the unix IPC
+  socket is pinned to mode 0600 after bind, hook stdin reads are bounded at
+  64 MiB, and maintenance review reads gate their proposal id.
+- **The TCP serving listener is bounded.** At most 64 unauthenticated
+  connections are held before the token is known, mirroring the iroh accept
+  loop's permit cap, and responses past the 16 MiB serving limit are refused
+  instead of serialized whole — a tokened `limit: usize::MAX` no longer ships
+  the entire catalog in one line.
+- **Dependency advisories gate CI.** `deny.toml` gained an `[advisories]`
+  section (`yanked = "deny"`, reasoned ignores for the two unmaintained
+  transitive advisories), CI runs `cargo deny check advisories licenses`, and
+  the yanked `chacha20 0.10.1` left the lockfile for 0.10.2.
+- **A maximum-performance self-build profile.** `[profile.release-max]` adds
+  fat LTO and single-codegen on top of `release`, for binaries that never
+  leave the machine they were built on; `docs/self-build-performance.md`
+  records when that pays and why shipped binaries stay portable.
+- **One-line duplicate symbol uses no longer abort the scan.** Two calls to
+  the same function written on a single line inside one container produce an
+  identical `symbol_uses` tuple; the duplicate is dropped at the insert. Found
+  by the new membench harness on lodash, where 7 of 48 JS files — `lodash.js`
+  included — aborted every code scan.
+- **membench: a reproducible memory-tool benchmark.** `experiments/membench`
+  carries a four-arm agent battery (continuity, locate, bugfix, stale-memory
+  poisoning) and a speed harness, with its first recorded run stamped and
+  committed: cfetch vs openwolf-enhanced 1.28.1 on lodash, fastify, tokio, and
+  a synthetic 300-module tree.
+
 - **Atomic local admission release boundary.** One hash-locked command replays
   the current admitted cohort, stages bounded physical evidence, runs every
   exact target-package/scope conformance challenge, creates the activation
