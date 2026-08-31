@@ -147,9 +147,12 @@ impl RerankClient {
         // wrong statement — the reranking equivalent of a mis-aligned vector.
         // A duplicate or out-of-range index means the response cannot be
         // trusted at all, so it is an error rather than a partial application.
+        // An OMITTED index is the same defect (the embeddings client refuses
+        // the identical shape): falling back to array position silently
+        // reorders best-first responses into wrong scores.
         let mut scores: Vec<Option<f32>> = vec![None; documents.len()];
-        for (pos, row) in parsed.results.into_iter().enumerate() {
-            let i = row.index.unwrap_or(pos);
+        for row in parsed.results.into_iter() {
+            let i = row.index.context("rerank endpoint omitted an index; array order is not promised")?;
             anyhow::ensure!(
                 i < scores.len(),
                 "rerank endpoint returned index {i} for {} document(s)",

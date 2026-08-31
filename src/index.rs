@@ -199,8 +199,16 @@ pub(crate) fn frontmatter_ring(text: &str) -> (Option<u8>, usize) {
         }
         let lower = t.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("ring:") {
-            let token = v.split_whitespace().next().unwrap_or("");
-            ring = Some(token.parse::<u8>().unwrap_or(255));
+            // Only a TOP-LEVEL key counts: a nested `ring:` (under
+            // `template:` or any other key, indented or inline) is a value
+            // of that key, not a ring declaration. Matching any line
+            // starting with `ring:` after a trim let
+            // `template:\n  ring: 0` self-promote a knowledge file into the
+            // policy band from what YAML says is a nested value.
+            if !line.starts_with(' ') && !line.starts_with('\t') {
+                let token = v.split_whitespace().next().unwrap_or("");
+                ring = Some(token.parse::<u8>().unwrap_or(255));
+            }
         }
     }
     // Unterminated frontmatter: treat as content.
@@ -337,10 +345,18 @@ fn fence_open(t: &str) -> Option<(char, usize)> {
 }
 
 /// CommonMark closing rule: only a run of the SAME character at least as long
-/// as the opener closes a fence — a ```` fence containing ``` examples (or a
-/// ~~~ fence containing ```) must not close early.
+/// as the opener closes a fence, and a closing fence may be followed only by
+/// spaces — ```` ```bash ```` INSIDE a fence is an info string on an opening
+/// fence, not a closer. Without the trailing-text check, a note documenting
+/// another fence's language tag closed the outer fence early, promoting
+/// fenced wikilinks into curated graph edges.
 fn fence_closes(t: &str, (ch, len): (char, usize)) -> bool {
-    t.chars().take_while(|&x| x == ch).count() >= len
+    let run = t.chars().take_while(|&x| x == ch).count();
+    if run < len {
+        return false;
+    }
+    // Everything after the closing run must be whitespace (CommonMark 4.5).
+    t.chars().skip(run).all(char::is_whitespace)
 }
 
 /// Setext heading underline: a line of only `=` (level 1) or only `-`
@@ -1395,7 +1411,22 @@ fn fts_query(user_query: &str) -> String {
     user_query
         .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
         .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"*", t.replace('"', "")))
+        // The FTS5 tokenizer splits on hyphens, so a hyphenated term inside
+        // one quoted token becomes an ADJACENCY phrase query — far narrower
+        // than the recall-first contract. `state-machine` must find "the
+        // machine's state", so the hyphen splits into two independent
+        // prefix terms here, matching what the tokenizer will see at
+        // index time.
+        .flat_map(|t| {
+            let cleaned = t.replace('"', "");
+            if cleaned.contains('-') && cleaned.chars().all(|c| c.is_alphanumeric() || c == '-') {
+                cleaned.split('-').filter(|s| !s.is_empty()).map(str::to_string).collect()
+            } else {
+                vec![cleaned]
+            }
+        })
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"*", t))
         .collect::<Vec<_>>()
         .join(" OR ")
 }

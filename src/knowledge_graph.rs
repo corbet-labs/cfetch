@@ -147,7 +147,12 @@ pub fn build_matching(
         .filter_map(Result::ok)
         .filter_map(|(from, to)| Some((*by_id.get(&from)?, *by_id.get(&to)?)))
         .collect();
-    let resolved_references = resolved_links.len();
+    // Self-references (`[[overview]]` inside `overview.md`) resolve to the
+    // same doc: they are valid links (resolve_links deliberately refuses to
+    // insert them into `links`), but counting them as unresolved inflated
+    // the broken-link metric by exactly the self-reference count.
+    let self_references = resolved_links.iter().filter(|(from, to)| from == to).count();
+    let resolved_references = resolved_links.len().saturating_sub(self_references);
     let mut links: Vec<(usize, usize)> = resolved_links
         .into_iter()
         .filter(|(from, to)| from != to)

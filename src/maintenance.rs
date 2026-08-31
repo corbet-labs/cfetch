@@ -498,9 +498,16 @@ fn query_for(candidate: &staging::Candidate) -> String {
                 if term.len() >= 3 && !terms.iter().any(|seen| seen == term) {
                     terms.push(term.to_string());
                 }
-                if terms.len() == 12 {
+                // The cap applies to the WHOLE term list, not per key: the
+                // inner `break` only exits this key's loop, and the next key
+                // restarts it — `== 12` never fires again and every unique
+                // token from every later payload key joins the query.
+                if terms.len() >= 12 {
                     break;
                 }
+            }
+            if terms.len() >= 12 {
+                break;
             }
         }
     }
