@@ -5,6 +5,21 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Semantic recall on explicitly configured endpoints (#39).** A new
+  `embeddings.endpoint_model` config field carries the wire-level name a
+  serving layer expects (LM Studio prefixes `text-embedding-`, Ollama uses
+  short names) while the canonical `model` field remains the vector-space
+  identity. The admission gate and profile-attestation checks now apply
+  only to the package-local path serving the canonical model: an operator
+  who configures their own Ollama or LM Studio endpoint has taken
+  responsibility for vector-space consistency. The first semantic recall
+  benchmark is recorded alongside (`experiments/membench/results/`):
+  cfetch at 71 ms vs openwolf-enhanced at 155 ms, with hardware load
+  (~140 MB total) and weaker-system extrapolation. Three root causes are
+  documented: IPv6 localhost adds a 2-second connection-refused penalty on
+  Windows (use `127.0.0.1`), LM Studio unloads embedding models on every
+  connection close (Ollama with `KEEP_ALIVE=-1` does not), and serving
+  layers rename models (the `endpoint_model` field resolves this).
 - **Round 4: the last three findings (#35), closing the 2026-08-31 bug
   hunt at 22/22.** The model's output budget (16384 tokens) now gates at
   submit time — a proposal whose `after` bytes exceed what the model can
