@@ -5,6 +5,19 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Round 4: the last three findings (#35), closing the 2026-08-31 bug
+  hunt at 22/22.** The model's output budget (16384 tokens) now gates at
+  submit time — a proposal whose `after` bytes exceed what the model can
+  echo is refused with a clear split-or-apply-manually message, instead of
+  truncating, failing the JSON parse, and retrying forever. Evidence
+  coverage holds across late arrivals: when raw events rotated out at
+  submit time (candidate-record citation was sufficient) and new matching
+  events arrive during the review round-trip, the fallback stays
+  sufficient at apply time — the proposer cannot cite events it has never
+  seen. And stream appends hold a per-stream advisory lock across
+  rotate+open+write, closing the race where a concurrent writer's
+  rotation between our rotate check and our open landed our line in the
+  wrong generation. Issue #27 is closed.
 - **Round 3 of the 2026-08-31 bug hunt (#32, #33): boundaries and
   consistency.** `ensure_fresh` refuses to serve a never-scanned empty
   catalog instead of silently answering every query with zero hits;
