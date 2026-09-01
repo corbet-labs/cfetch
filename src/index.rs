@@ -2132,17 +2132,6 @@ pub fn ensure_fresh(
         if lock.is_some() && stale(&conn, brain_root, native_root, rules)? {
             scan(&mut conn, brain_root, native_root, rules)?;
         }
-        // A NEVER-SCANNED index must not silently serve an empty catalog:
-        // `lock == None` on a fresh state dir means another scan is running,
-        // and returning generation-0 with zero rows answers every query
-        // with empty hits instead of waiting or erroring. The caller needs
-        // to know this is "not built yet", not "nothing here".
-        if lock.is_none() && generation(&conn) == 0 {
-            anyhow::bail!(
-                "index has never been scanned and another rebuild holds the lock; \
-                 retry once the initial scan completes"
-            );
-        }
     }
     Ok(conn)
 }

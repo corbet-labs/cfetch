@@ -170,6 +170,14 @@ pub fn append(
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create log dir {}", dir.display()))?;
     let path = stream_path(dir, stem, host);
+    // Per-stream lock around rotate+open+write: without it, a concurrent
+    // writer on the same host can rotate the file between OUR rotate check
+    // and OUR open — our handle would then point at the old inode (now the
+    // rotated generation), and our line would land in the wrong file.
+    // The lock is advisory and best-effort (same semantics as the shared
+    // index lock): a crashed holder releases it via the kernel.
+    let lock_path = path.with_extension("jsonl.lock");
+    let _stream_lock = crate::lockfile::acquire(&lock_path, 2_000, 0);
     rotate_if_needed(&path, max_bytes, line.len() as u64);
     // O_APPEND: the offset is chosen by the kernel under the inode lock, so
     // concurrent same-host writers cannot overwrite each other's lines.
@@ -412,6 +420,7 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| !name.ends_with(".lock"))
             .collect();
         assert_eq!(
             files,
