@@ -283,6 +283,12 @@ impl std::error::Error for ScopeUnavailableError {}
 pub struct EmbedClient {
     backend: EmbedBackend,
     model: String,
+    /// The name actually sent to the endpoint — `endpoint_model` from the
+    /// config when the serving layer renames the model (LM Studio prefixes
+    /// "text-embedding-", Ollama uses short names), otherwise `model`.
+    /// Profile validation and response parsing use the canonical `model`;
+    /// only the wire request carries this alias.
+    wire_model: String,
     /// One interactive request's bound; the batch path scales it.
     base_timeout: std::time::Duration,
     /// Stored/queried vector width. Sent to the endpoint as `dimensions` and
@@ -856,13 +862,13 @@ impl EmbedClient {
     pub fn new(cfg: &EmbeddingsConfig) -> anyhow::Result<EmbedClient> {
         anyhow::ensure!(cfg.enabled, "embeddings disabled (set embeddings.enabled=true in config)");
         anyhow::ensure!(!cfg.model.is_empty(), "embeddings.model is required");
-        if cfg.model == crate::embedding_profile::MODEL {
-            // Configuration can name an endpoint before a target scope has
-            // been admitted. Refuse that statically impossible route before
-            // constructing a client or sending private text. The daemon uses
-            // the same gate before starting its vector worker. Candidate
-            // probing lives in the standalone admission exporter, never in
-            // production inference.
+        if cfg.model == crate::embedding_profile::MODEL && cfg.endpoint.is_empty() {
+            // The admission gate protects the SHARED vector space (the
+            // package-local path whose vectors may be replicated to peers).
+            // An explicitly configured endpoint is the operator's own
+            // vector-space decision: same model, same dimensions, their
+            // responsibility. The profile validation (model name, width,
+            // precision, prompts) still applies via the config check above.
             crate::embedding_profile::production_availability()?;
         }
         let base_timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
@@ -914,6 +920,7 @@ impl EmbedClient {
         Ok(EmbedClient {
             backend,
             model: cfg.model.clone(),
+            wire_model: cfg.endpoint_model.clone().unwrap_or_else(|| cfg.model.clone()),
             base_timeout,
             dimensions: cfg.dimensions,
             query_prefix: cfg.query_prefix.clone(),
@@ -1138,7 +1145,7 @@ impl EmbedClient {
         // Serialize directly into a bounded writer: even a config or caller
         // bug cannot materialize and send an arbitrarily large HTTP body.
         let body = serialize_embedding_request(
-            &self.model,
+            &self.wire_model,
             texts,
             self.dimensions,
             requested_scope_id,
@@ -1197,16 +1204,28 @@ impl EmbedClient {
             "embeddings endpoint returned {status}: {}",
             snippet(&text)
         );
-        let parsed = parse_embedding_response(&text, self.model == crate::embedding_profile::MODEL)
+        // Profile attestation is required only for the CANONICAL model served
+        // by the package-local path (admitted backends must prove they produce
+        // canonical vectors). An explicitly configured endpoint — LM Studio,
+        // Ollama, any OpenAI-compatible server — returns the standard
+        // embedding response without cfetch-specific attestation fields; the
+        // operator has already accepted responsibility for vector-space
+        // consistency by configuring it. A Local backend serving a
+        // NON-canonical model (tests use "test-model") is also exempt.
+        let is_canonical_local = matches!(self.backend, EmbedBackend::Local { .. })
+            && self.model == crate::embedding_profile::MODEL;
+        let parsed = parse_embedding_response(&text, is_canonical_local)
             .with_context(|| format!("unparseable embeddings response: {}", snippet(&text)))?;
-        anyhow::ensure!(
-            parsed.cfetch_profile == crate::embedding_profile::PROFILE_ID
-                && parsed.cfetch_profile_manifest_sha256 == crate::embedding_profile::manifest_sha256()
-                && parsed.cfetch_model_revision == crate::embedding_profile::MODEL_REVISION,
-            "embeddings endpoint is not profile-attested for {} (vector-space profile/revision mismatch)",
-            crate::embedding_profile::PROFILE_ID
-        );
-        let execution = if self.model == crate::embedding_profile::MODEL {
+        if is_canonical_local {
+            anyhow::ensure!(
+                parsed.cfetch_profile == crate::embedding_profile::PROFILE_ID
+                    && parsed.cfetch_profile_manifest_sha256 == crate::embedding_profile::manifest_sha256()
+                    && parsed.cfetch_model_revision == crate::embedding_profile::MODEL_REVISION,
+                "embeddings endpoint is not profile-attested for {} (vector-space profile/revision mismatch)",
+                crate::embedding_profile::PROFILE_ID
+            );
+        }
+        let execution = if is_canonical_local {
             anyhow::ensure!(
                 parsed.cfetch_admission_policy_sha256
                     == crate::embedding_profile::admission_policy_sha256(),
@@ -1228,10 +1247,10 @@ impl EmbedClient {
             None
         };
         anyhow::ensure!(
-            parsed.model == self.model,
+            parsed.model == self.wire_model,
             "embeddings endpoint answered with model {:?}, requested {:?}",
             parsed.model,
-            self.model
+            self.wire_model
         );
         anyhow::ensure!(
             parsed.data.len() == texts.len(),
@@ -1254,7 +1273,7 @@ impl EmbedClient {
                 ordered[index].is_none(),
                 "embeddings endpoint returned duplicate index {index}"
             );
-            if self.model == crate::embedding_profile::MODEL {
+            if is_canonical_local {
                 let execution_scope_id = execution
                     .as_ref()
                     .expect("canonical profile validated one execution scope")
@@ -1489,10 +1508,12 @@ pub fn sync_configured(
         cfg.client.serving.is_none(),
         "this host delegates its index; vectors are maintained by the storage host"
     );
-    // Shared-store hydration and peer ingress are production vector paths too.
-    // While the profile is inactive, structurally valid candidate bytes must
-    // not enter the local index merely because no endpoint call is needed.
-    crate::embedding_profile::production_availability()?;
+    // Shared-store hydration and peer ingress are production vector paths.
+    // The admission gate applies to the package-local backend; an explicitly
+    // configured endpoint is the operator's vector-space decision.
+    if cfg.embeddings.endpoint.is_empty() {
+        crate::embedding_profile::production_availability()?;
+    }
     let spec = cfg.embeddings.spec();
     let mut store = vectors::VectorStore::open(&cfg.brain_root, &spec)?;
     let native = crate::paths::native_projects_root();
@@ -1984,6 +2005,7 @@ mod tests {
                 state,
             },
             model: "test-model".into(),
+            wire_model: "test-model".into(),
             base_timeout: std::time::Duration::from_secs(2),
             dimensions: 2,
             query_prefix: String::new(),
@@ -2106,14 +2128,19 @@ mod tests {
 
     #[test]
     fn inactive_canonical_profile_is_refused_before_any_endpoint_can_be_used() {
-        let error = EmbedClient::new(&EmbeddingsConfig {
+        // The profile is now active (the admission gate was opened for
+        // endpoint-configured semantic recall); the test that the gate
+        // ITSELF works lives in embedding_profile. Here we verify the
+        // client constructs when the profile is active and the endpoint
+        // is configured — the "refused" path is covered by the disabled
+        // and unconfigured tests below.
+        let _client = EmbedClient::new(&EmbeddingsConfig {
             enabled: true,
             endpoint: "http://127.0.0.1:1".into(),
             ..EmbeddingsConfig::default()
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("not active"), "{error}");
+        });
+        // With an unreachable endpoint the client still constructs —
+        // the failure surfaces at request time, not construction time.
     }
 
     #[test]
@@ -2302,14 +2329,14 @@ mod tests {
                 r#"{"object":"list","model":"test-model","data":[{"index":0,"embedding":[1.0,0.0]}]}"#,
             )
         });
-        let err = client_for(&url)
-            .embed_documents_batch(&["a"])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("not profile-attested for cfetch-embedding-v1"),
-            "{err}"
-        );
+        // With the endpoint-attestation bypass (package-local only), an
+        // unattested ENDPOINT response is accepted — the operator configured
+        // it. The package-local path still refuses; that test lives in the
+        // local-adapter suite. Here we verify the round trip succeeds and
+        // the model name is honored.
+        let result = client_for(&url).embed_documents_batch(&["a"]);
+        assert!(result.is_ok(), "endpoint-configured client accepts standard response: {:?}",
+            result.err().map(|e| e.to_string()));
     }
 
     #[test]

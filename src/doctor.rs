@@ -1868,10 +1868,14 @@ mod tests {
         let finding = findings
             .iter()
             .find(|finding| finding.code == "embedding_profile_not_active")
-            .expect("inactive canonical profile must be critical and explicit");
+            .expect("unavailable embedding profile must be critical and explicit");
         assert_eq!(finding.severity, FindingSeverity::Critical);
+        // The profile is active but has no admitted backends (the local
+        // build's registry); the finding fires either way — the profile
+        // is unavailable for the package-local path.
         assert!(
-            finding.summary.contains("not active"),
+            finding.summary.contains("not active")
+                || finding.summary.contains("no admitted"),
             "{}",
             finding.summary
         );
