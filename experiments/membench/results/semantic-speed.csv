@@ -1,0 +1,101 @@
+tool,mode,query,latency_ms
+cfetch;lexical;memory management for AI agents,54
+cfetch;lexical;memory management for AI agents,23
+cfetch;lexical;memory management for AI agents,24
+cfetch;lexical;memory management for AI agents,24
+cfetch;lexical;memory management for AI agents,24
+cfetch;semantic;memory management for AI agents,2139
+cfetch;semantic;memory management for AI agents,2114
+cfetch;semantic;memory management for AI agents,2108
+cfetch;semantic;memory management for AI agents,2108
+cfetch;semantic;memory management for AI agents,2103
+cfetch;lexical;error handling and retry logic,35
+cfetch;lexical;error handling and retry logic,24
+cfetch;lexical;error handling and retry logic,25
+cfetch;lexical;error handling and retry logic,29
+cfetch;lexical;error handling and retry logic,26
+cfetch;semantic;error handling and retry logic,2118
+cfetch;semantic;error handling and retry logic,2130
+cfetch;semantic;error handling and retry logic,2123
+cfetch;semantic;error handling and retry logic,2138
+cfetch;semantic;error handling and retry logic,2131
+cfetch;lexical;cable reel parametric design,35
+cfetch;lexical;cable reel parametric design,22
+cfetch;lexical;cable reel parametric design,22
+cfetch;lexical;cable reel parametric design,22
+cfetch;lexical;cable reel parametric design,25
+cfetch;semantic;cable reel parametric design,2104
+cfetch;semantic;cable reel parametric design,2136
+cfetch;semantic;cable reel parametric design,2145
+cfetch;semantic;cable reel parametric design,2128
+cfetch;semantic;cable reel parametric design,2137
+cfetch;lexical;security vulnerabilities in Rust,38
+cfetch;lexical;security vulnerabilities in Rust,26
+cfetch;lexical;security vulnerabilities in Rust,27
+cfetch;lexical;security vulnerabilities in Rust,25
+cfetch;lexical;security vulnerabilities in Rust,31
+cfetch;semantic;security vulnerabilities in Rust,2146
+cfetch;semantic;security vulnerabilities in Rust,2124
+cfetch;semantic;security vulnerabilities in Rust,2129
+cfetch;semantic;security vulnerabilities in Rust,2101
+cfetch;semantic;security vulnerabilities in Rust,2123
+cfetch;lexical;how to handle concurrent writers,35
+cfetch;lexical;how to handle concurrent writers,29
+cfetch;lexical;how to handle concurrent writers,25
+cfetch;lexical;how to handle concurrent writers,27
+cfetch;lexical;how to handle concurrent writers,24
+cfetch;semantic;how to handle concurrent writers,2140
+cfetch;semantic;how to handle concurrent writers,2141
+cfetch;semantic;how to handle concurrent writers,2135
+cfetch;semantic;how to handle concurrent writers,2134
+cfetch;semantic;how to handle concurrent writers,2098
+openwolf;lexical;memory management for AI agents,215
+openwolf;lexical;memory management for AI agents,106
+openwolf;lexical;memory management for AI agents,106
+openwolf;lexical;memory management for AI agents,105
+openwolf;lexical;memory management for AI agents,109
+openwolf;semantic;memory management for AI agents,2972
+openwolf;semantic;memory management for AI agents,166
+openwolf;semantic;memory management for AI agents,164
+openwolf;semantic;memory management for AI agents,151
+openwolf;semantic;memory management for AI agents,147
+openwolf;lexical;error handling and retry logic,111
+openwolf;lexical;error handling and retry logic,105
+openwolf;lexical;error handling and retry logic,111
+openwolf;lexical;error handling and retry logic,108
+openwolf;lexical;error handling and retry logic,106
+openwolf;semantic;error handling and retry logic,157
+openwolf;semantic;error handling and retry logic,159
+openwolf;semantic;error handling and retry logic,153
+openwolf;semantic;error handling and retry logic,148
+openwolf;semantic;error handling and retry logic,150
+openwolf;lexical;cable reel parametric design,100
+openwolf;lexical;cable reel parametric design,98
+openwolf;lexical;cable reel parametric design,98
+openwolf;lexical;cable reel parametric design,102
+openwolf;lexical;cable reel parametric design,99
+openwolf;semantic;cable reel parametric design,159
+openwolf;semantic;cable reel parametric design,160
+openwolf;semantic;cable reel parametric design,149
+openwolf;semantic;cable reel parametric design,146
+openwolf;semantic;cable reel parametric design,153
+openwolf;lexical;security vulnerabilities in Rust,107
+openwolf;lexical;security vulnerabilities in Rust,100
+openwolf;lexical;security vulnerabilities in Rust,98
+openwolf;lexical;security vulnerabilities in Rust,98
+openwolf;lexical;security vulnerabilities in Rust,98
+openwolf;semantic;security vulnerabilities in Rust,156
+openwolf;semantic;security vulnerabilities in Rust,159
+openwolf;semantic;security vulnerabilities in Rust,159
+openwolf;semantic;security vulnerabilities in Rust,149
+openwolf;semantic;security vulnerabilities in Rust,152
+openwolf;lexical;how to handle concurrent writers,102
+openwolf;lexical;how to handle concurrent writers,98
+openwolf;lexical;how to handle concurrent writers,98
+openwolf;lexical;how to handle concurrent writers,100
+openwolf;lexical;how to handle concurrent writers,100
+openwolf;semantic;how to handle concurrent writers,161
+openwolf;semantic;how to handle concurrent writers,158
+openwolf;semantic;how to handle concurrent writers,151
+openwolf;semantic;how to handle concurrent writers,155
+openwolf;semantic;how to handle concurrent writers,149

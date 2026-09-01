@@ -478,6 +478,13 @@ pub struct EmbeddingsConfig {
     pub endpoint: String,
     #[serde(default = "default_embed_model")]
     pub model: String,
+    /// Model name SENT to the endpoint, when the serving layer renames the
+    /// model (LM Studio prefixes "text-embedding-", Ollama uses short names).
+    /// The `model` field above remains the canonical profile identity and
+    /// is what the vector-space consistency check validates against; this
+    /// field is purely the wire-level name the endpoint expects.
+    #[serde(default)]
+    pub endpoint_model: Option<String>,
     /// Exact hostnames/IPs the operator exempts from the private-range
     /// refusal (mesh overlays, lab networks). Never exempts from https.
     #[serde(default)]
@@ -601,6 +608,7 @@ impl Default for EmbeddingsConfig {
             enabled: false,
             endpoint: String::new(),
             model: crate::embedding_profile::MODEL.to_string(),
+            endpoint_model: None,
             allow_hosts: Vec::new(),
             api_key_env: String::new(),
             timeout_secs: default_embed_timeout_secs(),
