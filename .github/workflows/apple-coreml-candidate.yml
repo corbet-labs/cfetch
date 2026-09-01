@@ -34,7 +34,7 @@ jobs:
           test "$(uname -m)" = arm64
 
       - name: Restore the revision-pinned Core ML bundle
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/cfetch-embeddinggemma-coreml
           key: embeddinggemma-coreml-d1dc305086782e958f91fa278de97e4af9caeaf0
