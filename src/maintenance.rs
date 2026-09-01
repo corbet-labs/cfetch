@@ -436,6 +436,11 @@ fn evidence_coverage(
     candidate: &staging::Candidate,
     records: &[jsonl::Record],
     selected: &HashSet<&str>,
+    // At apply time: the proposal's created_at. New matching events that
+    // arrived AFTER the proposal was submitted could not have been cited
+    // by the proposer; requiring it to have cited them is impossible.
+    // `None` at submit time (first evaluation, no proposal yet).
+    proposal_created_at: Option<i64>,
 ) -> anyhow::Result<String> {
     let matching: Vec<&jsonl::Record> = records
         .iter()
@@ -449,6 +454,22 @@ fn evidence_coverage(
             candidate.id
         );
         return Ok("candidate record covers the source whose raw event has rotated out".to_string());
+    }
+    // Regime-flip guard: at APPLY time, if the fallback was cited and every
+    // matching event postdates the proposal, the fallback stays sufficient.
+    // The proposer cited the candidate record because the raw events HAD
+    // rotated out at submit time; new events arriving during the review
+    // round-trip do not retroactively invalidate that decision.
+    if let Some(created_at) = proposal_created_at {
+        let fallback = candidate_evidence_id(candidate);
+        if selected.contains(fallback.as_str())
+            && matching.iter().all(|record| record.ts > created_at)
+        {
+            return Ok(format!(
+                "candidate record cited; all {} matching raw event(s) arrived after the proposal was submitted",
+                matching.len()
+            ));
+        }
     }
     let chosen: Vec<&jsonl::Record> = matching
         .into_iter()
@@ -976,6 +997,25 @@ fn validate_input(input: &ProposalInput) -> anyhow::Result<()> {
     if input.transition.changes_memory() {
         anyhow::ensure!(input.target.is_some(), "content transition requires target");
         anyhow::ensure!(input.after.is_some(), "content transition requires complete after bytes");
+        // The model's output is capped at 16384 tokens (~24-65 KB of text,
+        // less with JSON escaping). A proposal whose `after` exceeds what
+        // the model can echo back is structurally unproposable through the
+        // autonomous path: the response truncates, the JSON parse fails,
+        // and the candidate throws an exception every retry. Refuse here,
+        // at the gate, instead of sending the model an impossible task.
+        // 3 bytes/token is conservative for English and code; JSON string
+        // escaping inflates by another ~2x on markdown-heavy content.
+        const MODEL_AFTER_BUDGET: usize = 16_384 * 3 / 2; // ~24 KB
+        if let Some(after) = &input.after {
+            anyhow::ensure!(
+                after.len() <= MODEL_AFTER_BUDGET,
+                "proposed Markdown is {} bytes; the model's output budget ({ } tokens) can echo at most ~{} bytes. \
+                 Split the change or apply it manually with `cfetch maintain apply`",
+                after.len(),
+                crate::maintenance_model::MAX_OUTPUT_TOKENS,
+                MODEL_AFTER_BUDGET,
+            );
+        }
     } else {
         anyhow::ensure!(input.target.is_none() && input.after.is_none(), "dismiss/noop may not carry a target or content");
     }
@@ -996,7 +1036,7 @@ pub fn submit(cfg: &Config, input: ProposalInput) -> anyhow::Result<SubmitResult
     let all = jsonl::read_all(&paths::logs_dir(&cfg.brain_root), exhaust::STREAM);
     let selected: HashSet<&str> = input.evidence.iter().map(String::as_str).collect();
     for candidate in &candidates {
-        evidence_coverage(candidate, &all.records, &selected)?;
+        evidence_coverage(candidate, &all.records, &selected, None)?;
     }
 
     let (target, before, before_sha256, after) = if input.transition.changes_memory() {
@@ -1192,7 +1232,7 @@ fn verify_evidence(cfg: &Config, proposal: &Proposal) -> anyhow::Result<String> 
     let selected: HashSet<&str> = proposal.evidence.iter().map(String::as_str).collect();
     for source in &proposal.candidates {
         let candidate = find_candidate(&dir, &source.id)?;
-        evidence_coverage(&candidate, &all.records, &selected)?;
+        evidence_coverage(&candidate, &all.records, &selected, Some(proposal.created_at))?;
     }
     let known: HashSet<String> = all.records.iter().map(event_id).collect();
     for id in proposal.evidence.iter().filter(|id| id.starts_with("e6-")) {
