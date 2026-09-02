@@ -5,6 +5,16 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Host KAT reproduction harness (#56).** Added
+  `experiments/embedding-profile/kat_host_runner.py`: replays the bundle's
+  recorded session contract on any host and compares canonical `INT8x768`
+  outputs against the schema-2 known answers, with flags that refuse the
+  two classic measurement traps — silent CPU fallback after a GPU factory
+  failure (`--require-provider`) and hybrid CPU remainder (`--strict`).
+  A `--baseline-schema1` diagnostic detects hosts that deterministically
+  reproduce the superseded saturating-kernel bytes (observed on physical
+  Windows Zen 3 with official ORT 1.28.0; see the hardware report on the
+  certification issue). Unit-tested in CI; dependency-light at import.
 - **Local cross-encoder reranking without an endpoint (#54).** With the
   `embedded-embeddings` feature, an EMPTY `rerank.endpoint` in the config
   now selects the in-process reranker (Jina reranker v2 multilingual via

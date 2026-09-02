@@ -133,6 +133,36 @@ the parsed manifest fields. The later `release` state adds only the global
 report binding, rebinds the inventory and launcher transactionally, and must
 pass final package conformance.
 
+## Reproduce the runtime KAT on one host
+
+`kat_host_runner.py` replays the bundle's recorded session contract on any
+host and compares the canonical `INT8x768` outputs against the schema-2
+known answers. It is the harness behind third-party hardware reports on the
+certification issue: passing, mismatching, and blocked results are all
+useful evidence.
+
+    python kat_host_runner.py <bundle-dir> <provider> --require-provider
+
+The runner downloads nothing and hides nothing:
+
+- `--require-provider` refuses to compare bytes when the requested provider
+  is not ACTIVE — a GPU factory failure otherwise leaves the session silently
+  on CPU and measures the wrong route.
+- `--strict` sets `session.disable_cpu_ep_fallback`; any CPU remainder then
+  fails session creation instead of quietly joining the computation.
+- `--no-u8s8` applies the `session.qdqisint8allowed=0` lowering control.
+- `--baseline-schema1` compares against the superseded schema-1 known
+  answers embedded in `model.onnx.build.json`. This baseline is diagnostic
+  only: a host that reports 11/11 there and 0/11 against schema 2 is
+  deterministically reproducing the old saturating-kernel bytes and is a
+  rejected producer, not a passing one.
+
+Report the exact runtime version(s), the requested and active providers,
+per-case byte-diff counts, and whether repeats were byte-identical. On
+Windows with ORT 1.28 CUDA, also state how the CUDA 13 dependencies were
+sourced; the PyPI `nvidia-cublas-cu13` package is a placeholder and CUDA 12
+DLLs make the CUDA EP fail closed into a CPU-only session.
+
 ## Export one adapter scope
 
 `export_adapter_cache.py` is the backend-neutral bridge between a target-native

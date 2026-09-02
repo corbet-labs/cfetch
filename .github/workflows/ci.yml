@@ -88,6 +88,7 @@ jobs:
           python -m unittest -v
           test_cross_backend_eval.py
           test_export_adapter_cache.py
+          test_kat_host_runner.py
           test_measurement_bundle.py
           test_physical_evidence.py
           test_openvino_scope_keys.py
