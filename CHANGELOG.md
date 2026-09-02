@@ -5,6 +5,19 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **fastembed: 30+ embedding models, local reranking, automatic caching
+  (#49, #50).** The embedded backend now uses the `fastembed` crate
+  (built on ONNX Runtime + HuggingFace tokenizers), replacing ~300 lines
+  of manual session, tokenizer, download, and pooling code with ~100
+  lines. Models download automatically on first use and cache in the
+  state directory. The default embedding model is multilingual-e5-base
+  (278M params, 768 dims, 100+ languages including German); the default
+  reranker is Jina v2 multilingual (local cross-encoder, no HTTP
+  endpoint needed). `cfetch embed-model test` verifies the installation
+  end-to-end. Available models include multilingual-e5 (small/base/large),
+  embeddinggemma-300m, BGE-M3 (dense+sparse+ColBERT), Qwen3 embeddings,
+  and quantized variants of many models. Verified: German and English
+  embeddings at 768 dims, ~15ms per query on CPU.
 - **Embedded embedding backend: ONNX Runtime + BPE tokenizer (#43, #44,
   #46).** A new `embedded-embeddings` cargo feature adds ONNX Runtime
   (~20 MB) and the HuggingFace `tokenizers` crate to the binary.
