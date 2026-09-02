@@ -5,6 +5,22 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Local cross-encoder reranking without an endpoint (#54).** With the
+  `embedded-embeddings` feature, an EMPTY `rerank.endpoint` in the config
+  now selects the in-process reranker (Jina reranker v2 multilingual via
+  fastembed) instead of erroring. A set endpoint keeps the HTTP path
+  unchanged. Recall reorders its shortlist locally — zero network, zero
+  external server.
+- **Model compatibility check for shared vector stores (#53).** When
+  multiple hosts share a brain tree via iroh, all hosts must use the
+  exact same embedding model — vectors from different models live in
+  different spaces and cosine similarity between them is meaningless.
+  `cfetch embed-model check-compat` reads the shared store's model
+  metadata proactively (instead of waiting for a hydration error) and
+  reports Compatible or Incompatible with a fix suggestion.
+  `cfetch embed-model switch-to-shared` downloads the correct model
+  via fastembed and guides the re-embedding. `cfetch embed-model list`
+  shows all available embedding and reranker models.
 - **fastembed: 30+ embedding models, local reranking, automatic caching
   (#49, #50).** The embedded backend now uses the `fastembed` crate
   (built on ONNX Runtime + HuggingFace tokenizers), replacing ~300 lines

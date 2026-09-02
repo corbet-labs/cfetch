@@ -531,6 +531,8 @@ enum EmbedModelAction {
     CheckCompat,
     /// Switch to the model expected by the shared vector store
     SwitchToShared,
+    /// List all available embedding and reranker models
+    List,
 }
 
 #[derive(Subcommand)]
@@ -3050,6 +3052,17 @@ fn main() {
                                 }
                             }
                         }
+                    }
+                }
+                EmbedModelAction::List => {
+                    println!("Embedding models:");
+                    for (name, desc) in embedded_embed::available_models() {
+                        println!("  {:<28} {}", name, desc);
+                    }
+                    println!();
+                    println!("Reranker models:");
+                    for (name, desc) in embedded_embed::available_rerankers() {
+                        println!("  {:<28} {}", name, desc);
                     }
                 }
                 EmbedModelAction::Test { text } => {
