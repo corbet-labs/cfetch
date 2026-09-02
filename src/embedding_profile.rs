@@ -271,7 +271,7 @@ pub fn manifest_sha256() -> String {
     use sha2::Digest as _;
 
     let bytes = serde_json::to_vec(&manifest()).expect("embedding manifest serializes");
-    let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+    let digest = crate::hashing::hex_lower(sha2::Sha256::digest(bytes));
     assert_eq!(
         digest, PROFILE_MANIFEST_SHA256,
         "embedding profile digest changed without updating its frozen identity"
@@ -284,7 +284,7 @@ pub fn admission_policy_sha256() -> String {
 
     let bytes =
         serde_json::to_vec(&admission_policy()).expect("embedding admission policy serializes");
-    let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+    let digest = crate::hashing::hex_lower(sha2::Sha256::digest(bytes));
     assert_eq!(
         digest, ADMISSION_POLICY_SHA256,
         "embedding admission policy digest changed without recertifying its scopes"
@@ -673,7 +673,7 @@ mod tests {
             digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
-        let computed = format!("{:x}", digest.finalize());
+        let computed = crate::hashing::hex_lower(digest.finalize());
         let registry: serde_json::Value =
             serde_json::from_str(include_str!("../release/inference-backends.json")).unwrap();
 

@@ -5,6 +5,12 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Dependency and supply-chain hardening.** Rust dependencies and GitHub
+  Actions are updated as a tested set, SwiftNIO is raised past three published
+  security advisories, and the OpenVINO build environment now uses a fixed
+  Transformers release. Dependabot coverage now includes the maintained
+  Python packaging and Swift manifests. SHA-256 identifiers retain their
+  exact lowercase representation through a safe, dependency-free encoder.
 - **Safe-Rust and embedding-boundary hardening.** The cfetch package now
   forbids `unsafe` code on every target and feature combination. Atomic file
   replacement uses a safe cross-platform library boundary, and auth tests no

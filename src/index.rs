@@ -318,7 +318,7 @@ pub fn markdown_links(text: &str) -> Vec<String> {
 /// digest, so a citation and the vector stored under its hash can never end
 /// up describing different content.
 pub fn content_hash(text: &str) -> String {
-    format!("{:x}", sha2::Sha256::digest(normalize(text).as_bytes()))
+    crate::hashing::hex_lower(sha2::Sha256::digest(normalize(text).as_bytes()))
 }
 
 /// 40 hash bits: at ~20k blocks the birthday collision expectation is ~0.0002
@@ -836,7 +836,7 @@ fn source_fingerprint(files: &[SourceFile]) -> String {
         hasher.update(f.size.to_le_bytes());
         hasher.update([0xffu8]);
     }
-    format!("{:x}", hasher.finalize())
+    crate::hashing::hex_lower(hasher.finalize())
 }
 
 /// The stat fingerprint of the tree AS IT IS NOW — one stat walk, no file
@@ -1362,7 +1362,7 @@ pub fn catalog_checksum_matching(
         hasher.update(ring.to_le_bytes());
         hasher.update([0xffu8]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::hashing::hex_lower(hasher.finalize()))
 }
 
 /// Read-only open for serving-side query threads: never contends for the

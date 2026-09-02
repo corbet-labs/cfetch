@@ -48,6 +48,7 @@ mod import;
 mod embedded_embed;
 mod graph;
 mod hardware;
+mod hashing;
 mod heartbeat;
 mod hook_io;
 mod hooks;

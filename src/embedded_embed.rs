@@ -56,9 +56,17 @@ fn verify_artifact(path: &Path, expected_size: u64, expected_sha256: &str) -> an
     let mut file = std::fs::File::open(path)
         .map_err(|error| anyhow::anyhow!("open {}: {error}", path.display()))?;
     let mut hasher = sha2::Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|error| anyhow::anyhow!("hash {}: {error}", path.display()))?;
-    let actual = format!("{:x}", hasher.finalize());
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| anyhow::anyhow!("hash {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = crate::hashing::hex_lower(hasher.finalize());
     anyhow::ensure!(
         actual == expected_sha256,
         "{} has SHA-256 {actual}, expected {expected_sha256}",
@@ -127,7 +135,7 @@ fn download_to(
         downloaded == expected_size,
         "downloaded {label} has {downloaded} bytes, expected {expected_size}"
     );
-    let actual = format!("{:x}", hasher.finalize());
+    let actual = crate::hashing::hex_lower(hasher.finalize());
     anyhow::ensure!(
         actual == expected_sha256,
         "downloaded {label} has SHA-256 {actual}, expected {expected_sha256}"
