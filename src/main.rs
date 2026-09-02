@@ -522,6 +522,11 @@ enum EmbedModelAction {
     Download,
     /// Check whether the model is downloaded and loadable
     Status,
+    /// Embed a test string and print the first values
+    Test {
+        /// Text to embed
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2967,18 +2972,50 @@ fn main() {
                 }
                 EmbedModelAction::Status => {
                     let state = crate::paths::state_dir();
-                    if embedded_embed::model_available(&state) {
-                        let size = std::fs::metadata(embedded_embed::model_path(&state))
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        println!("model: {} ({} MB)", embedded_embed::model_path(&state).display(), size / 1024 / 1024);
+                    let model = embedded_embed::model_path(&state);
+                    let tokenizer = embedded_embed::tokenizer_path(&state);
+                    if model.is_file() {
+                        let size = std::fs::metadata(&model).map(|m| m.len()).unwrap_or(0);
+                        println!("model: {} ({} MB)", model.display(), size / 1024 / 1024);
+                    } else {
+                        println!("model: not downloaded");
+                    }
+                    if tokenizer.is_file() {
+                        println!("tokenizer: {}", tokenizer.display());
+                    } else {
+                        println!("tokenizer: not downloaded");
+                    }
+                    if model.is_file() && tokenizer.is_file() {
                         match embedded_embed::EmbeddedEmbedder::load(&state) {
-                            Ok(_) => println!("status: loadable"),
+                            Ok(_) => println!("status: loadable (ONNX + BPE tokenizer)"),
                             Err(e) => println!("status: load failed: {e:#}"),
                         }
                     } else {
-                        println!("model: not downloaded");
-                        println!("run `cfetch embed-model download` to fetch it (~130 MB)");
+                        println!("run `cfetch embed-model download` to fetch both files (~130 MB)");
+                    }
+                }
+                EmbedModelAction::Test { text } => {
+                    let state = crate::paths::state_dir();
+                    let mut embedder = match embedded_embed::EmbeddedEmbedder::load(&state) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!("cfetch embed-model test: {e:#}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let start = std::time::Instant::now();
+                    match embedder.embed(&text) {
+                        Ok(vec) => {
+                            let elapsed = start.elapsed();
+                            let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+                            println!("dims: {}, norm: {:.4}, time: {:?}", vec.len(), norm, elapsed);
+                            println!("first 5: {:?}", &vec[..5.min(vec.len())]);
+                            println!("last 5:  {:?}", &vec[vec.len().saturating_sub(5)..]);
+                        }
+                        Err(e) => {
+                            eprintln!("embed failed: {e:#}");
+                            std::process::exit(1);
+                        }
                     }
                 }
             },

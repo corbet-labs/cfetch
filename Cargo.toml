@@ -51,6 +51,9 @@ notify = "8"
 # dependencies at runtime — the model runs inside the cfetch binary.
 # Enable with: cargo build --features embedded-embeddings
 ort = { version = "2.0.0-rc.13", optional = true }
+# Optional: HuggingFace BPE tokenizer for the embedded embedding model.
+# Loaded from tokenizer.json alongside the ONNX model file.
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
 ratatui = "0.30.2"
 # Exact-pinned official MCP SDK. cfetch owns its tools; rmcp owns JSON-RPC,
 # protocol negotiation, capability discovery, schemas, and stdio framing.
@@ -93,7 +96,7 @@ tempfile = "3"
 # a local embedding model (nomic-embed-text ONNX) without Ollama or LM
 # Studio. The model file is downloaded separately (`cfetch embed-model
 # download`) and stored in the state directory. Adds ~20 MB to the binary.
-embedded-embeddings = ["ort/download-binaries"]
+embedded-embeddings = ["ort/download-binaries", "tokenizers"]
 
 [profile.release]
 lto = "thin"
