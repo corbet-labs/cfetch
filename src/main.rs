@@ -2964,39 +2964,31 @@ fn main() {
             #[cfg(feature = "embedded-embeddings")]
             Command::EmbedModel { action } => match action {
                 EmbedModelAction::Download => {
-                    let state = crate::paths::state_dir();
-                    if let Err(e) = embedded_embed::download_model(&state) {
-                        eprintln!("cfetch embed-model download: {e:#}");
-                        std::process::exit(1);
+                    // fastembed downloads models on first use; trigger it now
+                    match embedded_embed::EmbeddedEmbedder::load() {
+                        Ok(_) => println!("embedding model downloaded and cached"),
+                        Err(e) => {
+                            eprintln!("cfetch embed-model download: {e:#}");
+                            std::process::exit(1);
+                        }
                     }
                 }
                 EmbedModelAction::Status => {
-                    let state = crate::paths::state_dir();
-                    let model = embedded_embed::model_path(&state);
-                    let tokenizer = embedded_embed::tokenizer_path(&state);
-                    if model.is_file() {
-                        let size = std::fs::metadata(&model).map(|m| m.len()).unwrap_or(0);
-                        println!("model: {} ({} MB)", model.display(), size / 1024 / 1024);
+                    let cache = embedded_embed::cache_dir();
+                    println!("cache dir: {}", cache.display());
+                    if cache.join("models--intfloat--multilingual-e5-base").is_dir() {
+                        println!("embedding model: cached (multilingual-e5-base)");
                     } else {
-                        println!("model: not downloaded");
+                        println!("embedding model: not cached (downloads on first embed)");
                     }
-                    if tokenizer.is_file() {
-                        println!("tokenizer: {}", tokenizer.display());
-                    } else {
-                        println!("tokenizer: not downloaded");
-                    }
-                    if model.is_file() && tokenizer.is_file() {
-                        match embedded_embed::EmbeddedEmbedder::load(&state) {
-                            Ok(_) => println!("status: loadable (ONNX + BPE tokenizer)"),
-                            Err(e) => println!("status: load failed: {e:#}"),
-                        }
-                    } else {
-                        println!("run `cfetch embed-model download` to fetch both files (~130 MB)");
+                    println!("reranker model: not cached (downloads on first rerank)");
+                    match embedded_embed::EmbeddedEmbedder::load() {
+                        Ok(_) => println!("status: loadable"),
+                        Err(e) => println!("status: load failed: {e:#}"),
                     }
                 }
                 EmbedModelAction::Test { text } => {
-                    let state = crate::paths::state_dir();
-                    let mut embedder = match embedded_embed::EmbeddedEmbedder::load(&state) {
+                    let mut embedder = match embedded_embed::EmbeddedEmbedder::load() {
                         Ok(e) => e,
                         Err(e) => {
                             eprintln!("cfetch embed-model test: {e:#}");
@@ -3004,13 +2996,17 @@ fn main() {
                         }
                     };
                     let start = std::time::Instant::now();
-                    match embedder.embed(&text) {
-                        Ok(vec) => {
+                    match embedder.embed(vec![text.clone()]) {
+                        Ok(embeddings) => {
                             let elapsed = start.elapsed();
-                            let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-                            println!("dims: {}, norm: {:.4}, time: {:?}", vec.len(), norm, elapsed);
-                            println!("first 5: {:?}", &vec[..5.min(vec.len())]);
-                            println!("last 5:  {:?}", &vec[vec.len().saturating_sub(5)..]);
+                            if let Some(vec) = embeddings.first() {
+                                let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+                                println!("dims: {}, norm: {:.4}, time: {:?}", vec.len(), norm, elapsed);
+                                println!("first 5: {:?}", &vec[..5.min(vec.len())]);
+                                println!("last 5:  {:?}", &vec[vec.len().saturating_sub(5)..]);
+                            } else {
+                                println!("no embedding returned");
+                            }
                         }
                         Err(e) => {
                             eprintln!("embed failed: {e:#}");
