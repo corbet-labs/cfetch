@@ -47,12 +47,11 @@ iroh-blobs = { version = "=0.103.0", default-features = false }
 # the exact profile-derived byte boundary.
 n0-future = "0.3"
 notify = "8"
-# Optional experimental Nomic probe via ONNX Runtime. It is deliberately not
-# connected to cfetch's admitted EmbeddingGemma production vector path.
-ort = { version = "2.0.0-rc.13", optional = true }
-# Optional: HuggingFace BPE tokenizer for the embedded embedding model.
-# Loaded from tokenizer.json alongside the ONNX model file.
-tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+# Optional: embedded embedding + reranking via fastembed (ONNX Runtime).
+# Zero external dependencies at runtime — models run inside the cfetch binary.
+# fastembed handles model download, tokenization, pooling, and caching.
+# Enable with: cargo build --features embedded-embeddings
+fastembed = { version = "6", optional = true }
 ratatui = "0.30.2"
 # Exact-pinned official MCP SDK. cfetch owns its tools; rmcp owns JSON-RPC,
 # protocol negotiation, capability discovery, schemas, and stdio framing.
@@ -88,7 +87,7 @@ rustix = { version = "1", features = ["fs", "system"] }
 [features]
 # Experimental standalone Nomic model probe. Enabling it adds diagnostic
 # download/status/test commands, never a producer for cfetch's shared vectors.
-embedded-embeddings = ["ort/download-binaries", "tokenizers"]
+embedded-embeddings = ["fastembed"]
 
 [lints.rust]
 # cfetch itself is safe Rust on every target. Native implementations may live
