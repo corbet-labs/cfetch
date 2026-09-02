@@ -24,6 +24,9 @@ pub const DEFAULT_EMBEDDING_MODEL: fastembed::EmbeddingModel =
 pub const DEFAULT_RERANKER_MODEL: fastembed::RerankerModel =
     fastembed::RerankerModel::JINARerankerV2BaseMultiligual;
 
+/// Human-readable name of the default reranker (for status output).
+pub const DEFAULT_RERANKER_MODEL_NAME: &str = "jina-reranker-v2-base-multilingual";
+
 /// Where fastembed caches downloaded models.
 pub fn cache_dir() -> PathBuf {
     crate::paths::state_dir().join("models")
@@ -185,6 +188,20 @@ impl EmbeddedReranker {
             .into_iter()
             .map(|r| (r.index, r.score, r.document))
             .collect())
+    }
+
+    /// Scores every document against the query, one score per input document
+    /// in INPUT order — the same contract as `RerankClient::rank`.
+    pub fn rank(&mut self, query: &str, documents: &[&str]) -> anyhow::Result<Vec<f32>> {
+        let results = self.model.rerank(query, documents, false, None)
+            .map_err(|e| anyhow::anyhow!("rerank: {e}"))?;
+        let mut scores = vec![f32::MIN; documents.len()];
+        for r in results {
+            if let Some(slot) = scores.get_mut(r.index) {
+                *slot = r.score;
+            }
+        }
+        Ok(scores)
     }
 }
 
