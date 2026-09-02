@@ -5,6 +5,16 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **`cfetch import openwolf` (#41).** A one-way importer that migrates an
+  openwolf-enhanced `.wolf/` directory into the brain tree. Content files
+  are placed at their ring-appropriate destinations (`OPENWOLF.md` →
+  `AGENT.md` at ring 1, `cerebrum.md` → `knowledge/` at ring 3, `memory.md`
+  → `mind/memories/` at ring 2), dated archives and backups go to
+  `knowledge/archive/` (excluded from the index), and staging candidates
+  keep their ring-5 quarantine. Ring frontmatter is prepended only when
+  the file has none. `--dry-run` shows the mapping without writing.
+  Everything cfetch regenerates on its own is skipped with a printed
+  reason (code index, token ledger, buglog, cron, embeddings, config).
 - **Semantic recall on explicitly configured endpoints (#39).** A new
   `embeddings.endpoint_model` config field carries the wire-level name a
   serving layer expects (LM Studio prefixes `text-embedding-`, Ollama uses
