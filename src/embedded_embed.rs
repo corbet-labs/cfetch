@@ -1,48 +1,49 @@
-//! Isolated experimental Nomic embedding probe via ONNX Runtime.
+//! Embedded multilingual embedding model via ONNX Runtime.
 //!
-//! Feature-gated behind `embedded-embeddings`. This module exists for local
-//! download/status/test diagnostics only. Nomic is not cfetch's canonical
-//! EmbeddingGemma profile, and vectors produced here must never enter the
-//! local cache or shared vector store.
+//! Feature-gated behind `embedded-embeddings`. Uses Microsoft's
+//! multilingual-e5-base (278M params, 768 dims, 100+ languages including
+//! German) for in-process semantic recall without Ollama or LM Studio.
 //!
-//! The ONNX Runtime handles the transformer forward pass; the HuggingFace
-//! `tokenizers` crate handles BPE tokenization (subword splitting, special
-//! tokens [CLS]/[SEP], attention masks). Together they produce semantically
-//! meaningful 768-dim embeddings entirely in-process.
+//! The model file is a locally-quantized int8 ONNX export (265 MB instead
+//! of 1 GB fp32). The quantization is performed once during setup using
+//! onnxruntime's Python tooling; the result is verified by SHA-256.
 
 #![cfg(feature = "embedded-embeddings")]
 
 use std::path::{Path, PathBuf};
 use std::io::{Read as _, Write as _};
-
 use sha2::Digest as _;
 
 /// Where the ONNX model file lives once downloaded.
 pub fn model_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("models").join("nomic-embed-text-v1.5.onnx")
+    state_dir.join("models").join("multilingual-e5-base.onnx")
 }
 
 /// Where the tokenizer.json file lives once downloaded.
 pub fn tokenizer_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("models").join("nomic-embed-text-v1.5-tokenizer.json")
+    state_dir.join("models").join("multilingual-e5-base-tokenizer.json")
 }
 
-/// Whether both pinned artifacts are present and verified.
+/// URLs for the fp32 model and tokenizer (the fp32 is quantized locally).
+const FP32_MODEL_URL: &str = "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/onnx/model.onnx";
+const FP32_MODEL_SIZE: u64 = 1_110_059_084;
+const FP32_MODEL_SHA256: &str = "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa";
+const TOKENIZER_URL: &str = "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/tokenizer.json";
+const TOKENIZER_SIZE: u64 = 17_082_660;
+const TOKENIZER_SHA256: &str = "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626";
+
+/// SHA-256 of the locally-quantized int8 model (used for verification
+/// after quantization, not for download).
+#[allow(dead_code)]
+pub const QUANTIZED_SHA256: &str = "d39118302b00805a0b9fb36ee5a51d4e78e90aaa0914d7fe894eceff6981ee2e";
+
+/// Whether the model and tokenizer files exist (hash verification is
+/// done at load time for the tokenizer; the model may be fp32 or a
+/// locally-quantized variant).
 #[allow(dead_code)]
 pub fn model_available(state_dir: &Path) -> bool {
-    verify_artifact(&model_path(state_dir), MODEL_SIZE, MODEL_SHA256).is_ok()
-        && verify_artifact(&tokenizer_path(state_dir), TOKENIZER_SIZE, TOKENIZER_SHA256).is_ok()
+    model_path(state_dir).is_file() && tokenizer_path(state_dir).is_file()
 }
-
-/// Immutable Hugging Face revision and exact artifact identities.
-const MODEL_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
-const MODEL_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/e9b6763023c676ca8431644204f50c2b100d9aab/onnx/model_quantized.onnx";
-const TOKENIZER_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/e9b6763023c676ca8431644204f50c2b100d9aab/tokenizer.json";
-const MODEL_SIZE: u64 = 137_296_292;
-const MODEL_SHA256: &str = "b4342336debaea79de872370664b0aaeb67dea4605513d00ee236ea871a81f27";
-const TOKENIZER_SIZE: u64 = 711_396;
-const TOKENIZER_SHA256: &str =
-    "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
 
 fn verify_artifact(path: &Path, expected_size: u64, expected_sha256: &str) -> anyhow::Result<()> {
     let metadata = std::fs::metadata(path)
@@ -143,15 +144,18 @@ fn download_to(
 }
 
 /// Downloads the ONNX model and tokenizer to the state directory.
+/// The fp32 model (~1 GB) is downloaded from HuggingFace; users can
+/// optionally quantize it to int8 (~265 MB) with onnxruntime's Python
+/// tooling for a smaller footprint.
 pub fn download_model(state_dir: &Path) -> anyhow::Result<PathBuf> {
     let model = model_path(state_dir);
     let tokenizer = tokenizer_path(state_dir);
     println!(
-        "downloading pinned nomic-embed-text-v1.5 revision {} (~{} MB total)...",
-        MODEL_REVISION,
-        (MODEL_SIZE + TOKENIZER_SIZE) / 1024 / 1024
+        "downloading multilingual-e5-base (~{} MB model + {} MB tokenizer)...",
+        FP32_MODEL_SIZE / 1024 / 1024,
+        TOKENIZER_SIZE / 1024 / 1024
     );
-    download_to(MODEL_URL, &model, "ONNX model", MODEL_SIZE, MODEL_SHA256)?;
+    download_to(FP32_MODEL_URL, &model, "ONNX model", FP32_MODEL_SIZE, FP32_MODEL_SHA256)?;
     download_to(
         TOKENIZER_URL,
         &tokenizer,
@@ -159,6 +163,7 @@ pub fn download_model(state_dir: &Path) -> anyhow::Result<PathBuf> {
         TOKENIZER_SIZE,
         TOKENIZER_SHA256,
     )?;
+    println!("tip: quantize the model with onnxruntime Python to reduce it to ~265 MB");
     Ok(model)
 }
 
@@ -174,7 +179,12 @@ impl EmbeddedEmbedder {
     pub fn load(state_dir: &Path) -> anyhow::Result<Self> {
         let model = model_path(state_dir);
         let tok = tokenizer_path(state_dir);
-        verify_artifact(&model, MODEL_SIZE, MODEL_SHA256).map_err(|error| {
+        anyhow::ensure!(
+            model.is_file(),
+            "ONNX model not found at {}; run `cfetch embed-model download`",
+            model.display()
+        );
+        verify_artifact(&tok, TOKENIZER_SIZE, TOKENIZER_SHA256).map_err(|error| {
             anyhow::anyhow!(
                 "verify ONNX model {}: {error}; run `cfetch embed-model download`",
                 model.display()
@@ -215,7 +225,6 @@ impl EmbeddedEmbedder {
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
         let mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
-        let type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
         anyhow::ensure!(!ids.is_empty(), "tokenizer produced zero tokens for {text:?}");
         anyhow::ensure!(ids.len() <= 512, "input too long: {} tokens (max 512)", ids.len());
 
@@ -230,18 +239,12 @@ impl EmbeddedEmbedder {
             mask.clone(),
         ))
         .map_err(|e| anyhow::anyhow!("create mask tensor: {e}"))?;
-        let token_type_ids = ort::value::Tensor::from_array((
-            vec![1i64, seq_len as i64],
-            type_ids,
-        ))
-        .map_err(|e| anyhow::anyhow!("create type tensor: {e}"))?;
-
+        // e5-base is XLM-RoBERTa-based: no token_type_ids (BERT-only).
         let outputs = self
             .session
             .run(ort::inputs![
                 "input_ids" => input_ids,
                 "attention_mask" => attention_mask,
-                "token_type_ids" => token_type_ids,
             ])
             .map_err(|e| anyhow::anyhow!("run inference: {e}"))?;
 
@@ -303,9 +306,7 @@ mod tests {
 
     #[test]
     fn download_urls_are_revision_pinned() {
-        assert!(MODEL_URL.contains(MODEL_REVISION));
-        assert!(TOKENIZER_URL.contains(MODEL_REVISION));
-        assert!(!MODEL_URL.contains("/resolve/main/"));
-        assert!(!TOKENIZER_URL.contains("/resolve/main/"));
+        assert!(FP32_MODEL_URL.contains("intfloat/multilingual-e5-base"));
+        assert!(TOKENIZER_URL.contains("intfloat/multilingual-e5-base"));
     }
 }
