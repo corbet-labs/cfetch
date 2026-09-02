@@ -4,9 +4,6 @@
 use anyhow::Context as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically replaces `path` without replacing a symlink that the user or a
 /// declarative manager owns. Existing permissions are retained; a new file is
@@ -23,80 +20,31 @@ pub fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("stat {}", target.display())),
     };
-    let name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    let tmp = parent.join(format!(
-        ".{name}.cfetch-tmp.{}.{}",
-        std::process::id(),
-        TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    let result = (|| -> anyhow::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-            let mode = existing.as_ref().map_or(0o600, |p| p.mode() & 0o7777);
-            options.mode(mode);
-        }
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
-        // `OpenOptionsExt::mode` is still filtered through the process umask.
-        // An atomic rewrite must preserve an existing 0660/0640 file exactly,
-        // not silently narrow it to the daemon's current umask.
-        if let Some(permissions) = existing.clone() {
-            std::fs::set_permissions(&tmp, permissions)
-                .with_context(|| format!("set permissions on {}", tmp.display()))?;
-        }
-        file.write_all(content.as_ref())
-            .with_context(|| format!("write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync {}", tmp.display()))?;
-        drop(file);
-
-        replace_file(&tmp, &target)
-            .with_context(|| format!("replace {} with {}", target.display(), tmp.display()))?;
-        sync_parent(parent);
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{name}.cfetch-tmp."))
+        .tempfile_in(parent)
+        .with_context(|| format!("create temporary file in {}", parent.display()))?;
+    // NamedTempFile is private by default. An atomic rewrite must preserve an
+    // existing 0660/0640 file exactly, not narrow it to the process umask.
+    if let Some(permissions) = existing {
+        tmp.as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("set permissions on {}", tmp.path().display()))?;
     }
-    result
-}
+    tmp.write_all(content.as_ref())
+        .with_context(|| format!("write {}", tmp.path().display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("sync {}", tmp.path().display()))?;
 
-#[cfg(unix)]
-fn replace_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, target)
-}
-
-#[cfg(windows)]
-fn replace_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let tmp: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    // `std::fs::rename` does not replace an existing file on Windows. The
-    // installer is an upsert, so use the platform's atomic replacement API.
-    let ok = unsafe {
-        MoveFileExW(
-            tmp.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    // tempfile supplies the platform-specific atomic replacement behind a
+    // safe API, including replacing an existing file on Windows.
+    tmp.persist(&target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {}", target.display()))?;
+    sync_parent(parent);
+    Ok(())
 }
 
 fn resolved_write_target(path: &Path) -> anyhow::Result<PathBuf> {

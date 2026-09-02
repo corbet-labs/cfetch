@@ -47,9 +47,8 @@ iroh-blobs = { version = "=0.103.0", default-features = false }
 # the exact profile-derived byte boundary.
 n0-future = "0.3"
 notify = "8"
-# Optional: embedded embedding model via ONNX Runtime. Zero external
-# dependencies at runtime — the model runs inside the cfetch binary.
-# Enable with: cargo build --features embedded-embeddings
+# Optional experimental Nomic probe via ONNX Runtime. It is deliberately not
+# connected to cfetch's admitted EmbeddingGemma production vector path.
 ort = { version = "2.0.0-rc.13", optional = true }
 # Optional: HuggingFace BPE tokenizer for the embedded embedding model.
 # Loaded from tokenizer.json alongside the ONNX model file.
@@ -62,6 +61,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 # Used only by the cfetch 0.9 one-time Codex registration conversion and the
 # features.hooks health check. New registrations are owned by agent-config.
@@ -85,18 +85,16 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "system"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
-
-[dev-dependencies]
-tempfile = "3"
-
 [features]
-# Embedded embedding model via ONNX Runtime. When enabled, cfetch can run
-# a local embedding model (nomic-embed-text ONNX) without Ollama or LM
-# Studio. The model file is downloaded separately (`cfetch embed-model
-# download`) and stored in the state directory. Adds ~20 MB to the binary.
+# Experimental standalone Nomic model probe. Enabling it adds diagnostic
+# download/status/test commands, never a producer for cfetch's shared vectors.
 embedded-embeddings = ["ort/download-binaries", "tokenizers"]
+
+[lints.rust]
+# cfetch itself is safe Rust on every target. Native implementations may live
+# behind dependencies with their own audited safe APIs, but unsafe code cannot
+# enter this package's binary, build script, or integration-test targets.
+unsafe_code = "forbid"
 
 [profile.release]
 lto = "thin"

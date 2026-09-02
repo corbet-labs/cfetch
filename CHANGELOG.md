@@ -5,6 +5,13 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Safe-Rust and embedding-boundary hardening.** The cfetch package now
+  forbids `unsafe` code on every target and feature combination. Atomic file
+  replacement uses a safe cross-platform library boundary, and auth tests no
+  longer mutate the process environment. The optional Nomic ONNX experiment
+  is isolated to download/status/test commands, pins and verifies exact model
+  artifacts, and cannot produce local or shared cfetch vectors. Canonical
+  EmbeddingGemma transports remain fail-closed until admitted and attested.
 - **`cfetch import openwolf` (#41).** A one-way importer that migrates an
   openwolf-enhanced `.wolf/` directory into the brain tree. Content files
   are placed at their ring-appropriate destinations (`OPENWOLF.md` →
@@ -19,10 +26,10 @@ listed here is a fix or an internal change with no effect on behavior.
   `embeddings.endpoint_model` config field carries the wire-level name a
   serving layer expects (LM Studio prefixes `text-embedding-`, Ollama uses
   short names) while the canonical `model` field remains the vector-space
-  identity. The admission gate and profile-attestation checks now apply
-  only to the package-local path serving the canonical model: an operator
-  who configures their own Ollama or LM Studio endpoint has taken
-  responsibility for vector-space consistency. The first semantic recall
+  identity. Explicitly named noncanonical endpoints remain separate vector
+  spaces; endpoints claiming the canonical model must pass the same
+  admission and profile-attestation checks as a package-local producer. The
+  first semantic recall
   benchmark is recorded alongside (`experiments/membench/results/`):
   cfetch at 71 ms vs openwolf-enhanced at 155 ms, with hardware load
   (~140 MB total) and weaker-system extrapolation. Three root causes are

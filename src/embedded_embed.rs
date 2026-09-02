@@ -1,10 +1,9 @@
-//! Embedded embedding model via ONNX Runtime — no external server needed.
+//! Isolated experimental Nomic embedding probe via ONNX Runtime.
 //!
-//! Feature-gated behind `embedded-embeddings`. When enabled, cfetch loads a
-//! quantized nomic-embed-text ONNX model directly in-process and serves
-//! embeddings without Ollama or LM Studio. The model and tokenizer files
-//! are downloaded once (`cfetch embed-model download`) and cached in the
-//! state directory.
+//! Feature-gated behind `embedded-embeddings`. This module exists for local
+//! download/status/test diagnostics only. Nomic is not cfetch's canonical
+//! EmbeddingGemma profile, and vectors produced here must never enter the
+//! local cache or shared vector store.
 //!
 //! The ONNX Runtime handles the transformer forward pass; the HuggingFace
 //! `tokenizers` crate handles BPE tokenization (subword splitting, special
@@ -14,6 +13,9 @@
 #![cfg(feature = "embedded-embeddings")]
 
 use std::path::{Path, PathBuf};
+use std::io::{Read as _, Write as _};
+
+use sha2::Digest as _;
 
 /// Where the ONNX model file lives once downloaded.
 pub fn model_path(state_dir: &Path) -> PathBuf {
@@ -25,42 +27,118 @@ pub fn tokenizer_path(state_dir: &Path) -> PathBuf {
     state_dir.join("models").join("nomic-embed-text-v1.5-tokenizer.json")
 }
 
-/// Whether both the model and tokenizer have been downloaded.
+/// Whether both pinned artifacts are present and verified.
 #[allow(dead_code)]
 pub fn model_available(state_dir: &Path) -> bool {
-    model_path(state_dir).is_file() && tokenizer_path(state_dir).is_file()
+    verify_artifact(&model_path(state_dir), MODEL_SIZE, MODEL_SHA256).is_ok()
+        && verify_artifact(&tokenizer_path(state_dir), TOKENIZER_SIZE, TOKENIZER_SHA256).is_ok()
 }
 
-/// URLs for the ONNX export and tokenizer of nomic-embed-text-v1.5.
-const MODEL_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model_quantized.onnx";
-const TOKENIZER_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json";
-const MODEL_SIZE_HINT: u64 = 130 * 1024 * 1024; // ~130 MB
-const TOKENIZER_SIZE_HINT: u64 = 700 * 1024; // ~700 KB
+/// Immutable Hugging Face revision and exact artifact identities.
+const MODEL_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
+const MODEL_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/e9b6763023c676ca8431644204f50c2b100d9aab/onnx/model_quantized.onnx";
+const TOKENIZER_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/e9b6763023c676ca8431644204f50c2b100d9aab/tokenizer.json";
+const MODEL_SIZE: u64 = 137_296_292;
+const MODEL_SHA256: &str = "b4342336debaea79de872370664b0aaeb67dea4605513d00ee236ea871a81f27";
+const TOKENIZER_SIZE: u64 = 711_396;
+const TOKENIZER_SHA256: &str =
+    "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
 
-fn download_to(url: &str, dest: &Path, label: &str) -> anyhow::Result<()> {
+fn verify_artifact(path: &Path, expected_size: u64, expected_sha256: &str) -> anyhow::Result<()> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("inspect {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        metadata.len() == expected_size,
+        "{} has {} bytes, expected {expected_size}",
+        path.display(),
+        metadata.len()
+    );
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| anyhow::anyhow!("open {}: {error}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| anyhow::anyhow!("hash {}: {error}", path.display()))?;
+    let actual = format!("{:x}", hasher.finalize());
+    anyhow::ensure!(
+        actual == expected_sha256,
+        "{} has SHA-256 {actual}, expected {expected_sha256}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn download_to(
+    url: &str,
+    dest: &Path,
+    label: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> anyhow::Result<()> {
     if dest.is_file() {
-        println!("{} already downloaded: {}", label, dest.display());
-        return Ok(());
+        match verify_artifact(dest, expected_size, expected_sha256) {
+            Ok(()) => {
+                println!("{} already downloaded and verified: {}", label, dest.display());
+                return Ok(());
+            }
+            Err(error) => println!("{} is invalid ({error}); downloading a verified replacement", label),
+        }
     }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("create {}: {e}", parent.display()))?;
-    }
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", dest.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("create {}: {error}", parent.display()))?;
     println!("downloading {}...", label);
     let response = ureq::Agent::config_builder()
+        .max_redirects(5)
         .timeout_global(Some(std::time::Duration::from_secs(300)))
         .build()
         .new_agent()
         .get(url)
         .call()
-        .map_err(|e| anyhow::anyhow!("download {} failed: {e}", label))?;
+        .map_err(|error| anyhow::anyhow!("download {label} failed: {error}"))?;
     let mut reader = response.into_body().into_reader();
-    let mut file = std::fs::File::create(dest)
-        .map_err(|e| anyhow::anyhow!("create {}: {e}", dest.display()))?;
-    std::io::copy(&mut reader, &mut file)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", dest.display()))?;
-    let size = std::fs::metadata(dest)?.len();
-    println!("  {} MB -> {}", size / 1024 / 1024, dest.display());
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".cfetch-model-download.")
+        .tempfile_in(parent)
+        .map_err(|error| anyhow::anyhow!("create temporary file in {}: {error}", parent.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut downloaded = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| anyhow::anyhow!("read {label}: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        downloaded = downloaded
+            .checked_add(count as u64)
+            .ok_or_else(|| anyhow::anyhow!("download size overflow for {label}"))?;
+        anyhow::ensure!(
+            downloaded <= expected_size,
+            "downloaded {label} exceeds the pinned {expected_size}-byte size"
+        );
+        tmp.write_all(&buffer[..count])
+            .map_err(|error| anyhow::anyhow!("write temporary {label}: {error}"))?;
+        hasher.update(&buffer[..count]);
+    }
+    anyhow::ensure!(
+        downloaded == expected_size,
+        "downloaded {label} has {downloaded} bytes, expected {expected_size}"
+    );
+    let actual = format!("{:x}", hasher.finalize());
+    anyhow::ensure!(
+        actual == expected_sha256,
+        "downloaded {label} has SHA-256 {actual}, expected {expected_sha256}"
+    );
+    tmp.as_file()
+        .sync_all()
+        .map_err(|error| anyhow::anyhow!("sync temporary {label}: {error}"))?;
+    tmp.persist(dest)
+        .map_err(|error| error.error)
+        .map_err(|error| anyhow::anyhow!("replace {}: {error}", dest.display()))?;
+    println!("  {} MB -> {}", downloaded / 1024 / 1024, dest.display());
     Ok(())
 }
 
@@ -68,10 +146,19 @@ fn download_to(url: &str, dest: &Path, label: &str) -> anyhow::Result<()> {
 pub fn download_model(state_dir: &Path) -> anyhow::Result<PathBuf> {
     let model = model_path(state_dir);
     let tokenizer = tokenizer_path(state_dir);
-    println!("downloading nomic-embed-text-v1.5 (~{} MB total)...",
-        (MODEL_SIZE_HINT + TOKENIZER_SIZE_HINT) / 1024 / 1024);
-    download_to(MODEL_URL, &model, "ONNX model")?;
-    download_to(TOKENIZER_URL, &tokenizer, "tokenizer")?;
+    println!(
+        "downloading pinned nomic-embed-text-v1.5 revision {} (~{} MB total)...",
+        MODEL_REVISION,
+        (MODEL_SIZE + TOKENIZER_SIZE) / 1024 / 1024
+    );
+    download_to(MODEL_URL, &model, "ONNX model", MODEL_SIZE, MODEL_SHA256)?;
+    download_to(
+        TOKENIZER_URL,
+        &tokenizer,
+        "tokenizer",
+        TOKENIZER_SIZE,
+        TOKENIZER_SHA256,
+    )?;
     Ok(model)
 }
 
@@ -87,11 +174,18 @@ impl EmbeddedEmbedder {
     pub fn load(state_dir: &Path) -> anyhow::Result<Self> {
         let model = model_path(state_dir);
         let tok = tokenizer_path(state_dir);
-        anyhow::ensure!(
-            model.is_file() && tok.is_file(),
-            "embedding model not found at {}; run `cfetch embed-model download` first",
-            model.display()
-        );
+        verify_artifact(&model, MODEL_SIZE, MODEL_SHA256).map_err(|error| {
+            anyhow::anyhow!(
+                "verify ONNX model {}: {error}; run `cfetch embed-model download`",
+                model.display()
+            )
+        })?;
+        verify_artifact(&tok, TOKENIZER_SIZE, TOKENIZER_SHA256).map_err(|error| {
+            anyhow::anyhow!(
+                "verify tokenizer {}: {error}; run `cfetch embed-model download`",
+                tok.display()
+            )
+        })?;
         let session = ort::session::Session::builder()
             .map_err(|e| anyhow::anyhow!("create ONNX session: {e}"))?
             .commit_from_file(&model)
@@ -190,5 +284,28 @@ mod tests {
         let dir = Path::new("/tmp/state");
         assert!(model_path(dir).ends_with("models/nomic-embed-text-v1.5.onnx"));
         assert!(tokenizer_path(dir).ends_with("models/nomic-embed-text-v1.5-tokenizer.json"));
+    }
+
+    #[test]
+    fn artifact_verification_checks_size_and_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("artifact");
+        std::fs::write(&artifact, b"cfetch").unwrap();
+        verify_artifact(
+            &artifact,
+            6,
+            "bab49db60fd8b88607513a9fe8049f460efcecbb58a4fc18191c90bd1e6799d8",
+        )
+        .unwrap();
+        assert!(verify_artifact(&artifact, 7, "irrelevant").is_err());
+        assert!(verify_artifact(&artifact, 6, &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn download_urls_are_revision_pinned() {
+        assert!(MODEL_URL.contains(MODEL_REVISION));
+        assert!(TOKENIZER_URL.contains(MODEL_REVISION));
+        assert!(!MODEL_URL.contains("/resolve/main/"));
+        assert!(!TOKENIZER_URL.contains("/resolve/main/"));
     }
 }

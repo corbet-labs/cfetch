@@ -111,7 +111,7 @@ enum Command {
         #[command(subcommand)]
         source: ImportSource,
     },
-    /// Manage the embedding model (feature-gated: embedded-embeddings)
+    /// Run the isolated experimental Nomic probe (never shared vectors)
     #[cfg(feature = "embedded-embeddings")]
     EmbedModel {
         #[command(subcommand)]
@@ -518,11 +518,11 @@ enum MaintainAction {
 #[derive(Subcommand)]
 #[cfg(feature = "embedded-embeddings")]
 enum EmbedModelAction {
-    /// Download the nomic-embed-text ONNX model (~130 MB)
+    /// Download and verify the pinned nomic-embed-text ONNX model (~130 MB)
     Download,
     /// Check whether the model is downloaded and loadable
     Status,
-    /// Embed a test string and print the first values
+    /// Embed a test string locally; the result is never stored or shared
     Test {
         /// Text to embed
         text: String,
