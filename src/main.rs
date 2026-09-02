@@ -43,6 +43,7 @@ mod exhaust;
 mod fsutil;
 mod govern;
 mod grant;
+mod import;
 mod graph;
 mod hardware;
 mod heartbeat;
@@ -102,6 +103,11 @@ enum Command {
         /// Coding-agent adapter invoking the hook
         #[arg(long, value_name = "ID")]
         agent: Option<String>,
+    },
+    /// Import data from another memory tool
+    Import {
+        #[command(subcommand)]
+        source: ImportSource,
     },
     /// Manage the per-host daemon
     Daemon {
@@ -499,6 +505,18 @@ enum MaintainAction {
     Reject { id: String },
     /// Finish a legacy manual apply after git HEAD contains its exact bytes
     Finalize { id: String },
+}
+
+#[derive(Subcommand)]
+enum ImportSource {
+    /// Migrate an openwolf-enhanced .wolf/ directory into the brain tree
+    Openwolf {
+        /// Path to the .wolf/ directory to import
+        path: std::path::PathBuf,
+        /// Show what would be imported without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2858,7 +2876,66 @@ fn main() {
     }
     let cli = Cli::parse();
     match cli.command {
-        Command::Hook { event, agent } => {
+            Command::Import { source } => match source {
+                ImportSource::Openwolf { path, dry_run } => {
+                    let brain = crate::paths::default_brain_root();
+                    if dry_run {
+                        println!("dry run — nothing will be written");
+                    }
+                    let report = if dry_run {
+                        // Read-only: report what WOULD be imported.
+                        let mut mock = import::ImportReport {
+                            imported: Vec::new(),
+                            skipped: Vec::new(),
+                            errors: Vec::new(),
+                        };
+                        for (name, dest, _) in import::MIGRATIONS {
+                            if path.join(name).is_file() {
+                                if brain.join(dest).exists() {
+                                    mock.skipped.push((name.to_string(), "destination exists".to_string()));
+                                } else {
+                                    mock.imported.push((name.to_string(), dest.to_string()));
+                                }
+                            }
+                        }
+                        mock
+                    } else {
+                        match import::import_openwolf(&path, &brain) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("cfetch import openwolf: {e:#}");
+                                std::process::exit(1);
+                            }
+                        }
+                    };
+                    println!();
+                    if !report.imported.is_empty() {
+                        println!("imported:");
+                        for (src, dest) in &report.imported {
+                            println!("  {} -> {}", src, dest);
+                        }
+                    }
+                    if !report.skipped.is_empty() {
+                        println!("skipped:");
+                        for (name, reason) in &report.skipped {
+                            println!("  {} ({})", name, reason);
+                        }
+                    }
+                    if !report.errors.is_empty() {
+                        println!("errors:");
+                        for (name, error) in &report.errors {
+                            println!("  {}: {}", name, error);
+                        }
+                    }
+                    if report.imported.is_empty() && report.skipped.is_empty() {
+                        println!("nothing to import from {}", path.display());
+                    } else {
+                        println!();
+                        println!("run `cfetch scan` to index the imported content");
+                    }
+                }
+            },
+            Command::Hook { event, agent } => {
             // Unreachable in practice (pre-dispatch above), kept for --help.
             hooks::run(&event, agent.as_deref());
         }
