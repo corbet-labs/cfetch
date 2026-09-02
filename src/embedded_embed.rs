@@ -96,8 +96,14 @@ impl EmbeddedEmbedder {
             .map_err(|e| anyhow::anyhow!("create ONNX session: {e}"))?
             .commit_from_file(&model)
             .map_err(|e| anyhow::anyhow!("load model {}: {e}", model.display()))?;
-        let tokenizer = tokenizers::Tokenizer::from_file(&tok)
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tok)
             .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tok.display()))?;
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 512,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("configure truncation: {e}"))?;
         Ok(Self { session, tokenizer })
     }
 
