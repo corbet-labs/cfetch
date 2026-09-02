@@ -44,6 +44,8 @@ mod fsutil;
 mod govern;
 mod grant;
 mod import;
+#[cfg(feature = "embedded-embeddings")]
+mod embedded_embed;
 mod graph;
 mod hardware;
 mod heartbeat;
@@ -108,6 +110,12 @@ enum Command {
     Import {
         #[command(subcommand)]
         source: ImportSource,
+    },
+    /// Manage the embedding model (feature-gated: embedded-embeddings)
+    #[cfg(feature = "embedded-embeddings")]
+    EmbedModel {
+        #[command(subcommand)]
+        action: EmbedModelAction,
     },
     /// Manage the per-host daemon
     Daemon {
@@ -505,6 +513,15 @@ enum MaintainAction {
     Reject { id: String },
     /// Finish a legacy manual apply after git HEAD contains its exact bytes
     Finalize { id: String },
+}
+
+#[derive(Subcommand)]
+#[cfg(feature = "embedded-embeddings")]
+enum EmbedModelAction {
+    /// Download the nomic-embed-text ONNX model (~130 MB)
+    Download,
+    /// Check whether the model is downloaded and loadable
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -2939,7 +2956,33 @@ fn main() {
             // Unreachable in practice (pre-dispatch above), kept for --help.
             hooks::run(&event, agent.as_deref());
         }
-        Command::Daemon { action } => {
+            #[cfg(feature = "embedded-embeddings")]
+            Command::EmbedModel { action } => match action {
+                EmbedModelAction::Download => {
+                    let state = crate::paths::state_dir();
+                    if let Err(e) = embedded_embed::download_model(&state) {
+                        eprintln!("cfetch embed-model download: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                EmbedModelAction::Status => {
+                    let state = crate::paths::state_dir();
+                    if embedded_embed::model_available(&state) {
+                        let size = std::fs::metadata(embedded_embed::model_path(&state))
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        println!("model: {} ({} MB)", embedded_embed::model_path(&state).display(), size / 1024 / 1024);
+                        match embedded_embed::EmbeddedEmbedder::load(&state) {
+                            Ok(_) => println!("status: loadable"),
+                            Err(e) => println!("status: load failed: {e:#}"),
+                        }
+                    } else {
+                        println!("model: not downloaded");
+                        println!("run `cfetch embed-model download` to fetch it (~130 MB)");
+                    }
+                }
+            },
+            Command::Daemon { action } => {
             let result = match action {
                 DaemonAction::Run => daemon::run(),
                 DaemonAction::Start => daemon::start(),
