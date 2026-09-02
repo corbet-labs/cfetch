@@ -5,6 +5,18 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Embedded embedding backend: ONNX Runtime + BPE tokenizer (#43, #44,
+  #46).** A new `embedded-embeddings` cargo feature adds ONNX Runtime
+  (~20 MB) and the HuggingFace `tokenizers` crate to the binary.
+  `cfetch embed-model download` fetches the quantized nomic-embed-text
+  ONNX model (~131 MB) and tokenizer (~700 KB); `cfetch embed-model
+  status` and `test` verify the installation. The `EmbedClient` gains an
+  `Embedded` backend variant that runs inference in-process — no Ollama,
+  LM Studio, or any HTTP endpoint. 6-8 ms per embedding on a modern CPU,
+  512-token truncation for long documents, masked mean pooling. The
+  default build is completely unaffected. (The safe-Rust entry above
+  additionally isolates the experimental Nomic path until the admission
+  framework certifies it.)
 - **Safe-Rust and embedding-boundary hardening.** The cfetch package now
   forbids `unsafe` code on every target and feature combination. Atomic file
   replacement uses a safe cross-platform library boundary, and auth tests no
