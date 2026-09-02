@@ -182,9 +182,9 @@ pub(crate) fn resolve_auth(api_key_env: &str, field: &str) -> anyhow::Result<Opt
 enum EmbedBackend {
     Endpoint {
         agent: ureq::Agent,
-        /// Full `…/embeddings` URL, endpoint trailing slashes normalized away.
+        /// Full `./embeddings` URL, endpoint trailing slashes normalized away.
         url: String,
-        /// Ready `Bearer …` header value, resolved from `api_key_env` at
+        /// Ready `Bearer .` header value, resolved from `api_key_env` at
         /// construction (a missing variable fails fast, not mid-batch).
         auth: Option<String>,
     },
@@ -192,6 +192,10 @@ enum EmbedBackend {
         agent: ureq::Agent,
         state: std::sync::Arc<std::sync::Mutex<LocalBackendState>>,
     },
+    /// In-process ONNX Runtime inference — no external server. The model
+    /// and tokenizer are loaded once at construction and stay in memory.
+    #[cfg(feature = "embedded-embeddings")]
+    Embedded(std::sync::Mutex<crate::embedded_embed::EmbeddedEmbedder>),
 }
 
 struct LocalBackendState {
@@ -208,6 +212,43 @@ type SharedLocalBackendState = std::sync::Arc<std::sync::Mutex<LocalBackendState
 /// repeat NPU/GPU/CPU discovery for every recall.
 static LOCAL_BACKEND_STATE: std::sync::OnceLock<Result<SharedLocalBackendState, String>> =
     std::sync::OnceLock::new();
+
+/// Builds the package-local backend (admitted NPU/GPU/CPU plan). Extracted
+/// so the embedded-embeddings feature can bypass it when the model is
+/// downloaded — the caller has already checked that route.
+fn build_package_local_backend(
+    cfg: &crate::config::EmbeddingsConfig,
+    agent: ureq::Agent,
+) -> anyhow::Result<EmbedBackend> {
+    anyhow::ensure!(
+        cfg.model == crate::embedding_profile::MODEL,
+        "an unmanaged embedding model requires an explicit endpoint"
+    );
+    anyhow::ensure!(
+        cfg.api_key_env.is_empty() && cfg.allow_hosts.is_empty(),
+        "embeddings endpoint credentials/host exemptions cannot configure a package-local adapter"
+    );
+    let plan = crate::local_inference::selected_local_package_plan()?
+        .context(
+            "no admitted local inference package; install a compatible local variant, configure an explicit endpoint, or build with --features embedded-embeddings and run `cfetch embed-model download`",
+        )?;
+    let executable = std::env::current_exe().context("resolve the running cfetch binary")?;
+    let package_directory = executable
+        .parent()
+        .context("the running cfetch binary has no package directory")?;
+    let sibling = package_directory.join(&plan.dispatcher.binary);
+    let state = cached_local_backend_state(
+        &LOCAL_BACKEND_STATE,
+        crate::local_adapter::AdapterLaunch {
+            binary: sibling,
+            sha256: plan.dispatcher.sha256,
+            package_manifest: package_directory.join("package-manifest.json"),
+            package_manifest_sha256: plan.package_manifest_sha256,
+            ordered_scope_ids: plan.ordered_scope_ids,
+        },
+    )?;
+    Ok(EmbedBackend::Local { agent, state })
+}
 
 fn cached_local_backend_state(
     cache: &std::sync::OnceLock<Result<SharedLocalBackendState, String>>,
@@ -847,6 +888,8 @@ impl std::fmt::Debug for EmbedClient {
         let backend = match &self.backend {
             EmbedBackend::Endpoint { url, .. } => url.as_str(),
             EmbedBackend::Local { .. } => "package-local",
+            #[cfg(feature = "embedded-embeddings")]
+            EmbedBackend::Embedded(_) => "embedded",
         };
         f.debug_struct("EmbedClient")
             .field("backend", &backend)
@@ -862,7 +905,19 @@ impl EmbedClient {
     pub fn new(cfg: &EmbeddingsConfig) -> anyhow::Result<EmbedClient> {
         anyhow::ensure!(cfg.enabled, "embeddings disabled (set embeddings.enabled=true in config)");
         anyhow::ensure!(!cfg.model.is_empty(), "embeddings.model is required");
-        if cfg.model == crate::embedding_profile::MODEL && cfg.endpoint.is_empty() {
+        if cfg.model == crate::embedding_profile::MODEL
+            && cfg.endpoint.is_empty()
+            && !{
+                #[cfg(feature = "embedded-embeddings")]
+                {
+                    crate::embedded_embed::model_available(&crate::paths::state_dir())
+                }
+                #[cfg(not(feature = "embedded-embeddings"))]
+                {
+                    false
+                }
+            }
+        {
             // The admission gate protects the SHARED vector space (the
             // package-local path whose vectors may be replicated to peers).
             // An explicitly configured endpoint is the operator's own
@@ -879,33 +934,25 @@ impl EmbedClient {
             .build()
             .new_agent();
         let backend = if cfg.endpoint.is_empty() {
-            anyhow::ensure!(
-                cfg.model == crate::embedding_profile::MODEL,
-                "an unmanaged embedding model requires an explicit endpoint"
-            );
-            anyhow::ensure!(
-                cfg.api_key_env.is_empty() && cfg.allow_hosts.is_empty(),
-                "embeddings endpoint credentials/host exemptions cannot configure a package-local adapter"
-            );
-            let plan = crate::local_inference::selected_local_package_plan()?.context(
-                "this exact cfetch build contains no admitted local inference package; install a compatible local variant or configure an explicit endpoint",
-            )?;
-            let executable = std::env::current_exe().context("resolve the running cfetch binary")?;
-            let package_directory = executable
-                .parent()
-                .context("the running cfetch binary has no package directory")?;
-            let sibling = package_directory.join(&plan.dispatcher.binary);
-            let state = cached_local_backend_state(
-                &LOCAL_BACKEND_STATE,
-                crate::local_adapter::AdapterLaunch {
-                    binary: sibling,
-                    sha256: plan.dispatcher.sha256,
-                    package_manifest: package_directory.join("package-manifest.json"),
-                    package_manifest_sha256: plan.package_manifest_sha256,
-                    ordered_scope_ids: plan.ordered_scope_ids,
-                },
-            )?;
-            EmbedBackend::Local { agent, state }
+            // When the embedded-embeddings feature is enabled and the model
+            // is downloaded, use in-process ONNX inference — no external
+            // server, no HTTP, 6-8ms per embedding. This is the preferred
+            // zero-dependency path for users who want semantic recall
+            // without Ollama or LM Studio.
+            #[cfg(feature = "embedded-embeddings")]
+            {
+                let state_dir = crate::paths::state_dir();
+                if crate::embedded_embed::model_available(&state_dir) {
+                    let embedder = crate::embedded_embed::EmbeddedEmbedder::load(&state_dir)?;
+                    EmbedBackend::Embedded(std::sync::Mutex::new(embedder))
+                } else {
+                    build_package_local_backend(cfg, agent)?
+                }
+            }
+            #[cfg(not(feature = "embedded-embeddings"))]
+            {
+                build_package_local_backend(cfg, agent)?
+            }
         } else {
             // A configured endpoint is an explicit route and never a hidden
             // fourth step after package-local NPU/GPU/CPU fallback.
@@ -1016,6 +1063,20 @@ impl EmbedClient {
         texts: &[&str],
         timeout: std::time::Duration,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
+        // In-process ONNX inference: no HTTP, no attestation, no response
+        // parsing — just a direct forward pass through the model.
+        #[cfg(feature = "embedded-embeddings")]
+        if let EmbedBackend::Embedded(embedder) = &self.backend {
+            let mut embedder = embedder
+                .lock()
+                .map_err(|_| anyhow::anyhow!("embedded embedder mutex poisoned"))?;
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                vectors.push(embedder.embed(text)?);
+            }
+            return Ok(vectors);
+        }
+
         let (mode, route, result) = match &self.backend {
             EmbedBackend::Endpoint { agent, url, auth } => (
                 crate::runtime_status::InferenceMode::Endpoint,
@@ -1034,6 +1095,8 @@ impl EmbedClient {
                 crate::runtime_status::InferenceRoute::Local,
                 self.embed_local(agent, state, texts, timeout),
             ),
+            #[cfg(feature = "embedded-embeddings")]
+            EmbedBackend::Embedded(_) => unreachable!("embedded backend handled above"),
         };
         match &result {
             Ok(batch) => {
@@ -1510,8 +1573,20 @@ pub fn sync_configured(
     );
     // Shared-store hydration and peer ingress are production vector paths.
     // The admission gate applies to the package-local backend; an explicitly
-    // configured endpoint is the operator's vector-space decision.
-    if cfg.embeddings.endpoint.is_empty() {
+    // configured endpoint or an available embedded model is the operator's
+    // vector-space decision.
+    #[allow(unused_variables)]
+    let embedded_ready = {
+        #[cfg(feature = "embedded-embeddings")]
+        {
+            crate::embedded_embed::model_available(&crate::paths::state_dir())
+        }
+        #[cfg(not(feature = "embedded-embeddings"))]
+        {
+            false
+        }
+    };
+    if cfg.embeddings.endpoint.is_empty() && !embedded_ready {
         crate::embedding_profile::production_availability()?;
     }
     let spec = cfg.embeddings.spec();
