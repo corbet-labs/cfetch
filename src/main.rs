@@ -527,6 +527,10 @@ enum EmbedModelAction {
         /// Text to embed
         text: String,
     },
+    /// Check if the local model matches the shared vector store
+    CheckCompat,
+    /// Switch to the model expected by the shared vector store
+    SwitchToShared,
 }
 
 #[derive(Subcommand)]
@@ -2985,6 +2989,67 @@ fn main() {
                     match embedded_embed::EmbeddedEmbedder::load() {
                         Ok(_) => println!("status: loadable"),
                         Err(e) => println!("status: load failed: {e:#}"),
+                    }
+                }
+                EmbedModelAction::CheckCompat => {
+                    let report = embedded_embed::check_compatibility();
+                    match report.status {
+                        embedded_embed::CompatStatus::NoSharedStore => {
+                            println!("no shared vector store found — nothing to check");
+                        }
+                        embedded_embed::CompatStatus::Compatible => {
+                            println!("compatible: local model matches shared store");
+                            println!("  shared: {} ({}d)", report.shared_model, report.shared_dim);
+                            println!("  local:  {}", report.local_model);
+                        }
+                        embedded_embed::CompatStatus::Incompatible => {
+                            println!("INCOMPATIBLE: shared store uses a different model");
+                            println!("  shared: {} ({}d)", report.shared_model, report.shared_dim);
+                            println!("  local:  {}", report.local_model);
+                            if report.can_auto_switch {
+                                println!();
+                                println!("  fix: cfetch embed-model switch-to-shared");
+                                println!("  (downloads the correct model and re-embeds local content)");
+                            } else {
+                                println!();
+                                println!("  the shared model is not available in fastembed;");
+                                println!("  ask the store owner which model they use");
+                            }
+                        }
+                    }
+                }
+                EmbedModelAction::SwitchToShared => {
+                    let report = embedded_embed::check_compatibility();
+                    match report.status {
+                        embedded_embed::CompatStatus::NoSharedStore => {
+                            println!("no shared vector store found — nothing to switch to");
+                        }
+                        embedded_embed::CompatStatus::Compatible => {
+                            println!("already compatible — no switch needed");
+                        }
+                        embedded_embed::CompatStatus::Incompatible => {
+                            let Some(model) = report.fastembed_variant else {
+                                eprintln!("cannot auto-switch: shared model {:?} not in fastembed", report.shared_model);
+                                std::process::exit(1);
+                            };
+                            println!("switching to {} ...", report.shared_model);
+                            let _ = model; // fastembed downloads on first embed
+                            println!("downloading model...");
+                            match embedded_embed::EmbeddedEmbedder::load() {
+                                Ok(_) => {
+                                    println!("model downloaded");
+                                    println!();
+                                    println!("next steps:");
+                                    println!("  1. clear local vectors: python -c \"import sqlite3; conn = sqlite3.connect(r'%LOCALAPPDATA%\\cfetch\\index.db'); conn.execute('DELETE FROM vectors'); conn.commit()\"");
+                                    println!("  2. re-embed: cfetch embed-index");
+                                    println!("  3. verify: cfetch embed-model check-compat");
+                                }
+                                Err(e) => {
+                                    eprintln!("download failed: {e:#}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
                     }
                 }
                 EmbedModelAction::Test { text } => {

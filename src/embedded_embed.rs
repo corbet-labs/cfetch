@@ -29,6 +29,99 @@ pub fn cache_dir() -> PathBuf {
     crate::paths::state_dir().join("models")
 }
 
+/// Reads the shared vector store's model metadata (without loading it).
+/// Returns None if no shared store exists.
+/// The filename encodes the spec: network1-<profile>-<model>-<dim>-<precision>-<hash>.idx
+pub fn shared_store_model() -> Option<(String, usize)> {
+    let store_dir = crate::paths::shared_vector_dir(&crate::paths::default_brain_root());
+    let entries = std::fs::read_dir(&store_dir).ok()?;
+    let idx_file = entries.flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "idx"))?;
+    let filename = idx_file.file_name()?.to_str()?;
+    let parts: Vec<&str> = filename.split('-').collect();
+    // Expected: [network1, profile, ..., model_name, dim, precision, hash.idx]
+    // Find the dim part (a pure number) near the end
+    if parts.len() < 4 {
+        return None;
+    }
+    let dim: usize = parts.get(parts.len().saturating_sub(3))?.parse().ok()?;
+    let model = parts[2..parts.len().saturating_sub(3)].join("-");
+    Some((model, dim))
+}
+
+/// Maps a model name (from the shared store) to a fastembed model.
+/// Handles both the canonical HuggingFace name and the filename variant.
+pub fn model_from_name(name: &str) -> Option<fastembed::EmbeddingModel> {
+    use fastembed::EmbeddingModel::*;
+    let lower = name.to_lowercase().replace('_', "/");
+    if lower.contains("multilingual-e5-base") {
+        Some(MultilingualE5Base)
+    } else if lower.contains("multilingual-e5-large") {
+        Some(MultilingualE5Large)
+    } else if lower.contains("multilingual-e5-small") {
+        Some(MultilingualE5Small)
+    } else if lower.contains("embeddinggemma") {
+        Some(EmbeddingGemma300M)
+    } else if lower.contains("bge-small-en") {
+        Some(BGESmallENV15)
+    } else if lower.contains("bge-large-en") {
+        Some(BGELargeENV15)
+    } else if lower.contains("nomic-embed-text") {
+        Some(NomicEmbedTextV15)
+    } else if lower.contains("minilm-l6") {
+        Some(AllMiniLML6V2)
+    } else {
+        None
+    }
+}
+
+/// Checks whether the local model is compatible with the shared vector store.
+/// Returns a human-readable report and whether auto-switch is possible.
+pub fn check_compatibility() -> CompatibilityReport {
+    let Some((shared_model, shared_dim)) = shared_store_model() else {
+        return CompatibilityReport {
+            status: CompatStatus::NoSharedStore,
+            shared_model: String::new(),
+            shared_dim: 0,
+            local_model: "multilingual-e5-base (default)".to_string(),
+            can_auto_switch: false,
+            fastembed_variant: None,
+        };
+    };
+    // For now, the local model is always the default (MultilingualE5Base).
+    // When per-model config is added, read from config here.
+    let local = "multilingual-e5-base";
+    let compatible = shared_model.contains("multilingual-e5-base")
+        || shared_model.replace('_', "/").contains("multilingual/e5/base");
+    let fastembed_variant = model_from_name(&shared_model);
+    CompatibilityReport {
+        status: if compatible { CompatStatus::Compatible } else { CompatStatus::Incompatible },
+        shared_model,
+        shared_dim,
+        local_model: local.to_string(),
+        can_auto_switch: fastembed_variant.is_some(),
+        fastembed_variant,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompatStatus {
+    NoSharedStore,
+    Compatible,
+    Incompatible,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompatibilityReport {
+    pub status: CompatStatus,
+    pub shared_model: String,
+    pub shared_dim: usize,
+    pub local_model: String,
+    pub can_auto_switch: bool,
+    pub fastembed_variant: Option<fastembed::EmbeddingModel>,
+}
+
 /// An in-process embedding backend using fastembed.
 /// Handles model download (first use), tokenization, and inference.
 pub struct EmbeddedEmbedder {
