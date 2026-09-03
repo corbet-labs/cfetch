@@ -1,286 +1,235 @@
-//! Isolated experimental Nomic embedding probe via ONNX Runtime.
+//! Embedded embedding and reranking via fastembed (ONNX Runtime).
 //!
-//! Feature-gated behind `embedded-embeddings`. This module exists for local
-//! download/status/test diagnostics only. Nomic is not cfetch's canonical
-//! EmbeddingGemma profile, and vectors produced here must never enter the
-//! local cache or shared vector store.
+//! Feature-gated behind `embedded-embeddings`. Uses the `fastembed` crate
+//! which handles model download, tokenization, pooling, caching, and ONNX
+//! inference — all in-process with zero external server dependencies.
 //!
-//! The ONNX Runtime handles the transformer forward pass; the HuggingFace
-//! `tokenizers` crate handles BPE tokenization (subword splitting, special
-//! tokens [CLS]/[SEP], attention masks). Together they produce semantically
-//! meaningful 768-dim embeddings entirely in-process.
+//! Supported models include multilingual-e5-base (768-dim, 100+ languages,
+//! for German/English semantic recall), embeddinggemma-300m (cfetch's
+//! canonical profile), BGE-M3 (multi-vector), and Jina reranker v2
+//! multilingual (local cross-encoder reranking).
 
 #![cfg(feature = "embedded-embeddings")]
 
-use std::path::{Path, PathBuf};
-use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
 
-use sha2::Digest as _;
+/// Default embedding model: multilingual-e5-base (278M, 768 dims).
+/// Covers 100+ languages including German and English.
+pub const DEFAULT_EMBEDDING_MODEL: fastembed::EmbeddingModel =
+    fastembed::EmbeddingModel::MultilingualE5Base;
 
-/// Where the ONNX model file lives once downloaded.
-pub fn model_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("models").join("nomic-embed-text-v1.5.onnx")
-}
-
-/// Where the tokenizer.json file lives once downloaded.
-pub fn tokenizer_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("models").join("nomic-embed-text-v1.5-tokenizer.json")
-}
-
-/// Whether both pinned artifacts are present and verified.
+/// Default reranking model: Jina reranker v2 multilingual.
+/// Cross-encoder that scores query-document pairs locally.
 #[allow(dead_code)]
-pub fn model_available(state_dir: &Path) -> bool {
-    verify_artifact(&model_path(state_dir), MODEL_SIZE, MODEL_SHA256).is_ok()
-        && verify_artifact(&tokenizer_path(state_dir), TOKENIZER_SIZE, TOKENIZER_SHA256).is_ok()
+pub const DEFAULT_RERANKER_MODEL: fastembed::RerankerModel =
+    fastembed::RerankerModel::JINARerankerV2BaseMultiligual;
+
+/// Human-readable name of the default reranker (for status output).
+pub const DEFAULT_RERANKER_MODEL_NAME: &str = "jina-reranker-v2-base-multilingual";
+
+/// Where fastembed caches downloaded models.
+pub fn cache_dir() -> PathBuf {
+    crate::paths::state_dir().join("models")
 }
 
-/// Immutable Hugging Face revision and exact artifact identities.
-const MODEL_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
-const MODEL_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/e9b6763023c676ca8431644204f50c2b100d9aab/onnx/model_quantized.onnx";
-const TOKENIZER_URL: &str = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/e9b6763023c676ca8431644204f50c2b100d9aab/tokenizer.json";
-const MODEL_SIZE: u64 = 137_296_292;
-const MODEL_SHA256: &str = "b4342336debaea79de872370664b0aaeb67dea4605513d00ee236ea871a81f27";
-const TOKENIZER_SIZE: u64 = 711_396;
-const TOKENIZER_SHA256: &str =
-    "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
-
-fn verify_artifact(path: &Path, expected_size: u64, expected_sha256: &str) -> anyhow::Result<()> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| anyhow::anyhow!("inspect {}: {error}", path.display()))?;
-    anyhow::ensure!(
-        metadata.len() == expected_size,
-        "{} has {} bytes, expected {expected_size}",
-        path.display(),
-        metadata.len()
-    );
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| anyhow::anyhow!("open {}: {error}", path.display()))?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| anyhow::anyhow!("hash {}: {error}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
+/// Reads the shared vector store's model metadata (without loading it).
+/// Returns None if no shared store exists.
+/// The filename encodes the spec: network1-<profile>-<model>-<dim>-<precision>-<hash>.idx
+pub fn shared_store_model() -> Option<(String, usize)> {
+    let store_dir = crate::paths::shared_vector_dir(&crate::paths::default_brain_root());
+    let entries = std::fs::read_dir(&store_dir).ok()?;
+    let idx_file = entries.flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "idx"))?;
+    let filename = idx_file.file_name()?.to_str()?;
+    let parts: Vec<&str> = filename.split('-').collect();
+    // Expected: [network1, profile, ..., model_name, dim, precision, hash.idx]
+    // Find the dim part (a pure number) near the end
+    if parts.len() < 4 {
+        return None;
     }
-    let actual = crate::hashing::hex_lower(hasher.finalize());
-    anyhow::ensure!(
-        actual == expected_sha256,
-        "{} has SHA-256 {actual}, expected {expected_sha256}",
-        path.display()
-    );
-    Ok(())
+    let dim: usize = parts.get(parts.len().saturating_sub(3))?.parse().ok()?;
+    let model = parts[2..parts.len().saturating_sub(3)].join("-");
+    Some((model, dim))
 }
 
-fn download_to(
-    url: &str,
-    dest: &Path,
-    label: &str,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> anyhow::Result<()> {
-    if dest.is_file() {
-        match verify_artifact(dest, expected_size, expected_sha256) {
-            Ok(()) => {
-                println!("{} already downloaded and verified: {}", label, dest.display());
-                return Ok(());
-            }
-            Err(error) => println!("{} is invalid ({error}); downloading a verified replacement", label),
-        }
+/// Maps a model name (from the shared store) to a fastembed model.
+/// Handles both the canonical HuggingFace name and the filename variant.
+pub fn model_from_name(name: &str) -> Option<fastembed::EmbeddingModel> {
+    use fastembed::EmbeddingModel::*;
+    let lower = name.to_lowercase().replace('_', "/");
+    if lower.contains("multilingual-e5-base") {
+        Some(MultilingualE5Base)
+    } else if lower.contains("multilingual-e5-large") {
+        Some(MultilingualE5Large)
+    } else if lower.contains("multilingual-e5-small") {
+        Some(MultilingualE5Small)
+    } else if lower.contains("embeddinggemma") {
+        Some(EmbeddingGemma300M)
+    } else if lower.contains("bge-small-en") {
+        Some(BGESmallENV15)
+    } else if lower.contains("bge-large-en") {
+        Some(BGELargeENV15)
+    } else if lower.contains("nomic-embed-text") {
+        Some(NomicEmbedTextV15)
+    } else if lower.contains("minilm-l6") {
+        Some(AllMiniLML6V2)
+    } else {
+        None
     }
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", dest.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| anyhow::anyhow!("create {}: {error}", parent.display()))?;
-    println!("downloading {}...", label);
-    let response = ureq::Agent::config_builder()
-        .max_redirects(5)
-        .timeout_global(Some(std::time::Duration::from_secs(300)))
-        .build()
-        .new_agent()
-        .get(url)
-        .call()
-        .map_err(|error| anyhow::anyhow!("download {label} failed: {error}"))?;
-    let mut reader = response.into_body().into_reader();
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".cfetch-model-download.")
-        .tempfile_in(parent)
-        .map_err(|error| anyhow::anyhow!("create temporary file in {}: {error}", parent.display()))?;
-    let mut hasher = sha2::Sha256::new();
-    let mut downloaded = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|error| anyhow::anyhow!("read {label}: {error}"))?;
-        if count == 0 {
-            break;
-        }
-        downloaded = downloaded
-            .checked_add(count as u64)
-            .ok_or_else(|| anyhow::anyhow!("download size overflow for {label}"))?;
-        anyhow::ensure!(
-            downloaded <= expected_size,
-            "downloaded {label} exceeds the pinned {expected_size}-byte size"
-        );
-        tmp.write_all(&buffer[..count])
-            .map_err(|error| anyhow::anyhow!("write temporary {label}: {error}"))?;
-        hasher.update(&buffer[..count]);
+}
+
+/// Checks whether the local model is compatible with the shared vector store.
+/// Returns a human-readable report and whether auto-switch is possible.
+pub fn check_compatibility() -> CompatibilityReport {
+    let Some((shared_model, shared_dim)) = shared_store_model() else {
+        return CompatibilityReport {
+            status: CompatStatus::NoSharedStore,
+            shared_model: String::new(),
+            shared_dim: 0,
+            local_model: "multilingual-e5-base (default)".to_string(),
+            can_auto_switch: false,
+            fastembed_variant: None,
+        };
+    };
+    // For now, the local model is always the default (MultilingualE5Base).
+    // When per-model config is added, read from config here.
+    let local = "multilingual-e5-base";
+    let compatible = shared_model.contains("multilingual-e5-base")
+        || shared_model.replace('_', "/").contains("multilingual/e5/base");
+    let fastembed_variant = model_from_name(&shared_model);
+    CompatibilityReport {
+        status: if compatible { CompatStatus::Compatible } else { CompatStatus::Incompatible },
+        shared_model,
+        shared_dim,
+        local_model: local.to_string(),
+        can_auto_switch: fastembed_variant.is_some(),
+        fastembed_variant,
     }
-    anyhow::ensure!(
-        downloaded == expected_size,
-        "downloaded {label} has {downloaded} bytes, expected {expected_size}"
-    );
-    let actual = crate::hashing::hex_lower(hasher.finalize());
-    anyhow::ensure!(
-        actual == expected_sha256,
-        "downloaded {label} has SHA-256 {actual}, expected {expected_sha256}"
-    );
-    tmp.as_file()
-        .sync_all()
-        .map_err(|error| anyhow::anyhow!("sync temporary {label}: {error}"))?;
-    tmp.persist(dest)
-        .map_err(|error| error.error)
-        .map_err(|error| anyhow::anyhow!("replace {}: {error}", dest.display()))?;
-    println!("  {} MB -> {}", downloaded / 1024 / 1024, dest.display());
-    Ok(())
 }
 
-/// Downloads the ONNX model and tokenizer to the state directory.
-pub fn download_model(state_dir: &Path) -> anyhow::Result<PathBuf> {
-    let model = model_path(state_dir);
-    let tokenizer = tokenizer_path(state_dir);
-    println!(
-        "downloading pinned nomic-embed-text-v1.5 revision {} (~{} MB total)...",
-        MODEL_REVISION,
-        (MODEL_SIZE + TOKENIZER_SIZE) / 1024 / 1024
-    );
-    download_to(MODEL_URL, &model, "ONNX model", MODEL_SIZE, MODEL_SHA256)?;
-    download_to(
-        TOKENIZER_URL,
-        &tokenizer,
-        "tokenizer",
-        TOKENIZER_SIZE,
-        TOKENIZER_SHA256,
-    )?;
-    Ok(model)
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompatStatus {
+    NoSharedStore,
+    Compatible,
+    Incompatible,
 }
 
-/// An in-process embedding backend: ONNX Runtime for the transformer
-/// forward pass, HuggingFace tokenizers for BPE subword tokenization.
+#[derive(Debug, Clone)]
+pub struct CompatibilityReport {
+    pub status: CompatStatus,
+    pub shared_model: String,
+    pub shared_dim: usize,
+    pub local_model: String,
+    pub can_auto_switch: bool,
+    pub fastembed_variant: Option<fastembed::EmbeddingModel>,
+}
+
+/// An in-process embedding backend using fastembed.
+/// Handles model download (first use), tokenization, and inference.
 pub struct EmbeddedEmbedder {
-    session: ort::session::Session,
-    tokenizer: tokenizers::Tokenizer,
+    model: fastembed::TextEmbedding,
 }
 
 impl EmbeddedEmbedder {
-    /// Loads the ONNX model and tokenizer from the state directory.
-    pub fn load(state_dir: &Path) -> anyhow::Result<Self> {
-        let model = model_path(state_dir);
-        let tok = tokenizer_path(state_dir);
-        verify_artifact(&model, MODEL_SIZE, MODEL_SHA256).map_err(|error| {
-            anyhow::anyhow!(
-                "verify ONNX model {}: {error}; run `cfetch embed-model download`",
-                model.display()
-            )
-        })?;
-        verify_artifact(&tok, TOKENIZER_SIZE, TOKENIZER_SHA256).map_err(|error| {
-            anyhow::anyhow!(
-                "verify tokenizer {}: {error}; run `cfetch embed-model download`",
-                tok.display()
-            )
-        })?;
-        let session = ort::session::Session::builder()
-            .map_err(|e| anyhow::anyhow!("create ONNX session: {e}"))?
-            .commit_from_file(&model)
-            .map_err(|e| anyhow::anyhow!("load model {}: {e}", model.display()))?;
-        let mut tokenizer = tokenizers::Tokenizer::from_file(&tok)
-            .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tok.display()))?;
-        tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: 512,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow::anyhow!("configure truncation: {e}"))?;
-        Ok(Self { session, tokenizer })
+    /// Loads the embedding model, downloading it on first use.
+    pub fn load() -> anyhow::Result<Self> {
+        let model = fastembed::TextEmbedding::try_new(
+            fastembed::TextInitOptions::new(DEFAULT_EMBEDDING_MODEL)
+                .with_cache_dir(cache_dir())
+                .with_show_download_progress(true),
+        )
+        .map_err(|e| anyhow::anyhow!("load embedding model: {e}"))?;
+        Ok(Self { model })
     }
 
-    /// Embeds one text into a 768-dim f32 vector using proper BPE
-    /// tokenization and masked mean pooling of the last hidden state.
-    ///
-    /// The caller (cfetch's EmbedClient) is responsible for prepending
-    /// task-specific prefixes (query vs document) before calling this.
-    pub fn embed(&mut self, text: &str) -> anyhow::Result<Vec<f32>> {
-        // BPE tokenize with special tokens ([CLS], [SEP] added by the
-        // tokenizer's post-processor, matching the model's training).
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-        let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
-        let type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
-        anyhow::ensure!(!ids.is_empty(), "tokenizer produced zero tokens for {text:?}");
-        anyhow::ensure!(ids.len() <= 512, "input too long: {} tokens (max 512)", ids.len());
+    /// Embeds texts into 768-dim f32 vectors.
+    /// fastembed handles tokenization, truncation, and mean pooling.
+    pub fn embed(&mut self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.model
+            .embed(texts, None)
+            .map_err(|e| anyhow::anyhow!("embed: {e}"))
+    }
+}
 
-        let seq_len = ids.len();
-        let input_ids = ort::value::Tensor::from_array((
-            vec![1i64, seq_len as i64],
-            ids,
-        ))
-        .map_err(|e| anyhow::anyhow!("create input tensor: {e}"))?;
-        let attention_mask = ort::value::Tensor::from_array((
-            vec![1i64, seq_len as i64],
-            mask.clone(),
-        ))
-        .map_err(|e| anyhow::anyhow!("create mask tensor: {e}"))?;
-        let token_type_ids = ort::value::Tensor::from_array((
-            vec![1i64, seq_len as i64],
-            type_ids,
-        ))
-        .map_err(|e| anyhow::anyhow!("create type tensor: {e}"))?;
+/// An in-process reranker using fastembed.
+/// Scores query-document pairs with a local cross-encoder.
+#[allow(dead_code)]
+pub struct EmbeddedReranker {
+    model: fastembed::TextRerank,
+}
 
-        let outputs = self
-            .session
-            .run(ort::inputs![
-                "input_ids" => input_ids,
-                "attention_mask" => attention_mask,
-                "token_type_ids" => token_type_ids,
-            ])
-            .map_err(|e| anyhow::anyhow!("run inference: {e}"))?;
+#[allow(dead_code)]
+impl EmbeddedReranker {
+    /// Loads the reranker model, downloading it on first use.
+    pub fn load() -> anyhow::Result<Self> {
+        let model = fastembed::TextRerank::try_new(
+            fastembed::RerankInitOptions::new(DEFAULT_RERANKER_MODEL)
+                .with_cache_dir(cache_dir())
+                .with_show_download_progress(true),
+        )
+        .map_err(|e| anyhow::anyhow!("load reranker: {e}"))?;
+        Ok(Self { model })
+    }
 
-        // Extract the last hidden state [batch=1, seq, hidden=768] and
-        // mean-pool with the attention mask (padding tokens excluded).
-        let (_shape, data) = outputs["last_hidden_state"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow::anyhow!("extract output: {e}"))?;
-        let total = data.len();
-        anyhow::ensure!(total % 768 == 0, "output length {} is not a multiple of 768", total);
-        let hidden_dim = 768usize;
-        let seq = total / hidden_dim;
-        anyhow::ensure!(seq == seq_len, "output seq {} != input seq {}", seq, seq_len);
+    /// Reranks documents against a query. Returns (index, score) sorted by
+    /// relevance (best first). If `return_text` is true, includes content.
+    pub fn rerank(
+        &mut self,
+        query: &str,
+        documents: &[&str],
+        return_text: bool,
+    ) -> anyhow::Result<Vec<(usize, f32, Option<String>)>> {
+        let results = self
+            .model
+            .rerank(query, documents, return_text, None)
+            .map_err(|e| anyhow::anyhow!("rerank: {e}"))?;
+        Ok(results
+            .into_iter()
+            .map(|r| (r.index, r.score, r.document))
+            .collect())
+    }
 
-        // Masked mean pooling: only tokens where mask == 1 contribute.
-        let mut pooled = vec![0.0f32; hidden_dim];
-        let mut count = 0.0f32;
-        for s in 0..seq {
-            if mask[s] == 1 {
-                count += 1.0;
-                for h in 0..hidden_dim {
-                    pooled[h] += data[s * hidden_dim + h];
-                }
+    /// Scores every document against the query, one score per input document
+    /// in INPUT order — the same contract as `RerankClient::rank`.
+    pub fn rank(&mut self, query: &str, documents: &[&str]) -> anyhow::Result<Vec<f32>> {
+        let results = self.model.rerank(query, documents, false, None)
+            .map_err(|e| anyhow::anyhow!("rerank: {e}"))?;
+        let mut scores = vec![f32::MIN; documents.len()];
+        for r in results {
+            if let Some(slot) = scores.get_mut(r.index) {
+                *slot = r.score;
             }
         }
-        anyhow::ensure!(count > 0.0, "attention mask is all zeros");
-        for p in &mut pooled {
-            *p /= count;
-        }
-        Ok(pooled)
+        Ok(scores)
     }
+}
+
+/// Lists all available embedding models (for `cfetch embed-model list`).
+#[allow(dead_code)]
+pub fn available_models() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("MultilingualE5Base", "278M, 768d, 100+ languages (default)"),
+        ("MultilingualE5Large", "560M, 1024d, 100+ languages"),
+        ("MultilingualE5Small", "118M, 384d, 100+ languages"),
+        ("EmbeddingGemma300M", "300M, 768d, cfetch canonical"),
+        ("BGESmallENV15", "33M, 384d, English"),
+        ("BGELargeENV15", "335M, 1024d, English"),
+        ("AllMiniLML6V2", "22M, 384d, English (fastest)"),
+        ("NomicEmbedTextV15", "137M, 768d, English"),
+        ("MultilingualE5BaseQ", "quantized, 768d, 100+ languages"),
+        ("EmbeddingGemma300MQ4", "4-bit, 768d, cfetch canonical"),
+    ]
+}
+
+/// Lists all available reranker models.
+#[allow(dead_code)]
+pub fn available_rerankers() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("BGERerankerBase", "English cross-encoder"),
+        ("BGERerankerV2M3", "Multilingual cross-encoder"),
+        ("JinaRerankerV2BaseMultilingual", "Multilingual (default)"),
+    ]
 }
 
 #[cfg(test)]
@@ -288,32 +237,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_path_is_deterministic() {
-        let dir = Path::new("/tmp/state");
-        assert!(model_path(dir).ends_with("models/nomic-embed-text-v1.5.onnx"));
-        assert!(tokenizer_path(dir).ends_with("models/nomic-embed-text-v1.5-tokenizer.json"));
-    }
-
-    #[test]
-    fn artifact_verification_checks_size_and_hash() {
-        let dir = tempfile::tempdir().unwrap();
-        let artifact = dir.path().join("artifact");
-        std::fs::write(&artifact, b"cfetch").unwrap();
-        verify_artifact(
-            &artifact,
-            6,
-            "bab49db60fd8b88607513a9fe8049f460efcecbb58a4fc18191c90bd1e6799d8",
-        )
-        .unwrap();
-        assert!(verify_artifact(&artifact, 7, "irrelevant").is_err());
-        assert!(verify_artifact(&artifact, 6, &"0".repeat(64)).is_err());
-    }
-
-    #[test]
-    fn download_urls_are_revision_pinned() {
-        assert!(MODEL_URL.contains(MODEL_REVISION));
-        assert!(TOKENIZER_URL.contains(MODEL_REVISION));
-        assert!(!MODEL_URL.contains("/resolve/main/"));
-        assert!(!TOKENIZER_URL.contains("/resolve/main/"));
+    fn cache_dir_is_under_state() {
+        assert!(cache_dir().starts_with(crate::paths::state_dir()));
     }
 }

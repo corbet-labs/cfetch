@@ -25,6 +25,11 @@ pub struct RerankClient {
     auth: Option<String>,
     timeout: std::time::Duration,
     candidates: usize,
+    /// Local cross-encoder reranker (feature-gated). When the endpoint is
+    /// empty and the `embedded-embeddings` feature is enabled, reranking
+    /// runs in-process via fastembed instead of over HTTP.
+    #[cfg(feature = "embedded-embeddings")]
+    embedded: Option<std::sync::Mutex<crate::embedded_embed::EmbeddedReranker>>,
 }
 
 impl std::fmt::Debug for RerankClient {
@@ -39,13 +44,39 @@ impl std::fmt::Debug for RerankClient {
 impl RerankClient {
     /// The one gate for every rerank path, so a misconfiguration is a single
     /// clear line rather than a surprise mid-query.
+    ///
+    /// With the `embedded-embeddings` feature an EMPTY endpoint selects the
+    /// in-process cross-encoder (Jina reranker v2 multilingual via fastembed);
+    /// a set endpoint keeps the HTTP path. Without the feature the endpoint
+    /// remains required.
     pub fn new(cfg: &RerankConfig) -> anyhow::Result<RerankClient> {
         anyhow::ensure!(cfg.enabled, "rerank disabled (set rerank.enabled=true in config)");
+        anyhow::ensure!(cfg.candidates > 0, "rerank.candidates must be at least 1");
+
+        #[cfg(feature = "embedded-embeddings")]
+        if cfg.endpoint.is_empty() {
+            let reranker = crate::embedded_embed::EmbeddedReranker::load()
+                .context("loading embedded reranker (rerank.endpoint is empty)")?;
+            return Ok(RerankClient {
+                embedded: Some(std::sync::Mutex::new(reranker)),
+                agent: ureq::Agent::config_builder()
+                    .max_redirects(0)
+                    .timeout_global(Some(std::time::Duration::from_secs(cfg.timeout_secs.max(1))))
+                    .http_status_as_error(false)
+                    .build()
+                    .new_agent(),
+                url: String::new(),
+                model: crate::embedded_embed::DEFAULT_RERANKER_MODEL_NAME.to_string(),
+                auth: None,
+                timeout: std::time::Duration::from_secs(cfg.timeout_secs.max(1)),
+                candidates: cfg.candidates,
+            });
+        }
+
         anyhow::ensure!(
             !cfg.endpoint.is_empty() && !cfg.model.is_empty(),
             "rerank not configured (rerank.endpoint and rerank.model required)"
         );
-        anyhow::ensure!(cfg.candidates > 0, "rerank.candidates must be at least 1");
         check_endpoint(&cfg.endpoint, &cfg.allow_hosts)?;
         let auth = resolve_auth(&cfg.api_key_env, "rerank")?;
         let timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
@@ -62,6 +93,8 @@ impl RerankClient {
             auth,
             timeout,
             candidates: cfg.candidates,
+            #[cfg(feature = "embedded-embeddings")]
+            embedded: None,
         })
     }
 
@@ -81,6 +114,21 @@ impl RerankClient {
     /// unbounded and negative); only their ORDER is meaningful, and nothing
     /// here interprets them as probabilities.
     pub fn rank(&self, query: &str, documents: &[&str]) -> anyhow::Result<Vec<f32>> {
+        #[cfg(feature = "embedded-embeddings")]
+        if let Some(reranker) = &self.embedded {
+            let result = reranker
+                .lock()
+                .expect("reranker mutex poisoned")
+                .rank(query, documents);
+            crate::runtime_status::record_inference_attempt(
+                crate::runtime_status::InferenceMode::Local,
+                crate::runtime_status::InferenceRoute::Local,
+                "rerank-embedded",
+                None,
+                result.is_ok(),
+            );
+            return result;
+        }
         let result = self.rank_request(query, documents);
         crate::runtime_status::record_inference_attempt(
             crate::runtime_status::InferenceMode::Endpoint,
