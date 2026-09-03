@@ -76,6 +76,7 @@ mod paths;
 mod pipeline;
 mod rerank;
 mod resident;
+mod retrieval_fixture;
 mod runtime_status;
 mod serve;
 mod session_state;
@@ -258,6 +259,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Compare BM25, vectors, hybrid fusion, reranking, and graph expansion on safe temporary data
+    RetrievalFixture {
+        #[arg(long)]
+        json: bool,
+        /// Print every vector component instead of a short preview
+        #[arg(long)]
+        show_vectors: bool,
+    },
     /// Show this host's network identity (created on first use)
     Identity {
         #[arg(long)]
@@ -328,6 +337,12 @@ enum Command {
         /// Do not contact joined remote origins
         #[arg(long)]
         no_network: bool,
+        /// Call the configured retrieval models on safe temporary data
+        #[arg(long, conflicts_with = "tui")]
+        deep: bool,
+        /// Include every vector component in the deep report
+        #[arg(long, requires = "deep", conflicts_with = "tui")]
+        show_vectors: bool,
     },
     /// Serve recall/find/expand over MCP (stdio) for any MCP client
     Mcp,
@@ -3266,6 +3281,12 @@ fn main() {
                 );
             }
         }
+        Command::RetrievalFixture { json, show_vectors } => {
+            if let Err(error) = retrieval_fixture::run(json, show_vectors) {
+                eprintln!("cfetch retrieval-fixture: {error:#}");
+                std::process::exit(1);
+            }
+        }
         Command::Identity { json } => {
             match net::endpoint_id(&paths::state_dir()) {
                 Ok(id) if json => println!("{}", serde_json::json!({"endpoint_id": id.to_string()})),
@@ -3323,11 +3344,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Doctor { json, tui, no_network } => {
+        Command::Doctor {
+            json,
+            tui,
+            no_network,
+            deep,
+            show_vectors,
+        } => {
             let result = if tui {
                 dashboard::run_system(!no_network)
             } else {
-                let report = doctor::gather(!no_network);
+                let report = if deep {
+                    doctor::gather_deep(!no_network, show_vectors)
+                } else {
+                    doctor::gather(!no_network)
+                };
                 if json {
                     serde_json::to_string_pretty(&report)
                         .map(|body| println!("{body}"))

@@ -286,7 +286,23 @@ hits cannot unexpectedly fill the context window.
 $ cfetch recall --hybrid "request retry policy"
 $ cfetch recall --slice engineering "deployment rollback"
 $ cfetch recall --expand "database migration"
+$ cfetch retrieval-fixture
+$ cfetch doctor --deep
 ```
+
+`cfetch retrieval-fixture` builds a small temporary Markdown tree and compares
+BM25, vector search, hybrid fusion, optional reranking, and graph expansion on
+the same fixed query. It says `ACTIVE` only after the configured embedding
+route successfully returns both query and document vectors. The normal view
+shows vector dimensions, encoding, checksums, a short component preview, and
+cosine scores; `--show-vectors` prints every component and `--json` provides a
+stable machine-readable report. It never reads or changes the configured brain,
+index, or shared vector store.
+
+`cfetch doctor --deep` includes the same test in the wider system report. It
+also explains the job of each configured model and distinguishes “configured”
+from “actually answered.” Deep mode may start a packaged local model or contact
+the configured model endpoints. The ordinary `cfetch doctor` command does not.
 
 ### Graphs and vectors remain derived from readable files
 
@@ -458,7 +474,7 @@ line should not try to fit:
 - whether each device is architecturally usable, supported by this binary,
   selected by the runtime, or merely present;
 - which embedding profile, model revision, artifact, vector encoding, endpoint
-  route, and optional reranker are configured;
+  route, and optional reranker are configured, plus what each model does;
 - which backend was successfully selected and which inference route was last
   attempted;
 - whether the daemon and its authenticated network endpoint are running, and
@@ -474,6 +490,9 @@ line should not try to fit:
 
 ```console
 $ cfetch doctor               # one read-only diagnostic report with bounded peer probes
+$ cfetch doctor --deep        # call retrieval models on temporary data and compare every stage
+$ cfetch doctor --deep --show-vectors # include every vector component
+$ cfetch doctor --deep --json # include the retrieval test in DoctorReportV1
 $ cfetch doctor --json        # stable, machine-readable DoctorReportV1
 $ cfetch doctor --no-network  # inspect local state without contacting peers
 $ cfetch doctor --tui         # open the live, scrollable System pane
@@ -486,10 +505,13 @@ is not presented as current utilization. Until a backend exposes a real device
 counter, utilization is shown as `not_reported` instead of an invented
 percentage.
 
-Doctor does not compact files, repair configuration, call an inference model,
-or apply maintenance. `cfetch selfcheck` remains the installation verifier with
-a nonzero exit on hard failures; doctor is the wider read-only evidence report
-for debugging and support.
+Doctor does not compact files, repair configuration, or apply maintenance. Its
+normal mode does not call an inference model. The explicit `--deep` mode calls
+only the embedding and optional reranking routes, using temporary fixture data;
+it does not call the maintenance models or alter the configured brain, index, or
+shared vector store. `cfetch selfcheck` remains the installation verifier with a
+nonzero exit on hard failures; doctor is the wider evidence report for debugging
+and support.
 
 ## Installation
 

@@ -5,7 +5,9 @@
 //! which hardware was detected, what this binary can bind, which model
 //! contract is configured, and whether remembered peers answer right now.
 //! It never treats discovery as selection or a past selection as live device
-//! utilization.
+//! utilization. The normal report does not call a model. `doctor --deep` is
+//! the explicit exception: it runs the configured retrieval models over safe
+//! temporary data and includes their actual outputs.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,7 +17,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::{
     daemon, embed, embedding_profile, grant, hardware, heartbeat, index, maintenance,
-    maintenance_model, net, paths, rerank, runtime_status, variant, vectors,
+    maintenance_model, net, paths, rerank, retrieval_fixture, runtime_status, variant, vectors,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -36,6 +38,10 @@ pub struct ReportV1 {
     pub topology: TopologyDiagnostic,
     pub integrations: IntegrationDiagnostic,
     pub runtime: runtime_status::RuntimeStatusV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_probe: Option<retrieval_fixture::RetrievalFixtureReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_probe_error: Option<String>,
     pub findings: Vec<Finding>,
 }
 
@@ -296,6 +302,44 @@ pub fn gather(probe_network: bool) -> ReportV1 {
     }
 }
 
+/// Runs the real embedding and optional reranking routes against a disposable
+/// fixture, then collects the wider report so the recorded backend selection
+/// reflects the probe that just ran.
+pub fn gather_deep(probe_network: bool, show_vectors: bool) -> ReportV1 {
+    let state_dir = paths::state_dir();
+    match Config::load() {
+        Ok(cfg) => {
+            let retrieval_probe =
+                retrieval_fixture::gather_with_config(&cfg, show_vectors);
+            let mut report = gather_with(&cfg, &state_dir, None, probe_network);
+            match retrieval_probe {
+                Ok(probe) => report.retrieval_probe = Some(probe),
+                Err(error) => {
+                    let error = short_error(&format!("{error:#}"));
+                    report.retrieval_probe_error = Some(error.clone());
+                    report.findings.push(Finding {
+                        code: "deep_retrieval_check_failed".into(),
+                        severity: FindingSeverity::Warning,
+                        summary: error,
+                        action: Some(
+                            "inspect the error and retry cfetch doctor --deep".into(),
+                        ),
+                    });
+                }
+            }
+            report
+        }
+        Err(error) => {
+            let detail = short_error(&error.to_string());
+            let mut report = gather_without_config(&state_dir, error, probe_network);
+            report.retrieval_probe_error = Some(format!(
+                "configuration unavailable, so retrieval models could not be tested: {detail}"
+            ));
+            report
+        }
+    }
+}
+
 /// Dashboard entry point: reuse its already-completed daemon probe so one
 /// screen refresh does not ask the local control channel the same question
 /// twice.
@@ -486,6 +530,8 @@ fn gather_inner(
         topology,
         integrations,
         runtime,
+        retrieval_probe: None,
+        retrieval_probe_error: None,
         findings,
     }
 }
@@ -1360,44 +1406,80 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
     ));
 
     lines.push(DisplayLine::new(DisplayTone::Heading, "Inference"));
+    let embedding_config_error = report.findings.iter().any(|finding| {
+        matches!(
+            finding.code.as_str(),
+            "embedding_profile_mismatch"
+                | "embedding_profile_not_active"
+                | "embedding_endpoint_unusable"
+        )
+    });
+    let (embedding_tone, embedding_state) = match report.retrieval_probe.as_ref() {
+        Some(probe) if retrieval_fixture::vector_active(probe) => {
+            (DisplayTone::Good, "ACTIVE — deep check passed")
+        }
+        Some(_) if report.inference.embeddings.enabled => {
+            (DisplayTone::Error, "INACTIVE — deep check failed")
+        }
+        Some(_) => (DisplayTone::Muted, "disabled"),
+        None if !report.inference.embeddings.enabled => (DisplayTone::Muted, "disabled"),
+        None if embedding_config_error => (DisplayTone::Error, "unavailable"),
+        None => (DisplayTone::Normal, "configured, not tested"),
+    };
+    let embedding_route = report
+        .inference
+        .embeddings
+        .route
+        .as_deref()
+        .map(|route| format!(" ({route})"))
+        .unwrap_or_default();
     lines.push(DisplayLine::new(
-        if report.inference.embeddings.enabled {
-            DisplayTone::Good
-        } else {
-            DisplayTone::Muted
-        },
+        embedding_tone,
         format!(
-            "  embeddings {} — {} @ {} · {} · {} · {} dimensions / {}",
-            if report.inference.embeddings.enabled {
-                format!(
-                    "configured ({})",
-                    report
-                        .inference
-                        .embeddings
-                        .route
-                        .as_deref()
-                        .unwrap_or("route unknown")
-                )
-            } else {
-                "disabled".into()
-            },
+            "  embedding model {embedding_state}{embedding_route} — {} @ {}",
             report.inference.embeddings.model,
             short_id(&report.inference.embeddings.model_revision),
-            report.inference.embeddings.artifact_policy,
-            report.inference.embeddings.profile_id,
+        ),
+    ));
+    lines.push(DisplayLine::new(
+        DisplayTone::Muted,
+        "    job: turns queries and notes into vectors for meaning-based search",
+    ));
+    lines.push(DisplayLine::new(
+        DisplayTone::Muted,
+        format!(
+            "    output: {} dimensions, {}",
             report.inference.embeddings.dimensions,
             report.inference.embeddings.vector_encoding,
         ),
     ));
     lines.push(DisplayLine::new(
-        if report.inference.reranker.enabled {
-            DisplayTone::Good
-        } else {
-            DisplayTone::Muted
+        DisplayTone::Muted,
+        format!(
+            "    profile: {} · artifact rule: {}",
+            report.inference.embeddings.profile_id,
+            report.inference.embeddings.artifact_policy,
+        ),
+    ));
+    let reranker_config_error = report
+        .findings
+        .iter()
+        .any(|finding| finding.code == "rerank_endpoint_unusable");
+    let (reranker_tone, reranker_state) = match report.retrieval_probe.as_ref() {
+        Some(probe) => match retrieval_fixture::reranker_status(probe) {
+            "active" => (DisplayTone::Good, "ACTIVE — deep check passed"),
+            "unavailable" => (DisplayTone::Warning, "INACTIVE — deep check failed"),
+            _ => (DisplayTone::Muted, "disabled"),
         },
+        None if !report.inference.reranker.enabled => (DisplayTone::Muted, "disabled"),
+        None if reranker_config_error => (DisplayTone::Warning, "unavailable"),
+        None => (DisplayTone::Normal, "configured, not tested"),
+    };
+    lines.push(DisplayLine::new(
+        reranker_tone,
         if report.inference.reranker.enabled {
             format!(
-                "  reranker configured ({}) — {} · top {} candidates",
+                "  reranker model {reranker_state} ({}) — {} · top {} candidates",
                 report
                     .inference
                     .reranker
@@ -1413,8 +1495,12 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
                 report.inference.reranker.candidates.unwrap_or(0)
             )
         } else {
-            "  reranker disabled".into()
+            "  reranker model disabled".into()
         },
+    ));
+    lines.push(DisplayLine::new(
+        DisplayTone::Muted,
+        "    job: reorders the shortlist; it does not find new notes",
     ));
     lines.push(DisplayLine::new(
         match report.inference.maintenance.state.as_str() {
@@ -1427,7 +1513,7 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
         if report.inference.maintenance.configured {
             format!(
                 "  maintenance {} ({}) — propose {} · review {} · {} staged / {} event(s) / {} unreadable / {} exception(s)",
-                report.inference.maintenance.state,
+                report.inference.maintenance.state.replace('_', " "),
                 report
                     .inference
                     .maintenance
@@ -1454,10 +1540,14 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
         } else {
             format!(
                 "  maintenance {} — {} staged candidate(s)",
-                report.inference.maintenance.state,
+                report.inference.maintenance.state.replace('_', " "),
                 report.inference.maintenance.candidates,
             )
         },
+    ));
+    lines.push(DisplayLine::new(
+        DisplayTone::Muted,
+        "    job: proposes and reviews memory changes; it is not part of recall",
     ));
     lines.push(DisplayLine::new(
         if report.inference.selected.is_some() {
@@ -1511,6 +1601,12 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
             report.inference.utilization.detail
         ),
     ));
+    if report.retrieval_probe.is_none() && report.retrieval_probe_error.is_none() {
+        lines.push(DisplayLine::new(
+            DisplayTone::Muted,
+            "  normal doctor does not call models; run cfetch doctor --deep to prove enabled retrieval models answer",
+        ));
+    }
 
     lines.push(DisplayLine::new(DisplayTone::Heading, "Detected hardware"));
     for device in &report.hardware {
@@ -1547,6 +1643,47 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
                 format!("    note: {caveat}"),
             ));
         }
+    }
+
+    if let Some(probe) = &report.retrieval_probe {
+        lines.push(DisplayLine::new(
+            DisplayTone::Heading,
+            "Deep retrieval check",
+        ));
+        for text in retrieval_fixture::display_lines(probe) {
+            let tone = if text.starts_with("embedding model: ACTIVE")
+                || text.starts_with("reranker model: ACTIVE")
+                || text.starts_with("graph expansion: ACTIVE")
+            {
+                DisplayTone::Good
+            } else if text.starts_with("embedding model: INACTIVE")
+                || text.starts_with("reranker model: UNAVAILABLE")
+                || text.starts_with("graph expansion: INACTIVE")
+            {
+                DisplayTone::Warning
+            } else if text.starts_with("temporary retrieval test") {
+                DisplayTone::Muted
+            } else {
+                DisplayTone::Normal
+            };
+            lines.push(DisplayLine::new(
+                tone,
+                if text.is_empty() {
+                    text
+                } else {
+                    format!("  {text}")
+                },
+            ));
+        }
+    } else if let Some(error) = &report.retrieval_probe_error {
+        lines.push(DisplayLine::new(
+            DisplayTone::Heading,
+            "Deep retrieval check",
+        ));
+        lines.push(DisplayLine::new(
+            DisplayTone::Warning,
+            format!("  NOT RUN — {error}"),
+        ));
     }
 
     lines.push(DisplayLine::new(DisplayTone::Heading, "Peers and grants"));
@@ -1814,6 +1951,8 @@ mod tests {
                 summary: "hooks: all registered hooks reporting, healthy".into(),
             },
             runtime,
+            retrieval_probe: None,
+            retrieval_probe_error: None,
             findings: Vec::new(),
         }
     }
