@@ -486,7 +486,7 @@ fn preserve_full_output(
         event.tool_use_id.as_deref().unwrap_or_default(),
         output
     );
-    let id = format!("{:x}", sha2::Sha256::digest(artifact_identity.as_bytes()));
+    let id = crate::hashing::hex_lower(sha2::Sha256::digest(artifact_identity.as_bytes()));
     let path = state_dir.join("condensed-output").join(format!("{id}.txt"));
     let preserved = format!(
         "command: {}\nsession: {}\ntool_use_id: {}\n\n{}",

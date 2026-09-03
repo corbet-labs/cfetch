@@ -1,4 +1,5 @@
 {
+  "originHash" : "ecf8499080dfdd09c9116928b794ac1ec6f045f98d30c399660fb5289dd853bb",
   "pins" : [
     {
       "identity" : "coreml-llm",
@@ -76,8 +77,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio.git",
       "state" : {
-        "revision" : "cd6710454f25733900e133c6caf5188952763c36",
-        "version" : "2.98.0"
+        "revision" : "0b18836bd8b0162e7e17a995a3fbee20ed8f3b2b",
+        "version" : "2.101.3"
       }
     },
     {
@@ -108,5 +109,5 @@
       }
     }
   ],
-  "version" : 2
+  "version" : 3
 }

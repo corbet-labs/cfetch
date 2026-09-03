@@ -1992,11 +1992,12 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(&package_manifest, "{\"schema_version\":1}\n").unwrap();
-        let digest = format!("{:x}", sha2::Sha256::digest(std::fs::read(&adapter).unwrap()));
-        let package_manifest_sha256 = format!(
-            "{:x}",
-            sha2::Sha256::digest(std::fs::read(&package_manifest).unwrap())
-        );
+        let digest = crate::hashing::hex_lower(sha2::Sha256::digest(
+            std::fs::read(&adapter).unwrap(),
+        ));
+        let package_manifest_sha256 = crate::hashing::hex_lower(sha2::Sha256::digest(
+            std::fs::read(&package_manifest).unwrap(),
+        ));
         let launch = crate::local_adapter::AdapterLaunch {
             binary: adapter,
             sha256: digest,

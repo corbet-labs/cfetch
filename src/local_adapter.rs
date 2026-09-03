@@ -209,7 +209,7 @@ fn file_sha256(path: &Path) -> anyhow::Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(crate::hashing::hex_lower(digest.finalize()))
 }
 
 fn spawn_adapter(launch: &AdapterLaunch) -> anyhow::Result<RunningAdapter> {

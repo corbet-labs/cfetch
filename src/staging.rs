@@ -56,7 +56,7 @@ pub fn id_for(reason: &str, key: &str) -> String {
     h.update(reason.as_bytes());
     h.update([0u8]);
     h.update(key.as_bytes());
-    let digest = format!("{:x}", h.finalize());
+    let digest = crate::hashing::hex_lower(h.finalize());
     format!("{}-{}", slug(reason), &digest[..8])
 }
 

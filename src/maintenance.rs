@@ -316,7 +316,7 @@ fn now() -> i64 {
 }
 
 fn hash_bytes(bytes: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(bytes.as_ref()))
+    crate::hashing::hex_lower(Sha256::digest(bytes.as_ref()))
 }
 
 fn candidate_hash(candidate: &staging::Candidate) -> String {
@@ -1421,7 +1421,8 @@ fn approval_token(proposal: &Proposal, review: &Review) -> anyhow::Result<String
     let mut hash = Sha256::new();
     hash.update(b"cfetch-maintenance-approval-v1\0");
     hash.update(bytes);
-    Ok(format!("approve-{}", &format!("{:x}", hash.finalize())[..20]))
+    let digest = crate::hashing::hex_lower(hash.finalize());
+    Ok(format!("approve-{}", &digest[..20]))
 }
 
 fn verify_proposal(

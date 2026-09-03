@@ -19,3 +19,23 @@ updates:
         patterns:
           - "*"
     open-pull-requests-limit: 5
+
+  - package-ecosystem: pip
+    directory: "/packages/openvino"
+    schedule:
+      interval: monthly
+    groups:
+      openvino-build-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: swift
+    directory: "/experiments/embedding-profile/apple-coreml"
+    schedule:
+      interval: monthly
+    groups:
+      apple-coreml-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
