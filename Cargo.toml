@@ -20,6 +20,7 @@ include = [
   "/docs/local-embedding-adapter.md",
   "/docs/ai-maintenance.md",
   "/docs/embedding-profile-v1.md",
+  "/docs/retrieval-readiness.md",
   "/LICENSE.md",
   "/THIRD-PARTY-LICENSES.txt",
   "/release/variants.json",

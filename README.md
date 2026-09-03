@@ -288,6 +288,7 @@ $ cfetch recall --slice engineering "deployment rollback"
 $ cfetch recall --expand "database migration"
 $ cfetch retrieval-fixture
 $ cfetch doctor --deep
+$ cfetch doctor --deep --require production
 ```
 
 `cfetch retrieval-fixture` builds a small temporary Markdown tree and compares
@@ -303,6 +304,14 @@ index, or shared vector store.
 also explains the job of each configured model and distinguishes “configured”
 from “actually answered.” Deep mode may start a packaged local model or contact
 the configured model endpoints. The ordinary `cfetch doctor` command does not.
+
+Both commands now publish explicit pass, fail, and not-run gates. Add a
+repeatable `--require` for BM25, profile admission, vectors, hybrid fusion,
+reranking, graph expansion, local acceleration, or the complete production
+set to turn the report into a nonzero-exit CI or release check. The production
+gate requires an active canonical profile and evidence that the call used a
+real local NPU, GPU, or accelerated CPU package; a working test endpoint is
+not enough. See [retrieval readiness gates](docs/retrieval-readiness.md).
 
 ### Graphs and vectors remain derived from readable files
 
@@ -493,6 +502,7 @@ $ cfetch doctor               # one read-only diagnostic report with bounded pee
 $ cfetch doctor --deep        # call retrieval models on temporary data and compare every stage
 $ cfetch doctor --deep --show-vectors # include every vector component
 $ cfetch doctor --deep --json # include the retrieval test in DoctorReportV1
+$ cfetch doctor --deep --require production # fail unless production retrieval is ready
 $ cfetch doctor --json        # stable, machine-readable DoctorReportV1
 $ cfetch doctor --no-network  # inspect local state without contacting peers
 $ cfetch doctor --tui         # open the live, scrollable System pane
