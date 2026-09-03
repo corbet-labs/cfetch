@@ -186,6 +186,10 @@ struct RerankerReport {
     purpose: &'static str,
     status: &'static str,
     input: &'static str,
+    /// Size of the shortlist handed to the reranker. The gate requires one
+    /// score per input item, which can legitimately be fewer than `LIMIT`
+    /// when BM25 returns fewer hits.
+    input_size: usize,
     model: Option<String>,
     reason: Option<String>,
     execution: Option<ExecutionReport>,
@@ -290,11 +294,12 @@ fn evaluate_gates(
     };
     let reranker_status = match rankings.reranker.status {
         "active"
-            if rankings
-                .reranker
-                .ranking
-                .as_ref()
-                .is_some_and(|rows| rows.len() == LIMIT) =>
+            if rankings.reranker.input_size > 0
+                && rankings
+                    .reranker
+                    .ranking
+                    .as_ref()
+                    .is_some_and(|rows| rows.len() == rankings.reranker.input_size) =>
         {
             GateStatus::Pass
         }
@@ -640,6 +645,7 @@ fn rerank_fixture(
                 purpose: "reorders an existing shortlist; it does not find new notes",
                 status: "disabled",
                 input,
+                input_size: base.len(),
                 model: None,
                 reason: None,
                 execution: None,
@@ -656,6 +662,7 @@ fn rerank_fixture(
                     purpose: "reorders an existing shortlist; it does not find new notes",
                     status: "unavailable",
                     input,
+                    input_size: base.len(),
                     model: (!cfg.rerank.model.is_empty()).then(|| cfg.rerank.model.clone()),
                     reason: Some(one_line(format!("{error:#}"))),
                     execution: None,
@@ -666,6 +673,7 @@ fn rerank_fixture(
         }
     };
     let model = client.model().to_string();
+    let input_size = base.len();
     let result = rerank::apply(&client, QUERY, base, |hit: &index::Hit| hit.snippet.clone());
     let ranking = ranked_paths(&result.hits);
     let active = result.note.is_none();
@@ -673,6 +681,7 @@ fn rerank_fixture(
         purpose: "reorders an existing shortlist; it does not find new notes",
         status: if active { "active" } else { "unavailable" },
         input,
+        input_size,
         model: Some(model),
         reason: result.note,
         execution: active.then(current_execution).flatten(),
@@ -1274,6 +1283,46 @@ mod tests {
         assert!(enforce_requirements(&report, &[Requirement::Profile]).is_err());
         assert!(enforce_requirements(&report, &[Requirement::LocalAcceleration]).is_err());
         assert!(enforce_requirements(&report, &[Requirement::Production]).is_err());
+    }
+
+    #[test]
+    fn reranker_gate_passes_when_a_shorter_shortlist_is_fully_reranked() {
+        let cfg = active_config();
+        let mut report = gather_with_config(&cfg, false).unwrap();
+        // A shortlist shorter than LIMIT is legitimate: BM25 can return
+        // fewer hits. The reranker still scored every submitted item, so
+        // the gate must pass.
+        report.rankings.reranker.input_size = 2;
+        if let Some(rows) = report.rankings.reranker.ranking.as_mut() {
+            rows.truncate(2);
+        }
+        report.gates = evaluate_gates(&cfg, &report.vector, &report.rankings, &report.graph);
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "reranker")
+                .unwrap()
+                .status,
+            GateStatus::Pass
+        );
+        enforce_requirements(&report, &[Requirement::Reranker]).unwrap();
+
+        // A dropped row is still a failure: two scored of three submitted.
+        report.rankings.reranker.input_size = 3;
+        report.gates = evaluate_gates(&cfg, &report.vector, &report.rankings, &report.graph);
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "reranker")
+                .unwrap()
+                .status,
+            GateStatus::Fail
+        );
+        assert!(enforce_requirements(&report, &[Requirement::Reranker]).is_err());
     }
 
     #[test]
