@@ -1654,14 +1654,20 @@ pub fn display_lines(report: &ReportV1) -> Vec<DisplayLine> {
             let tone = if text.starts_with("embedding model: ACTIVE")
                 || text.starts_with("reranker model: ACTIVE")
                 || text.starts_with("graph expansion: ACTIVE")
+                || text.starts_with("production retrieval gate: PASS")
+                || text.trim_start().starts_with("PASS ")
             {
                 DisplayTone::Good
             } else if text.starts_with("embedding model: INACTIVE")
                 || text.starts_with("reranker model: UNAVAILABLE")
                 || text.starts_with("graph expansion: INACTIVE")
+                || text.starts_with("production retrieval gate: BLOCKED")
+                || text.trim_start().starts_with("FAIL ")
             {
                 DisplayTone::Warning
-            } else if text.starts_with("temporary retrieval test") {
+            } else if text.starts_with("temporary retrieval test")
+                || text.trim_start().starts_with("NOT RUN ")
+            {
                 DisplayTone::Muted
             } else {
                 DisplayTone::Normal

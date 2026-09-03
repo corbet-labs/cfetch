@@ -16,6 +16,7 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     let output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
         .args(["doctor", "--json", "--no-network"])
         .env("HOME", &home)
+        .env("APPDATA", &home)
         .env("CFETCH_STATE_DIR", &state)
         .env("CFETCH_BRAIN", &brain)
         .output()
@@ -65,6 +66,7 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     let output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
         .args(["doctor", "--no-network"])
         .env("HOME", &home)
+        .env("APPDATA", &home)
         .env("CFETCH_STATE_DIR", &state)
         .env("CFETCH_BRAIN", &brain)
         .output()
@@ -101,6 +103,7 @@ fn deep_doctor_uses_a_temporary_retrieval_fixture() {
     let output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
         .args(["doctor", "--deep", "--json", "--no-network"])
         .env("HOME", &home)
+        .env("APPDATA", &home)
         .env("CFETCH_STATE_DIR", &state)
         .env("CFETCH_BRAIN", &brain)
         .output()
@@ -112,7 +115,11 @@ fn deep_doctor_uses_a_temporary_retrieval_fixture() {
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let probe = &report["retrieval_probe"];
+    assert_eq!(probe["schema_version"], 2);
     assert_eq!(probe["temporary_data"], true);
+    assert_eq!(probe["gates"]["production_ready"], false);
+    assert_eq!(probe["gates"]["checks"][0]["id"], "bm25");
+    assert_eq!(probe["gates"]["checks"][0]["status"], "pass");
     assert_eq!(probe["vector"]["active"], false);
     assert_eq!(probe["rankings"]["bm25"][0], "knowledge/deployment-metrics.md");
     assert_eq!(
@@ -125,4 +132,27 @@ fn deep_doctor_uses_a_temporary_retrieval_fixture() {
         "- user data must stay untouched\n"
     );
     assert!(!state.join("index.db").exists());
+
+    let gated = Command::new(env!("CARGO_BIN_EXE_cfetch"))
+        .args([
+            "doctor",
+            "--deep",
+            "--json",
+            "--no-network",
+            "--require",
+            "vector",
+        ])
+        .env("HOME", &home)
+        .env("APPDATA", &home)
+        .env("CFETCH_STATE_DIR", &state)
+        .env("CFETCH_BRAIN", &brain)
+        .output()
+        .unwrap();
+    assert!(!gated.status.success());
+    let gated_report: serde_json::Value = serde_json::from_slice(&gated.stdout).unwrap();
+    assert_eq!(gated_report["retrieval_probe"]["gates"]["production_ready"], false);
+    assert!(
+        String::from_utf8_lossy(&gated.stderr)
+            .contains("required vector gate did not pass: vector_output (not run)")
+    );
 }

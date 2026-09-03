@@ -5,6 +5,13 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Retrieval readiness gates.** The temporary retrieval fixture and
+  `doctor --deep` now publish stable pass, fail, and not-run checks for BM25,
+  canonical profile admission, vector output, semantic ordering, hybrid RRF,
+  optional reranking, graph expansion, and actual local execution evidence.
+  Repeatable `--require` options turn those reports into nonzero-exit CI or
+  release gates. The strict `production` requirement cannot be satisfied by a
+  custom endpoint or hardware discovery alone.
 - **Dependency and supply-chain hardening.** Rust dependencies and GitHub
   Actions are updated as a tested set, SwiftNIO is raised past three published
   security advisories, and the OpenVINO build environment now uses a fixed

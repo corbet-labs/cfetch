@@ -14,8 +14,12 @@ use crate::config::{Config, Precision};
 use crate::{embed, embedding_profile, hashing, index, rerank};
 
 const QUERY: &str = "database deployment failure rollback";
-const LIMIT: usize = 5;
+const LIMIT: usize = 3;
 const PREVIEW_COMPONENTS: usize = 12;
+const LEXICAL_DECOY: &str = "knowledge/deployment-metrics.md";
+const LINK_SOURCE: &str = "knowledge/restore-release.md";
+const LINK_TARGET: &str = "knowledge/recovery-checklist.md";
+const SEMANTIC_TARGET: &str = "knowledge/schema-rollback.md";
 
 struct FixtureDocument {
     path: &'static str,
@@ -50,9 +54,73 @@ pub struct RetrievalFixtureReport {
     schema_version: u32,
     temporary_data: bool,
     query: &'static str,
+    gates: GateReport,
     vector: VectorReport,
     rankings: RankingReport,
     graph: GraphReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Requirement {
+    Bm25,
+    Profile,
+    Vector,
+    Hybrid,
+    Reranker,
+    Graph,
+    LocalAcceleration,
+    Production,
+}
+
+impl Requirement {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bm25 => "bm25",
+            Self::Profile => "profile",
+            Self::Vector => "vector",
+            Self::Hybrid => "hybrid",
+            Self::Reranker => "reranker",
+            Self::Graph => "graph",
+            Self::LocalAcceleration => "local-acceleration",
+            Self::Production => "production",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GateStatus {
+    Pass,
+    Fail,
+    NotRun,
+}
+
+impl GateStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::NotRun => "NOT RUN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GateReport {
+    production_ready: bool,
+    passed: usize,
+    failed: usize,
+    not_run: usize,
+    checks: Vec<GateCheck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GateCheck {
+    id: &'static str,
+    status: GateStatus,
+    production_required: bool,
+    checks: &'static str,
+    evidence: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +186,10 @@ struct RerankerReport {
     purpose: &'static str,
     status: &'static str,
     input: &'static str,
+    /// Size of the shortlist handed to the reranker. The gate requires one
+    /// score per input item, which can legitimately be fewer than `LIMIT`
+    /// when BM25 returns fewer hits.
+    input_size: usize,
     model: Option<String>,
     reason: Option<String>,
     execution: Option<ExecutionReport>,
@@ -132,6 +204,272 @@ struct GraphReport {
     fixture_edge_from: &'static str,
     fixture_edge_to: &'static str,
     fixture_edge_active: bool,
+}
+
+fn position(paths: &[String], target: &str) -> Option<usize> {
+    paths.iter().position(|path| path == target)
+}
+
+fn gate(
+    id: &'static str,
+    status: GateStatus,
+    production_required: bool,
+    checks: &'static str,
+    evidence: impl Into<String>,
+) -> GateCheck {
+    GateCheck {
+        id,
+        status,
+        production_required,
+        checks,
+        evidence: evidence.into(),
+    }
+}
+
+fn evaluate_gates(
+    cfg: &Config,
+    vector: &VectorReport,
+    rankings: &RankingReport,
+    graph: &GraphReport,
+) -> GateReport {
+    let bm25_passed = rankings
+        .bm25
+        .first()
+        .is_some_and(|path| path == LEXICAL_DECOY)
+        && rankings.bm25.iter().any(|path| path == LINK_SOURCE);
+    let (profile_passed, profile_evidence) = if cfg.embeddings.model != embedding_profile::MODEL {
+        (
+            false,
+            format!(
+                "configured model {} is not the canonical shared-vector model {}",
+                cfg.embeddings.model,
+                embedding_profile::MODEL
+            ),
+        )
+    } else {
+        match embedding_profile::production_availability() {
+            Ok(()) => (
+                true,
+                format!(
+                    "model {} is active with at least one admitted backend",
+                    cfg.embeddings.model
+                ),
+            ),
+            Err(error) => (false, one_line(error)),
+        }
+    };
+    let vector_passed =
+        vector.active && vector.query.is_some() && vector.documents.len() == DOCUMENTS.len();
+
+    let vector_status = if vector_passed {
+        GateStatus::Pass
+    } else if vector.configured {
+        GateStatus::Fail
+    } else {
+        GateStatus::NotRun
+    };
+    let semantic_status = match rankings.vector.as_deref() {
+        Some(paths)
+            if position(paths, SEMANTIC_TARGET)
+                .zip(position(paths, LEXICAL_DECOY))
+                .is_some_and(|(semantic, decoy)| semantic < decoy) =>
+        {
+            GateStatus::Pass
+        }
+        Some(_) => GateStatus::Fail,
+        None if vector.configured => GateStatus::Fail,
+        None => GateStatus::NotRun,
+    };
+    let hybrid_status = match rankings.hybrid.as_deref() {
+        Some(paths)
+            if paths.len() == LIMIT
+                && position(paths, SEMANTIC_TARGET).is_some()
+                && position(paths, LEXICAL_DECOY).is_some() =>
+        {
+            GateStatus::Pass
+        }
+        Some(_) => GateStatus::Fail,
+        None if vector.configured => GateStatus::Fail,
+        None => GateStatus::NotRun,
+    };
+    let reranker_status = match rankings.reranker.status {
+        "active"
+            if rankings.reranker.input_size > 0
+                && rankings
+                    .reranker
+                    .ranking
+                    .as_ref()
+                    .is_some_and(|rows| rows.len() == rankings.reranker.input_size) =>
+        {
+            GateStatus::Pass
+        }
+        "disabled" => GateStatus::NotRun,
+        _ => GateStatus::Fail,
+    };
+    let graph_passed =
+        graph.fixture_edge_active && graph.neighbors.iter().any(|path| path == LINK_TARGET);
+    let local_acceleration_status = if !vector.active {
+        GateStatus::NotRun
+    } else {
+        match &vector.execution {
+            Some(execution)
+                if vector.route == "local-package"
+                    && execution.route.as_deref() == Some("local")
+                    && execution.backend != "endpoint"
+                    && execution
+                        .device_class
+                        .as_deref()
+                        .is_some_and(|device| matches!(device, "npu" | "gpu" | "cpu")) =>
+            {
+                GateStatus::Pass
+            }
+            Some(_) => GateStatus::Fail,
+            None => GateStatus::Fail,
+        }
+    };
+
+    let checks = vec![
+        gate(
+            "bm25",
+            if bm25_passed {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            true,
+            "keyword retrieval returns the lexical control in deterministic order",
+            if bm25_passed {
+                "the lexical control ranked first and the linked recovery note was returned"
+            } else {
+                "the fixed lexical controls were missing or out of order"
+            },
+        ),
+        gate(
+            "profile_admission",
+            if profile_passed {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            true,
+            "the canonical shared-vector profile is active",
+            profile_evidence,
+        ),
+        gate(
+            "vector_output",
+            vector_status,
+            true,
+            "the embedding route returns one valid query vector and every document vector",
+            if vector_passed {
+                format!(
+                    "received one query vector and {} document vectors at {} dimensions",
+                    vector.documents.len(),
+                    vector.dimensions
+                )
+            } else {
+                vector
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "complete vector output was not available".into())
+            },
+        ),
+        gate(
+            "semantic_ranking",
+            semantic_status,
+            true,
+            "meaning-based ranking puts the rollback note above the keyword trap",
+            match rankings.vector.as_deref() {
+                Some(paths) => format!("vector order: {}", paths.join(" -> ")),
+                None => "vector ranking was not produced".into(),
+            },
+        ),
+        gate(
+            "hybrid_fusion",
+            hybrid_status,
+            true,
+            "RRF keeps evidence contributed by both BM25 and vector ranking",
+            match rankings.hybrid.as_deref() {
+                Some(paths) => format!(
+                    "hybrid order at k={}: {}",
+                    rankings.hybrid_rrf_k,
+                    paths.join(" -> ")
+                ),
+                None => "hybrid ranking was not produced".into(),
+            },
+        ),
+        gate(
+            "reranker",
+            reranker_status,
+            cfg.rerank.enabled,
+            "a configured reranker returns one score for every shortlist item",
+            match rankings.reranker.status {
+                "active" => format!(
+                    "model {} reranked {} items",
+                    rankings.reranker.model.as_deref().unwrap_or("unknown"),
+                    rankings.reranker.ranking.as_ref().map_or(0, Vec::len)
+                ),
+                "disabled" => "reranking is optional and is not configured".into(),
+                _ => rankings
+                    .reranker
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "the configured reranker did not answer".into()),
+            },
+        ),
+        gate(
+            "graph_expansion",
+            if graph_passed {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            true,
+            "post-ranking expansion follows the fixture's known wikilink",
+            if graph_passed {
+                format!("followed {} -> {}", LINK_SOURCE, LINK_TARGET)
+            } else {
+                "the known fixture wikilink was not present in expanded results".into()
+            },
+        ),
+        gate(
+            "local_acceleration",
+            local_acceleration_status,
+            true,
+            "the embedding call used an admitted local NPU, GPU, or accelerated CPU package",
+            match &vector.execution {
+                Some(execution) => format!(
+                    "backend {}, route {}, device {}",
+                    execution.backend,
+                    execution.route.as_deref().unwrap_or("not reported"),
+                    execution.device_class.as_deref().unwrap_or("not reported")
+                ),
+                None => "no local backend and device evidence was recorded".into(),
+            },
+        ),
+    ];
+    let passed = checks
+        .iter()
+        .filter(|check| check.status == GateStatus::Pass)
+        .count();
+    let failed = checks
+        .iter()
+        .filter(|check| check.status == GateStatus::Fail)
+        .count();
+    let not_run = checks
+        .iter()
+        .filter(|check| check.status == GateStatus::NotRun)
+        .count();
+    let production_ready = checks
+        .iter()
+        .filter(|check| check.production_required)
+        .all(|check| check.status == GateStatus::Pass);
+    GateReport {
+        production_ready,
+        passed,
+        failed,
+        not_run,
+        checks,
+    }
 }
 
 fn one_line(error: impl std::fmt::Display) -> String {
@@ -307,6 +645,7 @@ fn rerank_fixture(
                 purpose: "reorders an existing shortlist; it does not find new notes",
                 status: "disabled",
                 input,
+                input_size: base.len(),
                 model: None,
                 reason: None,
                 execution: None,
@@ -323,6 +662,7 @@ fn rerank_fixture(
                     purpose: "reorders an existing shortlist; it does not find new notes",
                     status: "unavailable",
                     input,
+                    input_size: base.len(),
                     model: (!cfg.rerank.model.is_empty()).then(|| cfg.rerank.model.clone()),
                     reason: Some(one_line(format!("{error:#}"))),
                     execution: None,
@@ -333,6 +673,7 @@ fn rerank_fixture(
         }
     };
     let model = client.model().to_string();
+    let input_size = base.len();
     let result = rerank::apply(&client, QUERY, base, |hit: &index::Hit| hit.snippet.clone());
     let ranking = ranked_paths(&result.hits);
     let active = result.note.is_none();
@@ -340,6 +681,7 @@ fn rerank_fixture(
         purpose: "reorders an existing shortlist; it does not find new notes",
         status: if active { "active" } else { "unavailable" },
         input,
+        input_size,
         model: Some(model),
         reason: result.note,
         execution: active.then(current_execution).flatten(),
@@ -444,35 +786,40 @@ pub(crate) fn gather_with_config(
         .into_iter()
         .map(|(path, _)| path)
         .collect();
-    let fixture_edge_from = "knowledge/restore-release.md";
-    let fixture_edge_to = "knowledge/recovery-checklist.md";
+    let fixture_edge_from = LINK_SOURCE;
+    let fixture_edge_to = LINK_TARGET;
     let fixture_edge_active = index::linked_docs(&conn, &[fixture_edge_from.to_string()], 8)?
         .iter()
         .any(|(path, _)| path == fixture_edge_to);
 
+    let rankings = RankingReport {
+        bm25_role: "keyword matching; no model is used",
+        bm25,
+        vector_role: "meaning matching using the embedding model",
+        vector: vector_ranking,
+        hybrid_role: "BM25 and vector ranks combined with reciprocal rank fusion",
+        hybrid_rrf_k: cfg.recall.rrf_k,
+        hybrid: hybrid_ranking,
+        reranker,
+    };
+    let graph = GraphReport {
+        role: "post-ranking one-hop expansion; not a ranking input",
+        from: "top three final hits",
+        neighbors: graph_neighbors,
+        fixture_edge_from,
+        fixture_edge_to,
+        fixture_edge_active,
+    };
+    let gates = evaluate_gates(cfg, &vector, &rankings, &graph);
+
     Ok(RetrievalFixtureReport {
-        schema_version: 1,
+        schema_version: 2,
         temporary_data: true,
         query: QUERY,
+        gates,
         vector,
-        rankings: RankingReport {
-            bm25_role: "keyword matching; no model is used",
-            bm25,
-            vector_role: "meaning matching using the embedding model",
-            vector: vector_ranking,
-            hybrid_role: "BM25 and vector ranks combined with reciprocal rank fusion",
-            hybrid_rrf_k: cfg.recall.rrf_k,
-            hybrid: hybrid_ranking,
-            reranker,
-        },
-        graph: GraphReport {
-            role: "post-ranking one-hop expansion; not a ranking input",
-            from: "top three final hits",
-            neighbors: graph_neighbors,
-            fixture_edge_from,
-            fixture_edge_to,
-            fixture_edge_active,
-        },
+        rankings,
+        graph,
     })
 }
 
@@ -504,6 +851,83 @@ pub fn reranker_status(report: &RetrievalFixtureReport) -> &str {
     report.rankings.reranker.status
 }
 
+fn required_gate_ids(
+    report: &RetrievalFixtureReport,
+    requirements: &[Requirement],
+) -> std::collections::BTreeSet<&'static str> {
+    let mut ids = std::collections::BTreeSet::new();
+    for requirement in requirements {
+        match requirement {
+            Requirement::Bm25 => {
+                ids.insert("bm25");
+            }
+            Requirement::Profile => {
+                ids.insert("profile_admission");
+            }
+            Requirement::Vector => {
+                ids.extend(["vector_output", "semantic_ranking"]);
+            }
+            Requirement::Hybrid => {
+                ids.extend(["vector_output", "semantic_ranking", "hybrid_fusion"]);
+            }
+            Requirement::Reranker => {
+                ids.insert("reranker");
+            }
+            Requirement::Graph => {
+                ids.insert("graph_expansion");
+            }
+            Requirement::LocalAcceleration => {
+                ids.extend(["vector_output", "local_acceleration"]);
+            }
+            Requirement::Production => {
+                ids.extend(
+                    report
+                        .gates
+                        .checks
+                        .iter()
+                        .filter(|check| check.production_required)
+                        .map(|check| check.id),
+                );
+            }
+        }
+    }
+    ids
+}
+
+pub fn enforce_requirements(
+    report: &RetrievalFixtureReport,
+    requirements: &[Requirement],
+) -> anyhow::Result<()> {
+    if requirements.is_empty() {
+        return Ok(());
+    }
+    let required = required_gate_ids(report, requirements);
+    let blockers: Vec<String> = report
+        .gates
+        .checks
+        .iter()
+        .filter(|check| required.contains(check.id) && check.status != GateStatus::Pass)
+        .map(|check| {
+            format!(
+                "{} ({})",
+                check.id,
+                check.status.label().to_ascii_lowercase()
+            )
+        })
+        .collect();
+    anyhow::ensure!(
+        blockers.is_empty(),
+        "required {} gate did not pass: {}",
+        requirements
+            .iter()
+            .map(|requirement| requirement.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        blockers.join(", ")
+    );
+    Ok(())
+}
+
 pub fn display_lines(report: &RetrievalFixtureReport) -> Vec<String> {
     let show_vectors = report
         .vector
@@ -513,6 +937,29 @@ pub fn display_lines(report: &RetrievalFixtureReport) -> Vec<String> {
     let mut lines = vec![
         "temporary retrieval test (your brain and vector store are untouched)".into(),
         format!("query: {}", report.query),
+        String::new(),
+        format!(
+            "production retrieval gate: {}",
+            if report.gates.production_ready {
+                "PASS"
+            } else {
+                "BLOCKED"
+            }
+        ),
+        format!(
+            "  {} passed · {} failed · {} not run",
+            report.gates.passed, report.gates.failed, report.gates.not_run
+        ),
+    ];
+    for check in &report.gates.checks {
+        lines.push(format!(
+            "  {:<7} {:<20} {}",
+            check.status.label(),
+            check.id,
+            check.evidence
+        ));
+    }
+    lines.extend([
         String::new(),
         format!(
             "embedding model: {}",
@@ -538,7 +985,7 @@ pub fn display_lines(report: &RetrievalFixtureReport) -> Vec<String> {
             "  output: {} dimensions, {}",
             report.vector.dimensions, report.vector.encoding
         ),
-    ];
+    ]);
     if let Some(reason) = &report.vector.reason {
         lines.push(format!("  reason: {reason}"));
     }
@@ -670,14 +1117,14 @@ pub fn gather(show_vectors: bool) -> anyhow::Result<RetrievalFixtureReport> {
     gather_with_config(&cfg, show_vectors)
 }
 
-pub fn run(json: bool, show_vectors: bool) -> anyhow::Result<()> {
+pub fn run(json: bool, show_vectors: bool, requirements: &[Requirement]) -> anyhow::Result<()> {
     let report = gather(show_vectors)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("{}", render_text(&report));
     }
-    Ok(())
+    enforce_requirements(&report, requirements)
 }
 
 #[cfg(test)]
@@ -757,6 +1204,7 @@ mod tests {
     #[test]
     fn inactive_vectors_are_visible_while_bm25_and_graph_still_run() {
         let report = gather_with_config(&Config::default(), false).unwrap();
+        assert_eq!(report.schema_version, 2);
         assert!(!report.vector.active);
         assert!(
             report
@@ -777,6 +1225,30 @@ mod tests {
                 .contains(&"knowledge/recovery-checklist.md".to_string())
         );
         assert!(report.graph.fixture_edge_active);
+        assert!(!report.gates.production_ready);
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "bm25")
+                .unwrap()
+                .status,
+            GateStatus::Pass
+        );
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "vector_output")
+                .unwrap()
+                .status,
+            GateStatus::NotRun
+        );
+        assert!(enforce_requirements(&report, &[Requirement::Bm25]).is_ok());
+        assert!(enforce_requirements(&report, &[Requirement::Vector]).is_err());
+        assert!(enforce_requirements(&report, &[Requirement::Production]).is_err());
     }
 
     #[test]
@@ -799,6 +1271,58 @@ mod tests {
         );
         assert!(report.rankings.reranker.ranking.is_some());
         assert!(report.graph.fixture_edge_active);
+        for requirement in [
+            Requirement::Bm25,
+            Requirement::Vector,
+            Requirement::Hybrid,
+            Requirement::Reranker,
+            Requirement::Graph,
+        ] {
+            enforce_requirements(&report, &[requirement]).unwrap();
+        }
+        assert!(enforce_requirements(&report, &[Requirement::Profile]).is_err());
+        assert!(enforce_requirements(&report, &[Requirement::LocalAcceleration]).is_err());
+        assert!(enforce_requirements(&report, &[Requirement::Production]).is_err());
+    }
+
+    #[test]
+    fn reranker_gate_passes_when_a_shorter_shortlist_is_fully_reranked() {
+        let cfg = active_config();
+        let mut report = gather_with_config(&cfg, false).unwrap();
+        // A shortlist shorter than LIMIT is legitimate: BM25 can return
+        // fewer hits. The reranker still scored every submitted item, so
+        // the gate must pass.
+        report.rankings.reranker.input_size = 2;
+        if let Some(rows) = report.rankings.reranker.ranking.as_mut() {
+            rows.truncate(2);
+        }
+        report.gates = evaluate_gates(&cfg, &report.vector, &report.rankings, &report.graph);
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "reranker")
+                .unwrap()
+                .status,
+            GateStatus::Pass
+        );
+        enforce_requirements(&report, &[Requirement::Reranker]).unwrap();
+
+        // A dropped row is still a failure: two scored of three submitted.
+        report.rankings.reranker.input_size = 3;
+        report.gates = evaluate_gates(&cfg, &report.vector, &report.rankings, &report.graph);
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "reranker")
+                .unwrap()
+                .status,
+            GateStatus::Fail
+        );
+        assert!(enforce_requirements(&report, &[Requirement::Reranker]).is_err());
     }
 
     #[test]
@@ -811,6 +1335,56 @@ mod tests {
             Components::Float(_) => panic!("fixture uses signed INT8"),
         }
         assert_eq!(query.sha256.len(), 64);
+    }
+
+    #[test]
+    fn local_acceleration_needs_the_package_route_not_loopback_telemetry() {
+        let cfg = active_config();
+        let mut report = gather_with_config(&cfg, false).unwrap();
+        report.vector.execution = Some(ExecutionReport {
+            backend: "openvino".into(),
+            device_class: Some("npu".into()),
+            route: Some("local".into()),
+        });
+        report.gates = evaluate_gates(&cfg, &report.vector, &report.rankings, &report.graph);
+        assert!(enforce_requirements(&report, &[Requirement::LocalAcceleration]).is_err());
+
+        report.vector.route = "local-package";
+        report.gates = evaluate_gates(&cfg, &report.vector, &report.rankings, &report.graph);
+        enforce_requirements(&report, &[Requirement::LocalAcceleration]).unwrap();
+    }
+
+    #[test]
+    fn valid_vectors_do_not_pass_when_the_semantic_control_loses() {
+        let cfg = active_config();
+        let mut report = gather_with_config(&cfg, false).unwrap();
+        let vector = report.rankings.vector.as_mut().unwrap();
+        let semantic = position(vector, SEMANTIC_TARGET).unwrap();
+        let decoy = position(vector, LEXICAL_DECOY).unwrap();
+        vector.swap(semantic, decoy);
+        report.gates = evaluate_gates(&cfg, &report.vector, &report.rankings, &report.graph);
+
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "vector_output")
+                .unwrap()
+                .status,
+            GateStatus::Pass
+        );
+        assert_eq!(
+            report
+                .gates
+                .checks
+                .iter()
+                .find(|check| check.id == "semantic_ranking")
+                .unwrap()
+                .status,
+            GateStatus::Fail
+        );
+        assert!(enforce_requirements(&report, &[Requirement::Vector]).is_err());
     }
 
     #[test]
