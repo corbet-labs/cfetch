@@ -1150,6 +1150,28 @@ impl Config {
         // On hosts where the harness already auto-loads the ring files,
         // injecting them again would double-pay the context budget.
         for r in &self.resident {
+            // The bar the whole trust model rests on — "never indexed,
+            // recalled or injected, at ANY configuration" — must hold at
+            // this layer too. A resident entry is the one mechanism that
+            // injects WITHOUT recall being asked, and the tree config it
+            // lives in is written by agents and cloned across machines:
+            // an entry pointing into the hard-excluded prefixes (or the
+            // operator's own exclusions) would smuggle exactly what those
+            // boundaries exist to keep out into every session. Refused at
+            // load, loudly, whatever the layer it arrived from.
+            let rel = r.path.to_string_lossy().replace('\\', "/");
+            if HARD_EXCLUDE_PREFIXES.iter().any(|p| under_prefix(&rel, p)) {
+                anyhow::bail!(
+                    "resident entry {} is under a hard-excluded prefix: the secrets/exhaust bar — never indexed, recalled or injected, at ANY configuration — holds for resident entries too",
+                    r.path.display()
+                );
+            }
+            if self.exclude_prefixes.iter().any(|p| under_prefix(&rel, p.as_str())) {
+                anyhow::bail!(
+                    "resident entry {} is under exclude_prefixes: a file cannot be excluded from the index and injected into every session at once",
+                    r.path.display()
+                );
+            }
             match r.ring {
                 0 | 1 => {}
                 // Ring 2 is injectable, but only as policy: a scope, and not
@@ -1867,6 +1889,64 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.budget_chars, 4321);
         assert!(cfg.exclude_prefixes.iter().any(|p| p == "z/"), "tree content keys survive the overlay");
+    }
+
+    #[test]
+    fn resident_entries_cannot_break_the_secrets_bar() {
+        // The one mechanism that injects without recall being asked must
+        // honor the strongest guarantee the tool makes — whatever layer
+        // the entry arrived from, including an agent-written, cloned tree
+        // config.
+        for path in ["mind/secrets/token.md", "mind/secrets/deep/nested.key", "logs/exhaust.txt"] {
+            let err = Config::load_layered(
+                Some((
+                    std::path::Path::new("/t"),
+                    &format!(r#"{{"resident":[{{"path":"{path}","ring":0}}]}}"#),
+                )),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("hard-excluded"),
+                "resident {path} must be refused: {err}"
+            );
+        }
+        // The tree config is exactly the layer agents write and machines
+        // clone; a machine-layer entry is refused just the same.
+        let err = Config::load_layered(
+            None,
+            Some((
+                std::path::Path::new("/m"),
+                r#"{"resident":[{"path":"mind/secrets/api_key","ring":1}]}"#,
+            )),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("hard-excluded"), "machine layer too: {err}");
+    }
+
+    #[test]
+    fn resident_entries_under_operator_exclusions_are_refused() {
+        let err = Config::load_layered(
+            Some((
+                std::path::Path::new("/t"),
+                r#"{"exclude_prefixes":["knowledge/drafts/"],"resident":[{"path":"knowledge/drafts/wip.md","ring":1}]}"#,
+            )),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("exclude_prefixes"),
+            "excluded and injected at once must be refused: {err}"
+        );
+        // Sanity: the same entry outside the exclusion loads fine.
+        Config::load_layered(
+            Some((
+                std::path::Path::new("/t"),
+                r#"{"exclude_prefixes":["knowledge/drafts/"],"resident":[{"path":"knowledge/notes.md","ring":1}]}"#,
+            )),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
