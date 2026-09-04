@@ -5,6 +5,20 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **`--settings <file>` stops double-installing Claude's hooks.** The
+  explicit settings path redirected `apply_claude`'s hooks and status
+  line, but agent-config's Claude hook surface still wrote the DEFAULT
+  `~/.claude/settings.json` — a double registration that created the
+  very files the operator pointed elsewhere to avoid (four other files,
+  three directories, in the reporting tree). With an explicit `--settings`
+  file, the default-path hook surface is deselected: hooks and status
+  line land only in the named file. MCP and instruction surfaces keep
+  their own locations.
+- **The hard-rule cap counts characters, not bytes.** A 120-character
+  German rule is 208 UTF-8 bytes and silently dropped while its English
+  twin passed — the cap is a readability limit and now measures what the
+  operator reads. The English-only opener set (`never`, `no`, `don't`,
+  `do not`) is unchanged and recorded in #69 as a design question.
 - **Commands stop reporting success they did not achieve.** Three from the
   sweep. (1) `daemon stop` printed `daemon stopped` on a mere
   acknowledgement — the acknowledged process outlived the claim by minutes
