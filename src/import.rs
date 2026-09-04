@@ -8,7 +8,8 @@
 //!
 //! | openwolf | cfetch | ring | why |
 //! |---|---|---|---|
-//! | `OPENWOLF.md` | `AGENT.md` | 1 | resident context, read every session |
+//! | `OPENWOLF.md` | `knowledge/openwolf-protocol.md` | 3 | the old operating protocol, preserved verbatim but recall-only: its instructions point at `.wolf/` paths that do not exist here and at `openwolf recall`; injecting them with ring-1 authority would redirect every session's work outside the brain |
+//! | *(authored)* | `AGENT.md` | 1 | a migration bridge written by cfetch (never overwriting an operator's file): where knowledge, bugs, memories, and staging live now, and where the old protocol is kept |
 //! | `cerebrum.md` | `knowledge/cerebrum.md` | 3 | curated, recallable |
 //! | `memory.md` | `mind/memories/MEMORY.md` | 2 | behaviour, scoped injection |
 //! | `identity.md` | `knowledge/identity.md` | 3 | project identity |
@@ -54,13 +55,19 @@ pub struct ImportReport {
 /// frontmatter to prepend (None = no frontmatter needed, the location
 /// default already applies).
 pub const MIGRATIONS: &[(&str, &str, Option<u8>)] = &[
-    ("OPENWOLF.md", "AGENT.md", Some(1)),
+    ("OPENWOLF.md", "knowledge/openwolf-protocol.md", Some(3)),
     ("cerebrum.md", "knowledge/cerebrum.md", Some(3)),
     ("memory.md", "mind/memories/MEMORY.md", Some(2)),
     ("identity.md", "knowledge/identity.md", Some(3)),
     ("reframe-frameworks.md", "knowledge/reframe-frameworks.md", Some(3)),
     ("STATUS.md", "knowledge/handoff.md", Some(0)),
 ];
+
+/// The ring-1 file cfetch authors when a migration would otherwise leave
+/// the resident channel to the old tool's protocol (or to nothing). Facts
+/// only: where the migrated conventions live now and where the old protocol
+/// is kept. An operator's own AGENT.md is never overwritten.
+const AGENT_BRIDGE: &str = "---\nring: 1\n---\n\n# Migration bridge (authored by `cfetch import openwolf`)\n\nThis brain was migrated from an openwolf-enhanced `.wolf/` tree. The\nprevious operating protocol is preserved verbatim at\n`knowledge/openwolf-protocol.md` — recall-only. Its instructions reference\n`.wolf/` paths (`.wolf/STATUS.md`, `.wolf/memory.md`, `.wolf/buglog.json`)\nand the `openwolf recall` command; none of these exist in a cfetch brain.\nFollowing them here sends work outside the tree.\n\nWhere things live now:\n\n- curated facts and project knowledge → `knowledge/`\n- one note per bug or failure conclusion → `knowledge/bugs/`\n- behaviour and working agreements → `mind/memories/`\n- quarantine for anything unreviewed → `todo/staging/`\n- the migrated project-state snapshot (ring-0 handoff) → `knowledge/handoff.md`\n";
 
 /// Files cfetch regenerates or tracks differently — skipped with a reason.
 const SKIPPED: &[(&str, &str)] = &[
@@ -228,6 +235,18 @@ fn collect(wolf_dir: &Path, brain_root: &Path, execute: bool) -> anyhow::Result<
                 .map_err(|e| anyhow::anyhow!("write {}: {e}", dest.display()))?;
         }
         report.imported.push((src_name.to_string(), dest_rel.to_string()));
+    }
+
+    // A migration with no AGENT.md would leave the resident channel to the
+    // old protocol — or, once that is demoted to ring 3, to nothing. cfetch
+    // authors the bridge instead; an operator's own file is never touched.
+    let agent_md = brain_root.join("AGENT.md");
+    if !agent_md.exists() {
+        if execute {
+            std::fs::write(&agent_md, AGENT_BRIDGE)
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", agent_md.display()))?;
+        }
+        report.imported.push(("cfetch import (authored)".to_string(), "AGENT.md".to_string()));
     }
 
     // Migrate the curated bug log: one note per entry under knowledge/bugs/.
@@ -461,8 +480,27 @@ mod tests {
 
         let report = import_openwolf(wolf.path(), brain.path()).unwrap();
 
-        assert!(report.imported.iter().any(|(s, d)| s == "OPENWOLF.md" && d == "AGENT.md"));
-        assert!(report.imported.iter().any(|(s, d)| s == "cerebrum.md" && d == "knowledge/cerebrum.md"));
+        // The old protocol is recall-only...
+        assert!(report
+            .imported
+            .iter()
+            .any(|(s, d)| s == "OPENWOLF.md" && d == "knowledge/openwolf-protocol.md"));
+        let protocol = std::fs::read_to_string(brain.path().join("knowledge/openwolf-protocol.md")).unwrap();
+        assert!(protocol.starts_with("---\nring: 3\n---"));
+        assert!(protocol.contains("# Context"));
+        // ...and the ring-1 file is the cfetch-authored bridge.
+        assert!(report
+            .imported
+            .iter()
+            .any(|(s, d)| s == "cfetch import (authored)" && d == "AGENT.md"));
+        let agent = std::fs::read_to_string(brain.path().join("AGENT.md")).unwrap();
+        assert!(agent.starts_with("---\nring: 1\n---"));
+        assert!(agent.contains("knowledge/openwolf-protocol.md"));
+        assert!(agent.contains("knowledge/bugs/"));
+        assert!(report
+            .imported
+            .iter()
+            .any(|(s, d)| s == "cerebrum.md" && d == "knowledge/cerebrum.md"));
         assert!(report.imported.iter().any(|(s, d)| s == "memory.md" && d == "mind/memories/MEMORY.md"));
         assert!(report.imported.iter().any(|(s, _)| s.starts_with("handoff-archiv")));
         assert!(report.imported.iter().any(|(s, _)| s.starts_with("todo/staging/")));
@@ -471,8 +509,53 @@ mod tests {
         // Ring frontmatter was applied.
         let memory = std::fs::read_to_string(brain.path().join("mind/memories/MEMORY.md")).unwrap();
         assert!(memory.starts_with("---\nring: 2\n---"), "got: {}", &memory[..40.min(memory.len())]);
+    }
+
+    #[test]
+    fn the_old_protocol_never_reaches_ring1_authority() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        // The protocol full of instructions for a world that no longer exists.
+        std::fs::write(
+            wolf.path().join("OPENWOLF.md"),
+            "# OpenWolf Operating Protocol\n\n- Read .wolf/STATUS.md first.\n- Append to .wolf/memory.md after every action.\n- Log bugs to .wolf/buglog.json.\n- Never re-read a file already read this session.\n",
+        )
+        .unwrap();
+
+        import_openwolf(wolf.path(), brain.path()).unwrap();
+
+        // Whatever lands resident at ring 1 is cfetch's bridge, and none of
+        // the old protocol's instructions or verbatim rules carry over: the
+        // bridge may NAME the dead paths (to say they do not exist), but it
+        // never instructs through them.
         let agent = std::fs::read_to_string(brain.path().join("AGENT.md")).unwrap();
-        assert!(agent.starts_with("---\nring: 1\n---"));
+        assert!(!agent.contains("Read .wolf/STATUS.md first"));
+        assert!(!agent.contains("Append to .wolf/memory.md after every action"));
+        assert!(!agent.contains("Log bugs to .wolf/buglog.json"));
+        assert!(!agent.contains("Never re-read a file already read"), "old hard rules must not carry verbatim");
+        assert!(agent.contains("none of these exist"), "the bridge names the dead paths to close them");
+        // The protocol itself stays findable, unmodified, recall-only.
+        let protocol = std::fs::read_to_string(brain.path().join("knowledge/openwolf-protocol.md")).unwrap();
+        assert!(protocol.contains(".wolf/buglog.json"));
+        assert!(protocol.contains("Never re-read"));
+    }
+
+    #[test]
+    fn an_existing_agent_md_is_never_overwritten() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(wolf.path().join("OPENWOLF.md"), "# Old protocol").unwrap();
+        std::fs::write(brain.path().join("AGENT.md"), "---\nring: 1\n---\n\n# My own rules").unwrap();
+
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+        let agent = std::fs::read_to_string(brain.path().join("AGENT.md")).unwrap();
+        assert!(agent.contains("My own rules"), "operator file must stay untouched: {agent}");
+        assert!(!report
+            .imported
+            .iter()
+            .any(|(s, _)| s == "cfetch import (authored)"));
+        // The old protocol still lands recall-only.
+        assert!(brain.path().join("knowledge/openwolf-protocol.md").is_file());
     }
 
     #[test]
@@ -516,8 +599,10 @@ mod tests {
         let brain = tempfile::tempdir().unwrap();
         std::fs::write(wolf.path().join("cerebrum.md"), "# Knowledge").unwrap();
         let report = plan_openwolf(wolf.path(), brain.path()).unwrap();
-        assert_eq!(report.imported.len(), 1);
+        // cerebrum.md plus the authored AGENT.md the plan announces.
+        assert_eq!(report.imported.len(), 2);
         assert!(!brain.path().join("knowledge/cerebrum.md").exists());
+        assert!(!brain.path().join("AGENT.md").exists());
     }
 
     #[test]
@@ -702,6 +787,9 @@ mod tests {
         std::fs::write(wolf.path().join("OPENWOLF.md"), "# Context").unwrap();
         let report = plan_openwolf(wolf.path(), brain.path()).unwrap();
         assert!(!brain.path().join(".cfetch/config.json").exists());
+        assert!(!brain.path().join("AGENT.md").exists(), "the authored bridge is a write too");
+        // The plan names both the migration and the authored bridge.
+        assert_eq!(report.imported.len(), 2);
         assert!(report.resident_note.is_some());
     }
 }

@@ -5,6 +5,22 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **`import openwolf`: the old protocol no longer speaks with ring-1
+  authority.** The imported `OPENWOLF.md` used to become `AGENT.md` — the
+  top-trust resident file — so the highest-trust instruction a migrated
+  brain injected was, verbatim, the operating protocol of the tool being
+  replaced: read `.wolf/STATUS.md`, append to `.wolf/memory.md`, log bugs
+  to `.wolf/buglog.json`, prefer `openwolf recall`. None of those paths
+  exist in a cfetch brain, and the measured consequence was a session
+  that "recorded a memory" while the brain stayed byte-identical — the
+  write went to the store the old instruction named, outside the tree.
+  Now `OPENWOLF.md` migrates verbatim to `knowledge/openwolf-protocol.md`
+  (ring 3, recall-only: findable, never injected), and when no operator
+  `AGENT.md` exists the import authors one — a migration bridge naming
+  where knowledge, bugs, memories, and staging live now, and stating that
+  the old protocol's paths do not exist here. The bridge is cfetch's own
+  text; an operator's `AGENT.md` is never overwritten, and the same-report
+  guarantee covers the authored entry.
 - **Hyphenated compounds rank as compounds.** `fts_query` now emits a
   hyphenated query term BOTH as an exact-adjacency phrase and as its split
   prefix terms. The recall contract is unchanged (`state-machine` still
