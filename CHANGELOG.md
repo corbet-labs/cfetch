@@ -5,6 +5,22 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **The secrets bar holds at the resident layer, and buglog ids can no
+  longer traverse.** Two fixes from the six-area sweep. (1) The strongest
+  guarantee the tool makes — "never indexed, recalled or injected, at ANY
+  configuration" — broke at the one mechanism that injects without recall
+  being asked: a resident entry pointing under `mind/secrets/` (or
+  `logs/`) injected the secret into every session, whatever layer the
+  entry arrived from, including the agent-written, machine-cloned tree
+  config, and selfcheck approved it. Config load now refuses such entries
+  loudly; resident entries under the operator's own `exclude_prefixes`
+  are refused for the same reason (a file cannot be excluded from the
+  index and injected into every session at once). (2) openwolf buglog ids
+  were used unchecked as note filenames: `../../x` and `/abs/path/y`
+  wrote outside the brain with exit 0 and no report entry. Ids are now
+  validated as filenames (`[A-Za-z0-9._-]+`, no leading dot, no `..`
+  hops, no doubled extension); an id that cannot become one is a reported
+  error with the original id named, never a write.
 - **`import openwolf`: the old protocol no longer speaks with ring-1
   authority.** The imported `OPENWOLF.md` used to become `AGENT.md` — the
   top-trust resident file — so the highest-trust instruction a migrated

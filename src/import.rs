@@ -155,6 +155,33 @@ impl BuglogEntry {
             _ => String::new(),
         }
     }
+
+    /// A safe note filename for the entry's id, or None when the id cannot
+    /// become one. Ids come from an external tool's data file and were never
+    /// checked as filenames: `../../x` and `/abs/path/y` traversed out of
+    /// `knowledge/bugs/` and wrote outside the brain with exit 0. A filename
+    /// id is `[A-Za-z0-9._-]+`, does not start with a dot, and is not a
+    /// `..` hop — anything else is reported, not written.
+    fn safe_filename_id(&self, index: usize) -> Result<String, String> {
+        let trimmed = self.id.trim();
+        let candidate = if trimmed.is_empty() {
+            format!("bug-{}", index + 1)
+        } else {
+            trimmed.to_string()
+        };
+        let ok = !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+            && !candidate.starts_with('.')
+            && !candidate.split('.').any(|part| part.is_empty() || part == "..")
+            && !candidate.ends_with(".md");
+        if ok {
+            Ok(candidate)
+        } else {
+            Err(self.id.clone())
+        }
+    }
 }
 
 /// One bug entry becomes one ring-3 note. The `bug-NNN` id is kept in the
@@ -261,10 +288,20 @@ fn collect(wolf_dir: &Path, brain_root: &Path, execute: bool) -> anyhow::Result<
             Ok(log) if !log.bugs.is_empty() => {
                 let mut written = 0usize;
                 for (index, entry) in log.bugs.iter().enumerate() {
-                    let id = if entry.id.is_empty() {
-                        format!("bug-{}", index + 1)
-                    } else {
-                        entry.id.clone()
+                    let id = match entry.safe_filename_id(index) {
+                        Ok(id) => id,
+                        Err(raw) => {
+                            let label = if raw.is_empty() {
+                                format!("buglog.json: entry {index} (empty id)")
+                            } else {
+                                format!("buglog.json entry {raw:?}")
+                            };
+                            report.errors.push((
+                                label,
+                                "id cannot be a note filename (path separators or '..'); entry left behind".to_string(),
+                            ));
+                            continue;
+                        }
                     };
                     let dest = brain_root.join("knowledge").join("bugs").join(format!("{id}.md"));
                     if dest.exists() {
@@ -646,6 +683,61 @@ mod tests {
         let report = import_openwolf(wolf.path(), brain.path()).unwrap();
         assert!(report.errors.iter().any(|(s, _)| s == "buglog.json"));
         assert!(report.imported.iter().any(|(s, _)| s == "memory.md"));
+    }
+
+    #[test]
+    fn buglog_ids_that_cannot_be_filenames_are_reported_not_traversed() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wolf.path().join("buglog.json"),
+            r#"{"version":1,"bugs":[
+                {"id":"bug-001","error_message":"fine"},
+                {"id":"../../escape","error_message":"traversal"},
+                {"id":"/abs/path/y","error_message":"absolute"},
+                {"id":"bug-004.md","error_message":"would double the extension"},
+                {"id":"..","error_message":"dot hop"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+
+        // The good entry lands.
+        assert!(brain.path().join("knowledge/bugs/bug-001.md").is_file());
+        // Nothing escaped knowledge/bugs/: no file at the brain root, none
+        // outside it.
+        assert_eq!(std::fs::read_dir(brain.path().join("knowledge/bugs")).unwrap().count(), 1);
+        assert!(!brain.path().join("escape.md").exists());
+        // Every refused id is named in the report.
+        let error_names: Vec<&str> = report.errors.iter().map(|(s, _)| s.as_str()).collect();
+        for expected in [
+            "buglog.json entry \"../../escape\"",
+            "buglog.json entry \"/abs/path/y\"",
+            "buglog.json entry \"bug-004.md\"",
+            "buglog.json entry \"..\"",
+        ] {
+            let needle = expected.trim_matches('"');
+            assert!(
+                error_names.iter().any(|e| e.contains(needle)),
+                "missing error for {expected}; got {error_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_buglog_id_falls_back_to_position_and_stays_a_filename() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wolf.path().join("buglog.json"),
+            r#"{"version":1,"bugs":[{"error_message":"no id given"},{"id":"  ","error_message":"whitespace id"}]}"#,
+        )
+        .unwrap();
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+        assert!(brain.path().join("knowledge/bugs/bug-1.md").is_file());
+        assert!(brain.path().join("knowledge/bugs/bug-2.md").is_file());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]
