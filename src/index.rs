@@ -504,6 +504,24 @@ fn db_path(state_dir: &Path) -> PathBuf {
     state_dir.join("index.db")
 }
 
+/// Whether a catalog database file exists at all — the cheap first half of
+/// a diagnostic's liveness probe, so a read-only look can be reserved for
+/// the case where there is something to read.
+pub(crate) fn db_exists(state_dir: &Path) -> bool {
+    db_path(state_dir).is_file()
+}
+
+/// READ-ONLY open for diagnostics: never creates the file, never repairs a
+/// corrupt one (`open`'s delete-and-rebuild is the writer's recovery, and a
+/// diagnostic must not be the thing that first writes an index). Reading a
+/// corrupt database surfaces as an error from the first query, not here —
+/// SQLite opens lazily.
+pub fn open_read_only(state_dir: &Path) -> anyhow::Result<Connection> {
+    let path = db_path(state_dir);
+    Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| anyhow::anyhow!("open {} read-only: {e}", path.display()))
+}
+
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
 /// disposable â€” mismatches are handled by delete-and-rebuild in `open()`.

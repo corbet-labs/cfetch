@@ -593,7 +593,20 @@ fn catalog_diagnostic(
         // avoid.
         return CatalogDiagnostic { state: "remote".into(), detail: Some(format!("served by {}", cs.addr)) };
     }
-    let conn = match index::open(state_dir) {
+    // A diagnostic must not be the thing that first writes an index: the
+    // existence check comes first, and the open is READ-ONLY (no
+    // delete-and-rebuild on a corrupt file — that recovery belongs to the
+    // writer, with the operator's eyes on it).
+    if !index::db_exists(state_dir) {
+        findings.push(Finding {
+            code: "index_never_scanned".into(),
+            severity: FindingSeverity::Warning,
+            summary: "no catalog has ever been committed; every recall answers from nothing".into(),
+            action: Some("run cfetch scan".into()),
+        });
+        return CatalogDiagnostic { state: "never_scanned".into(), detail: None };
+    }
+    let conn = match index::open_read_only(state_dir) {
         Ok(conn) => conn,
         Err(error) => {
             let detail = short_error(&error.to_string());
@@ -608,8 +621,21 @@ fn catalog_diagnostic(
     };
     let tree =
         index::tree_fingerprint(&cfg.brain_root, Some(&crate::paths::native_projects_root()), &cfg.rings());
-    let stored = index::stored_fingerprint(&conn);
-    let verdict = heartbeat::observe_index_in(state_dir, stored.as_deref(), &tree);
+    let stored = match index::stored_fingerprint(&conn) {
+        Some(fp) => fp,
+        None => {
+            // A corrupt or schemaless file: present, unreadable, and not
+            // ours to repair from here.
+            findings.push(Finding {
+                code: "index_unopenable".into(),
+                severity: FindingSeverity::Critical,
+                summary: "the index database is present but unreadable (empty or not a cfetch catalog)".into(),
+                action: Some("delete the state index and run cfetch scan to rebuild".into()),
+            });
+            return CatalogDiagnostic { state: "unavailable".into(), detail: Some("unreadable catalog".into()) };
+        }
+    };
+    let verdict = heartbeat::observe_index_in(state_dir, Some(stored.as_str()), &tree);
     match verdict {
         heartbeat::IndexLiveness::Current => CatalogDiagnostic {
             state: "current".into(),
