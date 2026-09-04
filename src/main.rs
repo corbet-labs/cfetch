@@ -2977,6 +2977,10 @@ fn main() {
                             println!("  {}: {}", name, error);
                         }
                     }
+                    if let Some(note) = &report.resident_note {
+                        println!();
+                        println!("{note}");
+                    }
                     if report.imported.is_empty()
                         && report.skipped.is_empty()
                         && report.unrecognized.is_empty()

@@ -13,20 +13,27 @@
 //! | `memory.md` | `mind/memories/MEMORY.md` | 2 | behaviour, scoped injection |
 //! | `identity.md` | `knowledge/identity.md` | 3 | project identity |
 //! | `reframe-frameworks.md` | `knowledge/reframe-frameworks.md` | 3 | reference |
+//! | `STATUS.md` | `knowledge/handoff.md` | 0 | snapshot of the project state at migration time; a one-way import makes it history, and it is the natural ring-0 handoff |
 //! | `buglog.json` | `knowledge/bugs/<id>.md` | 3 | one note per curated bug; the ids stay greppable so `bug-NNN` references inside imported files keep resolving |
 //! | archive `*.md` | `knowledge/archive/` | excl | out of the index |
 //! | `todo/staging/*` | `todo/staging/*` | 5 | quarantine, same contract |
 //!
 //! Files cfetch derives on its own are skipped with a note: `anatomy.md`
-//! (code index), `token-ledger.json`, `STATUS.md`, `config.json` (cfetch has
-//! its own two-layer config), `recall-embeddings.*` (cfetch will re-embed),
-//! hooks, logs, cron state. Anything else found at the top level is reported
+//! (code index), `token-ledger.json`, `config.json` (cfetch has its own
+//! two-layer config), `recall-embeddings.*` (cfetch will re-embed), hooks,
+//! logs, cron state. Anything else found at the top level is reported
 //! as `unrecognized` and left in place — ring placement for somebody else's
 //! conventions is the operator's call, not the importer's.
 //!
 //! The dry run and the real run share one code path: `collect()` builds the
 //! same report either way, and only the real run writes. The two cannot
 //! disagree with each other.
+//!
+//! A migrated tree must also reach the model, not just exist on disk: the
+//! real run writes a starter tree config (`<brain>/.cfetch/config.json`,
+//! never overwriting an existing one) that makes `AGENT.md` — and the
+//! migrated handoff, when present — resident, so the session hooks inject
+//! from the first `scan` onward instead of silently injecting nothing.
 
 use std::path::Path;
 
@@ -36,6 +43,11 @@ pub struct ImportReport {
     /// Top-level entries that matched no table — left in place, but named.
     pub unrecognized: Vec<String>,
     pub errors: Vec<(String, String)>,
+    /// What the import did about resident injection: confirmation of the
+    /// starter config it wrote, or a warning that the digest is empty and
+    /// the file that would fix it. `None` when an existing non-empty
+    /// resident config answers the question already.
+    pub resident_note: Option<String>,
 }
 
 /// Files that become brain content, with their destination and a ring
@@ -47,6 +59,7 @@ pub const MIGRATIONS: &[(&str, &str, Option<u8>)] = &[
     ("memory.md", "mind/memories/MEMORY.md", Some(2)),
     ("identity.md", "knowledge/identity.md", Some(3)),
     ("reframe-frameworks.md", "knowledge/reframe-frameworks.md", Some(3)),
+    ("STATUS.md", "knowledge/handoff.md", Some(0)),
 ];
 
 /// Files cfetch regenerates or tracks differently — skipped with a reason.
@@ -55,7 +68,6 @@ const SKIPPED: &[(&str, &str)] = &[
     ("anatomy-graph.json", "derived from the code index"),
     ("anatomy-symbols.json", "derived from the code index"),
     ("token-ledger.json", "cfetch has its own token accounting"),
-    ("STATUS.md", "runtime state, cfetch generates it"),
     ("config.json", "cfetch has its own two-layer config"),
     ("cron-manifest.json", "cfetch has its own cron engine"),
     ("cron-state.json", "cfetch has its own cron engine"),
@@ -191,6 +203,7 @@ fn collect(wolf_dir: &Path, brain_root: &Path, execute: bool) -> anyhow::Result<
         skipped: Vec::new(),
         unrecognized: Vec::new(),
         errors: Vec::new(),
+        resident_note: None,
     };
 
     // Migrate the named content files.
@@ -345,6 +358,58 @@ fn collect(wolf_dir: &Path, brain_root: &Path, execute: bool) -> anyhow::Result<
     unrecognized.sort();
     report.unrecognized = unrecognized;
 
+    // A migrated tree that injects nothing is a tree the model never sees.
+    // If no tree config exists, the real run writes one that makes the files
+    // this import just landed resident; an existing config is never
+    // overwritten, but an empty resident list is named, because the import
+    // output is the one place a migrating user is guaranteed to be reading.
+    // The note is identical in both modes — the dry run already speaks in
+    // the real run's voice ("imported:") for everything else.
+    let tree_config = crate::paths::tree_config_path(brain_root);
+    if tree_config.exists() {
+        let existing = std::fs::read_to_string(&tree_config)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", tree_config.display()))?;
+        let has_resident = serde_json::from_str::<serde_json::Value>(&existing)
+            .ok()
+            .and_then(|v| v.get("resident").and_then(|r| r.as_array()).cloned())
+            .is_some_and(|entries| !entries.is_empty());
+        if !has_resident {
+            report.resident_note = Some(format!(
+                "resident digest is empty — nothing will be injected; add resident entries to {}",
+                tree_config.display()
+            ));
+        }
+    } else {
+        // Mode-independent so dry run and real run agree on an empty brain:
+        // the handoff counts when it already exists (a previous import) or
+        // when STATUS.md is present and will land. Checking "will land" via
+        // dest-not-exists AFTER the migration loop would invert on the real
+        // run, which has just created the dest.
+        let with_handoff = brain_root.join("knowledge/handoff.md").exists()
+            || wolf_dir.join("STATUS.md").is_file();
+        let mut resident = vec![serde_json::json!({"path": "AGENT.md", "ring": 1})];
+        if with_handoff {
+            resident.push(serde_json::json!({"path": "knowledge/handoff.md", "ring": 0}));
+        }
+        if execute {
+            let starter = serde_json::json!({
+                "resident": resident,
+                "budget_chars": crate::config::default_budget_chars(),
+            });
+            if let Some(parent) = tree_config.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&tree_config, format!("{starter:#}\n"))
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", tree_config.display()))?;
+        }
+        let entries = if with_handoff { "2 resident entries (AGENT.md, knowledge/handoff.md)" } else { "1 resident entry (AGENT.md)" };
+        report.resident_note = Some(format!(
+            "starter tree config {} — {entries}; the session hooks will inject after `cfetch scan`",
+            tree_config.display()
+        ));
+    }
+
     Ok(report)
 }
 
@@ -414,6 +479,7 @@ mod tests {
     fn dry_run_reports_exactly_what_the_real_run_does() {
         let wolf = tempfile::tempdir().unwrap();
         std::fs::write(wolf.path().join("cerebrum.md"), "# Knowledge\nsee bug-001.").unwrap();
+        std::fs::write(wolf.path().join("STATUS.md"), "# Project state\nlast known good").unwrap();
         std::fs::write(
             wolf.path().join("buglog.json"),
             r#"{"version":1,"bugs":[{"id":"bug-001","timestamp":"2026-07-24","error_message":"frames decoded to noise","file":"loader.py","root_cause":"offsets were direct","fix":"use raw offsets","tags":["cwr"],"related_bugs":[],"occurrences":2,"last_seen":"2026-07-25"}]}"#,
@@ -422,16 +488,26 @@ mod tests {
         std::fs::write(wolf.path().join("anatomy.md"), "index").unwrap();
         std::fs::write(wolf.path().join("ENGINE.md"), "live instructions").unwrap();
 
-        let planned = plan_openwolf(wolf.path(), tempfile::tempdir().unwrap().path()).unwrap();
-        let executed = import_openwolf(wolf.path(), tempfile::tempdir().unwrap().path()).unwrap();
+        // Same brain for both: the dry run writes nothing, so the real run
+        // sees the same starting state — exactly the reported repro. The
+        // two reports must be identical, paths included.
+        let brain = tempfile::tempdir().unwrap();
+        let planned = plan_openwolf(wolf.path(), brain.path()).unwrap();
+        assert!(!brain.path().join(".cfetch/config.json").exists());
+        let executed = import_openwolf(wolf.path(), brain.path()).unwrap();
 
         assert_eq!(planned.imported, executed.imported);
         assert_eq!(planned.skipped, executed.skipped);
         assert_eq!(planned.unrecognized, executed.unrecognized);
         assert_eq!(planned.errors, executed.errors);
+        assert_eq!(planned.resident_note, executed.resident_note);
         // Both runs see the skip and the unknown file.
         assert!(planned.skipped.iter().any(|(s, _)| s == "anatomy.md"));
         assert_eq!(planned.unrecognized, vec!["ENGINE.md".to_string()]);
+        // Both name the starter config with the handoff included.
+        let note = planned.resident_note.expect("starter note");
+        assert!(note.contains("starter tree config"), "{note}");
+        assert!(note.contains("2 resident entries (AGENT.md, knowledge/handoff.md)"), "{note}");
     }
 
     #[test]
@@ -520,5 +596,112 @@ mod tests {
         // Nothing unrecognized was touched.
         assert!(wolf.path().join("ENGINE.md").is_file());
         assert!(wolf.path().join("proposals/p1.md").is_file());
+    }
+
+    #[test]
+    fn status_md_migrates_as_the_ring0_handoff() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(wolf.path().join("STATUS.md"), "# Project state\nlast known-good build").unwrap();
+
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+        assert!(report
+            .imported
+            .iter()
+            .any(|(s, d)| s == "STATUS.md" && d == "knowledge/handoff.md"));
+        let handoff = std::fs::read_to_string(brain.path().join("knowledge/handoff.md")).unwrap();
+        assert!(handoff.starts_with("---\nring: 0\n---"));
+        assert!(handoff.contains("last known-good build"));
+    }
+
+    #[test]
+    fn a_fresh_import_writes_a_starter_tree_config() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(wolf.path().join("OPENWOLF.md"), "# Context").unwrap();
+        std::fs::write(wolf.path().join("STATUS.md"), "# Project state").unwrap();
+
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+        let cfg_path = brain.path().join(".cfetch/config.json");
+        assert!(cfg_path.is_file());
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let resident = cfg["resident"].as_array().unwrap();
+        assert_eq!(resident.len(), 2);
+        assert_eq!(resident[0]["path"], "AGENT.md");
+        assert_eq!(resident[0]["ring"], 1);
+        assert_eq!(resident[1]["path"], "knowledge/handoff.md");
+        assert_eq!(resident[1]["ring"], 0);
+        assert_eq!(cfg["budget_chars"], crate::config::default_budget_chars());
+        // The written config must itself load as a valid cfetch config.
+        let loaded = crate::config::Config::load_from(&cfg_path);
+        loaded.unwrap_or_else(|e| panic!("starter config does not load: {e:#}"));
+        // The note names the starter.
+        assert!(report.resident_note.as_deref().unwrap_or_default().contains("starter tree config"));
+    }
+
+    #[test]
+    fn a_fresh_import_without_status_writes_a_single_entry_starter() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(wolf.path().join("OPENWOLF.md"), "# Context").unwrap();
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(brain.path().join(".cfetch/config.json")).unwrap()).unwrap();
+        assert_eq!(cfg["resident"].as_array().unwrap().len(), 1);
+        assert!(report
+            .resident_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("1 resident entry (AGENT.md)"));
+    }
+
+    #[test]
+    fn an_existing_tree_config_is_never_overwritten() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(wolf.path().join("OPENWOLF.md"), "# Context").unwrap();
+        std::fs::create_dir_all(brain.path().join(".cfetch")).unwrap();
+        std::fs::write(
+            brain.path().join(".cfetch/config.json"),
+            r#"{"resident": [], "budget_chars": 1234}"#,
+        )
+        .unwrap();
+
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+        let raw = std::fs::read_to_string(brain.path().join(".cfetch/config.json")).unwrap();
+        assert!(raw.contains("1234"), "starter must not overwrite: {raw}");
+        // An empty resident list is named, not left silent.
+        assert!(report
+            .resident_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("resident digest is empty"));
+    }
+
+    #[test]
+    fn an_existing_config_with_residents_stays_silent() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(wolf.path().join("OPENWOLF.md"), "# Context").unwrap();
+        std::fs::create_dir_all(brain.path().join(".cfetch")).unwrap();
+        std::fs::write(
+            brain.path().join(".cfetch/config.json"),
+            r#"{"resident": [{"path": "AGENT.md", "ring": 1}]}"#,
+        )
+        .unwrap();
+
+        let report = import_openwolf(wolf.path(), brain.path()).unwrap();
+        assert!(report.resident_note.is_none());
+    }
+
+    #[test]
+    fn the_dry_run_writes_no_starter_config() {
+        let wolf = tempfile::tempdir().unwrap();
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::write(wolf.path().join("OPENWOLF.md"), "# Context").unwrap();
+        let report = plan_openwolf(wolf.path(), brain.path()).unwrap();
+        assert!(!brain.path().join(".cfetch/config.json").exists());
+        assert!(report.resident_note.is_some());
     }
 }

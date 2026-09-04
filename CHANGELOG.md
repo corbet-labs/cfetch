@@ -5,6 +5,20 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **`import openwolf`: a migrated tree reaches the model from the first
+  scan.** Follow-up to the silent-import fixes. A fresh import used to
+  produce a brain that injected nothing at all — selfcheck reported an
+  empty resident digest and both session hooks emitted zero bytes — while
+  the import output read like success. The real run now writes a starter
+  tree config (`<brain>/.cfetch/config.json`, never overwriting an
+  existing one) making `AGENT.md` resident at ring 1 and the migrated
+  handoff at ring 0, so the hooks inject immediately after `cfetch scan`.
+  `STATUS.md` migrates as `knowledge/handoff.md` (ring 0): for a one-way
+  import it is a snapshot of project state, not live runtime state, and
+  it is the natural ring-0 nomination. An existing config with an empty
+  resident list is named in the output instead of leaving the "nothing
+  will be injected" state silent. The resident note is identical in dry
+  run and real run — the same-report guarantee now covers it.
 - **`import openwolf`: honest reporting and the curated bug log.** Three
   fixes from a report filed against a real, grown `.wolf/` tree. (1) The
   dry run and the real run now share one code path — `plan` builds the
