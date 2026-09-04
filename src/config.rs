@@ -911,7 +911,7 @@ pub struct Config {
     pub exclude_prefixes: Vec<String>,
 }
 
-fn default_budget_chars() -> usize {
+pub fn default_budget_chars() -> usize {
     6000
 }
 
