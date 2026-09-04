@@ -5,6 +5,17 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **The secrets bar holds for the code index, and a rescan heals it.**
+  Pointing `code_roots` at — or beneath — the brain's hard-excluded
+  prefixes used to make `find` return paths, symbol names, and exact line
+  ranges from `mind/secrets/`. The code walker now refuses those prefixes
+  at any configuration (component-wise path comparison, so a root outside
+  the brain never matches by string accident), a bare file root inside a
+  refused prefix is skipped whole, and the next scan purges whatever an
+  earlier configuration let in — refused rows are unseen rows, and unseen
+  rows are stale. `scan_code` gained a brain-root parameter internally
+  (`scan_code_in`) so the bar is testable without mutating the process
+  environment.
 - **The secrets bar holds at the resident layer, and buglog ids can no
   longer traverse.** Two fixes from the six-area sweep. (1) The strongest
   guarantee the tool makes — "never indexed, recalled or injected, at ANY

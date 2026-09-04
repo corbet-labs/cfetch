@@ -451,6 +451,16 @@ fn norm_keys(path: &str) -> (String, String) {
 /// thread drains it into the ONE write transaction (SQLite has a single
 /// writer anyway — parsing, not inserting, is the expensive part).
 pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<CodeScanReport> {
+    scan_code_in(conn, roots, &crate::paths::default_brain_root())
+}
+
+/// Same scan with an explicit brain root, so the secrets/exhaust bar can be
+/// tested without mutating the process environment.
+pub fn scan_code_in(
+    conn: &mut Connection,
+    roots: &[PathBuf],
+    brain_root: &Path,
+) -> anyhow::Result<CodeScanReport> {
     ensure_schema(conn)?;
     let mut report = CodeScanReport { files: 0, symbols: 0, edges: 0 };
     // Known (mtime, size) per path, read once — the walker threads make the
@@ -473,14 +483,30 @@ pub fn scan_code(conn: &mut Connection, roots: &[PathBuf]) -> anyhow::Result<Cod
     };
     let tx = conn.transaction()?;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The secrets/exhaust bar holds for the code index too, at ANY
+    // configuration: pointing code_roots at — or beneath — the brain's
+    // hard-excluded prefixes must refuse them, not index them, and a
+    // rescan purges whatever an earlier configuration let in (rows the
+    // walker never sees are stale and deleted below). The comparison is
+    // component-wise (`Path::starts_with`), so a root outside the brain
+    // can never match by string accident.
+    let refused: [std::path::PathBuf; 2] = [
+        brain_root.join("mind").join("secrets"),
+        brain_root.join("logs"),
+    ];
     for root in roots {
+        if refused.iter().any(|p| root.starts_with(p)) {
+            continue;
+        }
+        let refused = refused.clone();
         let (msg_tx, msg_rx) = std::sync::mpsc::channel::<WalkMsg>();
         let known = &known;
         std::thread::scope(|s| -> anyhow::Result<()> {
             s.spawn(move || {
                 crate::index::tree_walker(root)
-                    .filter_entry(|e| {
+                    .filter_entry(move |e| {
                         e.file_name().to_str().map(|n| !skip_dir(n)).unwrap_or(true)
+                            && !refused.iter().any(|p| e.path().starts_with(p))
                     })
                     .build_parallel()
                     .run(|| {
@@ -787,6 +813,89 @@ mod tests {
                 Symbol { name: "Beta".into(), kind: "struct_item".into(), start_line: 5, end_line: 7, parent_start_line: None },
             ]
         );
+    }
+
+    #[test]
+    fn the_secrets_bar_holds_for_the_code_index_at_any_configuration() {
+        // code_roots pointed straight AT the secrets prefix, at a parent
+        // containing it, and at an unrelated tree — the bar must refuse
+        // the prefix in every shape, and never by name accident elsewhere.
+        let brain = tempfile::tempdir().unwrap();
+        let secrets = brain.path().join("mind").join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("vault.rs"), "pub fn api_key() -> &'static str { \"MEINGEHEIMNIS-4711\" }\n").unwrap();
+        std::fs::create_dir_all(brain.path().join("src")).unwrap();
+        std::fs::write(brain.path().join("src/main.rs"), "pub fn visible() {}\n").unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+
+        // Root AT the prefix: nothing indexed, no error, no rows.
+        let r1 = scan_code_in(&mut conn, std::slice::from_ref(&secrets), brain.path()).unwrap();
+        assert_eq!(r1.files, 0, "the whole root is behind the bar");
+        // Root at the brain itself: the prefix is pruned, the real code is not.
+        let r2 = scan_code_in(&mut conn, &[brain.path().to_path_buf()], brain.path()).unwrap();
+        assert_eq!(r2.files, 1);
+        let rows: Vec<String> = conn
+            .prepare("SELECT path FROM code_files")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(rows.iter().any(|p| ends_with_path(p, "src/main.rs")));
+        assert!(!rows.iter().any(|p| p.contains("secrets") || p.contains("vault")), "no secret rows: {rows:?}");
+    }
+
+    #[test]
+    fn a_rescan_purges_secret_rows_an_earlier_configuration_let_in() {
+        // The bar must also HEAL: rows indexed before the refusal existed
+        // are stale once the walker refuses to see them, and the scan's
+        // gone-from-disk pass deletes them.
+        let brain = tempfile::tempdir().unwrap();
+        let secrets = brain.path().join("mind").join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("vault.rs"), "pub fn api_key() -> &'static str { \"sk-test-XYZ\" }\n").unwrap();
+        std::fs::create_dir_all(brain.path().join("src")).unwrap();
+        std::fs::write(brain.path().join("src/main.rs"), "pub fn visible() {}\n").unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+
+        // First scan creates the schema and indexes the visible file.
+        scan_code_in(&mut conn, &[brain.path().to_path_buf()], brain.path()).unwrap();
+        // Simulate the pre-fix state: a secret row already in the index.
+        conn.execute(
+            "INSERT INTO code_files(path, mtime, size, norm_stem, norm_path) VALUES(?1, 0, 0, 'vault', 'vault')",
+            [secrets.join("vault.rs").to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        let _ = scan_code_in(&mut conn, &[brain.path().to_path_buf()], brain.path()).unwrap();
+
+        let rows: Vec<String> = conn
+            .prepare("SELECT path FROM code_files")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert!(ends_with_path(&rows[0], "src/main.rs"), "stale secret row purged: {rows:?}");
+    }
+
+    #[test]
+    fn a_file_root_inside_the_prefix_is_refused_too() {
+        let brain = tempfile::tempdir().unwrap();
+        let secrets = brain.path().join("mind").join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let vault = secrets.join("vault.rs");
+        std::fs::write(&vault, "pub fn api_key() -> &'static str { \"MEINGEHEIMNIS\" }\n").unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = crate::index::open(state.path()).unwrap();
+        let r = scan_code_in(&mut conn, &[vault], brain.path()).unwrap();
+        assert_eq!(r.files, 0, "a bare file root under the prefix is behind the bar");
     }
 
     #[test]
