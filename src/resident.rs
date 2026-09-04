@@ -62,21 +62,35 @@ fn private_regions(s: &str) -> Vec<(usize, usize)> {
     regions
 }
 
-/// Like `strip_private`, but replaces private content with spaces instead of
-/// removing it, preserving newlines — so line numbers in citations computed
-/// from the blanked text still match the file on disk.
-pub fn blank_private(s: &str) -> String {
+/// What blanking did to a text, so the scan can say it instead of letting
+/// content vanish in silence. `unbalanced` is the sharp case: an unclosed
+/// `<private>` — often a mere mention of the tag in prose — blanks
+/// everything after it, fail-closed, and the file's tail leaves the index
+/// without a word unless the caller reports this.
+pub struct PrivateOutcome {
+    /// True when a `<private>` was never closed: the region extends to end
+    /// of input by design ("degrade to MORE private, never less").
+    pub unbalanced: bool,
+}
+
+/// Blanks `<private>` regions (spaces, newlines preserved — line numbers in
+/// citations stay accurate) and reports what the blanking did.
+pub fn blank_private_checked(s: &str) -> (String, PrivateOutcome) {
+    let regions = private_regions(s);
+    let unbalanced = regions
+        .last()
+        .is_some_and(|&(start, end)| end == s.len() && !s[start..end].ends_with(CLOSE));
     let mut out = String::with_capacity(s.len());
     let mut cursor = 0usize;
-    for (start, end) in private_regions(s) {
-        out.push_str(&s[cursor..start]);
-        for c in s[start..end].chars() {
+    for (start, end) in &regions {
+        out.push_str(&s[cursor..*start]);
+        for c in s[*start..*end].chars() {
             out.push(if c == '\n' { '\n' } else { ' ' });
         }
-        cursor = end;
+        cursor = *end;
     }
     out.push_str(&s[cursor..]);
-    out
+    (out, PrivateOutcome { unbalanced })
 }
 
 /// Removes `<private>...</private>` regions (nesting-aware, fail-closed).
@@ -925,7 +939,7 @@ mod tests {
         // The first </private> must NOT close the outer region.
         let s = "a<private>x<private>y</private>STILL-PRIVATE</private>b";
         assert_eq!(strip_private(s), "ab");
-        let b = blank_private(s);
+        let b = blank_private_checked(s).0;
         assert!(!b.contains("STILL-PRIVATE"));
         assert_eq!(b.len(), s.len());
     }
@@ -964,7 +978,7 @@ mod tests {
     #[test]
     fn blanking_preserves_length_and_newlines() {
         let s = "keep\n<private>zqx\nwvy</private>\ntail";
-        let b = blank_private(s);
+        let b = blank_private_checked(s).0;
         assert_eq!(b.len(), s.len());
         assert_eq!(b.matches('\n').count(), s.matches('\n').count());
         assert!(b.starts_with("keep\n"));
@@ -975,7 +989,7 @@ mod tests {
     #[test]
     fn blanking_unclosed_blanks_to_end_keeping_newlines() {
         let s = "keep\n<private>x\ny";
-        let b = blank_private(s);
+        let b = blank_private_checked(s).0;
         assert_eq!(b.len(), s.len());
         assert!(b.starts_with("keep\n"));
         assert!(!b.contains('x'));
