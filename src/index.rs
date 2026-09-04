@@ -1,6 +1,6 @@
-//! The recall index: SQLite + FTS5 over the brain's markdown, rings 0-4.
+﻿//! The recall index: SQLite + FTS5 over the brain's markdown, rings 0-4.
 //!
-//! The DB is a per-host DERIVED, DISPOSABLE cache of the shared tree — it
+//! The DB is a per-host DERIVED, DISPOSABLE cache of the shared tree â€” it
 //! lives in the local state dir (SQLite WAL cannot live on NFS), is rebuilt
 //! whenever the tree's (path, mtime, size) set changes, and is deleted and
 //! recreated on any corruption. The git-tracked markdown stays the only source
@@ -12,7 +12,7 @@
 //! level of a hit visible in the id itself.
 //!
 //! The FULL digest behind that prefix is the block's content address, and it
-//! is what every derived artifact is keyed by — so vectors survive a rebuild
+//! is what every derived artifact is keyed by â€” so vectors survive a rebuild
 //! that recycles every rowid in the file, and an edit costs the embeddings of
 //! exactly the blocks that changed.
 
@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use sha2::Digest as _;
 
 use crate::config::{Precision, RingRules, VectorSpec};
-use crate::resident::blank_private;
+use crate::resident::blank_private_checked;
 
 /// Rings 5-6 are never indexed: staging and exhaust must not surface in
 /// recall. A file declaring itself ring 5+ is skipped entirely.
@@ -47,29 +47,29 @@ pub struct Hit {
     pub end_line: usize,
     pub snippet: String,
     /// Paths of suppressed duplicate copies of this logical block: same
-    /// content hash AND same heading chain on a higher (or equal) ring —
+    /// content hash AND same heading chain on a higher (or equal) ring â€”
     /// e.g. the native auto-memory mirror of a brain file. Identical short
     /// blocks under DIFFERENT sections are different statements, never
     /// mirrors. Empty for a block that exists in exactly one place.
     pub mirrors: Vec<String>,
     /// Enclosing heading chain ("H1 > H2"), the second half of the mirror
-    /// dedup key. Internal — the snippet already displays it.
+    /// dedup key. Internal â€” the snippet already displays it.
     pub(crate) chain: String,
-    /// The block's whole body. Internal — `snippet` is the display form, and
+    /// The block's whole body. Internal â€” `snippet` is the display form, and
     /// it is capped at 160 characters. A consumer that only REORDERS hits can
     /// live with that cap; one that DROPS them cannot, or it would suppress a
     /// block whose evidence sat past the cut.
     pub(crate) text: String,
 }
 
-/// Rewrites `sep` to `/` — the canonical separator of every brain-relative
+/// Rewrites `sep` to `/` â€” the canonical separator of every brain-relative
 /// doc path.
 ///
 /// Doc paths are matched by PREFIX against `mind/secrets/`, `logs/`,
 /// `projects/`, `knowledge/archive/` and `.git/`, are stored in the catalog
 /// and are printed in citations. A platform whose separator is `\` produces
 /// `mind\secrets\age.key` from the same file, which matches none of those
-/// prefixes — the secrets boundary would open by pure string accident. On a
+/// prefixes â€” the secrets boundary would open by pure string accident. On a
 /// platform whose separator is already `/`, a backslash is an ordinary
 /// filename character and is left untouched.
 pub(crate) fn normalize_separators(rel: &str, sep: char) -> String {
@@ -84,15 +84,15 @@ pub(crate) fn rel_doc_path(rel: &Path) -> String {
 /// Whether a doc path names a file in Claude Code's native auto-memory store
 /// rather than the brain tree. The `native:` tag is the only thing that
 /// separates the two stores downstream of the scan, and each store has its
-/// own contract — a clamped ring, and its own link dialect.
+/// own contract â€” a clamped ring, and its own link dialect.
 fn is_native(doc_path: &str) -> bool {
     doc_path.starts_with("native:")
 }
 
 /// THE taxonomy entry point: the configured location default for a
 /// brain-root-relative path. Frontmatter `ring: N` still overrides it at
-/// scan time. Everything that needs a path's ring — the scan, the watcher,
-/// ring-6 capture — comes through here, so the mapping lives in the config
+/// scan time. Everything that needs a path's ring â€” the scan, the watcher,
+/// ring-6 capture â€” comes through here, so the mapping lives in the config
 /// and nowhere else.
 pub fn default_ring(rel: &str, rules: &RingRules) -> u8 {
     rules.ring_for(rel)
@@ -103,7 +103,7 @@ pub fn default_ring(rel: &str, rules: &RingRules) -> u8 {
 /// Built in rather than configurable, because a file under one of these is
 /// machine output wherever the tree lives and nobody would choose to recall
 /// it. `exclude_prefixes` could not express it anyway: those prefixes anchor
-/// at the brain root, and a dependency tree appears at arbitrary depth — a
+/// at the brain root, and a dependency tree appears at arbitrary depth â€” a
 /// documentation vault built with a static-site generator is an npm project,
 /// so one `npm install` inside it buries the operator's own notes under
 /// thousands of package READMEs that are prose-shaped, plausible, and enough
@@ -111,7 +111,7 @@ pub fn default_ring(rel: &str, rules: &RingRules) -> u8 {
 ///
 /// Deliberately NOT here: `build`, `dist`, `target`, `vendor`. Those are
 /// credible topic names in a knowledge tree, and a built-in nobody can switch
-/// off would make an operator's own notes silently unrecallable — a far worse
+/// off would make an operator's own notes silently unrecallable â€” a far worse
 /// failure than indexing a generated copy of prose that mirror dedup already
 /// collapses.
 const GENERATED_DIRS: &[&str] = &["node_modules", "__pycache__"];
@@ -123,9 +123,9 @@ fn under_generated_dir(rel: &str) -> bool {
 }
 
 /// Paths that must never enter the index: the compiled-in boundary (secrets,
-/// logs, git internals) plus the operator's `exclude_prefixes` — by default
+/// logs, git internals) plus the operator's `exclude_prefixes` â€” by default
 /// `projects/` (repo clones, owned by the code index) and
-/// `knowledge/archive/` (retired knowledge, not recallable by accident) —
+/// `knowledge/archive/` (retired knowledge, not recallable by accident) â€”
 /// plus the generated-directory built-ins.
 fn excluded(rel: &str, rules: &RingRules) -> bool {
     rules.excluded(rel) || under_generated_dir(rel)
@@ -133,13 +133,13 @@ fn excluded(rel: &str, rules: &RingRules) -> bool {
 
 /// Directory form of [`excluded`]: true when nothing under `rel` can ever be
 /// indexed, so the serving watcher can skip the whole subtree. One predicate
-/// serves both forms — the watch set is the index set by construction, never
+/// serves both forms â€” the watch set is the index set by construction, never
 /// by two hand-maintained lists agreeing.
 pub(crate) fn excluded_dir(rel: &str, rules: &RingRules) -> bool {
     rules.excluded_dir(rel) || under_generated_dir(rel)
 }
 
-/// Secret-shaped file names are refused even outside mind/secrets/ — capture
+/// Secret-shaped file names are refused even outside mind/secrets/ â€” capture
 /// the guard at the earliest point so every downstream store inherits it.
 fn secret_shaped(rel: &str) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
@@ -156,8 +156,8 @@ fn secret_shaped(rel: &str) -> bool {
 /// Measured rather than guessed: across a real brain of thousands of files
 /// the longest hand-authored line was a wide memory-index table row at ~3 KB,
 /// and nothing came within a factor of two of this cap. The shapes on the
-/// other side — a minified bundle pasted into a page, a base64 data URI, a
-/// one-line data dump saved as `.md` — sit orders of magnitude above it.
+/// other side â€” a minified bundle pasted into a page, a base64 data URI, a
+/// one-line data dump saved as `.md` â€” sit orders of magnitude above it.
 const MAX_PROSE_LINE: usize = 8 * 1024;
 
 /// Whether a statement is generated rather than written.
@@ -168,7 +168,7 @@ const MAX_PROSE_LINE: usize = 8 * 1024;
 /// embedding of its own. Bytes, not characters, because bytes are what the
 /// tokenizer and the embedder are charged for.
 ///
-/// One pass over a body already in memory — the walk that reads the file
+/// One pass over a body already in memory â€” the walk that reads the file
 /// pays nothing extra for this.
 fn generated_blob(body: &str) -> bool {
     body.lines().any(|l| l.len() > MAX_PROSE_LINE)
@@ -219,11 +219,11 @@ fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
 
-/// Extracts `[[wikilink]]` targets: alias (`|…`) and heading (`#…`) parts
+/// Extracts `[[wikilink]]` targets: alias (`|â€¦`) and heading (`#â€¦`) parts
 /// dropped, lowercased; slash-qualified targets (`[[hosts/zfs]]`) survive
 /// whole. Fenced code blocks are skipped first (brain-lint parity): a
 /// `[[link]]` inside a ``` or ~~~ fence is an example, not an edge. The brain
-/// is an Obsidian vault — these are human-curated edges, the graph we trust
+/// is an Obsidian vault â€” these are human-curated edges, the graph we trust
 /// most.
 pub fn wikilinks(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -264,7 +264,7 @@ pub fn wikilinks(text: &str) -> Vec<String> {
 ///
 /// This is the NATIVE store's dialect, not the brain's. The brain is an
 /// Obsidian vault whose edges are wikilinks and whose resolution keeps
-/// brain-lint parity; Claude Code's memory store has no wikilinks at all —
+/// brain-lint parity; Claude Code's memory store has no wikilinks at all â€”
 /// its index file points at its entries with ordinary markdown links. Reading
 /// one dialect per store is what keeps those pointers from being edges nobody
 /// can see, without inventing edges in the vault.
@@ -310,7 +310,7 @@ pub fn markdown_links(text: &str) -> Vec<String> {
 }
 
 /// THE content address of a statement: the full sha256 hex of its normalized
-/// text. Every derived artifact — vectors today, rerank scores tomorrow — is
+/// text. Every derived artifact â€” vectors today, rerank scores tomorrow â€” is
 /// keyed by this, and it is stable across hosts, rescans and reorderings
 /// because it is a function of the content alone.
 ///
@@ -322,12 +322,12 @@ pub fn content_hash(text: &str) -> String {
 }
 
 /// 40 hash bits: at ~20k blocks the birthday collision expectation is ~0.0002
-/// — the 24-bit version measurably collided in the real corpus. The citation
+/// â€” the 24-bit version measurably collided in the real corpus. The citation
 /// TRUNCATES the content address; the full digest keys the artifacts.
 const CITE_HASH_HEX: usize = 10;
 
 /// Citation id of a block: its ring, then a prefix of its content address.
-/// Takes the hash rather than the text so no caller ever hashes twice — the
+/// Takes the hash rather than the text so no caller ever hashes twice â€” the
 /// citation and the block's derived artifacts come from one digest.
 pub fn cite_from_hash(ring: u8, hash: &str) -> String {
     format!("r{ring}-{}", &hash[..CITE_HASH_HEX])
@@ -346,7 +346,7 @@ fn fence_open(t: &str) -> Option<(char, usize)> {
 
 /// CommonMark closing rule: only a run of the SAME character at least as long
 /// as the opener closes a fence, and a closing fence may be followed only by
-/// spaces — ```` ```bash ```` INSIDE a fence is an info string on an opening
+/// spaces â€” ```` ```bash ```` INSIDE a fence is an info string on an opening
 /// fence, not a closer. Without the trailing-text check, a note documenting
 /// another fence's language tag closed the outer fence early, promoting
 /// fenced wikilinks into curated graph edges.
@@ -360,7 +360,7 @@ fn fence_closes(t: &str, (ch, len): (char, usize)) -> bool {
 }
 
 /// Setext heading underline: a line of only `=` (level 1) or only `-`
-/// (level 2). Two characters minimum — a lone `-` in running text is far more
+/// (level 2). Two characters minimum â€” a lone `-` in running text is far more
 /// often a stray bullet than an underline.
 fn setext_level(t: &str) -> Option<u8> {
     let t = t.trim();
@@ -440,7 +440,7 @@ pub fn segment(text: &str, skip_lines: usize) -> Vec<(usize, usize, String)> {
                     i += 1;
                 }
                 // Loose continuation: blank line(s) followed by an indented
-                // non-item line — an indented continuation paragraph still
+                // non-item line â€” an indented continuation paragraph still
                 // belongs to the item (numbered items especially are written
                 // this way).
                 let mut j = i;
@@ -506,7 +506,7 @@ fn db_path(state_dir: &Path) -> PathBuf {
 
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
-/// disposable — mismatches are handled by delete-and-rebuild in `open()`.
+/// disposable â€” mismatches are handled by delete-and-rebuild in `open()`.
 const SCHEMA_VERSION: i64 = 7; // 7: blocks.hash + content-hash-keyed vectors(model, dim)
 
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
@@ -579,7 +579,7 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
-/// Opens the index; a corrupt file is deleted and recreated (derived cache —
+/// Opens the index; a corrupt file is deleted and recreated (derived cache â€”
 /// the tree is the truth).
 pub fn open(state_dir: &Path) -> anyhow::Result<Connection> {
     let path = db_path(state_dir);
@@ -618,17 +618,17 @@ fn stat_of(meta: &std::fs::Metadata) -> (u64, u64) {
 /// Per-directory overlay that scopes a subtree out of cfetch WITHOUT hiding
 /// it from git. Gitignore syntax, gitignore precedence, its own file name:
 /// until this existed `.gitignore` was the only file-based control the
-/// walkers read, so keeping generated markdown out of the brain index — or a
-/// vendored subtree out of the code index — meant untracking it first.
+/// walkers read, so keeping generated markdown out of the brain index â€” or a
+/// vendored subtree out of the code index â€” meant untracking it first.
 pub const IGNORE_FILE: &str = ".cfetchignore";
 
 /// THE walker every enumeration of a tree is built from: the brain scan, the
 /// code scan, and the serving watcher alike.
 ///
 /// The ignore policy lives here and nowhere else on purpose. The watch set
-/// must stay exactly the index set — a directory the watcher skips is a
+/// must stay exactly the index set â€” a directory the watcher skips is a
 /// directory whose writes never wake the daemon, which is silent staleness,
-/// the one failure serving mode refuses — and an overlay honored by one
+/// the one failure serving mode refuses â€” and an overlay honored by one
 /// walker but not another would reintroduce that drift one `.cfetchignore`
 /// at a time. Callers add their own traversal concerns (parallelism,
 /// `filter_entry`) on top of what is returned.
@@ -638,7 +638,7 @@ pub fn tree_walker(root: &Path) -> ignore::WalkBuilder {
         .hidden(true)
         .git_ignore(true)
         // Highest precedence of every ignore source, and read whether or not
-        // the tree is a git checkout — a brain that is not a repo can be
+        // the tree is a git checkout â€” a brain that is not a repo can be
         // scoped too.
         .add_custom_ignore_filename(IGNORE_FILE)
         .follow_links(false);
@@ -678,7 +678,7 @@ pub(crate) fn indexable_doc(rel: &str, rules: &RingRules) -> bool {
 
 /// A directory holding at least 9/10 of everything the indexer reads IS the
 /// index, not a subtree of it: excluding it would not scope cfetch, it would
-/// switch it off. Such a directory is never offered as a candidate — on a
+/// switch it off. Such a directory is never offered as a candidate â€” on a
 /// tree whose whole corpus sits under one `knowledge/`, the only honest
 /// answer is that there is nothing to scope out.
 const WHOLE_TREE_NUM: usize = 9;
@@ -688,8 +688,8 @@ const WHOLE_TREE_DEN: usize = 10;
 /// read under each directory of the tree.
 ///
 /// The measure is deliberately neither bytes on disk nor directory size. A
-/// 40 GiB directory of build artifacts costs the index nothing — the walker
-/// passes over every file in it — while a 3 MiB directory of generated
+/// 40 GiB directory of build artifacts costs the index nothing â€” the walker
+/// passes over every file in it â€” while a 3 MiB directory of generated
 /// markdown costs a doc, a watch and a block set per file, and is what makes
 /// a tree outgrow the watch budget. Advice derived from `du` would name the
 /// first and never the second.
@@ -720,7 +720,7 @@ impl DocCensus {
     /// least `min_share` of what the indexer reads, heaviest first.
     ///
     /// Depth decides whether an answer is useful at all. "`knowledge/` holds
-    /// 60%" is not advice — nobody can exclude their knowledge tree — while
+    /// 60%" is not advice â€” nobody can exclude their knowledge tree â€” while
     /// "`knowledge/archive/2019/` holds 55% of everything" is something to
     /// act on. So the deepest directory that clears the bar wins and its
     /// ancestors are dropped, and a directory that already IS the index (see
@@ -763,7 +763,7 @@ fn depth_of(prefix: &str) -> usize {
 
 /// Brain tree + (optionally) Claude Code's native auto-memory stores.
 /// Native memory (`<native_root>/<project-slug>/memory/*.md`) is indexed as
-/// ring 2 with doc paths `native:<slug>/<file>` — cfetch reads and surfaces
+/// ring 2 with doc paths `native:<slug>/<file>` â€” cfetch reads and surfaces
 /// the native store, it never writes to it.
 fn collect_files(
     brain_root: &Path,
@@ -824,7 +824,7 @@ fn collect_files(
 }
 
 /// One value answering "does this index describe these sources": sha256 over
-/// the sorted (doc_path, mtime, size) list — INCLUDING files the scan later
+/// the sorted (doc_path, mtime, size) list â€” INCLUDING files the scan later
 /// skips by ring, so a ring-frontmatter edit or a skipped file's change flips
 /// staleness like any other.
 fn source_fingerprint(files: &[SourceFile]) -> String {
@@ -839,7 +839,7 @@ fn source_fingerprint(files: &[SourceFile]) -> String {
     crate::hashing::hex_lower(hasher.finalize())
 }
 
-/// The stat fingerprint of the tree AS IT IS NOW — one stat walk, no file
+/// The stat fingerprint of the tree AS IT IS NOW â€” one stat walk, no file
 /// bodies read. This is the value the 60s backstop compares against, and the
 /// coverage token the serving daemon's unordered drain barrier takes at query
 /// entry (see `serve::BarrierMode`).
@@ -877,7 +877,7 @@ pub fn staleness(
     Ok((stale, current))
 }
 
-/// Cheap staleness decision: stat-only fingerprint comparison — no file
+/// Cheap staleness decision: stat-only fingerprint comparison â€” no file
 /// bodies are read.
 pub fn stale(
     conn: &Connection,
@@ -892,10 +892,23 @@ pub struct ScanReport {
     pub docs: usize,
     pub blocks: usize,
     pub skipped_high_ring: usize,
-    /// Doc paths of the files skipped as ring 5+ — including fail-closed
-    /// unparseable ring frontmatter — surfaced so a file quarantined by
+    /// Doc paths of the files skipped as ring 5+ â€” including fail-closed
+    /// unparseable ring frontmatter â€” surfaced so a file quarantined by
     /// accident is visible instead of silently absent from recall.
     pub skipped: Vec<String>,
+    /// Doc paths that could not be READ (invalid UTF-8, or a Windows sharing
+    /// violation). A distinct reason from `skipped`: an unreadable file is
+    /// not quarantined by policy, and reporting it as ring 5+ sends the
+    /// operator looking for a frontmatter that is not the problem.
+    pub unreadable: Vec<String>,
+    /// Doc paths where an unclosed `<private>` blanked to end of file â€”
+    /// fail-closed by design, but a tail leaving the index silently has
+    /// cost real trees most of a file to a mere mention of the tag.
+    pub private_swallowed: Vec<String>,
+    /// Statements dropped as generated blobs (a line over [`MAX_PROSE_LINE`]
+    /// bytes). The rest of their file indexes normally, so the drop is
+    /// invisible unless counted.
+    pub blob_dropped: usize,
     /// Catalog generation this scan committed (see [`generation`]).
     pub generation: u64,
 }
@@ -911,8 +924,8 @@ fn chain_text(chain: &[(u8, String)]) -> String {
         .join(" > ")
 }
 
-/// Inserts one source file's rows — doc, blocks (with heading-chain context),
-/// FTS rows, wikilink targets — or records it in `skipped_docs` when its ring
+/// Inserts one source file's rows â€” doc, blocks (with heading-chain context),
+/// FTS rows, wikilink targets â€” or records it in `skipped_docs` when its ring
 /// is 5+. Generated statements ([`generated_blob`]) are dropped individually
 /// while the rest of their file is indexed normally. Shared by the full scan
 /// and the incremental rescan so both derive byte-identical catalogs from the
@@ -934,7 +947,7 @@ fn insert_doc(
     // Quarantine locations (ring 5+: staging, logs) are decided by WHERE the
     // file lives, not by what it claims about itself: a candidate declaring
     // `ring: 2` in its frontmatter stays unindexed, exactly as one whose
-    // frontmatter was stripped or mangled — the taxonomy's "cannot be edited
+    // frontmatter was stripped or mangled â€” the taxonomy's "cannot be edited
     // away file by file" promise has to hold against a well-formed lie too.
     // Promotion BELOW the location ring stays available everywhere else: a
     // knowledge file declaring `ring: 1` is the documented, intended override.
@@ -951,8 +964,14 @@ fn insert_doc(
         )?;
         return Ok(());
     }
-    // Blank (not strip) private regions so line numbers stay accurate.
-    let blanked = blank_private(raw);
+    // Blank (not strip) private regions so line numbers stay accurate. An
+    // unclosed tag blanks to end of file fail-closed â€” that is the design â€”
+    // but the file is named in the report so the loss is a line of output,
+    // not a silent absence.
+    let (blanked, private_outcome) = blank_private_checked(raw);
+    if private_outcome.unbalanced {
+        report.private_swallowed.push(src.doc_path.clone());
+    }
     tx.execute(
         "INSERT INTO docs(path, ring, mtime, size) VALUES(?1, ?2, ?3, ?4)",
         rusqlite::params![src.doc_path, ring, src.mtime as i64, src.size as i64],
@@ -966,7 +985,7 @@ fn insert_doc(
         )?;
     }
     // Citation context: every block carries its enclosing heading chain
-    // (H1 > H2 > …); a heading block carries its ANCESTOR chain (a bare
+    // (H1 > H2 > â€¦); a heading block carries its ANCESTOR chain (a bare
     // heading has no other context); a table row additionally carries its
     // table's header row. `chain` is the dedup key part, `ctx` the searchable
     // and displayed form.
@@ -1014,6 +1033,7 @@ fn insert_doc(
         // paragraph's citation. Refusing the statement and not the file also
         // keeps a knowledge page that embeds one data URI fully recallable.
         if generated_blob(&body) {
+            report.blob_dropped += 1;
             continue;
         }
         let hash = content_hash(&body);
@@ -1033,9 +1053,9 @@ fn insert_doc(
 }
 
 /// Rebuilds the `links` table from `doc_links` + the doc registry. Every doc
-/// is registered under ALL its path suffixes (stem, parent/stem, …, full
+/// is registered under ALL its path suffixes (stem, parent/stem, â€¦, full
 /// path; `.md` stripped, lowercased) and a target resolves only when its key
-/// is unambiguous — a slash-qualified target resolves a stem collision
+/// is unambiguous â€” a slash-qualified target resolves a stem collision
 /// (brain-lint parity). A native-store link is tried against its own
 /// project's directory first, because a markdown link is a relative path.
 /// A pure function of (docs, doc_links): full and incremental scans converge
@@ -1140,14 +1160,22 @@ pub fn scan(
     // Windows sharing violation from an editor or antivirus) must be VISIBLE,
     // not invisible: the file stays in the fingerprint, so stale() reports
     // fresh forever and nothing would ever retry it. Report it as skipped.
-    let mut report =
-        ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new(), generation: 0 };
+    let mut report = ScanReport {
+        docs: 0,
+        blocks: 0,
+        skipped_high_ring: 0,
+        skipped: Vec::new(),
+        unreadable: Vec::new(),
+        private_swallowed: Vec::new(),
+        blob_dropped: 0,
+        generation: 0,
+    };
     let bodies: Vec<(SourceFile, String)> = files
         .into_iter()
         .filter_map(|src| match std::fs::read_to_string(&src.abs) {
             Ok(raw) => Some((src, raw)),
             Err(_) => {
-                report.skipped.push(src.doc_path.clone());
+                report.unreadable.push(src.doc_path.clone());
                 None
             }
         })
@@ -1156,7 +1184,7 @@ pub fn scan(
     // Vectors deliberately SURVIVE the rebuild: they are keyed by content
     // hash, not by a block rowid, so a rebuilt catalog re-joins every vector
     // whose text is still in the tree. They used to be dropped here because
-    // rowids are recycled — which made one markdown edit cost 100% of the
+    // rowids are recycled â€” which made one markdown edit cost 100% of the
     // embeddings. `prune_vectors` below drops exactly the hashes that left.
     tx.execute_batch(
         "DELETE FROM doc_links; DELETE FROM links;
@@ -1183,7 +1211,7 @@ pub fn scan(
 /// Removes one doc's rows everywhere: FTS rows (external-content FTS5 must be
 /// told each removed row's old values), blocks, the doc row (links and
 /// doc_links cascade), and any `skipped_docs` entry. Vectors are NOT touched
-/// here — they belong to content, not to a doc, and the same text in another
+/// here â€” they belong to content, not to a doc, and the same text in another
 /// file keeps them alive; [`prune_vectors`] settles that at the end of a scan.
 fn delete_doc(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<()> {
     tx.execute("DELETE FROM skipped_docs WHERE path=?1", [path])?;
@@ -1213,8 +1241,8 @@ fn delete_doc(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<()> 
 const INCREMENTAL_MAX_CHANGES: usize = 32;
 
 /// Incremental catalog update: re-reads ONLY the files whose (mtime, size)
-/// changed — each changed doc's rows are deleted and reinserted, vanished
-/// docs are pruned, links re-resolved — inside one transaction that also
+/// changed â€” each changed doc's rows are deleted and reinserted, vanished
+/// docs are pruned, links re-resolved â€” inside one transaction that also
 /// advances the generation, exactly like [`scan`]. Returns `None` when the
 /// incremental step has no valid basis (never scanned, different brain root)
 /// or the diff exceeds [`INCREMENTAL_MAX_CHANGES`]; the caller then runs the
@@ -1246,11 +1274,14 @@ pub fn rescan_changed(
             blocks: 0,
             skipped_high_ring: 0,
             skipped: Vec::new(),
+            unreadable: Vec::new(),
+            private_swallowed: Vec::new(),
+            blob_dropped: 0,
             generation: generation(conn),
         }));
     }
     // Stat diff against the stored per-file stats (indexed docs + skipped
-    // ring-5+ files) — the same (mtime, size) basis the fingerprint uses.
+    // ring-5+ files) â€” the same (mtime, size) basis the fingerprint uses.
     let mut stored_stats: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
     for table in ["docs", "skipped_docs"] {
@@ -1302,15 +1333,23 @@ pub fn rescan_changed(
     }
     set_fingerprint(&tx, &fingerprint)?;
     let generation = bump_generation(&tx)?;
-    let mut report =
-        ScanReport { docs: 0, blocks: 0, skipped_high_ring: 0, skipped: Vec::new(), generation };
+    let mut report = ScanReport {
+        docs: 0,
+        blocks: 0,
+        skipped_high_ring: 0,
+        skipped: Vec::new(),
+        unreadable: Vec::new(),
+        private_swallowed: Vec::new(),
+        blob_dropped: 0,
+        generation,
+    };
     for (src, raw) in &bodies {
         if let Some(raw) = raw {
             insert_doc(&tx, src, raw, &mut report)?;
         }
     }
     for path in unreadable {
-        report.skipped.push(path.to_string());
+        report.unreadable.push(path.to_string());
     }
     resolve_links(&tx)?;
     prune_vectors(&tx)?;
@@ -1330,8 +1369,8 @@ pub fn generation(conn: &Connection) -> u64 {
 }
 
 /// Deterministic digest of the catalog: sha256 over the sorted
-/// (cite, path, ring) rows. Two catalogs built from the same tree — by ANY
-/// derivation path (fresh scan, event-driven rebuild, post-crash backstop) —
+/// (cite, path, ring) rows. Two catalogs built from the same tree â€” by ANY
+/// derivation path (fresh scan, event-driven rebuild, post-crash backstop) â€”
 /// must produce the same checksum: the coherence invariant's cross-holder
 /// verification value. Generation is deliberately NOT part of the digest.
 pub fn catalog_checksum(conn: &Connection) -> anyhow::Result<String> {
@@ -1367,7 +1406,7 @@ pub fn catalog_checksum_matching(
 
 /// Read-only open for serving-side query threads: never contends for the
 /// write lock, never creates or migrates schema. Fails when no index exists
-/// yet — the caller reports that instead of racing the builder.
+/// yet â€” the caller reports that instead of racing the builder.
 pub fn open_ro(state_dir: &Path) -> anyhow::Result<Connection> {
     use rusqlite::OpenFlags;
     let conn = Connection::open_with_flags(
@@ -1379,7 +1418,7 @@ pub fn open_ro(state_dir: &Path) -> anyhow::Result<Connection> {
 }
 
 /// Docs linked (either direction, human-curated wikilinks) to the docs of the
-/// given citation paths — the deterministic 1-hop graph expansion of a recall
+/// given citation paths â€” the deterministic 1-hop graph expansion of a recall
 /// result. Returns (path, ring) sorted by ring then path, deduped.
 pub fn linked_docs(conn: &Connection, hit_paths: &[String], limit: usize) -> anyhow::Result<Vec<(String, u8)>> {
     let mut out: Vec<(String, u8)> = Vec::new();
@@ -1405,7 +1444,7 @@ pub fn linked_docs(conn: &Connection, hit_paths: &[String], limit: usize) -> any
     Ok(out)
 }
 
-/// FTS5 query string: each term becomes a quoted prefix token, OR-joined —
+/// FTS5 query string: each term becomes a quoted prefix token, OR-joined â€”
 /// recall-heavy on purpose (precision gates come at the consumer).
 fn fts_query(user_query: &str) -> String {
     // Ordered de-dup: the same term twice in one OR would double-count it
@@ -1426,7 +1465,7 @@ fn fts_query(user_query: &str) -> String {
         // hundreds of bug notes) OR `400` (prefix-matches 400002, 17.400,
         // 86_400_000), and the id note sinks. So a hyphenated term becomes
         // BOTH: the compound as an exact-adjacency phrase, and its parts as
-        // independent prefix terms — the recall contract stays (`state-
+        // independent prefix terms â€” the recall contract stays (`state-
         // machine` still finds "the machine's state"), and an id lookup
         // finds the id first because adjacency is high signal.
         .for_each(|t| {
@@ -1510,7 +1549,7 @@ const CTX_WEIGHT: f64 = 0.3;
 ///
 /// Compared by component rather than with LIKE or GLOB: a path is under a
 /// prefix when it IS the prefix or continues with `/`. That is the same rule
-/// `config::under_prefix` applies — so `drafts` never claims `draftsman` —
+/// `config::under_prefix` applies â€” so `drafts` never claims `draftsman` â€”
 /// and it cannot be confused by a `%`, `_` or `[` living in a filename.
 fn slice_filter_sql(prefix_count: usize) -> String {
     if prefix_count == 0 {
@@ -1541,7 +1580,7 @@ fn ranked_match_sql(select: &str, prefix_count: usize) -> String {
     )
 }
 
-/// Binds `(fts, limit, prefixes…)` in the order [`ranked_match_sql`] numbers
+/// Binds `(fts, limit, prefixesâ€¦)` in the order [`ranked_match_sql`] numbers
 /// them. Prefixes lose a trailing slash here so the SQL's length arithmetic
 /// matches `config::under_prefix` exactly.
 fn ranked_params(fts: &str, limit: usize, prefixes: &[String]) -> Vec<rusqlite::types::Value> {
@@ -1555,7 +1594,7 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
     recall_in(conn, query, limit, &[])
 }
 
-/// Recall restricted to documents under `prefixes` — the slice filter. An
+/// Recall restricted to documents under `prefixes` â€” the slice filter. An
 /// empty slice restricts nothing, which is what the root slice is.
 pub fn recall_in(
     conn: &Connection,
@@ -1570,7 +1609,7 @@ pub fn recall_in(
     // Candidate pool: `limit * 2` covers the common mirror case (one brain +
     // one native twin), but a pathological block with >2*limit copies can
     // exhaust the pool with duplicates and shrink below limit. The pool
-    // expands on demand — capped at a sane multiple — so the dedup never
+    // expands on demand â€” capped at a sane multiple â€” so the dedup never
     // silently drops a distinct block that ranked below the duplicate wall.
     let mut pool = limit * 2;
     let mut hits;
@@ -1599,7 +1638,7 @@ pub fn recall_in(
         }
         pool *= 2;
     }
-    // Ring-band slot reservation: rings 0-1 are the top-trust band — when
+    // Ring-band slot reservation: rings 0-1 are the top-trust band â€” when
     // any of them matches at all, the top slot carries the best of them.
     // Everything else stays in BM25(+prior) order.
     if let Some(pos) = hits.iter().position(|h| h.ring <= 1)
@@ -1627,7 +1666,7 @@ pub fn doc_block_counts(conn: &Connection) -> anyhow::Result<Vec<(String, usize)
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-/// Expands a citation id to its full block(s) — the second disclosure layer.
+/// Expands a citation id to its full block(s) â€” the second disclosure layer.
 /// Content-addressing means the HASH names the logical block while the ring
 /// prefix only labels one copy's trust level: expansion matches every copy
 /// sharing the hash (a mirror suppressed in recall stays reachable through
@@ -1661,7 +1700,7 @@ pub fn expand(conn: &Connection, cite: &str) -> anyhow::Result<Vec<Block>> {
 // cosine similarity reduces to a dot product. No vector-index dependency: at
 // ~20k blocks a linear scan in Rust is milliseconds and exact.
 //
-// A missing row means "not yet embedded" — that single fact makes both the
+// A missing row means "not yet embedded" â€” that single fact makes both the
 // hydrate from the shared store and `embed-index` resumable for free.
 
 /// IEEE binary32 -> binary16, round-to-nearest-even, subnormals included.
@@ -1700,7 +1739,7 @@ fn f32_to_f16(value: f32) -> u16 {
     sign | (half + u32::from(round_up)) as u16
 }
 
-/// Inverse of [`f32_to_f16`] — exact, every binary16 is a binary32.
+/// Inverse of [`f32_to_f16`] â€” exact, every binary16 is a binary32.
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits & 0x8000) as u32) << 16;
     let exponent = ((bits >> 10) & 0x1f) as u32;
@@ -1787,7 +1826,7 @@ pub fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-/// Plain dot product — cosine similarity, given both sides are normalized.
+/// Plain dot product â€” cosine similarity, given both sides are normalized.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -1825,7 +1864,7 @@ pub fn stored_vector_spec(conn: &Connection) -> Option<VectorSpec> {
 }
 
 /// Records `(model, dim, precision, doc_prefix)` in meta; a DIFFERENT stored spec drops
-/// every cached vector — vectors of two models, widths or precisions produce
+/// every cached vector â€” vectors of two models, widths or precisions produce
 /// numbers that look like similarity and are not. Returns true when a drop
 /// happened. Re-filling is a first-class path: the shared store still holds
 /// the artifacts, so the cost is usually a hydrate, not an embed run.
@@ -1854,7 +1893,7 @@ fn prune_vectors(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
 }
 
 /// The embed work queue: content hashes with no cached vector, each with one
-/// representative text, in document order. DISTINCT by hash — the same
+/// representative text, in document order. DISTINCT by hash â€” the same
 /// statement in two files is one artifact, embedded once.
 pub fn hashes_without_vectors(
     conn: &Connection,
@@ -1867,7 +1906,7 @@ pub fn hashes_without_vectors(
          WHERE v.content_hash IS NULL
          GROUP BY b.hash ORDER BY min(b.id) LIMIT ?3",
     )?;
-    // SQLite reads a negative LIMIT as unbounded — which is exactly what a
+    // SQLite reads a negative LIMIT as unbounded â€” which is exactly what a
     // caller asking for usize::MAX (a full hydrate) means.
     let bound = i64::try_from(limit).unwrap_or(-1);
     let rows = stmt.query_map(
@@ -1877,7 +1916,7 @@ pub fn hashes_without_vectors(
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-/// (blocks reachable by semantic recall, blocks total) FOR THIS SPEC — the
+/// (blocks reachable by semantic recall, blocks total) FOR THIS SPEC â€” the
 /// coverage number every degradation warning quotes. Spec-relative on
 /// purpose: vectors of another model are not coverage, they are ballast.
 pub fn vector_coverage(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<(usize, usize)> {
@@ -1955,7 +1994,7 @@ fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>
     Ok(out)
 }
 
-/// Block ids ranked by dot product against a normalized query vector — a full
+/// Block ids ranked by dot product against a normalized query vector â€” a full
 /// linear scan, exact by construction. Vectors join blocks BY CONTENT HASH,
 /// so a rebuilt catalog re-attaches every surviving vector to its new rowid.
 /// Rows whose width does not match the query are skipped (a transitional
@@ -2089,7 +2128,7 @@ fn bm25_block_ids(
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-/// Reciprocal rank fusion over ranked id lists: score(d) = Σ 1/(k + rank),
+/// Reciprocal rank fusion over ranked id lists: score(d) = Î£ 1/(k + rank),
 /// rank starting at 1. Ties break by id for determinism.
 pub fn rrf_fuse(lists: &[Vec<i64>], k: f64) -> Vec<i64> {
     let mut score: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
@@ -2103,7 +2142,7 @@ pub fn rrf_fuse(lists: &[Vec<i64>], k: f64) -> Vec<i64> {
     items.into_iter().map(|(id, _)| id).collect()
 }
 
-/// BM25 list ⊕ semantic list via RRF — each fetched with a wider pool than
+/// BM25 list âŠ• semantic list via RRF â€” each fetched with a wider pool than
 /// the final limit so fusion has something to reorder.
 pub fn hybrid_recall(
     conn: &Connection,
@@ -2163,7 +2202,7 @@ mod path_shape_tests {
     #[test]
     fn the_exclusion_boundary_holds_for_backslash_separated_paths() {
         // Without normalization every one of these slips past the prefix
-        // match and lands in the catalog — secrets first.
+        // match and lands in the catalog â€” secrets first.
         for raw in [r"mind\secrets\age.key.md", r"logs\session.md", r"projects\repo\a.md", r"knowledge\archive\old.md", r".git\COMMIT_EDITMSG.md"] {
             let rel = normalize_separators(raw, '\\');
             assert!(excluded(&rel, &RingRules::default()), "{raw} normalized to {rel} must be excluded");
@@ -2344,7 +2383,7 @@ mod scoping_tests {
             census.record(&format!("knowledge/hosts/h{i}.md"));
         }
         // No child of `todo/done` clears the bar alone, so `todo/done` is the
-        // deepest honest name — descending further would advise excluding one
+        // deepest honest name â€” descending further would advise excluding one
         // quarter and leaving three behind.
         assert_eq!(census.concentrations(0.5), vec![("todo/done".to_string(), 20)]);
     }
@@ -2630,6 +2669,59 @@ mod tests {
     }
 
     #[test]
+    fn an_unclosed_private_tag_is_reported_not_silent() {
+        // A mere mention of the tag in prose blanks everything after it,
+        // fail-closed — the hiding is the design; the silence was the bug.
+        let dir = brain(&[
+            ("knowledge/good.md", "public fact\n"),
+            ("knowledge/mentioned.md", "we use <private> blocks here\nand this tail is gone too\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.private_swallowed, vec!["knowledge/mentioned.md".to_string()]);
+        // Balanced private regions stay unreported.
+        assert!(report.unreadable.is_empty());
+        // The tail is really gone from recall (fail-closed held) ...
+        assert!(recall(&conn, "tail", 5).unwrap().is_empty());
+        // ... and the mention itself never entered the index either.
+        assert!(recall(&conn, "blocks here", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_under_its_own_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("knowledge")).unwrap();
+        std::fs::write(dir.path().join("knowledge").join("ok.md"), "fine\n").unwrap();
+        let bad = dir.path().join("knowledge").join("binary.md");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, b"not utf8: \xff\xfe broken\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.unreadable, vec!["knowledge/binary.md".to_string()]);
+        assert!(report.skipped.is_empty(), "not under the ring-5+ reason: {:?}", report.skipped);
+        assert_eq!(report.docs, 1, "the readable file indexed normally");
+    }
+
+    #[test]
+    fn dropped_blobs_are_counted() {
+        let long = "x".repeat(9 * 1024);
+        let dir = brain(&[(
+            "knowledge/blob.md",
+            format!("short intro\n\n{long}\n\nshort outro\n").as_str(),
+        )]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1);
+        assert_eq!(report.blob_dropped, 1);
+        // The neighbors of the blob stay recallable.
+        assert_eq!(recall(&conn, "intro", 5).unwrap().len(), 1);
+        assert_eq!(recall(&conn, "outro", 5).unwrap().len(), 1);
+    }
+
+    #[test]
     fn frontmatter_ring_overrides_and_high_rings_are_skipped() {
         let dir = brain(&[
             ("knowledge/promoted.md", "---\nring: 1\n---\nlocked decision here\n"),
@@ -2701,9 +2793,9 @@ mod tests {
         // Full rebuild: reported, not invisible.
         let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert!(
-            report.skipped.iter().any(|p| p.contains("gone.md")),
+            report.unreadable.iter().any(|p| p.contains("gone.md")),
             "unreadable file must be reported: {:?}",
-            report.skipped
+            report.unreadable
         );
 
         // Incremental rescan of a previously-indexed file that became
@@ -2714,7 +2806,7 @@ mod tests {
         let report = rescan_changed(&mut conn, dir2.path(), None, &RingRules::default())
             .unwrap()
             .expect("incremental rescan should handle one changed file");
-        assert!(report.skipped.iter().any(|p| p.contains("gone2.md")));
+        assert!(report.unreadable.iter().any(|p| p.contains("gone2.md")));
         assert_eq!(
             recall(&conn, "alamo", 5).unwrap().len(),
             1,
@@ -2789,8 +2881,8 @@ mod tests {
     fn lockfiles_and_agent_config_directories_never_reach_the_walk() {
         // Verification lock for the two hygiene classes this index gets for
         // free: lockfiles are not markdown, and agent-config directories are
-        // hidden. Both are load-bearing — an agent's own instruction files
-        // outrank real knowledge on any importance signal — so pin them
+        // hidden. Both are load-bearing â€” an agent's own instruction files
+        // outrank real knowledge on any importance signal â€” so pin them
         // rather than trusting the walker's defaults to stay put.
         let dir = brain(&[
             ("package-lock.json", "{\"name\": \"gribbet\"}\n"),
@@ -2808,7 +2900,7 @@ mod tests {
 
     #[test]
     fn a_generated_blob_is_refused_while_its_page_stays_recallable() {
-        // The realistic shape: a real page carrying one machine-made line —
+        // The realistic shape: a real page carrying one machine-made line â€”
         // a pasted minified bundle, a base64 data URI. Indexing it hands FTS
         // a statement that matches almost any query and means nothing; this
         // fixture tokenizes, so without the refusal it is genuinely findable.
@@ -2875,7 +2967,7 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.ring == 2));
         assert!(hits.iter().any(|h| h.path == "native:-home-user/feedback_zvol.md"));
-        // frontmatter of native files has no `ring:` — must not shift line numbers wrongly
+        // frontmatter of native files has no `ring:` â€” must not shift line numbers wrongly
         let fb = hits.iter().find(|h| h.path.ends_with("feedback_zvol.md")).unwrap();
         assert_eq!(fb.start_line, 5);
     }
@@ -2941,7 +3033,7 @@ mod tests {
     fn native_index_pointers_become_edges_in_both_directions() {
         // The native store's index is a hook table: one line per entry,
         // pointing at the file that explains it. The pointers are markdown
-        // links, which the vault's wikilink reader cannot see — so a hit on a
+        // links, which the vault's wikilink reader cannot see â€” so a hit on a
         // hook used to be a dead end, with the hook itself all the reader got.
         let brain = brain(&[("knowledge/a.md", "brain fact\n")]);
         let native = tempfile::tempdir().unwrap();
@@ -3034,7 +3126,7 @@ mod tests {
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
         // Editing the SKIPPED file (e.g. removing its ring-5 marker = promotion)
-        // must be noticed — the old subset comparison was blind to this.
+        // must be noticed â€” the old subset comparison was blind to this.
         std::fs::write(dir.path().join("knowledge/staged.md"), "now public\n").unwrap();
         assert!(stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
     }
@@ -3248,7 +3340,7 @@ mod tests {
             let id = format!("bug-{i:03}");
             std::fs::write(
                 bugs.join(format!("{id}.md")),
-                format!("# {id} — failure number {i}\n\nroot cause and fix for {id}\n"),
+                format!("# {id} â€” failure number {i}\n\nroot cause and fix for {id}\n"),
             )
             .unwrap();
         }
@@ -3256,7 +3348,7 @@ mod tests {
         // so nothing else collides with `400` except the traps below.
         std::fs::write(
             bugs.join("bug-400.md"),
-            "# bug-400 — frames decoded to noise\n\nroot cause and fix for bug-400\n",
+            "# bug-400 â€” frames decoded to noise\n\nroot cause and fix for bug-400\n",
         )
         .unwrap();
         std::fs::write(
@@ -3327,7 +3419,7 @@ mod tests {
     fn f16_conversion_matches_the_ieee_oracle_bit_for_bit() {
         // Expected bit patterns produced by an INDEPENDENT implementation
         // (CPython's struct "e" format, IEEE binary16, round-to-nearest-even)
-        // — this is the check that the hand-written narrowing is a real f16
+        // â€” this is the check that the hand-written narrowing is a real f16
         // and not merely self-consistent. Subnormals, the rounding floor
         // (2.98e-8 ties to zero, 5.96e-8 to the smallest subnormal), the
         // largest finite half, and the awkward decimal fractions are all in.
@@ -3495,7 +3587,7 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].1, "- three", "only the new block is queued");
 
-        // The incremental path must agree — it is the daemon's hot path.
+        // The incremental path must agree â€” it is the daemon's hot path.
         embed_everything(&conn, &spec, &[0.0, 1.0]);
         std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two\n- three\n- four\n").unwrap();
         rescan_changed(&mut conn, dir.path(), None, &RingRules::default())
@@ -3963,7 +4055,7 @@ mod tests {
         std::fs::write(dir.path().join("knowledge/d.md"), "arrived later, see [[a]]\n").unwrap();
         std::fs::remove_file(dir.path().join("knowledge/c.md")).unwrap();
 
-        let r2 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("small diff → incremental");
+        let r2 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("small diff â†’ incremental");
         assert_eq!(r2.generation, 2, "incremental commit advances the generation");
         assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
 
@@ -3988,7 +4080,7 @@ mod tests {
         let linked = linked_docs(&conn, &["knowledge/d.md".to_string()], 8).unwrap();
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].0, "knowledge/a.md");
-        // Unchanged BLOCKS kept their vectors — including the untouched line
+        // Unchanged BLOCKS kept their vectors â€” including the untouched line
         // of the doc that changed. Only genuinely new text needs embedding.
         let (vectors_after, blocks_after) = vector_coverage(&conn, &spec).unwrap();
         let a_blocks = 3; // heading + 2 table rows
@@ -4001,7 +4093,7 @@ mod tests {
 
         // A no-op rescan commits nothing and keeps the generation.
         let r3 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();
-        assert_eq!(r3.generation, 2, "fingerprint already current → no new commit");
+        assert_eq!(r3.generation, 2, "fingerprint already current â†’ no new commit");
         assert_eq!(generation(&conn), 2);
     }
 

@@ -5,6 +5,20 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Index losses are reported, not silent.** Three drops the sweep found
+  in a real tree are now lines in `cfetch scan` output. (1) An unclosed
+  `<private>` — often a mere mention of the tag in prose — blanks to end
+  of file fail-closed (that stays the design); the file is now named:
+  `<private> never closed — content blanked to end of file: …` (the
+  reporting tree lost 84% of one file and 33% of another while scan said
+  `0 skipped`). (2) Files that could not be read (invalid UTF-8, or a
+  Windows sharing violation) were reported under the ring-5+ skip reason,
+  sending the operator to look for a frontmatter that was not the
+  problem; they now carry their own line: `unreadable (invalid UTF-8 or
+  locked): …`. (3) Statements dropped as generated blobs (a line over
+  8 KiB) are counted: `N statement(s) dropped as generated blobs`.
+  `ScanReport` gained `unreadable`, `private_swallowed`, and
+  `blob_dropped` for the same visibility in the daemon path.
 - **The secrets bar holds for the code index, and a rescan heals it.**
   Pointing `code_roots` at — or beneath — the brain's hard-excluded
   prefixes used to make `find` return paths, symbol names, and exact line

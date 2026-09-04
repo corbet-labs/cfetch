@@ -794,7 +794,38 @@ fn scan(background: bool) -> anyhow::Result<()> {
             println!(
                 "  skipped (ring 5+ or unparseable ring frontmatter): {}{}",
                 shown.join(", "),
-                if more > 0 { format!(" … and {more} more") } else { String::new() }
+                if more > 0 { format!(" . and {more} more") } else { String::new() }
+            );
+        }
+        // Unreadable files are a different failure with a different fix
+        // (encoding, or an editor/antivirus lock on Windows) — naming them
+        // under the ring-5+ reason sends the operator to the wrong place.
+        if !report.unreadable.is_empty() {
+            let shown: Vec<&str> = report.unreadable.iter().take(10).map(String::as_str).collect();
+            let more = report.unreadable.len() - shown.len();
+            println!(
+                "  unreadable (invalid UTF-8 or locked): {}{}",
+                shown.join(", "),
+                if more > 0 { format!(" . and {more} more") } else { String::new() }
+            );
+        }
+        // An unclosed <private> blanks to end of file by design, fail-closed
+        // — often a mere mention of the tag in prose. The design keeps the
+        // hiding; the silence was the bug.
+        if !report.private_swallowed.is_empty() {
+            let shown: Vec<&str> =
+                report.private_swallowed.iter().take(10).map(String::as_str).collect();
+            let more = report.private_swallowed.len() - shown.len();
+            println!(
+                "  <private> never closed — content blanked to end of file: {}{}",
+                shown.join(", "),
+                if more > 0 { format!(" . and {more} more") } else { String::new() }
+            );
+        }
+        if report.blob_dropped > 0 {
+            println!(
+                "  {} statement(s) dropped as generated blobs (a line over 8 KiB)",
+                report.blob_dropped
             );
         }
         // Connection dropped here: the daemon's scan thread is the next writer.
