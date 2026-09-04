@@ -5,6 +5,17 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Hyphenated compounds rank as compounds.** `fts_query` now emits a
+  hyphenated query term BOTH as an exact-adjacency phrase and as its split
+  prefix terms. The recall contract is unchanged (`state-machine` still
+  finds "the machine's state" through the split terms); what is new is that
+  an id lookup like `bug-400` finds its note first. Before, the compound
+  dissolved into `bug` (near-zero signal once a tree holds hundreds of bug
+  notes) and `400` (prefix-matching 400002, 17.400, 86_400_000 elsewhere),
+  and the note sank below the default limit — roughly one id in eight from
+  a real migrated tree did not come back at all. The phrase restores the
+  compound's identity as high signal: measured on the reporter's fixture
+  shape, the id note moves from invisible to rank 1 in raw lexical order.
 - **`import openwolf`: a migrated tree reaches the model from the first
   scan.** Follow-up to the silent-import fixes. A fresh import used to
   produce a brain that injected nothing at all — selfcheck reported an

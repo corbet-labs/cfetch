@@ -1408,27 +1408,39 @@ pub fn linked_docs(conn: &Connection, hit_paths: &[String], limit: usize) -> any
 /// FTS5 query string: each term becomes a quoted prefix token, OR-joined —
 /// recall-heavy on purpose (precision gates come at the consumer).
 fn fts_query(user_query: &str) -> String {
+    // Ordered de-dup: the same term twice in one OR would double-count it
+    // in bm25 for no information gain.
+    let mut terms: Vec<String> = Vec::new();
+    let push = |terms: &mut Vec<String>, term: String| {
+        if !term.is_empty() && !terms.contains(&term) {
+            terms.push(term);
+        }
+    };
     user_query
         .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
         .filter(|t| !t.is_empty())
         // The FTS5 tokenizer splits on hyphens, so a hyphenated term inside
-        // one quoted token becomes an ADJACENCY phrase query — far narrower
-        // than the recall-first contract. `state-machine` must find "the
-        // machine's state", so the hyphen splits into two independent
-        // prefix terms here, matching what the tokenizer will see at
-        // index time.
-        .flat_map(|t| {
+        // one quoted token becomes an ADJACENCY phrase query. That phrase is
+        // also the only place a compound's identity survives: `bug-400` as
+        // bare prefix terms is `bug` (near-zero signal once a tree holds
+        // hundreds of bug notes) OR `400` (prefix-matches 400002, 17.400,
+        // 86_400_000), and the id note sinks. So a hyphenated term becomes
+        // BOTH: the compound as an exact-adjacency phrase, and its parts as
+        // independent prefix terms — the recall contract stays (`state-
+        // machine` still finds "the machine's state"), and an id lookup
+        // finds the id first because adjacency is high signal.
+        .for_each(|t| {
             let cleaned = t.replace('"', "");
             if cleaned.contains('-') && cleaned.chars().all(|c| c.is_alphanumeric() || c == '-') {
-                cleaned.split('-').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                push(&mut terms, format!("\"{cleaned}\""));
+                for part in cleaned.split('-').filter(|s| !s.is_empty()) {
+                    push(&mut terms, format!("\"{part}\"*"));
+                }
             } else {
-                vec![cleaned]
+                push(&mut terms, format!("\"{cleaned}\"*"));
             }
-        })
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"*", t))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        });
+    terms.join(" OR ")
 }
 
 /// One-line, length-capped preview of a block for hit listings.
@@ -3208,6 +3220,71 @@ mod tests {
         //             b = 1/4 = 0.25,        d = 1/5 = 0.2
         let fused = rrf_fuse(&[vec![1, 2, 3], vec![3, 1, 4]], 2.0);
         assert_eq!(fused, vec![1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn fts_query_keeps_the_compound_as_a_phrase_and_splits_for_recall() {
+        // An id lookup: the compound is the signal...
+        assert_eq!(fts_query("bug-400"), "\"bug-400\" OR \"bug\"* OR \"400\"*");
+        // ...while the recall contract survives: a hyphenated concept still
+        // matches its words scattered across a sentence.
+        assert_eq!(fts_query("state-machine"), "\"state-machine\" OR \"state\"* OR \"machine\"*");
+        // Plain terms are unchanged prefix terms.
+        assert_eq!(fts_query("database migration"), "\"database\"* OR \"migration\"*");
+        // Duplicate terms are not double-counted.
+        assert_eq!(fts_query("bug bug-400"), "\"bug\"* OR \"bug-400\" OR \"400\"*");
+    }
+
+    #[test]
+    fn an_id_lookup_ranks_the_id_note_first_even_among_prefix_traps() {
+        // The shape of the reported failure, scaled down: hundreds of bug
+        // notes flatten the term `bug`, and prefix matching makes `400` hit
+        // 400002, 17.400 and 86_400_000 elsewhere in the tree. The note
+        // carrying the literal compound must come back first.
+        let brain = tempfile::tempdir().unwrap();
+        let bugs = brain.path().join("knowledge/bugs");
+        std::fs::create_dir_all(&bugs).unwrap();
+        for i in 1..=60 {
+            let id = format!("bug-{i:03}");
+            std::fs::write(
+                bugs.join(format!("{id}.md")),
+                format!("# {id} — failure number {i}\n\nroot cause and fix for {id}\n"),
+            )
+            .unwrap();
+        }
+        // The id under test: round number, far outside the sequential range,
+        // so nothing else collides with `400` except the traps below.
+        std::fs::write(
+            bugs.join("bug-400.md"),
+            "# bug-400 — frames decoded to noise\n\nroot cause and fix for bug-400\n",
+        )
+        .unwrap();
+        std::fs::write(
+            brain.path().join("knowledge/budget.md"),
+            "# Budget\n\n- allocation 400002 units\n- ratio 17.400 measured\n- seconds 86_400_000 total\n",
+        )
+        .unwrap();
+        std::fs::write(
+            brain.path().join("knowledge/log.md"),
+            "# Log\n\n- see bug-225 and bug-400 in the bug list\n",
+        )
+        .unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), None, &RingRules::default()).unwrap();
+
+        let hits = recall(&conn, "bug-400", 8).unwrap();
+        assert!(!hits.is_empty(), "the id note must be findable at all");
+        assert_eq!(
+            hits[0].path, "knowledge/bugs/bug-400.md",
+            "the literal compound outranks everything; got: {}",
+            hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>().join(", ")
+        );
+        // The recall contract holds on the same shape: any other bug note is
+        // found by its id too, not just the one the phrase boosted hardest.
+        let scatter = recall(&conn, "bug-060", 8).unwrap();
+        assert!(scatter.iter().any(|h| h.path == "knowledge/bugs/bug-060.md"));
     }
 
     #[test]
