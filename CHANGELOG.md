@@ -5,6 +5,21 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Commands stop reporting success they did not achieve.** Three from the
+  sweep. (1) `daemon stop` printed `daemon stopped` on a mere
+  acknowledgement — the acknowledged process outlived the claim by minutes
+  on the reporting host. Stop now polls until the daemon stops answering,
+  and the daemon bounds its own shutdown with a five-second watchdog: the
+  graceful tail (iroh endpoint close, listener cleanup) can block on
+  network drains, and a daemon that acknowledged shutdown must not become
+  a zombie. A stop that cannot confirm exits nonzero instead of lying.
+  (2) `daemon start` sent the actual startup failure to /dev/null and
+  reported only "did not answer". The daemon's stderr now lands in
+  `state/daemon-start.stderr.log` (truncated per start), and a failed
+  start includes its last lines in the error. (3) `cards sync` completed
+  fetch and merge, then deadlocked on its own store lock: it held the lock
+  and called `status()`, which acquires it again. The report now runs
+  under the lock `sync` already holds.
 - **selfcheck stops claiming what it never tested.** (1) The ring-6 line
   said `ok … (this host writes)` without a single write: on a read-only
   brain that was a lie a live hook then paid for, silently dropping every

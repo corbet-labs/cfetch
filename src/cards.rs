@@ -185,11 +185,20 @@ fn sync(store: &Path, json: bool) -> anyhow::Result<()> {
         ["fetch", "--filter=blob:none", "origin", CATALOG_BRANCH],
     )?;
     git(store, ["merge", "--ff-only", "FETCH_HEAD"])?;
+    // The report runs UNDER the lock this function already holds — calling
+    // `status()` here deadlocked the command on its own store lock after
+    // fetch and merge were already done.
     if json {
-        println!("{}", serde_json::to_string_pretty(&status_report(store)?)?);
+        println!("{}", serde_json::to_string_pretty(&status_report_locked(store)?)?);
     } else {
         println!("synchronized nixcards catalogue");
-        status(store, false)?;
+        let report = status_report_locked(store)?;
+        if !report.initialized {
+            println!("not initialized: {}", report.store);
+        } else {
+            println!("revision: {}", report.revision.as_deref().unwrap_or("unknown"));
+            println!("selected sets: {}", report.selected_sets.len());
+        }
     }
     Ok(())
 }
@@ -226,6 +235,11 @@ fn status_report(store: &Path) -> anyhow::Result<CardsStatus> {
     // Same store lock as the mutators: a status snapshot concurrent with a
     // sync/select would otherwise be a torn view of the worktree.
     let _lock = acquire_store_lock(store)?;
+    status_report_locked(store)
+}
+
+/// The report body for a caller that already holds the store lock.
+fn status_report_locked(store: &Path) -> anyhow::Result<CardsStatus> {
     if !store.join(".git").exists() {
         return Ok(CardsStatus {
             store: store.display().to_string(),

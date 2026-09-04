@@ -1927,6 +1927,21 @@ pub fn run() -> anyhow::Result<()> {
             }
         });
     }
+    if ctx.shutdown.load(Ordering::SeqCst) {
+        // A daemon that acknowledged shutdown must not become a zombie.
+        // The graceful tail below (iroh endpoint close, listener cleanup)
+        // can block on network drains indefinitely; the watchdog bounds
+        // the whole shutdown to five seconds — measured on a real host,
+        // the acknowledged-but-alive process outlived its operator's
+        // patience by minutes.
+        std::thread::Builder::new()
+            .name("cfetch-shutdown-watchdog".into())
+            .spawn(|| {
+                std::thread::sleep(Duration::from_secs(5));
+                std::process::exit(0);
+            })
+            .ok();
+    }
     if let Ok(client) = iroh_client(&ctx) {
         client.runtime.block_on(client.endpoint.close());
     }
@@ -1945,11 +1960,30 @@ pub fn start() -> anyhow::Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
+    // The daemon's stderr goes to a file, not /dev/null: when a start fails,
+    // "did not answer" alone sends the operator nowhere. The file lives in
+    // the state directory and is truncated on every start — it describes
+    // the LAST start attempt, not an ever-growing log.
+    let stderr_path = crate::paths::state_dir().join("daemon-start.stderr.log");
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&stderr_path);
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    match &stderr_file {
+        Ok(file) => {
+            cmd.stderr(std::process::Stdio::from(file.try_clone()?));
+        }
+        Err(_) => {
+            // The state dir may be unwritable — starting is still worth the
+            // attempt, only the diagnosis gets poorer.
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -1969,14 +2003,40 @@ pub fn start() -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    anyhow::bail!("daemon did not answer after start")
+    // Name the actual reason when we captured one: the last few lines of
+    // the failed start's stderr say more than "did not answer" ever will.
+    let mut reason = String::new();
+    if stderr_file.is_ok()
+        && let Ok(tail) = std::fs::read_to_string(&stderr_path)
+    {
+        let lines: Vec<&str> = {
+            let all: Vec<&str> = tail.lines().collect();
+            all.split_at(all.len().saturating_sub(5)).1.to_vec()
+        };
+        if !lines.is_empty() {
+            reason = format!("\ndaemon stderr ({}):\n  {}", stderr_path.display(), lines.join("\n  "));
+        }
+    }
+    anyhow::bail!("daemon did not answer after start{reason}")
 }
 
 pub fn stop() -> anyhow::Result<()> {
     match call("shutdown", Duration::from_millis(500)) {
         Some(r) if r.ok => {
-            println!("daemon stopped");
-            Ok(())
+            // An acknowledged shutdown is a promise, not a fact: the daemon
+            // may still be draining. Poll until it stops ANSWERING — only
+            // then is "stopped" a measurement — and refuse to claim success
+            // while the process demonstrably lives on.
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(100));
+                if call("ping", Duration::from_millis(200)).is_none() {
+                    println!("daemon stopped");
+                    return Ok(());
+                }
+            }
+            anyhow::bail!(
+                "daemon acknowledged shutdown but is still answering after 5s — it may be blocked; check the process"
+            );
         }
         _ => {
             println!("daemon not running");
