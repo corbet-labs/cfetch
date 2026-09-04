@@ -31,6 +31,7 @@ pub struct ReportV1 {
     pub build: BuildDiagnostic,
     pub platform: PlatformDiagnostic,
     pub config: ConfigDiagnostic,
+    pub catalog: CatalogDiagnostic,
     pub daemon: DaemonDiagnostic,
     pub memory: MemoryDiagnostic,
     pub inference: InferenceDiagnostic,
@@ -66,6 +67,18 @@ pub struct ConfigDiagnostic {
     pub loaded: bool,
     pub brain_root: Option<String>,
     pub error: Option<String>,
+}
+
+/// The derived catalogue's state — a measurement, not an assumption: an
+/// installation that never scanned answers every recall from nothing, and
+/// one lagging the tree answers from a version of it that no longer exists.
+/// Doctor reported neither until this field existed.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogDiagnostic {
+    /// `current`, `stale`, `never_scanned`, `unavailable`, or `remote`
+    /// (a none-tier client holds no local catalog by design).
+    pub state: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -447,6 +460,14 @@ fn gather_inner(
         });
     }
 
+    // The brain root and the derived catalogue are measurements doctor used
+    // not to take: selfcheck detected a missing root, an unopenable or stale
+    // index, and doctor reported `0 critical` through all of it.
+    let catalog = match cfg {
+        Some(cfg) => catalog_diagnostic(cfg, state_dir, &mut findings),
+        None => CatalogDiagnostic { state: "unavailable".into(), detail: Some("config did not load".into()) },
+    };
+
     let memory = memory_diagnostic(cfg, state_dir, &runtime, daemon_running, &mut findings);
     let inference = inference_diagnostic(cfg, &runtime, &build_backend, &mut findings);
     let hardware = hardware_diagnostics(&runtime, &build_backend);
@@ -511,6 +532,7 @@ fn gather_inner(
             hardware_detection: hardware_detection.into(),
         },
         config,
+        catalog,
         daemon: DaemonDiagnostic {
             state: if daemon_running {
                 DaemonState::Running
@@ -546,6 +568,98 @@ fn compiled_backend() -> String {
         return release.backend.clone();
     }
     "endpoint".into()
+}
+
+/// The derived catalogue's state, with findings for everything a recall
+/// would silently get wrong. Mirrors the liveness verdict selfcheck prints,
+/// so the two diagnostics can never disagree about the same index.
+fn catalog_diagnostic(
+    cfg: &crate::config::Config,
+    state_dir: &std::path::Path,
+    findings: &mut Vec<Finding>,
+) -> CatalogDiagnostic {
+    if !cfg.brain_root.is_dir() {
+        findings.push(Finding {
+            code: "brain_root_missing".into(),
+            severity: FindingSeverity::Critical,
+            summary: format!("brain root {} does not exist", cfg.brain_root.display()),
+            action: Some("create the tree (cfetch init) or fix the brain root".into()),
+        });
+        return CatalogDiagnostic { state: "unavailable".into(), detail: Some("brain root missing".into()) };
+    }
+    if let Some(cs) = &cfg.client.serving {
+        // A none-tier client holds no local catalog by design; opening one
+        // here would build the second, silently stale truth it exists to
+        // avoid.
+        return CatalogDiagnostic { state: "remote".into(), detail: Some(format!("served by {}", cs.addr)) };
+    }
+    // A diagnostic must not be the thing that first writes an index: the
+    // existence check comes first, and the open is READ-ONLY (no
+    // delete-and-rebuild on a corrupt file — that recovery belongs to the
+    // writer, with the operator's eyes on it).
+    if !index::db_exists(state_dir) {
+        findings.push(Finding {
+            code: "index_never_scanned".into(),
+            severity: FindingSeverity::Warning,
+            summary: "no catalog has ever been committed; every recall answers from nothing".into(),
+            action: Some("run cfetch scan".into()),
+        });
+        return CatalogDiagnostic { state: "never_scanned".into(), detail: None };
+    }
+    let conn = match index::open_read_only(state_dir) {
+        Ok(conn) => conn,
+        Err(error) => {
+            let detail = short_error(&error.to_string());
+            findings.push(Finding {
+                code: "index_unopenable".into(),
+                severity: FindingSeverity::Critical,
+                summary: format!("the index database does not open: {detail}"),
+                action: Some("delete the state index and run cfetch scan to rebuild".into()),
+            });
+            return CatalogDiagnostic { state: "unavailable".into(), detail: Some(detail) };
+        }
+    };
+    let tree =
+        index::tree_fingerprint(&cfg.brain_root, Some(&crate::paths::native_projects_root()), &cfg.rings());
+    let stored = match index::stored_fingerprint(&conn) {
+        Some(fp) => fp,
+        None => {
+            // A corrupt or schemaless file: present, unreadable, and not
+            // ours to repair from here.
+            findings.push(Finding {
+                code: "index_unopenable".into(),
+                severity: FindingSeverity::Critical,
+                summary: "the index database is present but unreadable (empty or not a cfetch catalog)".into(),
+                action: Some("delete the state index and run cfetch scan to rebuild".into()),
+            });
+            return CatalogDiagnostic { state: "unavailable".into(), detail: Some("unreadable catalog".into()) };
+        }
+    };
+    let verdict = heartbeat::observe_index_in(state_dir, Some(stored.as_str()), &tree);
+    match verdict {
+        heartbeat::IndexLiveness::Current => CatalogDiagnostic {
+            state: "current".into(),
+            detail: Some(format!("generation {}", index::generation(&conn))),
+        },
+        heartbeat::IndexLiveness::NeverScanned => {
+            findings.push(Finding {
+                code: "index_never_scanned".into(),
+                severity: FindingSeverity::Warning,
+                summary: "no catalog has ever been committed; every recall answers from nothing".into(),
+                action: Some("run cfetch scan".into()),
+            });
+            CatalogDiagnostic { state: "never_scanned".into(), detail: Some(verdict.describe()) }
+        }
+        heartbeat::IndexLiveness::Stale { .. } => {
+            findings.push(Finding {
+                code: "index_stale".into(),
+                severity: FindingSeverity::Warning,
+                summary: format!("index: {}", verdict.describe()),
+                action: Some("run cfetch scan".into()),
+            });
+            CatalogDiagnostic { state: "stale".into(), detail: Some(verdict.describe()) }
+        }
+    }
 }
 
 fn memory_diagnostic(
@@ -1861,6 +1975,7 @@ mod tests {
                 brain_root: Some("/brain".into()),
                 error: None,
             },
+            catalog: CatalogDiagnostic { state: "current".into(), detail: Some("generation 1".into()) },
             daemon: DaemonDiagnostic {
                 state: DaemonState::Running,
                 version: Some("0.9.9".into()),

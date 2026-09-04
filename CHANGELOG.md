@@ -5,6 +5,18 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **doctor sees the catalogue.** A never-scanned, stale, unopenable, or
+  randomly overwritten index — and a missing brain root — all reported
+  `0 critical, exit 0` while selfcheck or status detected each one, and
+  the `--json` contract had no field for catalogue state at all. doctor
+  now takes the same liveness measurement selfcheck prints (the two
+  diagnostics cannot disagree about the same index): a new `catalog`
+  field (`current` / `stale` / `never_scanned` / `unavailable` /
+  `remote` with detail), findings for `index_never_scanned` and
+  `index_stale` (warnings, action: run `cfetch scan`), `index_unopenable`
+  (critical), and `brain_root_missing` (critical). A none-tier client
+  reports `remote` by design instead of building a second, silently
+  stale local catalog.
 - **Index losses are reported, not silent.** Three drops the sweep found
   in a real tree are now lines in `cfetch scan` output. (1) An unclosed
   `<private>` — often a mere mention of the tag in prose — blanks to end
