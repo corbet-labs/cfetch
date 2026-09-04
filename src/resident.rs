@@ -583,7 +583,11 @@ fn hard_rules(body: &str) -> Vec<String> {
     let (_, rest) = split_frontmatter(body);
     rest.lines()
         .map(undecorate)
-        .filter(|l| l.len() <= RULE_MAX_CHARS && is_prohibition(l))
+        // CHARS, not bytes: the cap is a readability limit, and measuring
+        // bytes made any non-ASCII rule count heavier than it reads — a
+        // 120-character German rule is 208 bytes and silently dropped
+        // while its English twin passed.
+        .filter(|l| l.chars().count() <= RULE_MAX_CHARS && is_prohibition(l))
         .map(str::to_string)
         .collect()
 }
@@ -1184,6 +1188,22 @@ mod tests {
             "frontmatter is a label, not a rule"
         );
         assert!(hard_rules("The rule is: do not do that\n").is_empty(), "only the opener decides");
+    }
+
+    #[test]
+    fn the_rule_cap_counts_chars_not_bytes() {
+        // The reporting shape: a German rule of 120 characters is 208 UTF-8
+        // bytes and was silently dropped while an English rule of the same
+        // visible length passed. The cap is a readability limit — it must
+        // measure what the operator reads.
+        let rule = format!("never {} gravierend", "ä".repeat(100));
+        assert_eq!(rule.chars().count(), 117);
+        assert!(rule.len() > 140, "the fixture must be over the cap in bytes");
+        assert_eq!(hard_rules(&rule), vec![rule], "a readable-length rule survives");
+        // And the cap itself still holds, in chars.
+        let over = format!("never {}", "x".repeat(140));
+        assert!(over.chars().count() > 140);
+        assert!(hard_rules(&over).is_empty(), "past the cap in chars it drops, whatever its byte length");
     }
 
     /// A brain whose catalog holds far more than any digest could carry. The

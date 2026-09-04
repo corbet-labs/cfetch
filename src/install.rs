@@ -1147,7 +1147,21 @@ pub fn configure(
         );
         return Ok(());
     }
-    let selections = select_surfaces(&agents, &scope, &exe)?;
+    let mut selections = select_surfaces(&agents, &scope, &exe)?;
+    // An explicit `--settings` file scopes Claude's hook surface to THAT
+    // file: `apply_claude` below installs the hooks and status line there.
+    // Without this, the same registration was also written to the DEFAULT
+    // ~/.claude/settings.json through agent-config — a double install that
+    // created files the operator pointed somewhere else precisely to avoid.
+    if settings.is_some()
+        && scope.local_root().is_none()
+        && let Some(selection) = agents
+            .iter()
+            .position(|agent| agent == "claude")
+            .and_then(|index| selections.get_mut(index))
+    {
+        selection.hooks = false;
+    }
 
     // Refuse known schema/ownership conflicts before touching any harness.
     for (agent, selected) in agents.iter().zip(&selections) {
