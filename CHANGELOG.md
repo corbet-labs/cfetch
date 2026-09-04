@@ -5,6 +5,22 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **`import openwolf`: honest reporting and the curated bug log.** Three
+  fixes from a report filed against a real, grown `.wolf/` tree. (1) The
+  dry run and the real run now share one code path — `plan` builds the
+  report, the real run executes it — so the preview can no longer hide
+  skips it never consulted. (2) Top-level files that match no table are
+  reported in a new `found, not recognized — left in place` section
+  instead of being dropped in silence (in the reporting tree: live
+  instruction files, pre-registrations with their hash evidence,
+  hand-written proposals). (3) `buglog.json` is no longer skipped: each
+  curated entry becomes one ring-3 note under `knowledge/bugs/<id>.md`
+  with the `bug-NNN` id kept in filename and title, so the references
+  inside imported files keep resolving and recall returns the specific
+  bug instead of nothing. Ring-6 exhaust remains the forward-looking
+  error stream; the bug log is imported history, and it does not
+  regenerate. A broken or empty bug log is a reported error or skip,
+  never an abort.
 - **Retrieval readiness gates.** The temporary retrieval fixture and
   `doctor --deep` now publish stable pass, fail, and not-run checks for BM25,
   canonical profile admission, vector output, semantic ordering, hybrid RRF,

@@ -2938,30 +2938,18 @@ fn main() {
                     if dry_run {
                         println!("dry run — nothing will be written");
                     }
-                    let report = if dry_run {
-                        // Read-only: report what WOULD be imported.
-                        let mut mock = import::ImportReport {
-                            imported: Vec::new(),
-                            skipped: Vec::new(),
-                            errors: Vec::new(),
-                        };
-                        for (name, dest, _) in import::MIGRATIONS {
-                            if path.join(name).is_file() {
-                                if brain.join(dest).exists() {
-                                    mock.skipped.push((name.to_string(), "destination exists".to_string()));
-                                } else {
-                                    mock.imported.push((name.to_string(), dest.to_string()));
-                                }
-                            }
-                        }
-                        mock
+                    // One code path builds the report; the dry run simply
+                    // does not execute it. Preview and act cannot disagree.
+                    let outcome = if dry_run {
+                        import::plan_openwolf(&path, &brain)
                     } else {
-                        match import::import_openwolf(&path, &brain) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("cfetch import openwolf: {e:#}");
-                                std::process::exit(1);
-                            }
+                        import::import_openwolf(&path, &brain)
+                    };
+                    let report = match outcome {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("cfetch import openwolf: {e:#}");
+                            std::process::exit(1);
                         }
                     };
                     println!();
@@ -2977,13 +2965,22 @@ fn main() {
                             println!("  {} ({})", name, reason);
                         }
                     }
+                    if !report.unrecognized.is_empty() {
+                        println!("found, not recognized — left in place:");
+                        for name in &report.unrecognized {
+                            println!("  {}", name);
+                        }
+                    }
                     if !report.errors.is_empty() {
                         println!("errors:");
                         for (name, error) in &report.errors {
                             println!("  {}: {}", name, error);
                         }
                     }
-                    if report.imported.is_empty() && report.skipped.is_empty() {
+                    if report.imported.is_empty()
+                        && report.skipped.is_empty()
+                        && report.unrecognized.is_empty()
+                    {
                         println!("nothing to import from {}", path.display());
                     } else {
                         println!();
