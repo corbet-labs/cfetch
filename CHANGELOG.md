@@ -5,6 +5,21 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **selfcheck stops claiming what it never tested.** (1) The ring-6 line
+  said `ok … (this host writes)` without a single write: on a read-only
+  brain that was a lie a live hook then paid for, silently dropping every
+  exhaust record while the diagnostic nodded. When the exhaust directory
+  exists, selfcheck now writes and removes a probe file — `ok … writable`
+  is a measurement; a probe failure is a FAIL naming that hooks silently
+  drop records. When the directory does not exist, selfcheck does not
+  create it (a diagnostic must not be the first writer into the brain)
+  and says so: `writability untested; the first hook write decides` —
+  no more untested claim. (2) A resident entry pointing at a missing
+  file counted as a healthy digest; the ~154 characters reported were
+  placeholder text, injected into every session. The placeholder is still
+  injected (a session should learn its contract broke), but
+  `ResidentDigest.missing` now carries the labels and selfcheck warns:
+  `resident file missing — the entry injects only a placeholder: …`.
 - **doctor sees the catalogue.** A never-scanned, stale, unopenable, or
   randomly overwritten index — and a missing brain root — all reported
   `0 critical, exit 0` while selfcheck or status detected each one, and

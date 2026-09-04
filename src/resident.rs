@@ -151,6 +151,12 @@ pub struct ResidentDigest {
     /// than dropped: a resident file that stops arriving must be explainable
     /// without reading the config.
     pub skipped_by_scope: Vec<String>,
+    /// Labels of the entries whose FILE is missing. The digest still carries
+    /// the one placeholder line (a session should learn its contract broke)
+    /// — but the placeholder must not pass as health: selfcheck reports
+    /// these, because a configured resident file that injects nothing but
+    /// `[resident file missing: …]` is a broken setup wearing a green line.
+    pub missing: Vec<String>,
 }
 
 /// Prohibitions carried verbatim out of the files the digest only indexed.
@@ -249,9 +255,10 @@ fn allocate(entries: &[(usize, f32)], usable: usize) -> Vec<usize> {
 
 /// The entries this session is entitled to, read and cleaned, plus the labels
 /// of the ones its scope left out.
-fn collect(cfg: &Config, scope: &SessionScope) -> (Vec<Section>, Vec<String>) {
+fn collect(cfg: &Config, scope: &SessionScope) -> (Vec<Section>, Vec<String>, Vec<String>) {
     let mut sections = Vec::new();
     let mut skipped_by_scope = Vec::new();
+    let mut missing = Vec::new();
     for entry in &cfg.resident {
         let label = format!("ring-{} {}", entry.ring, entry.path.display());
         if !entry.scope.matches(&scope.host, scope.repo.as_deref()) {
@@ -269,7 +276,12 @@ fn collect(cfg: &Config, scope: &SessionScope) -> (Vec<Section>, Vec<String>) {
             }
             // A missing resident file is worth one short line, not silence:
             // the resident set is the contract the operator configured.
-            Err(_) => format!("[resident file missing: {}]", path.display()),
+            // The line is for the SESSION; `missing` is for the operator's
+            // diagnostics — the placeholder must never pass as health.
+            Err(_) => {
+                missing.push(label.clone());
+                format!("[resident file missing: {}]", path.display())
+            }
         };
         sections.push(Section {
             label,
@@ -281,7 +293,7 @@ fn collect(cfg: &Config, scope: &SessionScope) -> (Vec<Section>, Vec<String>) {
             pinned: entry.scope.always,
         });
     }
-    (sections, skipped_by_scope)
+    (sections, skipped_by_scope, missing)
 }
 
 /// How the catalog would name this file: brain-root-relative, `/`-separated.
@@ -315,9 +327,9 @@ pub fn build(cfg: &Config, scope: &SessionScope) -> ResidentDigest {
 }
 
 fn build_in(cfg: &Config, scope: &SessionScope, state_dir: &Path) -> ResidentDigest {
-    let (sections, skipped_by_scope) = collect(cfg, scope);
+    let (sections, skipped_by_scope, missing) = collect(cfg, scope);
     if sections.is_empty() {
-        return ResidentDigest { text: String::new(), sources: Vec::new(), skipped_by_scope };
+        return ResidentDigest { text: String::new(), sources: Vec::new(), skipped_by_scope, missing };
     }
 
     // The budget is a HARD cap on the whole digest: headers, index lines, clip
@@ -344,7 +356,7 @@ fn build_in(cfg: &Config, scope: &SessionScope, state_dir: &Path) -> ResidentDig
             sources = compact_sources;
         }
     }
-    ResidentDigest { text: text.trim_end().to_string(), sources, skipped_by_scope }
+    ResidentDigest { text: text.trim_end().to_string(), sources, skipped_by_scope, missing }
 }
 
 /// Decides the disclosure level of every entry and renders the digest.
@@ -691,7 +703,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ResidentEntry, Scope};
+    use crate::config::{Config, ResidentEntry, Scope};
     use std::path::PathBuf;
 
     /// A brain with four resident files and the scopes the injection policy
@@ -745,6 +757,48 @@ mod tests {
     /// whatever catalog the machine running it happens to have.
     fn build(cfg: &Config, scope: &SessionScope) -> ResidentDigest {
         build_in(cfg, scope, &PathBuf::from("/nonexistent/cfetch-state"))
+    }
+
+    #[test]
+    fn a_missing_resident_file_is_injected_as_placeholder_but_reported_missing() {
+        // The session still learns its contract broke (one placeholder
+        // line); the OPERATOR's diagnostics must not count that line as
+        // health — `missing` is what selfcheck warns on.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENT.md"), "real rules\n").unwrap();
+        let cfg = Config {
+            brain_root: dir.path().to_path_buf(),
+            resident: vec![
+                ResidentEntry { path: "AGENT.md".into(), ring: 1, scope: Scope::default(), weight: None },
+                ResidentEntry { path: "knowledge/handoff.md".into(), ring: 0, scope: Scope::default(), weight: None },
+            ],
+            ..Config::default()
+        };
+        let digest = build(&cfg, &SessionScope { host: "h".into(), repo: None });
+        assert!(digest.text.contains("[resident file missing:"), "session sees the placeholder");
+        assert!(digest.text.contains("real rules"), "the present entry still arrives");
+        assert_eq!(digest.missing.len(), 1, "the missing entry is reported: {:?}", digest.missing);
+        assert!(digest.missing[0].contains("knowledge/handoff.md"));
+    }
+
+    #[test]
+    fn a_present_resident_set_reports_nothing_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("knowledge")).unwrap();
+        std::fs::write(dir.path().join("knowledge/handoff.md"), "state\n").unwrap();
+        let cfg = Config {
+            brain_root: dir.path().to_path_buf(),
+            resident: vec![ResidentEntry {
+                path: "knowledge/handoff.md".into(),
+                ring: 0,
+                scope: Scope::default(),
+                weight: None,
+            }],
+            ..Config::default()
+        };
+        let digest = build(&cfg, &SessionScope { host: "h".into(), repo: None });
+        assert!(digest.missing.is_empty());
+        assert!(!digest.text.contains("resident file missing"));
     }
 
     /// The index line the digest prints instead of a whole file.

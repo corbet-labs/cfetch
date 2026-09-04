@@ -623,6 +623,11 @@ fn selfcheck() -> anyhow::Result<()> {
                 println!("        {label}: {chars} chars");
             }
         }
+        // A placeholder is injected so the SESSION learns its contract broke,
+        // but it must not pass as health in the operator's diagnostic.
+        for label in &digest.missing {
+            println!("warn  resident file missing — the entry injects only a placeholder: {label}");
+        }
         if !digest.skipped_by_scope.is_empty() {
             println!(
                 "ok    {} resident entr(ies) out of scope for host {}{}",
@@ -646,16 +651,38 @@ fn selfcheck() -> anyhow::Result<()> {
     }
 
     if let Some(cfg) = &cfg {
-        // Rings 5 and 6 are records in the TREE, not per-host state. Report
-        // where they are without creating them: a diagnostic must not be the
-        // thing that first writes into the brain.
+        // Rings 5 and 6 are records in the TREE, not per-host state. A
+        // diagnostic must not be the thing that first writes into the
+        // brain — so the exhaust dir is never CREATED here, which also
+        // means writability cannot be honestly claimed before it exists.
+        // Test what can be tested: when the dir is there, write and remove
+        // a probe (leaves no record); when it is not, say "untested"
+        // instead of "this host writes", because on a read-only brain that
+        // claim was a lie a live hook then paid for.
         let logs = paths::logs_dir(&cfg.brain_root);
         let staging = paths::staging_dir(&cfg.brain_root);
         let host = paths::host_id();
-        println!(
-            "ok    ring-6 exhaust + ledger: {} (this host writes as {host})",
-            logs.display()
-        );
+        if logs.is_dir() {
+            let probe = logs.join(".selfcheck-write-probe");
+            match std::fs::write(&probe, b"").and_then(|()| std::fs::remove_file(&probe)) {
+                Ok(()) => println!(
+                    "ok    ring-6 exhaust writable: {} (this host writes as {host})",
+                    logs.display()
+                ),
+                Err(e) => {
+                    println!(
+                        "FAIL  ring-6 exhaust not writable: {} ({e}) — hooks silently drop every record",
+                        logs.display()
+                    );
+                    hard_failures += 1;
+                }
+            }
+        } else {
+            println!(
+                "warn  ring-6 exhaust dir not created yet: {} — writability untested; the first hook write decides",
+                logs.display()
+            );
+        }
         println!(
             "ok    ring-5 staging: {} ({} candidate(s) pending, all hosts)",
             staging.display(),
